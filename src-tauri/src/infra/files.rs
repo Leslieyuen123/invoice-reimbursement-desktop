@@ -19,12 +19,7 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn create(root: impl AsRef<Path>) -> Result<Self, AppError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)
-            .map_err(|error| internal_error("failed to create application root", error))?;
-        set_private_directory_permissions(&root)
-            .map_err(|error| internal_error("failed to secure application root", error))?;
-        let canonical_root = fs::canonicalize(&root)
-            .map_err(|error| internal_error("failed to resolve application root", error))?;
+        let canonical_root = ensure_application_root(&root)?;
         let paths = Self {
             originals: root.join("originals"),
             normalized: root.join("normalized"),
@@ -89,23 +84,14 @@ impl AppPaths {
             let canonical_year = fs::canonicalize(&year_directory)
                 .map_err(|error| internal_error("failed to resolve original year", error))?;
             ensure_storage_directory(&canonical_year, &destination_directory)?;
+            created_staging_file = false;
             promote_staged_original(&staging_path, &destination)?;
-            sync_directory(&destination_directory)
-                .map_err(|error| internal_error("failed to sync original directory", error))?;
-            sync_directory(&self.staging)
-                .map_err(|error| internal_error("failed to sync staging directory", error))?;
 
             Ok(destination)
         })();
 
         if result.is_err() && created_staging_file {
-            match fs::remove_file(&staging_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(internal_error("failed to clean staged original", error));
-                }
-            }
+            remove_file_durably(&staging_path)?;
         }
 
         result
@@ -156,6 +142,51 @@ fn set_private_directory_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn ensure_application_root(root: &Path) -> Result<PathBuf, AppError> {
+    let mut missing_components = Vec::new();
+    let mut existing_ancestor = root.to_path_buf();
+
+    loop {
+        match fs::metadata(&existing_ancestor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(AppError::Internal {
+                    message: "application root path is not a directory".to_owned(),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing_components.push(existing_ancestor.clone());
+                existing_ancestor = existing_ancestor
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(internal_error("failed to inspect application root", error));
+            }
+        }
+    }
+
+    for path in missing_components.iter().rev() {
+        fs::create_dir(path)
+            .map_err(|error| internal_error("failed to create application root", error))?;
+        set_private_directory_permissions(path)
+            .map_err(|error| internal_error("failed to secure application root", error))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_directory(parent)
+            .map_err(|error| internal_error("failed to sync application root parent", error))?;
+    }
+
+    set_private_directory_permissions(root)
+        .map_err(|error| internal_error("failed to secure application root", error))?;
+    fs::canonicalize(root)
+        .map_err(|error| internal_error("failed to resolve application root", error))
+}
+
 fn ensure_storage_directory(canonical_root: &Path, path: &Path) -> Result<(), AppError> {
     let created = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -201,21 +232,57 @@ fn ensure_storage_directory(canonical_root: &Path, path: &Path) -> Result<(), Ap
 }
 
 fn promote_staged_original(staging: &Path, destination: &Path) -> Result<(), AppError> {
+    promote_staged_original_with_sync(staging, destination, sync_directory)
+}
+
+fn promote_staged_original_with_sync(
+    staging: &Path,
+    destination: &Path,
+    mut sync_promoted_directory: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<(), AppError> {
     if let Err(error) = rename_staged_original(staging, destination) {
-        remove_staging_file(staging)?;
+        remove_file_durably(staging)?;
         return Err(error);
     }
 
-    match staging.try_exists() {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(AppError::Internal {
-            message: "staged original remained after promotion".to_owned(),
-        }),
-        Err(error) => Err(internal_error(
-            "failed to verify staged original promotion",
-            error,
-        )),
+    let destination_parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging_parent = staging
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let sync_result = sync_promoted_directory(destination_parent)
+        .and_then(|()| sync_promoted_directory(staging_parent));
+
+    if let Err(sync_error) = sync_result {
+        return match rename_staged_original(destination, staging) {
+            Ok(()) => {
+                let destination_sync_result = sync_directory(destination_parent);
+                remove_file_durably(staging)?;
+                destination_sync_result.map_err(|error| {
+                    internal_error("failed to sync original directory after rollback", error)
+                })?;
+
+                Err(internal_error(
+                    "failed to sync promoted original; promotion was rolled back",
+                    sync_error,
+                ))
+            }
+            Err(rollback_error) => Err(AppError::External {
+                service: "filesystem_sync".to_owned(),
+                retryable: false,
+                message: format!(
+                    "filesystem sync failed after promoting {}; rollback to {} also failed; manual recovery is required: sync error: {sync_error}; rollback error: {rollback_error}",
+                    destination.display(),
+                    staging.display(),
+                ),
+            }),
+        };
     }
+
+    Ok(())
 }
 
 #[cfg(any(
@@ -245,24 +312,36 @@ fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppE
 
 #[cfg(windows)]
 fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppError> {
-    match fs::rename(staging, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(AppError::Conflict {
-            message: "original destination already exists".to_owned(),
-        }),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            match destination.try_exists() {
-                Ok(true) => Err(AppError::Conflict {
-                    message: "original destination already exists".to_owned(),
-                }),
-                Ok(false) => Err(internal_error("failed to promote staged original", error)),
-                Err(inspect_error) => Err(internal_error(
-                    "failed to inspect original destination",
-                    inspect_error,
-                )),
-            }
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let staging_wide = staging
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    // Flags zero preserves MoveFileExW's strict no-replace behavior.
+    let moved = unsafe { MoveFileExW(staging_wide.as_ptr(), destination_wide.as_ptr(), 0) };
+    if moved != 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32 => {
+            Err(AppError::Conflict {
+                message: "original destination already exists".to_owned(),
+            })
         }
-        Err(error) => Err(internal_error("failed to promote staged original", error)),
+        _ => Err(internal_error("failed to promote staged original", error)),
     }
 }
 
@@ -282,9 +361,23 @@ fn rename_staged_original(_staging: &Path, _destination: &Path) -> Result<(), Ap
     })
 }
 
-fn remove_staging_file(path: &Path) -> Result<(), AppError> {
+fn remove_file_durably(path: &Path) -> Result<(), AppError> {
+    remove_file_durably_with_sync(path, sync_directory)
+}
+
+fn remove_file_durably_with_sync(
+    path: &Path,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), AppError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            sync_parent(parent)
+                .map_err(|error| internal_error("failed to sync cleaned file parent", error))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(internal_error("failed to clean staged original", error)),
     }
@@ -324,13 +417,16 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::sync::{Arc, Barrier};
 
     #[cfg(unix)]
     use super::open_staging_file;
-    use super::promote_staged_original;
+    use super::{
+        promote_staged_original, promote_staged_original_with_sync, remove_file_durably_with_sync,
+    };
     use crate::domain::error::AppError;
 
     #[cfg(unix)]
@@ -350,6 +446,96 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn durable_file_removal_syncs_the_parent_after_unlink() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let staging = directory.path().join("original.part");
+        fs::write(&staging, b"staged original").expect("staging fixture should write");
+        let parent_was_synced = Cell::new(false);
+
+        remove_file_durably_with_sync(&staging, |parent| {
+            assert_eq!(parent, directory.path());
+            parent_was_synced.set(true);
+            Ok(())
+        })
+        .expect("owned staging file should be removed durably");
+
+        assert!(!staging.exists());
+        assert!(parent_was_synced.get());
+    }
+
+    #[test]
+    fn durable_file_removal_ignores_a_missing_file_without_syncing() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let missing = directory.path().join("missing.part");
+
+        remove_file_durably_with_sync(&missing, |_| {
+            panic!("an unchanged directory must not be synced")
+        })
+        .expect("missing staging file cleanup should be idempotent");
+    }
+
+    #[test]
+    fn promotion_sync_failure_rolls_back_and_removes_the_owned_file() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let staging_directory = directory.path().join("staging");
+        let destination_directory = directory.path().join("originals");
+        fs::create_dir(&staging_directory).expect("staging directory should create");
+        fs::create_dir(&destination_directory).expect("destination directory should create");
+        let staging = staging_directory.join("original.part");
+        let destination = destination_directory.join("original.pdf");
+        fs::write(&staging, b"staged original").expect("staging fixture should write");
+
+        let error = promote_staged_original_with_sync(&staging, &destination, |_| {
+            Err(io::Error::other("injected directory sync failure"))
+        })
+        .expect_err("directory sync failure should roll promotion back");
+
+        assert!(matches!(error, AppError::Internal { .. }));
+        assert!(!destination.exists());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn promotion_rollback_failure_reports_explicit_manual_recovery() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let staging_directory = directory.path().join("staging");
+        let destination_directory = directory.path().join("originals");
+        fs::create_dir(&staging_directory).expect("staging directory should create");
+        fs::create_dir(&destination_directory).expect("destination directory should create");
+        let staging = staging_directory.join("original.part");
+        let destination = destination_directory.join("original.pdf");
+        fs::write(&staging, b"staged original").expect("staging fixture should write");
+
+        let error = promote_staged_original_with_sync(&staging, &destination, |_| {
+            fs::write(&staging, b"new staging owner")
+                .expect("replacement staging fixture should write");
+            Err(io::Error::other("injected directory sync failure"))
+        })
+        .expect_err("blocked rollback should require manual recovery");
+
+        match error {
+            AppError::External {
+                service,
+                retryable,
+                message,
+            } => {
+                assert_eq!(service, "filesystem_sync");
+                assert!(!retryable);
+                assert!(message.contains("manual recovery is required"));
+            }
+            other => panic!("unexpected rollback error: {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&destination).expect("promoted destination should remain"),
+            b"staged original"
+        );
+        assert_eq!(
+            fs::read(&staging).expect("new staging owner should remain"),
+            b"new staging owner"
         );
     }
 

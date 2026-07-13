@@ -37,6 +37,33 @@ fn app_paths_create_the_stable_storage_layout() {
 
 #[cfg(unix)]
 #[test]
+fn app_paths_secure_every_new_component_of_a_nested_root() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let first_component = directory.path().join("level-one");
+    let second_component = first_component.join("level-two");
+    let root = second_component.join("invoice-desk");
+
+    AppPaths::create(&root).expect("nested application root should create");
+
+    for path in [&first_component, &second_component, &root] {
+        let mode = fs::metadata(path)
+            .expect("nested root metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "nested root component is not private: {}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn app_paths_reject_a_storage_subdirectory_symlink_escape() {
     use std::os::unix::fs::symlink;
 
