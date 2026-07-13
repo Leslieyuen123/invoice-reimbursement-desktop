@@ -35,6 +35,66 @@ fn app_paths_create_the_stable_storage_layout() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn app_paths_reject_a_storage_subdirectory_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let root = directory.path().join("invoice-desk");
+    let outside = directory.path().join("outside");
+    fs::create_dir(&root).expect("application root fixture should create");
+    fs::create_dir(&outside).expect("outside fixture should create");
+    symlink(&outside, root.join("originals")).expect("symlink fixture should create");
+
+    let error = AppPaths::create(&root).expect_err("storage symlink should be rejected");
+
+    assert!(matches!(error, AppError::Internal { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_directories_and_original_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let root = directory.path().join("invoice-desk");
+    let paths = AppPaths::create(&root).expect("application paths should create");
+    let source = directory.path().join("upload.pdf");
+    fs::write(&source, b"private invoice").expect("source fixture should write");
+    let id = Uuid::new_v4();
+    let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("fixture date should be valid");
+
+    let destination = paths
+        .persist_original(&source, date, id, "pdf")
+        .expect("original should persist");
+
+    for path in [
+        &paths.root,
+        &paths.originals,
+        &paths.normalized,
+        &paths.exports,
+        &paths.staging,
+        &paths.originals.join("2026"),
+        &paths.originals.join("2026").join("07"),
+    ] {
+        let mode = fs::metadata(path)
+            .expect("directory metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "directory is not private: {}", path.display());
+    }
+    assert_eq!(
+        fs::metadata(destination)
+            .expect("original metadata should read")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn memory_credentials_are_scoped_by_account() {
     let credentials = MemoryCredentialStore::default();
@@ -156,6 +216,28 @@ fn persist_original_cleans_staging_when_the_source_cannot_be_read() {
 
     assert!(matches!(error, AppError::Internal { .. }));
     assert!(!paths.staging.join(format!("{id}.part")).exists());
+}
+
+#[test]
+fn persist_original_maps_an_existing_staging_file_to_conflict() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path()).expect("application paths should create");
+    let source = directory.path().join("upload.pdf");
+    fs::write(&source, b"new upload").expect("source fixture should write");
+    let id = Uuid::new_v4();
+    let staging = paths.staging.join(format!("{id}.part"));
+    fs::write(&staging, b"in progress").expect("stale staging fixture should write");
+    let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("fixture date should be valid");
+
+    let error = paths
+        .persist_original(&source, date, id, "pdf")
+        .expect_err("existing staging file should conflict");
+
+    assert!(matches!(error, AppError::Conflict { .. }));
+    assert_eq!(
+        fs::read(staging).expect("pre-existing staging file should remain"),
+        b"in progress"
+    );
 }
 
 #[test]

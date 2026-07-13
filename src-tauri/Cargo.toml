@@ -24,6 +24,7 @@ native-tls = "0.2"
 pdf-extract = "0.9"
 printpdf = "0.8"
 rust_decimal = "1"
+rustix = { version = "1", features = ["fs"] }
 rust_xlsxwriter = "0.90"
 sanitize-filename = "0.6"
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +35,6 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
-tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "io-util", "sync"] }
 tracing = "0.1"
@@ -45,3 +45,4 @@ zip = "4"
 
 [dev-dependencies]
 pretty_assertions = "1"
+tempfile = "3"

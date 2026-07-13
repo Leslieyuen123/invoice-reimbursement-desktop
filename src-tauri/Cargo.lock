@@ -2810,6 +2810,7 @@ dependencies = [
  "printpdf",
  "rust_decimal",
  "rust_xlsxwriter",
+ "rustix",
  "sanitize-filename",
  "serde",
  "serde_json",
