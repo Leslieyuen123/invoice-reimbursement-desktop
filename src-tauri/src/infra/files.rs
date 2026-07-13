@@ -77,24 +77,7 @@ impl AppPaths {
 
             fs::create_dir_all(&destination_directory)
                 .map_err(|error| internal_error("failed to create original directory", error))?;
-            if destination
-                .try_exists()
-                .map_err(|error| internal_error("failed to inspect original destination", error))?
-            {
-                return Err(AppError::Conflict {
-                    message: "original destination already exists".to_owned(),
-                });
-            }
-
-            fs::rename(&staging_path, &destination).map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    AppError::Conflict {
-                        message: "original destination already exists".to_owned(),
-                    }
-                } else {
-                    internal_error("failed to promote staged original", error)
-                }
-            })?;
+            promote_staged_original(&staging_path, &destination)?;
 
             Ok(destination)
         })();
@@ -110,6 +93,27 @@ impl AppPaths {
         }
 
         result
+    }
+}
+
+fn promote_staged_original(staging: &Path, destination: &Path) -> Result<(), AppError> {
+    let staging = tempfile::TempPath::try_from_path(staging.to_path_buf())
+        .map_err(|error| internal_error("failed to manage staged original", error))?;
+
+    match staging.persist_noclobber(destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let tempfile::PathPersistError { error, path } = error;
+            drop(path);
+
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Err(AppError::Conflict {
+                    message: "original destination already exists".to_owned(),
+                })
+            } else {
+                Err(internal_error("failed to promote staged original", error))
+            }
+        }
     }
 }
 
@@ -131,5 +135,70 @@ fn validate_extension(extension: &str) -> Result<(), AppError> {
 fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
     AppError::Internal {
         message: format!("{context}: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::sync::{Arc, Barrier};
+
+    use super::promote_staged_original;
+    use crate::domain::error::AppError;
+
+    #[test]
+    fn concurrent_promotions_never_clobber_the_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let destination = directory.path().join("original.pdf");
+        let staging_files = [
+            (directory.path().join("first.part"), b"first".as_slice()),
+            (directory.path().join("second.part"), b"second".as_slice()),
+        ];
+
+        for (path, content) in &staging_files {
+            let mut file = File::create(path).expect("staging file should create");
+            file.write_all(content)
+                .expect("staging content should write");
+            file.sync_all().expect("staging file should sync");
+        }
+
+        let barrier = Arc::new(Barrier::new(staging_files.len()));
+        let workers = staging_files
+            .iter()
+            .map(|(staging, content)| {
+                let staging = staging.clone();
+                let destination = destination.clone();
+                let content = content.to_vec();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (promote_staged_original(&staging, &destination), content)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut winner = None;
+        let mut conflicts = 0;
+        for worker in workers {
+            let (result, content) = worker.join().expect("promotion worker should finish");
+            match result {
+                Ok(()) => {
+                    assert!(winner.replace(content).is_none(), "only one worker may win");
+                }
+                Err(AppError::Conflict { .. }) => conflicts += 1,
+                Err(error) => panic!("unexpected promotion error: {error:?}"),
+            }
+        }
+
+        let winner = winner.expect("one promotion should succeed");
+        assert_eq!(conflicts, 1);
+        assert_eq!(
+            fs::read(&destination).expect("destination should read"),
+            winner
+        );
+        for (path, _) in staging_files {
+            assert!(!path.exists(), "staging file leaked: {}", path.display());
+        }
     }
 }
