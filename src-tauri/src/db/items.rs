@@ -190,7 +190,10 @@ impl ItemRepository {
     }
 
     pub async fn find_by_hash(&self, sha256: &str) -> Result<Option<InvoiceItem>, AppError> {
-        let query = format!("SELECT {ITEM_COLUMNS} FROM items WHERE sha256 = ? LIMIT 1");
+        let query = format!(
+            "SELECT {ITEM_COLUMNS} FROM items \
+             WHERE sha256 = ? ORDER BY created_at ASC, id ASC LIMIT 1"
+        );
         let row = sqlx::query_as::<_, DbItemRow>(&query)
             .bind(sha256)
             .fetch_optional(&self.pool)

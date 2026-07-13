@@ -16,6 +16,14 @@ pub struct AppPaths {
     pub staging: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct StagedOriginal {
+    paths: AppPaths,
+    path: PathBuf,
+    file: Option<File>,
+    owned: bool,
+}
+
 impl AppPaths {
     pub fn create(root: impl AsRef<Path>) -> Result<Self, AppError> {
         let root = root.as_ref().to_path_buf();
@@ -50,43 +58,129 @@ impl AppPaths {
         extension: &str,
     ) -> Result<PathBuf, AppError> {
         validate_extension(extension)?;
-
-        let staging_path = self.staging.join(format!("{id}.part"));
-        let year_directory = self.originals.join(date.format("%Y").to_string());
-        let destination_directory = year_directory.join(date.format("%m").to_string());
-        let destination = destination_directory.join(format!("{id}.{extension}"));
-        let mut created_staging_file = false;
-
-        let result = (|| {
-            let mut source_file = File::open(source.as_ref())
-                .map_err(|error| internal_error("failed to open original source", error))?;
-            let mut staging_file = open_staging_file(&staging_path)?;
-            created_staging_file = true;
-
-            io::copy(&mut source_file, &mut staging_file)
+        let mut source_file = File::open(source.as_ref())
+            .map_err(|error| internal_error("failed to open original source", error))?;
+        let mut staged = self.stage_original(id)?;
+        let copy_result = (|| {
+            let staging_file = staged.file.as_mut().expect("staged file should be open");
+            io::copy(&mut source_file, staging_file)
                 .map_err(|error| internal_error("failed to copy original to staging", error))?;
             staging_file
                 .sync_all()
-                .map_err(|error| internal_error("failed to sync staged original", error))?;
-            drop(staging_file);
-
-            let canonical_originals = fs::canonicalize(&self.originals)
-                .map_err(|error| internal_error("failed to resolve original storage", error))?;
-            ensure_storage_directory(&canonical_originals, &year_directory)?;
-            let canonical_year = fs::canonicalize(&year_directory)
-                .map_err(|error| internal_error("failed to resolve original year", error))?;
-            ensure_storage_directory(&canonical_year, &destination_directory)?;
-            created_staging_file = false;
-            promote_staged_original(&staging_path, &destination)?;
-
-            Ok(destination)
+                .map_err(|error| internal_error("failed to sync staged original", error))
         })();
-
-        if result.is_err() && created_staging_file {
-            remove_file_durably(&staging_path)?;
+        if let Err(error) = copy_result {
+            return Err(staged.cleanup_after(error));
         }
 
-        result
+        staged.promote(date, id, extension)
+    }
+
+    pub fn stage_original(&self, id: Uuid) -> Result<StagedOriginal, AppError> {
+        let path = self.staging.join(format!("{id}.part"));
+        let file = open_staging_file(&path)?;
+        Ok(StagedOriginal {
+            paths: self.clone(),
+            path,
+            file: Some(file),
+            owned: true,
+        })
+    }
+
+    pub fn delete_original(&self, path: impl AsRef<Path>) -> Result<(), AppError> {
+        let path = path.as_ref();
+        if !path.starts_with(&self.originals) {
+            return Err(AppError::Internal {
+                message: "refusing to delete a file outside original storage".to_owned(),
+            });
+        }
+        let canonical_originals = fs::canonicalize(&self.originals)
+            .map_err(|error| internal_error("failed to resolve original storage", error))?;
+        let parent = path.parent().ok_or_else(|| AppError::Internal {
+            message: "original path has no parent directory".to_owned(),
+        })?;
+        let canonical_parent = fs::canonicalize(parent)
+            .map_err(|error| internal_error("failed to resolve original parent", error))?;
+        if !canonical_parent.starts_with(canonical_originals) {
+            return Err(AppError::Internal {
+                message: "refusing to delete an original outside storage root".to_owned(),
+            });
+        }
+
+        remove_file_durably(path)
+    }
+}
+
+impl StagedOriginal {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn take_file(&mut self) -> Result<File, AppError> {
+        self.file.take().ok_or_else(|| AppError::Internal {
+            message: "staged original file is already closed".to_owned(),
+        })
+    }
+
+    pub fn promote(
+        mut self,
+        date: NaiveDate,
+        id: Uuid,
+        extension: &str,
+    ) -> Result<PathBuf, AppError> {
+        self.file.take();
+        let destination = match self.paths.original_destination(date, id, extension) {
+            Ok(destination) => destination,
+            Err(error) => return Err(self.cleanup_after(error)),
+        };
+        self.owned = false;
+        promote_staged_original(&self.path, &destination)?;
+        Ok(destination)
+    }
+
+    pub(crate) fn cleanup_after(mut self, error: AppError) -> AppError {
+        self.file.take();
+        self.owned = false;
+        match remove_file_durably(&self.path) {
+            Ok(()) => error,
+            Err(cleanup_error) => AppError::External {
+                service: "filesystem_sync".to_owned(),
+                retryable: false,
+                message: format!(
+                    "staged original cleanup was incomplete; manual recovery is required: original error: {error}; cleanup error: {cleanup_error}",
+                ),
+            },
+        }
+    }
+}
+
+impl Drop for StagedOriginal {
+    fn drop(&mut self) {
+        self.file.take();
+        if self.owned {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl AppPaths {
+    fn original_destination(
+        &self,
+        date: NaiveDate,
+        id: Uuid,
+        extension: &str,
+    ) -> Result<PathBuf, AppError> {
+        validate_extension(extension)?;
+        let year_directory = self.originals.join(date.format("%Y").to_string());
+        let destination_directory = year_directory.join(date.format("%m").to_string());
+        let destination = destination_directory.join(format!("{id}.{extension}"));
+        let canonical_originals = fs::canonicalize(&self.originals)
+            .map_err(|error| internal_error("failed to resolve original storage", error))?;
+        ensure_storage_directory(&canonical_originals, &year_directory)?;
+        let canonical_year = fs::canonicalize(&year_directory)
+            .map_err(|error| internal_error("failed to resolve original year", error))?;
+        ensure_storage_directory(&canonical_year, &destination_directory)?;
+        Ok(destination)
     }
 }
 
