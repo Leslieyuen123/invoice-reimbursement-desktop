@@ -5,6 +5,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::domain::error::AppError;
 
+pub mod accounts;
+pub mod batches;
 pub mod items;
 
 pub async fn connect(database_url: &str) -> Result<SqlitePool, AppError> {

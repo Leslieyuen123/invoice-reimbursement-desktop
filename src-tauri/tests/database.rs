@@ -1,9 +1,14 @@
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use invoice_reimbursement::db;
+use invoice_reimbursement::db::accounts::{
+    MailboxAccountRepository, MailboxProvider, NewMailboxAccount,
+};
+use invoice_reimbursement::db::batches::BatchRepository;
 use invoice_reimbursement::db::items::{ItemFilter, ItemPatch, ItemRepository, NewItemRecord};
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::domain::model::{
-    Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, SourceType,
+    BatchStatus, Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch,
+    RecognitionStatus, SourceType,
 };
 use sqlx::{SqlitePool, sqlite::SqliteQueryResult};
 use uuid::Uuid;
@@ -596,6 +601,499 @@ async fn item_repository_reports_missing_updates_as_item_not_found() {
         matches!(error, AppError::NotFound { ref entity, .. } if entity == "item"),
         "unexpected error: {error:?}"
     );
+}
+
+#[tokio::test]
+async fn batch_repository_creates_gets_and_lists_normalized_batches() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = BatchRepository::new(pool);
+    let new_batch = NewBatch::try_new(
+        "  July expenses  ",
+        "2026-07-01",
+        "2026-07-31",
+        Some("month close".to_owned()),
+    )
+    .expect("batch input should validate");
+
+    let created = repository
+        .create(new_batch)
+        .await
+        .expect("batch should create");
+    let fetched = repository
+        .get(created.id)
+        .await
+        .expect("batch should be retrievable");
+    let summaries = repository.list().await.expect("batches should list");
+
+    assert_eq!(created, fetched);
+    assert_eq!(created.name, "July expenses");
+    assert_eq!(created.start_date, date(2026, 7, 1));
+    assert_eq!(created.end_date, date(2026, 7, 31));
+    assert_eq!(created.status, BatchStatus::Draft);
+    assert_eq!(created.note.as_deref(), Some("month close"));
+    assert_eq!(created.created_at, created.updated_at);
+    assert_eq!(created.last_exported_at, None);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, created.id);
+    assert_eq!(summaries[0].name, created.name);
+    assert_eq!(summaries[0].status, BatchStatus::Draft);
+    assert_eq!(summaries[0].item_count, 0);
+    assert_eq!(summaries[0].total_amount_cents, 0);
+}
+
+#[tokio::test]
+async fn batch_repository_list_aggregates_only_assigned_items() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let batches = BatchRepository::new(pool.clone());
+    let items = ItemRepository::new(pool);
+    let target = batches
+        .create(sample_batch("Target batch"))
+        .await
+        .expect("target batch should create");
+    let other = batches
+        .create(sample_batch("Other batch"))
+        .await
+        .expect("other batch should create");
+
+    let mut assigned_amount = sample_item("assigned-amount", "sha256-assigned-amount");
+    assigned_amount.batch_id = Some(target.id);
+    assigned_amount.amount_cents = Some(12_345);
+    items
+        .insert(&assigned_amount)
+        .await
+        .expect("assigned item should insert");
+    let mut assigned_null = sample_item("assigned-null", "sha256-assigned-null");
+    assigned_null.batch_id = Some(target.id);
+    assigned_null.amount_cents = None;
+    items
+        .insert(&assigned_null)
+        .await
+        .expect("null amount item should insert");
+    let unassigned = sample_item("unassigned", "sha256-unassigned");
+    items
+        .insert(&unassigned)
+        .await
+        .expect("unassigned item should insert");
+    let mut assigned_elsewhere = sample_item("elsewhere", "sha256-elsewhere");
+    assigned_elsewhere.batch_id = Some(other.id);
+    assigned_elsewhere.amount_cents = Some(99_999);
+    items
+        .insert(&assigned_elsewhere)
+        .await
+        .expect("other batch item should insert");
+
+    let summaries = batches.list().await.expect("batches should list");
+    let target_summary = summaries
+        .iter()
+        .find(|summary| summary.id == target.id)
+        .expect("target summary should exist");
+    let other_summary = summaries
+        .iter()
+        .find(|summary| summary.id == other.id)
+        .expect("other summary should exist");
+
+    assert_eq!(target_summary.item_count, 2);
+    assert_eq!(target_summary.total_amount_cents, 12_345);
+    assert_eq!(other_summary.item_count, 1);
+    assert_eq!(other_summary.total_amount_cents, 99_999);
+}
+
+#[tokio::test]
+async fn batch_repository_list_orders_by_updated_at_then_id_descending() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = BatchRepository::new(pool.clone());
+    let same_time_a = repository
+        .create(sample_batch("Same time A"))
+        .await
+        .expect("batch should create");
+    let same_time_b = repository
+        .create(sample_batch("Same time B"))
+        .await
+        .expect("batch should create");
+    let newest = repository
+        .create(sample_batch("Newest"))
+        .await
+        .expect("batch should create");
+
+    for (id, updated_at) in [
+        (same_time_a.id, "2026-07-13T10:00:00Z"),
+        (same_time_b.id, "2026-07-13T10:00:00Z"),
+        (newest.id, "2026-07-14T10:00:00Z"),
+    ] {
+        sqlx::query("UPDATE batches SET updated_at = ? WHERE id = ?")
+            .bind(updated_at)
+            .bind(id.to_string())
+            .execute(&pool)
+            .await
+            .expect("batch timestamp should update");
+    }
+
+    let summaries = repository.list().await.expect("batches should list");
+    let mut tied_ids = [same_time_a.id, same_time_b.id];
+    tied_ids.sort_unstable_by(|left, right| right.cmp(left));
+
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>(),
+        vec![newest.id, tied_ids[0], tied_ids[1]]
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_batch_keeps_assigned_items_and_clears_their_batch_id() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let batches = BatchRepository::new(pool.clone());
+    let items = ItemRepository::new(pool);
+    let batch = batches
+        .create(sample_batch("Disposable batch"))
+        .await
+        .expect("batch should create");
+    let mut item = sample_item("delete-batch", "sha256-delete-batch");
+    item.batch_id = Some(batch.id);
+    items.insert(&item).await.expect("item should insert");
+
+    batches.delete(batch.id).await.expect("batch should delete");
+    let retained = items
+        .find_by_hash(&item.sha256)
+        .await
+        .expect("item lookup should succeed")
+        .expect("item should remain");
+
+    assert_eq!(retained.batch_id, None);
+    assert!(matches!(
+        batches.get(batch.id).await,
+        Err(AppError::NotFound { ref entity, .. }) if entity == "batch"
+    ));
+}
+
+#[tokio::test]
+async fn mailbox_account_repository_inserts_gets_lists_and_round_trips_providers() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = MailboxAccountRepository::new(pool);
+    let qq = repository
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::QQ,
+            email: "z@example.com".to_owned(),
+            host: "imap.qq.com".to_owned(),
+            port: 993,
+            enabled: false,
+            sync_interval_minutes: 60,
+        })
+        .await
+        .expect("QQ account should insert");
+    let gmail = repository
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "a@example.com".to_owned(),
+            host: "imap.gmail.com".to_owned(),
+            port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .expect("Gmail account should insert");
+
+    assert_eq!(repository.get(qq.id).await.expect("account should get"), qq);
+    let accounts = repository.list().await.expect("accounts should list");
+    assert_eq!(accounts, vec![gmail, qq]);
+    assert_eq!(accounts[0].provider, MailboxProvider::Gmail);
+    assert_eq!(accounts[1].provider, MailboxProvider::QQ);
+    assert_eq!(
+        serde_json::to_string(&MailboxProvider::Gmail).expect("Gmail provider should serialize"),
+        "\"gmail\""
+    );
+    assert_eq!(
+        serde_json::to_string(&MailboxProvider::QQ).expect("QQ provider should serialize"),
+        "\"qq\""
+    );
+    assert!(accounts[0].enabled);
+    assert!(!accounts[1].enabled);
+    assert_eq!(accounts[0].last_synced_at, None);
+    assert_eq!(accounts[0].last_error, None);
+
+    let missing_error = repository
+        .get(Uuid::new_v4())
+        .await
+        .expect_err("missing account should not be returned");
+    assert!(matches!(
+        missing_error,
+        AppError::NotFound { ref entity, .. } if entity == "mailbox_account"
+    ));
+}
+
+#[tokio::test]
+async fn mailbox_account_repository_validates_before_sql_and_rejects_duplicate_email() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = MailboxAccountRepository::new(pool.clone());
+    let valid = sample_account("duplicate@example.com");
+    repository
+        .insert(valid.clone())
+        .await
+        .expect("first account should insert");
+
+    let duplicate_error = repository
+        .insert(valid)
+        .await
+        .expect_err("duplicate email should conflict");
+    assert!(matches!(duplicate_error, AppError::Conflict { .. }));
+
+    for (field, account) in [
+        (
+            "port",
+            NewMailboxAccount {
+                port: 0,
+                email: "bad-port@example.com".to_owned(),
+                ..sample_account("unused-port@example.com")
+            },
+        ),
+        (
+            "port",
+            NewMailboxAccount {
+                port: 65_536,
+                email: "bad-high-port@example.com".to_owned(),
+                ..sample_account("unused-high-port@example.com")
+            },
+        ),
+        (
+            "sync_interval_minutes",
+            NewMailboxAccount {
+                sync_interval_minutes: 4,
+                email: "bad-interval@example.com".to_owned(),
+                ..sample_account("unused-interval@example.com")
+            },
+        ),
+        (
+            "sync_interval_minutes",
+            NewMailboxAccount {
+                sync_interval_minutes: 1_441,
+                email: "bad-high-interval@example.com".to_owned(),
+                ..sample_account("unused-high-interval@example.com")
+            },
+        ),
+    ] {
+        let error = repository
+            .insert(account)
+            .await
+            .expect_err("invalid account should be rejected");
+        assert!(
+            matches!(error, AppError::Validation { field: ref actual, .. } if actual == field),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    let stored_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mailbox_accounts")
+        .fetch_one(&pool)
+        .await
+        .expect("account count should query");
+    assert_eq!(stored_count, 1);
+}
+
+#[tokio::test]
+async fn persisted_domain_enums_round_trip_through_repository_rows() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let batches = BatchRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let accounts = MailboxAccountRepository::new(pool.clone());
+
+    let batch = batches
+        .create(sample_batch("Enum batch"))
+        .await
+        .expect("batch should create");
+    assert_eq!(batch.status, BatchStatus::Draft);
+
+    let account = accounts
+        .insert(sample_account("enum@example.com"))
+        .await
+        .expect("account should insert");
+    assert_eq!(account.provider, MailboxProvider::Gmail);
+    accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::QQ,
+            ..sample_account("enum-qq@example.com")
+        })
+        .await
+        .expect("QQ account should insert");
+
+    let category_cases = [
+        Category::Transport,
+        Category::Dining,
+        Category::Accommodation,
+        Category::Hospitality,
+    ];
+    let source_cases = [SourceType::Email, SourceType::ManualUpload];
+    let recognition_cases = [
+        RecognitionStatus::Pending,
+        RecognitionStatus::Succeeded,
+        RecognitionStatus::Failed,
+    ];
+    let confirmation_cases = [ConfirmationStatus::Pending, ConfirmationStatus::Confirmed];
+    let dedupe_cases = [
+        DedupeStatus::Unique,
+        DedupeStatus::SuspectedDuplicate,
+        DedupeStatus::Resolved,
+    ];
+
+    for index in 0..12 {
+        let mut item = sample_item(&format!("enum-{index}"), &format!("sha256-enum-{index}"));
+        item.suggested_category = Some(category_cases[index % category_cases.len()]);
+        item.final_category = Some(category_cases[(index + 1) % category_cases.len()]);
+        item.source_type = source_cases[index % source_cases.len()];
+        if item.source_type == SourceType::Email {
+            item.source_account_id = Some(account.id);
+            item.source_mailbox = Some("INBOX".to_owned());
+            item.source_uid = Some(index as i64 + 1);
+            item.source_part_id = Some("1".to_owned());
+        }
+        item.recognition_status = recognition_cases[index % recognition_cases.len()];
+        item.confirmation_status = confirmation_cases[index % confirmation_cases.len()];
+        item.dedupe_status = dedupe_cases[index % dedupe_cases.len()];
+
+        let inserted = items.insert(&item).await.expect("enum item should insert");
+        assert_eq!(inserted.suggested_category, item.suggested_category);
+        assert_eq!(inserted.final_category, item.final_category);
+        assert_eq!(inserted.source_type, item.source_type);
+        assert_eq!(inserted.recognition_status, item.recognition_status);
+        assert_eq!(inserted.confirmation_status, item.confirmation_status);
+        assert_eq!(inserted.dedupe_status, item.dedupe_status);
+    }
+
+    let exported_batch = batches
+        .create(sample_batch("Exported enum batch"))
+        .await
+        .expect("second batch should create");
+    sqlx::query("UPDATE batches SET status = 'exported' WHERE id = ?")
+        .bind(exported_batch.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("batch status should update");
+
+    let persisted_batch_statuses =
+        sqlx::query_scalar::<_, BatchStatus>("SELECT status FROM batches ORDER BY status")
+            .fetch_all(&pool)
+            .await
+            .expect("batch statuses should decode through SQLx");
+    let persisted_providers = sqlx::query_scalar::<_, MailboxProvider>(
+        "SELECT provider FROM mailbox_accounts ORDER BY provider",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("mailbox providers should decode through SQLx");
+    let persisted_item_enums = sqlx::query_as::<
+        _,
+        (
+            Category,
+            Category,
+            SourceType,
+            RecognitionStatus,
+            ConfirmationStatus,
+            DedupeStatus,
+        ),
+    >(
+        "SELECT suggested_category, final_category, source_type, recognition_status, \
+            confirmation_status, dedupe_status \
+         FROM items WHERE original_name LIKE 'invoice-enum-%'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("item enums should decode through SQLx");
+
+    assert_eq!(
+        persisted_batch_statuses,
+        vec![BatchStatus::Draft, BatchStatus::Exported]
+    );
+    assert_eq!(
+        persisted_providers,
+        vec![MailboxProvider::Gmail, MailboxProvider::QQ]
+    );
+    for expected in category_cases {
+        assert!(
+            persisted_item_enums
+                .iter()
+                .any(|(suggested, _, ..)| *suggested == expected)
+        );
+        assert!(
+            persisted_item_enums
+                .iter()
+                .any(|(_, final_category, ..)| *final_category == expected)
+        );
+    }
+    for expected in source_cases {
+        assert!(
+            persisted_item_enums
+                .iter()
+                .any(|(_, _, source, ..)| *source == expected)
+        );
+    }
+    for expected in recognition_cases {
+        assert!(
+            persisted_item_enums
+                .iter()
+                .any(|(_, _, _, recognition, ..)| *recognition == expected)
+        );
+    }
+    for expected in confirmation_cases {
+        assert!(
+            persisted_item_enums
+                .iter()
+                .any(|(_, _, _, _, confirmation, _)| *confirmation == expected)
+        );
+    }
+    for expected in dedupe_cases {
+        assert!(
+            persisted_item_enums
+                .iter()
+                .any(|(_, _, _, _, _, dedupe)| *dedupe == expected)
+        );
+    }
+
+    sqlx::query("UPDATE batches SET status = 'exported' WHERE id = ?")
+        .bind(batch.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("batch status should update");
+    assert_eq!(
+        batches
+            .get(batch.id)
+            .await
+            .expect("batch should reload")
+            .status,
+        BatchStatus::Exported
+    );
+}
+
+fn sample_batch(name: &str) -> NewBatch {
+    NewBatch::try_new(name, "2026-07-01", "2026-07-31", None).expect("sample batch should validate")
+}
+
+fn sample_account(email: &str) -> NewMailboxAccount {
+    NewMailboxAccount {
+        provider: MailboxProvider::Gmail,
+        email: email.to_owned(),
+        host: "imap.example.com".to_owned(),
+        port: 993,
+        enabled: true,
+        sync_interval_minutes: 15,
+    }
+}
+
+fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).expect("test date should be valid")
 }
 
 async fn insert_batch(pool: &SqlitePool, id: Uuid) {
