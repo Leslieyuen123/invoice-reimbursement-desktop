@@ -1,0 +1,128 @@
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, RwLock};
+
+use crate::domain::error::AppError;
+
+pub trait CredentialStore: Send + Sync {
+    fn get(&self, account_id: &str) -> Result<Option<String>, AppError>;
+    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError>;
+    fn delete(&self, account_id: &str) -> Result<(), AppError>;
+}
+
+const KEYRING_SERVICE: &str = "com.invoice-desk.credentials";
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyringCredentialStore;
+
+impl KeyringCredentialStore {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn entry(account_id: &str) -> Result<keyring::Entry, AppError> {
+        validate_account_id(account_id)?;
+        keyring::Entry::new(KEYRING_SERVICE, account_id)
+            .map_err(|_| keyring_error("failed to access credential store"))
+    }
+}
+
+impl CredentialStore for KeyringCredentialStore {
+    fn get(&self, account_id: &str) -> Result<Option<String>, AppError> {
+        match Self::entry(account_id)?.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err(keyring_error("failed to read credential")),
+        }
+    }
+
+    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
+        validate_secret(secret)?;
+        Self::entry(account_id)?
+            .set_password(secret)
+            .map_err(|_| keyring_error("failed to store credential"))
+    }
+
+    fn delete(&self, account_id: &str) -> Result<(), AppError> {
+        match Self::entry(account_id)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err(keyring_error("failed to delete credential")),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct MemoryCredentialStore {
+    secrets: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl fmt::Debug for MemoryCredentialStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MemoryCredentialStore")
+    }
+}
+
+impl CredentialStore for MemoryCredentialStore {
+    fn get(&self, account_id: &str) -> Result<Option<String>, AppError> {
+        validate_account_id(account_id)?;
+        self.secrets
+            .read()
+            .map(|secrets| secrets.get(account_id).cloned())
+            .map_err(|_| lock_error())
+    }
+
+    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
+        validate_account_id(account_id)?;
+        validate_secret(secret)?;
+        self.secrets
+            .write()
+            .map_err(|_| lock_error())?
+            .insert(account_id.to_owned(), secret.to_owned());
+        Ok(())
+    }
+
+    fn delete(&self, account_id: &str) -> Result<(), AppError> {
+        validate_account_id(account_id)?;
+        self.secrets
+            .write()
+            .map_err(|_| lock_error())?
+            .remove(account_id);
+        Ok(())
+    }
+}
+
+fn validate_account_id(account_id: &str) -> Result<(), AppError> {
+    if account_id.trim().is_empty() {
+        return Err(AppError::validation(
+            "account_id",
+            "account ID must not be blank",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_secret(secret: &str) -> Result<(), AppError> {
+    if secret.trim().is_empty() {
+        return Err(AppError::validation(
+            "secret",
+            "credential secret must not be blank",
+        ));
+    }
+
+    Ok(())
+}
+
+fn keyring_error(message: &str) -> AppError {
+    AppError::External {
+        service: "keyring".to_owned(),
+        retryable: false,
+        message: message.to_owned(),
+    }
+}
+
+fn lock_error() -> AppError {
+    AppError::Internal {
+        message: "credential storage lock is unavailable".to_owned(),
+    }
+}
