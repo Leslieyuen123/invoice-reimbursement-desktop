@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use sqlx::Type;
 
 use super::error::AppError;
@@ -85,13 +85,33 @@ pub fn derive_item_status(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewBatch {
-    pub name: String,
-    pub start_date: NaiveDate,
-    pub end_date: NaiveDate,
-    pub note: Option<String>,
+    name: String,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    note: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for NewBatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct NewBatchInput {
+            name: String,
+            start_date: String,
+            end_date: String,
+            note: Option<String>,
+        }
+
+        let input = NewBatchInput::deserialize(deserializer)?;
+        Self::try_new(input.name, input.start_date, input.end_date, input.note)
+            .map_err(de::Error::custom)
+    }
 }
 
 fn parse_date(input: &str, field: &str) -> Result<NaiveDate, AppError> {
@@ -130,56 +150,85 @@ impl NewBatch {
             note,
         })
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn start_date(&self) -> NaiveDate {
+        self.start_date
+    }
+
+    pub fn end_date(&self) -> NaiveDate {
+        self.end_date
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
+
+    use serde::{Serialize, de::DeserializeOwned};
+    use serde_json::json;
+
     use super::{
         BatchStatus, Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch,
         RecognitionStatus, SourceType, derive_item_status,
     };
     use crate::domain::error::AppError;
 
-    #[test]
-    fn serializes_domain_enums_as_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&Category::Transport).unwrap(),
-            "\"transport\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ItemStatus::PendingConfirmation).unwrap(),
-            "\"pending_confirmation\""
-        );
+    fn assert_enum_round_trips<T>(cases: &[(T, &str)])
+    where
+        T: Copy + Debug + DeserializeOwned + PartialEq + Serialize,
+    {
+        for (value, wire_value) in cases {
+            let serialized = serde_json::to_string(value).unwrap();
+            assert_eq!(serialized, format!("\"{wire_value}\""));
+            assert_eq!(serde_json::from_str::<T>(&serialized).unwrap(), *value);
+        }
     }
 
     #[test]
-    fn serializes_persisted_enums_as_snake_case() {
-        let cases = [
-            (
-                serde_json::to_value(SourceType::ManualUpload).unwrap(),
-                "manual_upload",
-            ),
-            (
-                serde_json::to_value(BatchStatus::Exported).unwrap(),
-                "exported",
-            ),
-            (
-                serde_json::to_value(RecognitionStatus::Failed).unwrap(),
-                "failed",
-            ),
-            (
-                serde_json::to_value(ConfirmationStatus::Confirmed).unwrap(),
-                "confirmed",
-            ),
-            (
-                serde_json::to_value(DedupeStatus::SuspectedDuplicate).unwrap(),
-                "suspected_duplicate",
-            ),
-        ];
-
-        for (serialized, expected) in cases {
-            assert_eq!(serialized, expected);
-        }
+    fn round_trips_every_enum_variant_with_its_snake_case_wire_value() {
+        assert_enum_round_trips(&[
+            (ItemStatus::PendingRecognition, "pending_recognition"),
+            (ItemStatus::PendingConfirmation, "pending_confirmation"),
+            (ItemStatus::RecognitionFailed, "recognition_failed"),
+            (ItemStatus::SuspectedDuplicate, "suspected_duplicate"),
+            (ItemStatus::Ready, "ready"),
+        ]);
+        assert_enum_round_trips(&[
+            (Category::Transport, "transport"),
+            (Category::Dining, "dining"),
+            (Category::Accommodation, "accommodation"),
+            (Category::Hospitality, "hospitality"),
+        ]);
+        assert_enum_round_trips(&[
+            (SourceType::Email, "email"),
+            (SourceType::ManualUpload, "manual_upload"),
+        ]);
+        assert_enum_round_trips(&[
+            (BatchStatus::Draft, "draft"),
+            (BatchStatus::Exported, "exported"),
+        ]);
+        assert_enum_round_trips(&[
+            (RecognitionStatus::Pending, "pending"),
+            (RecognitionStatus::Succeeded, "succeeded"),
+            (RecognitionStatus::Failed, "failed"),
+        ]);
+        assert_enum_round_trips(&[
+            (ConfirmationStatus::Pending, "pending"),
+            (ConfirmationStatus::Confirmed, "confirmed"),
+        ]);
+        assert_enum_round_trips(&[
+            (DedupeStatus::Unique, "unique"),
+            (DedupeStatus::SuspectedDuplicate, "suspected_duplicate"),
+            (DedupeStatus::Resolved, "resolved"),
+        ]);
     }
 
     #[test]
@@ -235,40 +284,117 @@ mod tests {
     fn trims_a_valid_batch_name() {
         let batch = NewBatch::try_new("  差旅报销  ", "2026-06-01", "2026-06-30", None).unwrap();
 
-        assert_eq!(batch.name, "差旅报销");
+        assert_eq!(batch.name(), "差旅报销");
     }
 
     #[test]
-    fn suspected_duplicate_takes_precedence_over_confirmed_recognition() {
-        let status = derive_item_status(
-            RecognitionStatus::Succeeded,
-            ConfirmationStatus::Confirmed,
-            DedupeStatus::SuspectedDuplicate,
+    fn deserialization_rejects_an_empty_batch_name() {
+        let error = serde_json::from_value::<NewBatch>(json!({
+            "name": "   ",
+            "startDate": "2026-06-01",
+            "endDate": "2026-06-30",
+            "note": null,
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("批次名称不能为空"));
+    }
+
+    #[test]
+    fn deserialization_rejects_a_reversed_batch_date_range() {
+        let error = serde_json::from_value::<NewBatch>(json!({
+            "name": "差旅报销",
+            "startDate": "2026-07-31",
+            "endDate": "2026-06-01",
+            "note": null,
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("开始日期不能晚于结束日期"));
+    }
+
+    #[test]
+    fn valid_batch_json_round_trips_through_the_validated_model() {
+        let input = json!({
+            "name": "  差旅报销  ",
+            "startDate": "2026-06-01",
+            "endDate": "2026-06-30",
+            "note": "客户拜访",
+        });
+
+        let batch = serde_json::from_value::<NewBatch>(input).unwrap();
+
+        assert_eq!(batch.name(), "差旅报销");
+        assert_eq!(
+            batch.start_date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
         );
-
-        assert_eq!(status, ItemStatus::SuspectedDuplicate);
+        assert_eq!(
+            batch.end_date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()
+        );
+        assert_eq!(batch.note(), Some("客户拜访"));
+        assert_eq!(
+            serde_json::to_value(batch).unwrap(),
+            json!({
+                "name": "差旅报销",
+                "startDate": "2026-06-01",
+                "endDate": "2026-06-30",
+                "note": "客户拜访",
+            })
+        );
     }
 
     #[test]
-    fn derives_each_item_status_in_precedence_order() {
+    fn derives_item_status_for_every_status_combination() {
         let cases = [
             (
-                RecognitionStatus::Succeeded,
-                ConfirmationStatus::Confirmed,
+                RecognitionStatus::Pending,
+                ConfirmationStatus::Pending,
+                DedupeStatus::Unique,
+                ItemStatus::PendingRecognition,
+            ),
+            (
+                RecognitionStatus::Pending,
+                ConfirmationStatus::Pending,
                 DedupeStatus::SuspectedDuplicate,
                 ItemStatus::SuspectedDuplicate,
             ),
             (
-                RecognitionStatus::Failed,
-                ConfirmationStatus::Confirmed,
-                DedupeStatus::Unique,
-                ItemStatus::RecognitionFailed,
+                RecognitionStatus::Pending,
+                ConfirmationStatus::Pending,
+                DedupeStatus::Resolved,
+                ItemStatus::PendingRecognition,
             ),
             (
                 RecognitionStatus::Pending,
                 ConfirmationStatus::Confirmed,
                 DedupeStatus::Unique,
                 ItemStatus::PendingRecognition,
+            ),
+            (
+                RecognitionStatus::Pending,
+                ConfirmationStatus::Confirmed,
+                DedupeStatus::SuspectedDuplicate,
+                ItemStatus::SuspectedDuplicate,
+            ),
+            (
+                RecognitionStatus::Pending,
+                ConfirmationStatus::Confirmed,
+                DedupeStatus::Resolved,
+                ItemStatus::PendingRecognition,
+            ),
+            (
+                RecognitionStatus::Succeeded,
+                ConfirmationStatus::Pending,
+                DedupeStatus::Unique,
+                ItemStatus::PendingConfirmation,
+            ),
+            (
+                RecognitionStatus::Succeeded,
+                ConfirmationStatus::Pending,
+                DedupeStatus::SuspectedDuplicate,
+                ItemStatus::SuspectedDuplicate,
             ),
             (
                 RecognitionStatus::Succeeded,
@@ -279,11 +405,60 @@ mod tests {
             (
                 RecognitionStatus::Succeeded,
                 ConfirmationStatus::Confirmed,
+                DedupeStatus::Unique,
+                ItemStatus::Ready,
+            ),
+            (
+                RecognitionStatus::Succeeded,
+                ConfirmationStatus::Confirmed,
+                DedupeStatus::SuspectedDuplicate,
+                ItemStatus::SuspectedDuplicate,
+            ),
+            (
+                RecognitionStatus::Succeeded,
+                ConfirmationStatus::Confirmed,
                 DedupeStatus::Resolved,
                 ItemStatus::Ready,
             ),
+            (
+                RecognitionStatus::Failed,
+                ConfirmationStatus::Pending,
+                DedupeStatus::Unique,
+                ItemStatus::RecognitionFailed,
+            ),
+            (
+                RecognitionStatus::Failed,
+                ConfirmationStatus::Pending,
+                DedupeStatus::SuspectedDuplicate,
+                ItemStatus::SuspectedDuplicate,
+            ),
+            (
+                RecognitionStatus::Failed,
+                ConfirmationStatus::Pending,
+                DedupeStatus::Resolved,
+                ItemStatus::RecognitionFailed,
+            ),
+            (
+                RecognitionStatus::Failed,
+                ConfirmationStatus::Confirmed,
+                DedupeStatus::Unique,
+                ItemStatus::RecognitionFailed,
+            ),
+            (
+                RecognitionStatus::Failed,
+                ConfirmationStatus::Confirmed,
+                DedupeStatus::SuspectedDuplicate,
+                ItemStatus::SuspectedDuplicate,
+            ),
+            (
+                RecognitionStatus::Failed,
+                ConfirmationStatus::Confirmed,
+                DedupeStatus::Resolved,
+                ItemStatus::RecognitionFailed,
+            ),
         ];
 
+        assert_eq!(cases.len(), 18);
         for (recognition, confirmation, dedupe, expected) in cases {
             assert_eq!(
                 derive_item_status(recognition, confirmation, dedupe),
