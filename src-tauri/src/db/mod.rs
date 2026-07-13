@@ -5,6 +5,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::domain::error::AppError;
 
+pub mod items;
+
 pub async fn connect(database_url: &str) -> Result<SqlitePool, AppError> {
     let options = SqliteConnectOptions::from_str(database_url)
         .map_err(|error| internal_error("failed to parse database URL", error))?
