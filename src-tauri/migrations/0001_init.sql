@@ -21,8 +21,8 @@ CREATE TABLE mailbox_accounts (
     id TEXT PRIMARY KEY NOT NULL,
     provider TEXT NOT NULL CHECK (provider IN ('gmail', 'qq')),
     email TEXT NOT NULL UNIQUE,
-    host TEXT NOT NULL,
-    port INTEGER NOT NULL,
+    imap_host TEXT NOT NULL,
+    imap_port INTEGER NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     sync_interval_minutes INTEGER NOT NULL CHECK (sync_interval_minutes BETWEEN 5 AND 1440),
     last_synced_at TEXT,
@@ -83,7 +83,7 @@ CREATE TABLE items (
 );
 
 CREATE INDEX idx_items_work_queue
-    ON items (recognition_status, confirmation_status, dedupe_status);
+    ON items (dedupe_status, recognition_status, confirmation_status);
 CREATE INDEX idx_items_period ON items (suggested_period);
 CREATE INDEX idx_items_batch ON items (batch_id);
 CREATE INDEX idx_items_hash ON items (sha256);
@@ -107,7 +107,7 @@ CREATE TABLE sync_runs (
     finished_at TEXT,
     status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
     imported_count INTEGER NOT NULL DEFAULT 0 CHECK (imported_count >= 0),
-    error TEXT,
+    error_message TEXT,
     FOREIGN KEY (account_id) REFERENCES mailbox_accounts(id) ON DELETE CASCADE
 );
 

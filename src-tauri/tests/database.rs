@@ -10,7 +10,7 @@ use invoice_reimbursement::domain::model::{
     BatchStatus, Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch,
     RecognitionStatus, SourceType,
 };
-use sqlx::{SqlitePool, sqlite::SqliteQueryResult};
+use sqlx::{Row, SqlitePool, sqlite::SqliteQueryResult};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -53,6 +53,76 @@ async fn connect_enables_foreign_key_enforcement() {
         .expect("foreign key pragma should be queryable");
 
     assert_eq!(foreign_keys, 1);
+}
+
+#[tokio::test]
+async fn mailbox_account_schema_uses_explicit_imap_column_names() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+
+    let rows = sqlx::query("PRAGMA table_info(mailbox_accounts)")
+        .fetch_all(&pool)
+        .await
+        .expect("mailbox account schema should be queryable");
+    let columns = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<String, _>("name")
+                .expect("column should have a name")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(columns.iter().any(|column| column == "imap_host"));
+    assert!(columns.iter().any(|column| column == "imap_port"));
+    assert!(!columns.iter().any(|column| column == "host"));
+    assert!(!columns.iter().any(|column| column == "port"));
+}
+
+#[tokio::test]
+async fn sync_run_schema_uses_error_message_column_name() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+
+    let rows = sqlx::query("PRAGMA table_info(sync_runs)")
+        .fetch_all(&pool)
+        .await
+        .expect("sync run schema should be queryable");
+    let columns = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<String, _>("name")
+                .expect("column should have a name")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(columns.iter().any(|column| column == "error_message"));
+    assert!(!columns.iter().any(|column| column == "error"));
+}
+
+#[tokio::test]
+async fn work_queue_index_prioritizes_dedupe_before_processing_statuses() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+
+    let rows = sqlx::query("PRAGMA index_info(idx_items_work_queue)")
+        .fetch_all(&pool)
+        .await
+        .expect("work queue index should be queryable");
+    let columns = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<String, _>("name")
+                .expect("index column should have a name")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        columns,
+        vec!["dedupe_status", "recognition_status", "confirmation_status"]
+    );
 }
 
 #[tokio::test]
@@ -128,7 +198,7 @@ async fn mailbox_accounts_reject_sync_intervals_outside_allowed_range() {
     ] {
         let result = sqlx::query(
             "INSERT INTO mailbox_accounts \
-             (id, provider, email, host, port, sync_interval_minutes, created_at, updated_at) \
+             (id, provider, email, imap_host, imap_port, sync_interval_minutes, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
@@ -786,8 +856,8 @@ async fn mailbox_account_repository_inserts_gets_lists_and_round_trips_providers
         .insert(NewMailboxAccount {
             provider: MailboxProvider::QQ,
             email: "z@example.com".to_owned(),
-            host: "imap.qq.com".to_owned(),
-            port: 993,
+            imap_host: "imap.qq.com".to_owned(),
+            imap_port: 993,
             enabled: false,
             sync_interval_minutes: 60,
         })
@@ -797,8 +867,8 @@ async fn mailbox_account_repository_inserts_gets_lists_and_round_trips_providers
         .insert(NewMailboxAccount {
             provider: MailboxProvider::Gmail,
             email: "a@example.com".to_owned(),
-            host: "imap.gmail.com".to_owned(),
-            port: 993,
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
             enabled: true,
             sync_interval_minutes: 15,
         })
@@ -853,17 +923,17 @@ async fn mailbox_account_repository_validates_before_sql_and_rejects_duplicate_e
 
     for (field, account) in [
         (
-            "port",
+            "imap_port",
             NewMailboxAccount {
-                port: 0,
+                imap_port: 0,
                 email: "bad-port@example.com".to_owned(),
                 ..sample_account("unused-port@example.com")
             },
         ),
         (
-            "port",
+            "imap_port",
             NewMailboxAccount {
-                port: 65_536,
+                imap_port: 65_536,
                 email: "bad-high-port@example.com".to_owned(),
                 ..sample_account("unused-high-port@example.com")
             },
@@ -1085,8 +1155,8 @@ fn sample_account(email: &str) -> NewMailboxAccount {
     NewMailboxAccount {
         provider: MailboxProvider::Gmail,
         email: email.to_owned(),
-        host: "imap.example.com".to_owned(),
-        port: 993,
+        imap_host: "imap.example.com".to_owned(),
+        imap_port: 993,
         enabled: true,
         sync_interval_minutes: 15,
     }
@@ -1115,7 +1185,7 @@ async fn insert_batch(pool: &SqlitePool, id: Uuid) {
 async fn insert_mailbox_account(pool: &SqlitePool, id: Uuid) {
     sqlx::query(
         "INSERT INTO mailbox_accounts \
-         (id, provider, email, host, port, sync_interval_minutes, created_at, updated_at) \
+         (id, provider, email, imap_host, imap_port, sync_interval_minutes, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())

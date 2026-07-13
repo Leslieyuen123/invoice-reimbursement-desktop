@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use crate::domain::error::AppError;
 
-const ACCOUNT_COLUMNS: &str = "id, provider, email, host, port, enabled, sync_interval_minutes, \
-    last_synced_at, last_error, created_at, updated_at";
+const ACCOUNT_COLUMNS: &str = "id, provider, email, imap_host, imap_port, enabled, \
+    sync_interval_minutes, last_synced_at, last_error, created_at, updated_at";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -22,8 +22,8 @@ pub struct MailboxAccount {
     pub id: Uuid,
     pub provider: MailboxProvider,
     pub email: String,
-    pub host: String,
-    pub port: u16,
+    pub imap_host: String,
+    pub imap_port: u16,
     pub enabled: bool,
     pub sync_interval_minutes: i64,
     pub last_synced_at: Option<DateTime<Utc>>,
@@ -36,8 +36,8 @@ pub struct MailboxAccount {
 pub struct NewMailboxAccount {
     pub provider: MailboxProvider,
     pub email: String,
-    pub host: String,
-    pub port: i64,
+    pub imap_host: String,
+    pub imap_port: i64,
     pub enabled: bool,
     pub sync_interval_minutes: i64,
 }
@@ -59,15 +59,15 @@ impl MailboxAccountRepository {
 
         sqlx::query(
             "INSERT INTO mailbox_accounts (\
-                id, provider, email, host, port, enabled, sync_interval_minutes, \
+                id, provider, email, imap_host, imap_port, enabled, sync_interval_minutes, \
                 created_at, updated_at\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(provider_str(account.provider))
         .bind(&account.email)
-        .bind(&account.host)
-        .bind(account.port)
+        .bind(&account.imap_host)
+        .bind(account.imap_port)
         .bind(account.enabled)
         .bind(account.sync_interval_minutes)
         .bind(now.to_rfc3339())
@@ -107,8 +107,8 @@ struct DbMailboxAccountRow {
     id: String,
     provider: String,
     email: String,
-    host: String,
-    port: i64,
+    imap_host: String,
+    imap_port: i64,
     enabled: i64,
     sync_interval_minutes: i64,
     last_synced_at: Option<String>,
@@ -125,8 +125,9 @@ impl TryFrom<DbMailboxAccountRow> for MailboxAccount {
             id: parse_uuid(&row.id, "id")?,
             provider: parse_provider(&row.provider)?,
             email: row.email,
-            host: row.host,
-            port: u16::try_from(row.port).map_err(|error| internal_error("invalid port", error))?,
+            imap_host: row.imap_host,
+            imap_port: u16::try_from(row.imap_port)
+                .map_err(|error| internal_error("invalid IMAP port", error))?,
             enabled: parse_enabled(row.enabled)?,
             sync_interval_minutes: row.sync_interval_minutes,
             last_synced_at: parse_optional_datetime(row.last_synced_at, "last_synced_at")?,
@@ -138,9 +139,9 @@ impl TryFrom<DbMailboxAccountRow> for MailboxAccount {
 }
 
 fn validate_account(account: &NewMailboxAccount) -> Result<(), AppError> {
-    if !(1..=65_535).contains(&account.port) {
+    if !(1..=65_535).contains(&account.imap_port) {
         return Err(AppError::validation(
-            "port",
+            "imap_port",
             "port must be between 1 and 65535",
         ));
     }
