@@ -139,6 +139,15 @@ impl TryFrom<DbMailboxAccountRow> for MailboxAccount {
 }
 
 fn validate_account(account: &NewMailboxAccount) -> Result<(), AppError> {
+    if account.email.trim().is_empty() {
+        return Err(AppError::validation("email", "email must not be blank"));
+    }
+    if account.imap_host.trim().is_empty() {
+        return Err(AppError::validation(
+            "imap_host",
+            "IMAP host must not be blank",
+        ));
+    }
     if !(1..=65_535).contains(&account.imap_port) {
         return Err(AppError::validation(
             "imap_port",

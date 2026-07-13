@@ -138,6 +138,7 @@ impl ItemRepository {
 
     pub async fn insert(&self, item: &NewItemRecord) -> Result<InvoiceItem, AppError> {
         validate_amount(item.amount_cents)?;
+        validate_source(item)?;
 
         sqlx::query(
             "INSERT INTO items (\
@@ -498,6 +499,28 @@ fn validate_amount(amount_cents: Option<i64>) -> Result<(), AppError> {
             "amount must be nonnegative",
         ));
     }
+    Ok(())
+}
+
+fn validate_source(item: &NewItemRecord) -> Result<(), AppError> {
+    if item.source_type == SourceType::Email
+        && (item.source_account_id.is_none_or(|id| id.is_nil())
+            || item
+                .source_mailbox
+                .as_deref()
+                .is_none_or(|mailbox| mailbox.trim().is_empty())
+            || item.source_uid.is_none_or(|uid| uid <= 0)
+            || item
+                .source_part_id
+                .as_deref()
+                .is_none_or(|part_id| part_id.trim().is_empty()))
+    {
+        return Err(AppError::validation(
+            "source",
+            "email source requires an account, mailbox, positive UID, and part ID",
+        ));
+    }
+
     Ok(())
 }
 

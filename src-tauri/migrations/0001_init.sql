@@ -20,9 +20,9 @@ CREATE TABLE batches (
 CREATE TABLE mailbox_accounts (
     id TEXT PRIMARY KEY NOT NULL,
     provider TEXT NOT NULL CHECK (provider IN ('gmail', 'qq')),
-    email TEXT NOT NULL UNIQUE,
-    imap_host TEXT NOT NULL,
-    imap_port INTEGER NOT NULL,
+    email TEXT NOT NULL UNIQUE CHECK (length(trim(email)) > 0),
+    imap_host TEXT NOT NULL CHECK (length(trim(imap_host)) > 0),
+    imap_port INTEGER NOT NULL CHECK (imap_port BETWEEN 1 AND 65535),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     sync_interval_minutes INTEGER NOT NULL CHECK (sync_interval_minutes BETWEEN 5 AND 1440),
     last_synced_at TEXT,
@@ -79,7 +79,15 @@ CREATE TABLE items (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (source_account_id) REFERENCES mailbox_accounts(id) ON DELETE SET NULL,
     FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE SET NULL,
-    FOREIGN KEY (duplicate_of_id) REFERENCES items(id) ON DELETE SET NULL
+    FOREIGN KEY (duplicate_of_id) REFERENCES items(id) ON DELETE SET NULL,
+    CHECK (
+        source_type != 'email' OR (
+            source_account_id IS NOT NULL AND length(trim(source_account_id)) > 0 AND
+            source_mailbox IS NOT NULL AND length(trim(source_mailbox)) > 0 AND
+            source_uid IS NOT NULL AND source_uid > 0 AND
+            source_part_id IS NOT NULL AND length(trim(source_part_id)) > 0
+        )
+    )
 );
 
 CREATE INDEX idx_items_work_queue

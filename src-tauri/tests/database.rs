@@ -56,6 +56,72 @@ async fn connect_enables_foreign_key_enforcement() {
 }
 
 #[tokio::test]
+async fn private_memory_url_aliases_keep_schema_access_on_one_connection() {
+    for database_url in ["sqlite://:memory:", "sqlite://?mode=memory"] {
+        let pool = db::connect(database_url)
+            .await
+            .unwrap_or_else(|error| panic!("{database_url} should connect: {error}"));
+
+        assert_eq!(
+            pool.options().get_max_connections(),
+            1,
+            "{database_url} must not create isolated private databases"
+        );
+
+        for _ in 0..3 {
+            let mut connection = pool
+                .acquire()
+                .await
+                .unwrap_or_else(|error| panic!("{database_url} should acquire: {error}"));
+            let item_table_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'items'",
+            )
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap_or_else(|error| panic!("{database_url} should retain its schema: {error}"));
+
+            assert_eq!(item_table_count, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_database_reopens_with_persisted_data_and_connection_pragmas() {
+    let directory = tempfile::tempdir().expect("temporary database directory should create");
+    let database_path = directory.path().join("invoice-reimbursement.sqlite3");
+    let database_url = format!("sqlite://{}", database_path.display());
+
+    let pool = db::connect(&database_url)
+        .await
+        .expect("file database should connect");
+    assert_eq!(pool.options().get_max_connections(), 5);
+    assert_eq!(pragma_string(&pool, "PRAGMA journal_mode").await, "wal");
+    assert_eq!(pragma_i64(&pool, "PRAGMA busy_timeout").await, 5_000);
+    assert_eq!(pragma_i64(&pool, "PRAGMA foreign_keys").await, 1);
+
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)")
+        .bind("persisted")
+        .bind(r#"{"enabled":true}"#)
+        .bind("2026-07-13T10:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("setting should persist");
+    pool.close().await;
+
+    let reopened = db::connect(&database_url)
+        .await
+        .expect("file database should reopen");
+    let value = sqlx::query_scalar::<_, String>("SELECT value_json FROM settings WHERE key = ?")
+        .bind("persisted")
+        .fetch_one(&reopened)
+        .await
+        .expect("persisted setting should be readable");
+
+    assert_eq!(value, r#"{"enabled":true}"#);
+    assert_eq!(pragma_i64(&reopened, "PRAGMA foreign_keys").await, 1);
+}
+
+#[tokio::test]
 async fn mailbox_account_schema_uses_explicit_imap_column_names() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -187,6 +253,36 @@ async fn items_reject_negative_amounts() {
 }
 
 #[tokio::test]
+async fn item_schema_rejects_email_items_without_part_provenance() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+
+    let result = sqlx::query(
+        "INSERT INTO items (\
+            id, original_name, original_path, sha256, mime_type, source_type, fetched_at, \
+            created_at, updated_at\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("email-without-provenance")
+    .bind("missing.pdf")
+    .bind("/invoices/missing.pdf")
+    .bind("sha256-missing-provenance")
+    .bind("application/pdf")
+    .bind("email")
+    .bind("2026-07-13T10:00:00Z")
+    .bind("2026-07-13T10:00:00Z")
+    .bind("2026-07-13T10:00:00Z")
+    .execute(&pool)
+    .await;
+
+    assert!(
+        result.is_err(),
+        "email provenance must be enforced by SQLite"
+    );
+}
+
+#[tokio::test]
 async fn mailbox_accounts_reject_sync_intervals_outside_allowed_range() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -215,6 +311,46 @@ async fn mailbox_accounts_reject_sync_intervals_outside_allowed_range() {
         assert!(
             result.is_err(),
             "invalid sync interval {interval} was accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mailbox_account_schema_rejects_blank_endpoints_and_invalid_ports() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+
+    for (id, email, imap_host, imap_port) in [
+        ("blank-email", "   ", "imap.example.com", 993),
+        ("blank-host", "blank-host@example.com", "   ", 993),
+        ("zero-port", "zero-port@example.com", "imap.example.com", 0),
+        (
+            "high-port",
+            "high-port@example.com",
+            "imap.example.com",
+            65_536,
+        ),
+    ] {
+        let result = sqlx::query(
+            "INSERT INTO mailbox_accounts \
+             (id, provider, email, imap_host, imap_port, sync_interval_minutes, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind("gmail")
+        .bind(email)
+        .bind(imap_host)
+        .bind(imap_port)
+        .bind(15)
+        .bind("2026-07-13T10:00:00Z")
+        .bind("2026-07-13T10:00:00Z")
+        .execute(&pool)
+        .await;
+
+        assert!(
+            result.is_err(),
+            "invalid endpoint was accepted: email={email:?}, host={imap_host:?}, port={imap_port}"
         );
     }
 }
@@ -310,6 +446,79 @@ async fn item_repository_maps_duplicate_email_parts_to_an_actionable_conflict() 
 }
 
 #[tokio::test]
+async fn item_repository_validates_email_provenance_before_sql() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool.clone());
+    pool.close().await;
+
+    let mut valid_email = sample_item("valid-email-source", "sha256-valid-email-source");
+    valid_email.source_type = SourceType::Email;
+    valid_email.source_account_id = Some(Uuid::new_v4());
+    valid_email.source_mailbox = Some("INBOX".to_owned());
+    valid_email.source_uid = Some(42);
+    valid_email.source_part_id = Some("2".to_owned());
+
+    let mut invalid_items = Vec::new();
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_account_id = None;
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_account_id = Some(Uuid::nil());
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_mailbox = None;
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_mailbox = Some("   ".to_owned());
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_uid = None;
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_uid = Some(0);
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_part_id = None;
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email;
+        item.source_part_id = Some("   ".to_owned());
+        item
+    });
+
+    for item in invalid_items {
+        let error = repository
+            .insert(&item)
+            .await
+            .expect_err("invalid email provenance should be rejected");
+        assert_eq!(
+            error,
+            AppError::Validation {
+                field: "source".to_owned(),
+                message: "email source requires an account, mailbox, positive UID, and part ID"
+                    .to_owned(),
+            }
+        );
+    }
+}
+
+#[tokio::test]
 async fn item_repository_filters_all_derived_statuses_with_dedupe_precedence() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -383,10 +592,16 @@ async fn item_repository_combines_typed_filters_text_search_and_deterministic_or
         .expect("in-memory database should connect");
     let batch_id = Uuid::new_v4();
     insert_batch(&pool, batch_id).await;
+    let account_id = Uuid::new_v4();
+    insert_mailbox_account(&pool, account_id).await;
     let repository = ItemRepository::new(pool);
     let mut target = sample_item("Quarterly-Invoice", "sha256-filter-target");
     target.id = Uuid::from_u128(3);
     target.source_type = SourceType::Email;
+    target.source_account_id = Some(account_id);
+    target.source_mailbox = Some("INBOX".to_owned());
+    target.source_uid = Some(3);
+    target.source_part_id = Some("1".to_owned());
     target.suggested_period = Some("2026-Q3".to_owned());
     target.batch_id = Some(batch_id);
     target.suggested_category = Some(Category::Transport);
@@ -973,6 +1188,55 @@ async fn mailbox_account_repository_validates_before_sql_and_rejects_duplicate_e
 }
 
 #[tokio::test]
+async fn mailbox_account_repository_rejects_invalid_endpoints_before_sql() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = MailboxAccountRepository::new(pool.clone());
+    pool.close().await;
+
+    for (field, account) in [
+        (
+            "email",
+            NewMailboxAccount {
+                email: "   ".to_owned(),
+                ..sample_account("unused-email@example.com")
+            },
+        ),
+        (
+            "imap_host",
+            NewMailboxAccount {
+                imap_host: "   ".to_owned(),
+                ..sample_account("blank-host@example.com")
+            },
+        ),
+        (
+            "imap_port",
+            NewMailboxAccount {
+                imap_port: 0,
+                ..sample_account("zero-port@example.com")
+            },
+        ),
+        (
+            "imap_port",
+            NewMailboxAccount {
+                imap_port: 65_536,
+                ..sample_account("high-port@example.com")
+            },
+        ),
+    ] {
+        let error = repository
+            .insert(account)
+            .await
+            .expect_err("invalid endpoint should be rejected");
+        assert!(
+            matches!(error, AppError::Validation { field: ref actual, .. } if actual == field),
+            "unexpected error: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn persisted_domain_enums_round_trip_through_repository_rows() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -1164,6 +1428,20 @@ fn sample_account(email: &str) -> NewMailboxAccount {
 
 fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).expect("test date should be valid")
+}
+
+async fn pragma_i64(pool: &SqlitePool, query: &str) -> i64 {
+    sqlx::query_scalar(query)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("{query} should be queryable: {error}"))
+}
+
+async fn pragma_string(pool: &SqlitePool, query: &str) -> String {
+    sqlx::query_scalar(query)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("{query} should be queryable: {error}"))
 }
 
 async fn insert_batch(pool: &SqlitePool, id: Uuid) {
