@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::domain::error::AppError;
@@ -139,54 +139,48 @@ impl ItemRepository {
     pub async fn insert(&self, item: &NewItemRecord) -> Result<InvoiceItem, AppError> {
         validate_amount(item.amount_cents)?;
         validate_source(item)?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin item transaction", error))?;
+        let result = async {
+            insert_with_connection(&mut transaction, item).await?;
+            get_with_connection(&mut transaction, item.id).await
+        }
+        .await;
+        finish_transaction(transaction, result).await
+    }
 
-        sqlx::query(
-            "INSERT INTO items (\
-                id, original_name, original_path, normalized_pdf_path, sha256, mime_type, \
-                source_type, source_account_id, source_mailbox, source_uid, source_message_id, \
-                source_part_id, fetched_at, invoice_date, suggested_period, batch_id, \
-                suggested_category, final_category, amount_cents, currency, city, company, \
-                recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, \
-                event_tag, project_tag, created_at, updated_at\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(item.id.to_string())
-        .bind(&item.original_name)
-        .bind(&item.original_path)
-        .bind(&item.normalized_pdf_path)
-        .bind(&item.sha256)
-        .bind(&item.mime_type)
-        .bind(source_type_str(item.source_type))
-        .bind(item.source_account_id.map(|id| id.to_string()))
-        .bind(&item.source_mailbox)
-        .bind(item.source_uid)
-        .bind(&item.source_message_id)
-        .bind(&item.source_part_id)
-        .bind(item.fetched_at.to_rfc3339())
-        .bind(item.invoice_date.map(|date| date.to_string()))
-        .bind(&item.suggested_period)
-        .bind(item.batch_id.map(|id| id.to_string()))
-        .bind(item.suggested_category.map(category_str))
-        .bind(item.final_category.map(category_str))
-        .bind(item.amount_cents)
-        .bind(&item.currency)
-        .bind(&item.city)
-        .bind(&item.company)
-        .bind(recognition_status_str(item.recognition_status))
-        .bind(confirmation_status_str(item.confirmation_status))
-        .bind(dedupe_status_str(item.dedupe_status))
-        .bind(item.duplicate_of_id.map(|id| id.to_string()))
-        .bind(&item.note)
-        .bind(&item.event_tag)
-        .bind(&item.project_tag)
-        .bind(item.created_at.to_rfc3339())
-        .bind(item.updated_at.to_rfc3339())
-        .execute(&self.pool)
-        .await
-        .map_err(map_insert_error)?;
-
-        self.get(item.id).await
+    pub async fn insert_deduplicated(
+        &self,
+        mut item: NewItemRecord,
+    ) -> Result<InvoiceItem, AppError> {
+        validate_amount(item.amount_cents)?;
+        validate_source(&item)?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin item transaction", error))?;
+        let result = async {
+            let canonical_id =
+                find_canonical_id_with_connection(&mut transaction, &item.sha256).await?;
+            match canonical_id {
+                Some(canonical_id) => {
+                    item.dedupe_status = DedupeStatus::SuspectedDuplicate;
+                    item.duplicate_of_id = Some(canonical_id);
+                }
+                None => {
+                    item.dedupe_status = DedupeStatus::Unique;
+                    item.duplicate_of_id = None;
+                }
+            }
+            insert_with_connection(&mut transaction, &item).await?;
+            get_with_connection(&mut transaction, item.id).await
+        }
+        .await;
+        finish_transaction(transaction, result).await
     }
 
     pub async fn find_by_hash(&self, sha256: &str) -> Result<Option<InvoiceItem>, AppError> {
@@ -403,21 +397,114 @@ impl ItemRepository {
 
         Ok(refreshed)
     }
+}
 
-    async fn get(&self, id: Uuid) -> Result<InvoiceItem, AppError> {
-        let query = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?");
-        let row = sqlx::query_as::<_, DbItemRow>(&query)
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
+async fn finish_transaction(
+    transaction: Transaction<'_, Sqlite>,
+    result: Result<InvoiceItem, AppError>,
+) -> Result<InvoiceItem, AppError> {
+    match result {
+        Ok(item) => transaction
+            .commit()
             .await
-            .map_err(|error| internal_error("failed to get item", error))?
-            .ok_or_else(|| AppError::NotFound {
-                entity: "item".to_owned(),
-                message: format!("item {id} was not found"),
-            })?;
-
-        InvoiceItem::try_from(row)
+            .map(|()| item)
+            .map_err(|error| map_database_error("failed to commit item transaction", error)),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(AppError::Internal {
+                message: format!(
+                    "item transaction failed and rollback also failed: original error: {error}; rollback error: {rollback_error}"
+                ),
+            }),
+        },
     }
+}
+
+async fn find_canonical_id_with_connection(
+    connection: &mut SqliteConnection,
+    sha256: &str,
+) -> Result<Option<Uuid>, AppError> {
+    let id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM items \
+         WHERE sha256 = ? AND duplicate_of_id IS NULL \
+         ORDER BY CASE WHEN dedupe_status = 'unique' THEN 0 ELSE 1 END, \
+                  created_at ASC, id ASC \
+         LIMIT 1",
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|error| map_database_error("failed to select canonical item", error))?;
+    id.map(|id| parse_uuid(&id, "id")).transpose()
+}
+
+async fn insert_with_connection(
+    connection: &mut SqliteConnection,
+    item: &NewItemRecord,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO items (\
+            id, original_name, original_path, normalized_pdf_path, sha256, mime_type, \
+            source_type, source_account_id, source_mailbox, source_uid, source_message_id, \
+            source_part_id, fetched_at, invoice_date, suggested_period, batch_id, \
+            suggested_category, final_category, amount_cents, currency, city, company, \
+            recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, \
+            event_tag, project_tag, created_at, updated_at\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+            ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(item.id.to_string())
+    .bind(&item.original_name)
+    .bind(&item.original_path)
+    .bind(&item.normalized_pdf_path)
+    .bind(&item.sha256)
+    .bind(&item.mime_type)
+    .bind(source_type_str(item.source_type))
+    .bind(item.source_account_id.map(|id| id.to_string()))
+    .bind(&item.source_mailbox)
+    .bind(item.source_uid)
+    .bind(&item.source_message_id)
+    .bind(&item.source_part_id)
+    .bind(item.fetched_at.to_rfc3339())
+    .bind(item.invoice_date.map(|date| date.to_string()))
+    .bind(&item.suggested_period)
+    .bind(item.batch_id.map(|id| id.to_string()))
+    .bind(item.suggested_category.map(category_str))
+    .bind(item.final_category.map(category_str))
+    .bind(item.amount_cents)
+    .bind(&item.currency)
+    .bind(&item.city)
+    .bind(&item.company)
+    .bind(recognition_status_str(item.recognition_status))
+    .bind(confirmation_status_str(item.confirmation_status))
+    .bind(dedupe_status_str(item.dedupe_status))
+    .bind(item.duplicate_of_id.map(|id| id.to_string()))
+    .bind(&item.note)
+    .bind(&item.event_tag)
+    .bind(&item.project_tag)
+    .bind(item.created_at.to_rfc3339())
+    .bind(item.updated_at.to_rfc3339())
+    .execute(&mut *connection)
+    .await
+    .map(|_| ())
+    .map_err(map_insert_error)
+}
+
+async fn get_with_connection(
+    connection: &mut SqliteConnection,
+    id: Uuid,
+) -> Result<InvoiceItem, AppError> {
+    let query = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?");
+    let row = sqlx::query_as::<_, DbItemRow>(&query)
+        .bind(id.to_string())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_database_error("failed to get item", error))?
+        .ok_or_else(|| AppError::NotFound {
+            entity: "item".to_owned(),
+            message: format!("item {id} was not found"),
+        })?;
+    InvoiceItem::try_from(row)
 }
 
 #[derive(FromRow)]
@@ -665,5 +752,38 @@ fn map_insert_error(error: sqlx::Error) -> AppError {
         };
     }
 
-    internal_error("failed to insert item", error)
+    if let sqlx::Error::Database(database_error) = &error
+        && (database_error.is_foreign_key_violation()
+            || database_error.is_check_violation()
+            || matches!(
+                database_error.kind(),
+                sqlx::error::ErrorKind::NotNullViolation
+            ))
+    {
+        return AppError::Conflict {
+            message: format!(
+                "invoice item violates a database constraint: {}",
+                database_error.message()
+            ),
+        };
+    }
+
+    map_database_error("failed to insert item", error)
+}
+
+fn map_database_error(context: &str, error: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(database_error) = &error
+        && database_error
+            .code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+    {
+        return AppError::External {
+            service: "database".to_owned(),
+            retryable: true,
+            message: format!("{context}: {error}"),
+        };
+    }
+
+    internal_error(context, error)
 }

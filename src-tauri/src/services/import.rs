@@ -2,7 +2,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use crate::db::items::{InvoiceItem, ItemRepository, NewItemRecord};
@@ -27,33 +27,38 @@ impl ImportService {
     }
 
     pub async fn import_manual(&self, source: &Path) -> Result<InvoiceItem, AppError> {
-        validate_source(source).await?;
+        self.import_manual_after_open(source, || Ok(())).await
+    }
+
+    async fn import_manual_after_open<F>(
+        &self,
+        source: &Path,
+        after_open: F,
+    ) -> Result<InvoiceItem, AppError>
+    where
+        F: FnOnce() -> Result<(), AppError>,
+    {
+        let mut source_file = match tokio::fs::File::open(source).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::validation("file", "file does not exist"));
+            }
+            Err(error) => return Err(internal_error("failed to open import source", error)),
+        };
+        after_open()?;
+        let metadata = source_file
+            .metadata()
+            .await
+            .map_err(|error| internal_error("failed to inspect import source", error))?;
+        validate_source_metadata(&metadata)?;
         let original_name = source
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or_else(|| AppError::validation("file", "file name is required"))?;
         let extension = supported_extension(source)?;
         let id = Uuid::new_v4();
-        let mut source_file = tokio::fs::File::open(source)
-            .await
-            .map_err(|error| internal_error("failed to open import source", error))?;
-        let mut staged = self.paths.stage_original(id)?;
-        let mut staged_file = tokio::fs::File::from_std(staged.take_file()?);
-        let copy_result = tokio::io::copy(&mut source_file, &mut staged_file).await;
-        let copy_result = match copy_result {
-            Ok(_) => staged_file
-                .sync_all()
-                .await
-                .map_err(|error| internal_error("failed to sync staged import", error)),
-            Err(error) => Err(internal_error(
-                "failed to copy import source to staging",
-                error,
-            )),
-        };
-        drop(staged_file);
-        if let Err(error) = copy_result {
-            return Err(staged.cleanup_after(error));
-        }
+        let (staged, writer) = self.paths.begin_staged_original(id)?;
+        let staged = copy_source_to_staging(&mut source_file, staged, writer).await?;
 
         let sha256 = match sha256_file(staged.path()).await {
             Ok(sha256) => sha256,
@@ -63,12 +68,9 @@ impl ImportService {
             Ok(mime_type) => mime_type,
             Err(error) => return Err(staged.cleanup_after(error)),
         };
-        let duplicate = match self.items.find_by_hash(&sha256).await {
-            Ok(duplicate) => duplicate,
-            Err(error) => return Err(staged.cleanup_after(error)),
-        };
         let now = Utc::now();
-        let original_path = staged.promote(now.date_naive(), id, &extension)?;
+        let promoted = staged.promote(now.date_naive(), id, &extension)?;
+        let original_path = promoted.path().to_path_buf();
         let item = NewItemRecord {
             id,
             original_name,
@@ -94,12 +96,8 @@ impl ImportService {
             company: None,
             recognition_status: RecognitionStatus::Pending,
             confirmation_status: ConfirmationStatus::Pending,
-            dedupe_status: if duplicate.is_some() {
-                DedupeStatus::SuspectedDuplicate
-            } else {
-                DedupeStatus::Unique
-            },
-            duplicate_of_id: duplicate.map(|item| item.id),
+            dedupe_status: DedupeStatus::Unique,
+            duplicate_of_id: None,
             note: None,
             event_tag: None,
             project_tag: None,
@@ -107,9 +105,12 @@ impl ImportService {
             updated_at: now,
         };
 
-        match self.items.insert(&item).await {
-            Ok(item) => Ok(item),
-            Err(database_error) => match self.paths.delete_original(&original_path) {
+        match self.items.insert_deduplicated(item).await {
+            Ok(item) => {
+                promoted.commit();
+                Ok(item)
+            }
+            Err(database_error) => match promoted.rollback() {
                 Ok(()) => Err(database_error),
                 Err(cleanup_error) => Err(AppError::External {
                     service: "filesystem_sync".to_owned(),
@@ -124,14 +125,7 @@ impl ImportService {
     }
 }
 
-async fn validate_source(source: &Path) -> Result<(), AppError> {
-    let metadata = match tokio::fs::metadata(source).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::validation("file", "file does not exist"));
-        }
-        Err(error) => return Err(internal_error("failed to inspect import source", error)),
-    };
+fn validate_source_metadata(metadata: &std::fs::Metadata) -> Result<(), AppError> {
     if !metadata.is_file() {
         return Err(AppError::validation("file", "path must reference a file"));
     }
@@ -146,6 +140,40 @@ async fn validate_source(source: &Path) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+async fn copy_source_to_staging<R>(
+    source: &mut R,
+    staged: crate::infra::files::StagedOriginal,
+    writer: std::fs::File,
+) -> Result<crate::infra::files::StagedOriginal, AppError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut writer = tokio::fs::File::from_std(writer);
+    let mut capped_source = source.take(MAX_FILE_SIZE + 1);
+    let copy_result = tokio::io::copy(&mut capped_source, &mut writer).await;
+    let result = match copy_result {
+        Ok(0) => Err(AppError::validation("file", "file must not be empty")),
+        Ok(bytes_copied) if bytes_copied > MAX_FILE_SIZE => Err(AppError::validation(
+            "file",
+            format!("file must not exceed {MAX_FILE_SIZE} bytes"),
+        )),
+        Ok(_) => writer
+            .sync_all()
+            .await
+            .map_err(|error| internal_error("failed to sync staged import", error)),
+        Err(error) => Err(internal_error(
+            "failed to copy import source to staging",
+            error,
+        )),
+    };
+    drop(writer);
+
+    match result {
+        Ok(()) => Ok(staged),
+        Err(error) => Err(staged.cleanup_after(error)),
+    }
 }
 
 fn supported_extension(source: &Path) -> Result<String, AppError> {
@@ -233,7 +261,16 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::signature_matches_extension;
+    use std::fs;
+
+    use tokio::io::{AsyncRead, AsyncReadExt};
+    use uuid::Uuid;
+
+    use super::{ImportService, copy_source_to_staging, signature_matches_extension};
+    use crate::db;
+    use crate::db::items::ItemRepository;
+    use crate::domain::error::AppError;
+    use crate::infra::files::AppPaths;
 
     #[test]
     fn signature_compatibility_uses_exact_families_for_supported_extensions() {
@@ -264,5 +301,76 @@ mod tests {
         assert!(!signature_matches_extension("doc", &zip));
         assert!(!signature_matches_extension("docx", &ole));
         assert!(!signature_matches_extension("pdf", b"unknown"));
+    }
+
+    #[tokio::test]
+    async fn capped_copy_rejects_zero_and_oversize_content_without_staging_residue() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let paths = AppPaths::create(directory.path().join("storage"))
+            .expect("application paths should create");
+
+        async fn assert_rejected<R>(paths: &AppPaths, reader: &mut R)
+        where
+            R: AsyncRead + Unpin,
+        {
+            let (staged, writer) = paths
+                .begin_staged_original(Uuid::new_v4())
+                .expect("staging should begin");
+            let error = copy_source_to_staging(reader, staged, writer)
+                .await
+                .expect_err("invalid actual byte count should fail");
+
+            assert!(matches!(error, AppError::Validation { ref field, .. } if field == "file"));
+            assert!(
+                fs::read_dir(&paths.staging)
+                    .expect("staging should read")
+                    .next()
+                    .is_none()
+            );
+        }
+
+        assert_rejected(&paths, &mut tokio::io::empty()).await;
+        assert_rejected(
+            &paths,
+            &mut tokio::io::repeat(0x5a).take(super::MAX_FILE_SIZE + 1),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacing_source_path_after_open_imports_the_pinned_inode() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let source = directory.path().join("pinned.pdf");
+        let moved = directory.path().join("opened.pdf");
+        let original = b"%PDF-1.7\nopened inode\n";
+        let replacement = b"%PDF-1.7\nreplacement path\n";
+        fs::write(&source, original).expect("original source should write");
+        let pool = db::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should connect");
+        let paths = AppPaths::create(directory.path().join("storage"))
+            .expect("application paths should create");
+        let service = ImportService::new(ItemRepository::new(pool), paths);
+        let source_for_hook = source.clone();
+
+        let imported = service
+            .import_manual_after_open(&source, move || {
+                fs::rename(&source_for_hook, &moved)
+                    .map_err(|error| super::internal_error("failed to replace source", error))?;
+                fs::write(&source_for_hook, replacement)
+                    .map_err(|error| super::internal_error("failed to write replacement", error))
+            })
+            .await
+            .expect("pinned source should import");
+
+        assert_eq!(
+            fs::read(imported.original_path).expect("imported original should read"),
+            original
+        );
+        assert_eq!(
+            fs::read(source).expect("replacement should read"),
+            replacement
+        );
     }
 }

@@ -465,6 +465,67 @@ async fn item_repository_inserts_and_finds_a_fully_typed_item_by_hash() {
 }
 
 #[tokio::test]
+async fn item_repository_rolls_back_when_typed_insert_readback_fails() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    sqlx::query(
+        "CREATE TRIGGER corrupt_item_readback AFTER INSERT ON items \
+         BEGIN UPDATE items SET created_at = 'not-a-date' WHERE id = NEW.id; END",
+    )
+    .execute(&pool)
+    .await
+    .expect("corrupting trigger should create");
+    let repository = ItemRepository::new(pool.clone());
+
+    let error = repository
+        .insert(&sample_item("corrupt-readback", "sha256-corrupt-readback"))
+        .await
+        .expect_err("invalid typed readback should fail");
+
+    assert!(matches!(error, AppError::Internal { .. }));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items")
+            .fetch_one(&pool)
+            .await
+            .expect("item count should query"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn deduplicated_insert_prefers_unique_then_earliest_canonical_root() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let hash = "sha256-canonical-preference";
+    let mut resolved_earliest = sample_item("resolved-earliest", hash);
+    resolved_earliest.created_at -= chrono::Duration::hours(2);
+    let mut unique_earliest = sample_item("unique-earliest", hash);
+    unique_earliest.dedupe_status = DedupeStatus::Unique;
+    unique_earliest.created_at -= chrono::Duration::hours(1);
+    let mut unique_later = sample_item("unique-later", hash);
+    unique_later.dedupe_status = DedupeStatus::Unique;
+    unique_later.created_at += chrono::Duration::hours(1);
+    for root in [&resolved_earliest, &unique_later, &unique_earliest] {
+        repository
+            .insert(root)
+            .await
+            .expect("canonical fixture should insert");
+    }
+    let incoming = sample_item("canonical-incoming", hash);
+
+    let inserted = repository
+        .insert_deduplicated(incoming)
+        .await
+        .expect("deduplicated item should insert");
+
+    assert_eq!(inserted.dedupe_status, DedupeStatus::SuspectedDuplicate);
+    assert_eq!(inserted.duplicate_of_id, Some(unique_earliest.id));
+}
+
+#[tokio::test]
 async fn item_repository_maps_duplicate_email_parts_to_an_actionable_conflict() {
     let pool = db::connect("sqlite::memory:")
         .await

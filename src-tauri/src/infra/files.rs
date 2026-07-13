@@ -20,7 +20,12 @@ pub struct AppPaths {
 pub struct StagedOriginal {
     paths: AppPaths,
     path: PathBuf,
-    file: Option<File>,
+    owned: bool,
+}
+
+#[derive(Debug)]
+pub struct PromotedOriginal {
+    path: PathBuf,
     owned: bool,
 }
 
@@ -60,31 +65,35 @@ impl AppPaths {
         validate_extension(extension)?;
         let mut source_file = File::open(source.as_ref())
             .map_err(|error| internal_error("failed to open original source", error))?;
-        let mut staged = self.stage_original(id)?;
+        let (staged, mut staging_file) = self.begin_staged_original(id)?;
         let copy_result = (|| {
-            let staging_file = staged.file.as_mut().expect("staged file should be open");
-            io::copy(&mut source_file, staging_file)
+            io::copy(&mut source_file, &mut staging_file)
                 .map_err(|error| internal_error("failed to copy original to staging", error))?;
             staging_file
                 .sync_all()
                 .map_err(|error| internal_error("failed to sync staged original", error))
         })();
+        drop(staging_file);
         if let Err(error) = copy_result {
             return Err(staged.cleanup_after(error));
         }
 
-        staged.promote(date, id, extension)
+        staged
+            .promote(date, id, extension)
+            .map(PromotedOriginal::commit)
     }
 
-    pub fn stage_original(&self, id: Uuid) -> Result<StagedOriginal, AppError> {
+    pub fn begin_staged_original(&self, id: Uuid) -> Result<(StagedOriginal, File), AppError> {
         let path = self.staging.join(format!("{id}.part"));
         let file = open_staging_file(&path)?;
-        Ok(StagedOriginal {
-            paths: self.clone(),
-            path,
-            file: Some(file),
-            owned: true,
-        })
+        Ok((
+            StagedOriginal {
+                paths: self.clone(),
+                path,
+                owned: true,
+            },
+            file,
+        ))
     }
 
     pub fn delete_original(&self, path: impl AsRef<Path>) -> Result<(), AppError> {
@@ -116,30 +125,25 @@ impl StagedOriginal {
         &self.path
     }
 
-    pub fn take_file(&mut self) -> Result<File, AppError> {
-        self.file.take().ok_or_else(|| AppError::Internal {
-            message: "staged original file is already closed".to_owned(),
-        })
-    }
-
     pub fn promote(
         mut self,
         date: NaiveDate,
         id: Uuid,
         extension: &str,
-    ) -> Result<PathBuf, AppError> {
-        self.file.take();
+    ) -> Result<PromotedOriginal, AppError> {
         let destination = match self.paths.original_destination(date, id, extension) {
             Ok(destination) => destination,
             Err(error) => return Err(self.cleanup_after(error)),
         };
         self.owned = false;
         promote_staged_original(&self.path, &destination)?;
-        Ok(destination)
+        Ok(PromotedOriginal {
+            path: destination,
+            owned: true,
+        })
     }
 
     pub(crate) fn cleanup_after(mut self, error: AppError) -> AppError {
-        self.file.take();
         self.owned = false;
         match remove_file_durably(&self.path) {
             Ok(()) => error,
@@ -156,9 +160,32 @@ impl StagedOriginal {
 
 impl Drop for StagedOriginal {
     fn drop(&mut self) {
-        self.file.take();
         if self.owned {
-            let _ = fs::remove_file(&self.path);
+            let _ = remove_file_durably(&self.path);
+        }
+    }
+}
+
+impl PromotedOriginal {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn commit(mut self) -> PathBuf {
+        self.owned = false;
+        self.path.clone()
+    }
+
+    pub fn rollback(mut self) -> Result<(), AppError> {
+        self.owned = false;
+        remove_file_durably(&self.path)
+    }
+}
+
+impl Drop for PromotedOriginal {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = remove_file_durably(&self.path);
         }
     }
 }

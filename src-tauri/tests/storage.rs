@@ -268,6 +268,32 @@ fn persist_original_maps_an_existing_staging_file_to_conflict() {
 }
 
 #[test]
+fn dropping_a_promoted_original_removes_the_final_file() {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path()).expect("application paths should create");
+    let id = Uuid::new_v4();
+    let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("fixture date should be valid");
+    let (staged, mut writer) = paths
+        .begin_staged_original(id)
+        .expect("staged original should begin");
+    writer
+        .write_all(b"promoted guard")
+        .expect("staged bytes should write");
+    writer.sync_all().expect("staged bytes should sync");
+    drop(writer);
+    let promoted = staged
+        .promote(date, id, "pdf")
+        .expect("staged original should promote");
+    let final_path = promoted.path().to_path_buf();
+
+    drop(promoted);
+
+    assert!(!final_path.exists());
+}
+
+#[test]
 fn memory_credential_delete_is_idempotent_and_account_scoped() {
     let credentials = MemoryCredentialStore::default();
     credentials

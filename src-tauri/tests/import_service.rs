@@ -273,6 +273,85 @@ async fn hash_lookup_returns_the_earliest_item_deterministically() {
     assert_eq!(found.id, second.id);
 }
 
+#[tokio::test]
+async fn concurrent_identical_imports_choose_one_canonical_root() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let source = directory.path().join("concurrent.pdf");
+    let content = b"%PDF-1.7\nconcurrent invoice\n";
+    fs::write(&source, content).expect("concurrent fixture should write");
+    let database_path = directory.path().join("concurrent.sqlite3");
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = db::connect(&database_url)
+        .await
+        .expect("disk database should connect");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let service = ImportService::new(ItemRepository::new(pool), paths);
+
+    let (first, second) = tokio::join!(
+        service.import_manual(&source),
+        service.import_manual(&source)
+    );
+    let first = first.expect("first concurrent import should succeed");
+    let second = second.expect("second concurrent import should succeed");
+    let items = [&first, &second];
+    let roots = items
+        .iter()
+        .filter(|item| item.dedupe_status == DedupeStatus::Unique)
+        .copied()
+        .collect::<Vec<_>>();
+    let duplicates = items
+        .iter()
+        .filter(|item| item.dedupe_status == DedupeStatus::SuspectedDuplicate)
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert_eq!(roots.len(), 1);
+    assert_eq!(duplicates.len(), 1);
+    assert_eq!(duplicates[0].duplicate_of_id, Some(roots[0].id));
+    assert!(std::path::Path::new(&first.original_path).is_file());
+    assert!(std::path::Path::new(&second.original_path).is_file());
+    assert_eq!(fs::read(&first.original_path).unwrap(), content);
+    assert_eq!(fs::read(&second.original_path).unwrap(), content);
+}
+
+#[tokio::test]
+async fn corrupt_after_insert_readback_rolls_back_row_and_promoted_file() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let source = directory.path().join("corrupt-readback.pdf");
+    fs::write(&source, b"%PDF-1.7\ncorrupt readback\n")
+        .expect("corrupt readback fixture should write");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    sqlx::query(
+        "CREATE TRIGGER corrupt_readback AFTER INSERT ON items \
+         BEGIN UPDATE items SET created_at = 'not-a-date' WHERE id = NEW.id; END",
+    )
+    .execute(&pool)
+    .await
+    .expect("corrupting trigger should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let service = ImportService::new(ItemRepository::new(pool.clone()), paths.clone());
+
+    let error = service
+        .import_manual(&source)
+        .await
+        .expect_err("typed readback corruption should fail import");
+
+    assert!(matches!(error, AppError::Internal { .. }));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items")
+            .fetch_one(&pool)
+            .await
+            .expect("item count should query"),
+        0
+    );
+    assert_eq!(count_files(&paths.originals), 0);
+    assert_directory_empty(&paths.staging);
+}
+
 fn count_files(path: &std::path::Path) -> usize {
     fs::read_dir(path)
         .unwrap_or_else(|error| panic!("{} should read: {error}", path.display()))
