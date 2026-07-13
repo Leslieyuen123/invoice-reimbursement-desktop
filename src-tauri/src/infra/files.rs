@@ -60,15 +60,7 @@ impl AppPaths {
         let result = (|| {
             let mut source_file = File::open(source.as_ref())
                 .map_err(|error| internal_error("failed to open original source", error))?;
-            let mut staging_file = open_staging_file(&staging_path).map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    AppError::Conflict {
-                        message: "original staging file already exists".to_owned(),
-                    }
-                } else {
-                    internal_error("failed to create staged original", error)
-                }
-            })?;
+            let mut staging_file = open_staging_file(&staging_path)?;
             created_staging_file = true;
 
             io::copy(&mut source_file, &mut staging_file)
@@ -98,7 +90,14 @@ impl AppPaths {
     }
 }
 
-fn open_staging_file(path: &Path) -> io::Result<File> {
+fn open_staging_file(path: &Path) -> Result<File, AppError> {
+    open_staging_file_with_permissions(path, set_private_file_permissions)
+}
+
+fn open_staging_file_with_permissions(
+    path: &Path,
+    set_permissions: impl FnOnce(&File) -> io::Result<()>,
+) -> Result<File, AppError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -107,9 +106,44 @@ fn open_staging_file(path: &Path) -> io::Result<File> {
         options.mode(0o600);
     }
 
-    let file = options.open(path)?;
-    set_private_file_permissions(&file)?;
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            AppError::Conflict {
+                message: "original staging file already exists".to_owned(),
+            }
+        } else {
+            internal_error("failed to create staged original", error)
+        }
+    })?;
+    if let Err(permission_error) = set_permissions(&file) {
+        drop(file);
+        let cleanup_result = remove_file_durably(path);
+        return Err(classify_staging_permission_failure(
+            permission_error,
+            cleanup_result,
+        ));
+    }
+
     Ok(file)
+}
+
+fn classify_staging_permission_failure(
+    permission_error: io::Error,
+    cleanup_result: Result<(), AppError>,
+) -> AppError {
+    match cleanup_result {
+        Ok(()) => internal_error(
+            "failed to secure staged original; created [staging] was removed",
+            permission_error,
+        ),
+        Err(cleanup_error) => AppError::External {
+            service: "filesystem_sync".to_owned(),
+            retryable: false,
+            message: format!(
+                "failed to secure newly created [staging] and durable cleanup was incomplete; manual recovery is required: permission error: {permission_error}; cleanup error: {cleanup_error}",
+            ),
+        },
+    }
 }
 
 #[cfg(unix)]
@@ -238,7 +272,21 @@ fn promote_staged_original(staging: &Path, destination: &Path) -> Result<(), App
 fn promote_staged_original_with_sync(
     staging: &Path,
     destination: &Path,
+    sync_promoted_directory: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<(), AppError> {
+    promote_staged_original_with_rollback_sync(
+        staging,
+        destination,
+        sync_promoted_directory,
+        sync_directory,
+    )
+}
+
+fn promote_staged_original_with_rollback_sync(
+    staging: &Path,
+    destination: &Path,
     mut sync_promoted_directory: impl FnMut(&Path) -> io::Result<()>,
+    sync_rollback_directory: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), AppError> {
     if let Err(error) = rename_staged_original(staging, destination) {
         remove_file_durably(staging)?;
@@ -259,30 +307,55 @@ fn promote_staged_original_with_sync(
     if let Err(sync_error) = sync_result {
         return match rename_staged_original(destination, staging) {
             Ok(()) => {
-                let destination_sync_result = sync_directory(destination_parent);
-                remove_file_durably(staging)?;
-                destination_sync_result.map_err(|error| {
-                    internal_error("failed to sync original directory after rollback", error)
-                })?;
-
-                Err(internal_error(
-                    "failed to sync promoted original; promotion was rolled back",
+                let destination_sync_result = sync_rollback_directory(destination_parent);
+                let cleanup_result = remove_file_durably(staging);
+                Err(classify_completed_rollback(
                     sync_error,
+                    destination_sync_result,
+                    cleanup_result,
                 ))
             }
             Err(rollback_error) => Err(AppError::External {
                 service: "filesystem_sync".to_owned(),
                 retryable: false,
                 message: format!(
-                    "filesystem sync failed after promoting {}; rollback to {} also failed; manual recovery is required: sync error: {sync_error}; rollback error: {rollback_error}",
-                    destination.display(),
-                    staging.display(),
+                    "filesystem sync failed after promoting [destination]; rollback to [staging] also failed; manual recovery is required: sync error: {sync_error}; rollback error: {rollback_error}",
                 ),
             }),
         };
     }
 
     Ok(())
+}
+
+fn classify_completed_rollback(
+    promotion_sync_error: io::Error,
+    destination_sync_result: io::Result<()>,
+    cleanup_result: Result<(), AppError>,
+) -> AppError {
+    match (destination_sync_result, cleanup_result) {
+        (Ok(()), Ok(())) => internal_error(
+            "failed to sync promoted original; promotion was rolled back",
+            promotion_sync_error,
+        ),
+        (destination_sync_result, cleanup_result) => {
+            let destination_sync_detail = destination_sync_result
+                .err()
+                .map(|error| format!("failed: {error}"))
+                .unwrap_or_else(|| "succeeded".to_owned());
+            let cleanup_detail = cleanup_result
+                .err()
+                .map(|error| format!("failed: {error}"))
+                .unwrap_or_else(|| "succeeded".to_owned());
+            AppError::External {
+                service: "filesystem_sync".to_owned(),
+                retryable: false,
+                message: format!(
+                    "promotion sync failed and rollback reached [staging], but rollback durability is incomplete for [destination] and [staging]; manual recovery is required: promotion sync error: {promotion_sync_error}; destination parent sync {destination_sync_detail}; staging cleanup {cleanup_detail}",
+                ),
+            }
+        }
+    }
 }
 
 #[cfg(any(
@@ -425,7 +498,10 @@ mod tests {
     #[cfg(unix)]
     use super::open_staging_file;
     use super::{
-        promote_staged_original, promote_staged_original_with_sync, remove_file_durably_with_sync,
+        classify_completed_rollback, classify_staging_permission_failure,
+        open_staging_file_with_permissions, promote_staged_original,
+        promote_staged_original_with_rollback_sync, promote_staged_original_with_sync,
+        remove_file_durably_with_sync,
     };
     use crate::domain::error::AppError;
 
@@ -447,6 +523,50 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn staging_permission_failure_durably_removes_the_created_file() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let staging = directory.path().join("original.part");
+
+        let error = open_staging_file_with_permissions(&staging, |_| {
+            Err(io::Error::other("injected staging permission failure"))
+        })
+        .expect_err("permission failure should reject the staged file");
+
+        assert!(matches!(
+            error,
+            AppError::Internal { ref message }
+                if message.contains("injected staging permission failure")
+        ));
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn staging_permission_cleanup_failure_requires_manual_recovery() {
+        let error = classify_staging_permission_failure(
+            io::Error::other("injected staging permission failure"),
+            Err(AppError::Internal {
+                message: "injected staging cleanup sync failure".to_owned(),
+            }),
+        );
+
+        match error {
+            AppError::External {
+                service,
+                retryable,
+                message,
+            } => {
+                assert_eq!(service, "filesystem_sync");
+                assert!(!retryable);
+                assert!(message.contains("manual recovery is required"));
+                assert!(message.contains("[staging]"));
+                assert!(message.contains("injected staging permission failure"));
+                assert!(message.contains("injected staging cleanup sync failure"));
+            }
+            other => panic!("unexpected staging cleanup error: {other:?}"),
+        }
     }
 
     #[test]
@@ -497,6 +617,55 @@ mod tests {
         assert!(matches!(error, AppError::Internal { .. }));
         assert!(!destination.exists());
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn rollback_directory_sync_failure_requires_manual_recovery() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let staging_directory = directory.path().join("staging");
+        let destination_directory = directory.path().join("originals");
+        fs::create_dir(&staging_directory).expect("staging directory should create");
+        fs::create_dir(&destination_directory).expect("destination directory should create");
+        let staging = staging_directory.join("original.part");
+        let destination = destination_directory.join("original.pdf");
+        fs::write(&staging, b"staged original").expect("staging fixture should write");
+
+        let error = promote_staged_original_with_rollback_sync(
+            &staging,
+            &destination,
+            |_| Err(io::Error::other("injected promotion sync failure")),
+            |_| Err(io::Error::other("injected rollback sync failure")),
+        )
+        .expect_err("rollback directory sync failure should require manual recovery");
+
+        assert_filesystem_sync_recovery_error(
+            error,
+            &[
+                "injected promotion sync failure",
+                "injected rollback sync failure",
+            ],
+        );
+        assert!(!destination.exists());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn rollback_cleanup_sync_failure_requires_manual_recovery() {
+        let error = classify_completed_rollback(
+            io::Error::other("injected promotion sync failure"),
+            Ok(()),
+            Err(AppError::Internal {
+                message: "injected cleanup sync failure".to_owned(),
+            }),
+        );
+
+        assert_filesystem_sync_recovery_error(
+            error,
+            &[
+                "injected promotion sync failure",
+                "injected cleanup sync failure",
+            ],
+        );
     }
 
     #[test]
@@ -591,6 +760,26 @@ mod tests {
         );
         for (path, _) in staging_files {
             assert!(!path.exists(), "staging file leaked: {}", path.display());
+        }
+    }
+
+    fn assert_filesystem_sync_recovery_error(error: AppError, expected_details: &[&str]) {
+        match error {
+            AppError::External {
+                service,
+                retryable,
+                message,
+            } => {
+                assert_eq!(service, "filesystem_sync");
+                assert!(!retryable);
+                assert!(message.contains("manual recovery is required"));
+                assert!(message.contains("[destination]"));
+                assert!(message.contains("[staging]"));
+                for detail in expected_details {
+                    assert!(message.contains(detail), "missing error detail: {detail}");
+                }
+            }
+            other => panic!("unexpected filesystem recovery error: {other:?}"),
         }
     }
 }
