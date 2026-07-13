@@ -86,6 +86,30 @@ async fn private_memory_url_aliases_keep_schema_access_on_one_connection() {
 }
 
 #[tokio::test]
+async fn percent_encoded_memory_mode_uses_one_migrated_connection() {
+    let database_url = "sqlite://?mode=mem%6Fry&cache=private";
+    let pool = db::connect(database_url)
+        .await
+        .expect("percent-encoded memory URL should connect");
+
+    assert_eq!(pool.options().get_max_connections(), 1);
+    for _ in 0..3 {
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("memory connection should acquire");
+        let item_table_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'items'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .expect("migrated schema should remain accessible");
+
+        assert_eq!(item_table_count, 1);
+    }
+}
+
+#[tokio::test]
 async fn file_database_reopens_with_persisted_data_and_connection_pragmas() {
     let directory = tempfile::tempdir().expect("temporary database directory should create");
     let database_path = directory.path().join("invoice-reimbursement.sqlite3");
@@ -119,6 +143,39 @@ async fn file_database_reopens_with_persisted_data_and_connection_pragmas() {
 
     assert_eq!(value, r#"{"enabled":true}"#);
     assert_eq!(pragma_i64(&reopened, "PRAGMA foreign_keys").await, 1);
+}
+
+#[tokio::test]
+async fn file_name_ending_in_memory_uses_disk_pool_and_reopens() {
+    let directory = tempfile::tempdir().expect("temporary database directory should create");
+    let database_path = directory.path().join("invoice:memory:");
+    let database_url = format!("sqlite://{}", database_path.display());
+
+    let pool = db::connect(&database_url)
+        .await
+        .expect("file database ending in :memory: should connect");
+    assert_eq!(pool.options().get_max_connections(), 5);
+    assert_eq!(pragma_string(&pool, "PRAGMA journal_mode").await, "wal");
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)")
+        .bind("disk-memory-suffix")
+        .bind(r#"{"persisted":true}"#)
+        .bind("2026-07-13T10:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("setting should persist to disk");
+    pool.close().await;
+
+    assert!(database_path.is_file());
+    let reopened = db::connect(&database_url)
+        .await
+        .expect("file database ending in :memory: should reopen");
+    let value = sqlx::query_scalar::<_, String>("SELECT value_json FROM settings WHERE key = ?")
+        .bind("disk-memory-suffix")
+        .fetch_one(&reopened)
+        .await
+        .expect("persisted setting should be readable");
+
+    assert_eq!(value, r#"{"persisted":true}"#);
 }
 
 #[tokio::test]
@@ -443,6 +500,43 @@ async fn item_repository_maps_duplicate_email_parts_to_an_actionable_conflict() 
         matches!(error, AppError::Conflict { ref message } if message.contains("email attachment")),
         "unexpected error: {error:?}"
     );
+}
+
+#[tokio::test]
+async fn deleting_mailbox_account_preserves_imported_email_provenance() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let account_id = Uuid::new_v4();
+    insert_mailbox_account(&pool, account_id).await;
+    let repository = ItemRepository::new(pool.clone());
+    let mut email_item = sample_item("preserved-email", "sha256-preserved-email");
+    email_item.source_type = SourceType::Email;
+    email_item.source_account_id = Some(account_id);
+    email_item.source_mailbox = Some("INBOX".to_owned());
+    email_item.source_uid = Some(42);
+    email_item.source_part_id = Some("2".to_owned());
+    repository
+        .insert(&email_item)
+        .await
+        .expect("email item should insert");
+
+    let deleted = sqlx::query("DELETE FROM mailbox_accounts WHERE id = ?")
+        .bind(account_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("mailbox account should delete without rewriting provenance");
+    let retained = repository
+        .find_by_hash(&email_item.sha256)
+        .await
+        .expect("item lookup should succeed")
+        .expect("imported email item should remain");
+
+    assert_eq!(deleted.rows_affected(), 1);
+    assert_eq!(retained.source_account_id, Some(account_id));
+    assert_eq!(retained.source_mailbox.as_deref(), Some("INBOX"));
+    assert_eq!(retained.source_uid, Some(42));
+    assert_eq!(retained.source_part_id.as_deref(), Some("2"));
 }
 
 #[tokio::test]

@@ -77,7 +77,6 @@ CREATE TABLE items (
     project_tag TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    FOREIGN KEY (source_account_id) REFERENCES mailbox_accounts(id) ON DELETE SET NULL,
     FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE SET NULL,
     FOREIGN KEY (duplicate_of_id) REFERENCES items(id) ON DELETE SET NULL,
     CHECK (

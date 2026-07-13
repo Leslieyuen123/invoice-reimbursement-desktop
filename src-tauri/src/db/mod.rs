@@ -37,14 +37,20 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool, AppError> {
     Ok(pool)
 }
 
-fn is_memory_database_url(database_url: &str) -> bool {
-    let (path, query) = database_url.split_once('?').unwrap_or((database_url, ""));
+fn is_memory_database_url(mut database_url: &str) -> bool {
+    database_url = database_url
+        .trim_start_matches("sqlite://")
+        .trim_start_matches("sqlite:");
 
-    path.ends_with(":memory:")
-        || query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .any(|(key, value)| key == "mode" && value == "memory")
+    let mut database_and_query = database_url.splitn(2, '?');
+    let database = database_and_query.next().unwrap_or_default();
+    let query = database_and_query.next();
+
+    database == ":memory:"
+        || query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .any(|(key, value)| key == "mode" && value == "memory")
+        })
 }
 
 fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
