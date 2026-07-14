@@ -8,6 +8,30 @@ fn main() {
         return;
     }
 
+    let executable = std::env::current_exe().unwrap();
+    if executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains("no-stdin"))
+    {
+        let stdin = io::stdin();
+        let mut lines = stdin.lock().lines();
+        let request = lines.next().unwrap().unwrap();
+        assert!(request.contains("arm-no-stdin.pdf"));
+        println!(r#"{{"ok":true,"text":"armed","warnings":[]}}"#);
+        io::stdout().flush().unwrap();
+        let descendant = Command::new(&executable)
+            .arg("--descendant")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(executable.with_extension("pid"), descendant.id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        return;
+    }
+
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let request = line.unwrap();

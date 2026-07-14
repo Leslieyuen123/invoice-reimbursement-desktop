@@ -638,6 +638,75 @@ fn process_gateway_restarts_after_a_timeout() {
     assert_eq!(recovered.text, "北京 出租车 价税合计 ¥128.50");
 }
 
+#[cfg(unix)]
+#[test]
+fn process_gateway_lock_wait_respects_each_call_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let (executable, pid_path) = no_stdin_ocr_helper(directory.path());
+    let gateway = Arc::new(ProcessOcrGateway::with_timeout(
+        executable,
+        Duration::from_secs(1),
+    ));
+    gateway
+        .recognize(Path::new("arm-no-stdin.pdf"))
+        .expect("helper should arm before it stops reading stdin");
+    assert!(wait_for_file(&pid_path, Duration::from_secs(2)));
+    let first_gateway = gateway.clone();
+    let first = std::thread::spawn(move || first_gateway.recognize(&backpressure_path()));
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+
+    let error = gateway
+        .recognize(Path::new("second-request.pdf"))
+        .expect_err("lock admission should respect the second request deadline");
+    let elapsed = started.elapsed();
+    let first_result = first.join().unwrap();
+
+    assert_external(&error, "ocr_sidecar");
+    assert!(first_result.is_err());
+    assert!(
+        elapsed < Duration::from_millis(1_500),
+        "second request waited beyond its own deadline: elapsed={elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn process_ocr_write_respects_deadline_when_sidecar_does_not_read_stdin() {
+    let directory = tempfile::tempdir().unwrap();
+    let (executable, pid_path) = no_stdin_ocr_helper(directory.path());
+    let gateway = ProcessOcrGateway::with_timeout(executable, Duration::from_secs(1));
+    gateway
+        .recognize(Path::new("arm-no-stdin.pdf"))
+        .expect("helper should arm before it stops reading stdin");
+    assert!(wait_for_file(&pid_path, Duration::from_secs(2)));
+    let started = Instant::now();
+
+    let error = gateway
+        .recognize(&backpressure_path())
+        .expect_err("stdin backpressure should time out");
+    let elapsed = started.elapsed();
+
+    assert_external(&error, "ocr_sidecar");
+    assert!(
+        elapsed < Duration::from_millis(1_500),
+        "stdin write ignored the request deadline: elapsed={elapsed:?}"
+    );
+    let descendant_pid = std::fs::read_to_string(pid_path)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let gone = (0..50).any(|_| {
+        if !process_exists(descendant_pid) {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        }
+    });
+    assert!(gone, "descendant {descendant_pid} survived write timeout");
+}
+
 #[test]
 fn local_extractor_propagates_process_sidecar_warnings_end_to_end() {
     let gateway = Arc::new(ProcessOcrGateway::new(ocr_helper()));
@@ -891,4 +960,29 @@ fn ocr_helper() -> PathBuf {
             executable
         })
         .clone()
+}
+
+#[cfg(unix)]
+fn no_stdin_ocr_helper(directory: &Path) -> (PathBuf, PathBuf) {
+    let executable = directory.join("ocr-sidecar-no-stdin");
+    std::fs::copy(ocr_helper(), &executable).unwrap();
+    let pid_path = executable.with_extension("pid");
+    (executable, pid_path)
+}
+
+#[cfg(unix)]
+fn backpressure_path() -> PathBuf {
+    PathBuf::from("x".repeat(2 * 1024 * 1024))
+}
+
+#[cfg(unix)]
+fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if path.is_file() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    path.is_file()
 }

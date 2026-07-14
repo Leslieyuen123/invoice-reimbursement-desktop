@@ -3,8 +3,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::domain::error::AppError;
@@ -114,7 +114,10 @@ impl SidecarOperation {
 
 impl ProcessOcrGateway {
     fn run(&self, path: &Path, operation: SidecarOperation) -> Result<OcrResult, AppError> {
-        let mut session = self.session.lock().map_err(|_| ocr_error())?;
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(ocr_error)?;
+        let mut session = self.lock_session_until(deadline)?;
         if session
             .as_mut()
             .is_some_and(|current| !current.is_running())
@@ -128,13 +131,32 @@ impl ProcessOcrGateway {
         let result = session
             .as_mut()
             .ok_or_else(ocr_error)?
-            .request(path, operation, self.timeout);
+            .request(path, operation, deadline);
         match result {
             Ok(result) => Ok(result),
             Err(SidecarRequestError::Operation(error)) => Err(error),
             Err(SidecarRequestError::SessionFatal(error)) => {
                 session.take();
                 Err(error)
+            }
+        }
+    }
+
+    fn lock_session_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<MutexGuard<'_, Option<SidecarSession>>, AppError> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ocr_error());
+            }
+            match self.session.try_lock() {
+                Ok(session) => return Ok(session),
+                Err(TryLockError::Poisoned(_)) => return Err(ocr_error()),
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(remaining.min(PROCESS_POLL_INTERVAL));
+                }
             }
         }
     }
@@ -153,7 +175,7 @@ impl SidecarRequestError {
 
 struct SidecarSession {
     child: Child,
-    stdin: ChildStdin,
+    requests: SyncSender<WriterInput>,
     responses: Receiver<ReaderOutput>,
     process_tree: ProcessTree,
     active: bool,
@@ -186,6 +208,13 @@ impl SidecarSession {
                 return Err(error);
             }
         };
+        let requests = match write_requests(stdin) {
+            Ok(writer) => writer,
+            Err(error) => {
+                process_tree.terminate(&mut child);
+                return Err(error);
+            }
+        };
         if let Err(error) = drain_stderr(stderr) {
             process_tree.terminate(&mut child);
             return Err(error);
@@ -193,7 +222,7 @@ impl SidecarSession {
 
         Ok(Self {
             child,
-            stdin,
+            requests,
             responses,
             process_tree,
             active: true,
@@ -208,11 +237,11 @@ impl SidecarSession {
         &mut self,
         path: &Path,
         operation: SidecarOperation,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<OcrResult, SidecarRequestError> {
-        let deadline = Instant::now() + timeout;
-        write_ocr_request(&mut self.stdin, path, operation)
+        let request = serialize_ocr_request(path, operation)
             .map_err(|_| SidecarRequestError::session_fatal())?;
+        self.write_request(request, deadline)?;
         let (stdout, stdout_too_large) = self.receive_response(deadline)?;
 
         if stdout_too_large || !self.is_running() {
@@ -234,6 +263,34 @@ impl SidecarSession {
             Err(SidecarRequestError::Operation(ocr_error()))
         } else {
             Err(SidecarRequestError::session_fatal())
+        }
+    }
+
+    fn write_request(&self, bytes: Vec<u8>, deadline: Instant) -> Result<(), SidecarRequestError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SidecarRequestError::session_fatal());
+        }
+        let (completion, completed) = mpsc::sync_channel(1);
+        let input = WriterInput { bytes, completion };
+        match self.requests.try_send(input) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                return Err(SidecarRequestError::session_fatal());
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SidecarRequestError::session_fatal());
+        }
+        match completed.recv_timeout(remaining) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(()))
+            | Err(mpsc::RecvTimeoutError::Timeout)
+            | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(SidecarRequestError::session_fatal())
+            }
         }
     }
 
@@ -312,19 +369,41 @@ struct OcrResponse {
     error: Option<String>,
 }
 
-fn write_ocr_request(
-    stdin: &mut ChildStdin,
-    path: &Path,
-    operation: SidecarOperation,
-) -> Result<(), ()> {
+fn serialize_ocr_request(path: &Path, operation: SidecarOperation) -> Result<Vec<u8>, ()> {
     let path = path.to_string_lossy();
     let request = OcrRequest {
         path: &path,
         operation: operation.protocol_name(),
     };
-    serde_json::to_writer(&mut *stdin, &request).map_err(|_| ())?;
-    stdin.write_all(b"\n").map_err(|_| ())?;
-    stdin.flush().map_err(|_| ())
+    let mut bytes = serde_json::to_vec(&request).map_err(|_| ())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+struct WriterInput {
+    bytes: Vec<u8>,
+    completion: SyncSender<Result<(), ()>>,
+}
+
+fn write_requests(mut stdin: ChildStdin) -> Result<SyncSender<WriterInput>, AppError> {
+    let (sender, receiver) = mpsc::sync_channel::<WriterInput>(1);
+    std::thread::Builder::new()
+        .name("ocr-protocol-writer".to_owned())
+        .spawn(move || {
+            while let Ok(input) = receiver.recv() {
+                let result = stdin
+                    .write_all(&input.bytes)
+                    .and_then(|_| stdin.flush())
+                    .map_err(|_| ());
+                let failed = result.is_err();
+                let _ = input.completion.send(result);
+                if failed {
+                    return;
+                }
+            }
+        })
+        .map_err(|_| ocr_error())?;
+    Ok(sender)
 }
 
 type ReaderOutput = std::io::Result<(Vec<u8>, bool)>;
