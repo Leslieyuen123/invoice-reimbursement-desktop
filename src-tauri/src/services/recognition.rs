@@ -162,14 +162,12 @@ pub fn recognize_with_warnings(
     received_date: NaiveDate,
     extraction_warnings: &[String],
 ) -> RecognitionOutcome {
-    let (invoice_date, mut warnings) = match labeled_date(text) {
-        Ok(date) => (date.or(Some(received_date)), extraction_warnings.to_vec()),
-        Err(()) => {
-            let mut warnings = extraction_warnings.to_vec();
-            warnings.push("invalid_invoice_date".to_owned());
-            (Some(received_date), warnings)
-        }
-    };
+    let (recognized_date, invalid_date) = labeled_date(text);
+    let invoice_date = recognized_date.or(Some(received_date));
+    let mut warnings = extraction_warnings.to_vec();
+    if invalid_date {
+        warnings.push("invalid_invoice_date".to_owned());
+    }
     let amount_cents = match labeled_amount(text) {
         Ok(amount) => amount,
         Err(()) => {
@@ -178,8 +176,8 @@ pub fn recognize_with_warnings(
         }
     };
     let category = scored_category(text);
-    let company =
-        labeled_line_value(text, "购买方名称").or_else(|| labeled_line_value(text, "销售方名称"));
+    let company = labeled_company_value(text, "购买方名称")
+        .or_else(|| labeled_company_value(text, "销售方名称"));
     let city = recognized_city(text);
     let suggested_period = invoice_date
         .map(|date| format!("{:04}-{:02}", date.year(), date.month()))
@@ -218,26 +216,78 @@ fn recognized_city(text: &str) -> Option<String> {
         .map(|(_, _, city)| city.to_owned())
 }
 
-fn labeled_line_value(text: &str, label: &str) -> Option<String> {
-    text.split_once(label)
-        .map(|(_, value)| value)
-        .map(|value| value.trim_start_matches(['：', ':']).trim_start())
-        .and_then(|value| value.lines().next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+fn labeled_company_value(text: &str, label: &str) -> Option<String> {
+    const END_LABELS: &[&str] = &[
+        "购买方名称",
+        "销售方名称",
+        "购买方纳税人识别号",
+        "销售方纳税人识别号",
+        "纳税人识别号",
+        "购买方税号",
+        "销售方税号",
+        "统一社会信用代码",
+        "税号",
+        "地址、电话",
+        "地址电话",
+        "地址",
+        "电话",
+        "开户行及账号",
+        "开户行",
+        "账号",
+    ];
+
+    let (_, after_label) = text.split_once(label)?;
+    let line = after_label
+        .trim_start_matches(['：', ':'])
+        .lines()
+        .next()?
+        .trim_start_matches([' ', '\t']);
+    let end = END_LABELS
+        .iter()
+        .filter_map(|end_label| line.find(end_label))
+        .min()
+        .unwrap_or(line.len());
+    let value = line[..end].trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn labeled_date(text: &str) -> Result<Option<NaiveDate>, ()> {
-    let Some(after_label) = text
-        .split_once("开票日期")
-        .or_else(|| text.split_once("日期"))
-        .map(|(_, after_label)| after_label)
-    else {
-        return Ok(None);
-    };
-    let value = after_label.trim_start_matches(['：', ':']).trim_start();
-    parse_date_prefix(value).map(Some).ok_or(())
+fn labeled_date(text: &str) -> (Option<NaiveDate>, bool) {
+    if let Some((_, after_invoice_label)) = text.split_once("开票日期") {
+        if let Some(date) = parse_labeled_date_value(after_invoice_label) {
+            return (Some(date), false);
+        }
+        let (generic_date, _) = generic_labeled_date(after_invoice_label);
+        return (generic_date, true);
+    }
+
+    generic_labeled_date(text)
+}
+
+fn generic_labeled_date(text: &str) -> (Option<NaiveDate>, bool) {
+    let mut invalid = false;
+    for (index, _) in text.match_indices("日期") {
+        let explicit_boundary = text[..index].chars().next_back().is_none_or(|character| {
+            character.is_whitespace()
+                || matches!(character, ':' | '：' | ',' | '，' | ';' | '；' | '。')
+        });
+        if !explicit_boundary {
+            continue;
+        }
+
+        let after_label = &text[index + "日期".len()..];
+        if let Some(date) = parse_labeled_date_value(after_label) {
+            return (Some(date), invalid);
+        }
+        invalid = true;
+    }
+    (None, invalid)
+}
+
+fn parse_labeled_date_value(after_label: &str) -> Option<NaiveDate> {
+    let value = after_label
+        .trim_start_matches(['：', ':'])
+        .trim_start_matches([' ', '\t']);
+    parse_date_prefix(value)
 }
 
 fn parse_date_prefix(value: &str) -> Option<NaiveDate> {

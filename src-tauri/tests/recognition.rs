@@ -130,6 +130,30 @@ fn invalid_calendar_date_falls_back_and_blocks_auto_confirmation() {
 }
 
 #[test]
+fn invalid_or_empty_invoice_date_uses_a_later_explicit_generic_date() {
+    for (text, expected_date, expected_period) in [
+        (
+            "开票日期：2026-02-31 日期：2026年06月19日 餐饮服务 价税合计 ¥128.50",
+            NaiveDate::from_ymd_opt(2026, 6, 19).unwrap(),
+            "2026-06",
+        ),
+        (
+            "开票日期：\n日期：2026-07-20 餐饮服务 价税合计 ¥128.50",
+            NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
+            "2026-07",
+        ),
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 8, 2).unwrap());
+
+        assert_eq!(recognized.invoice_date, Some(expected_date), "{text}");
+        assert_eq!(recognized.suggested_period, expected_period, "{text}");
+        assert_eq!(recognized.warnings, ["invalid_invoice_date"], "{text}");
+        assert_eq!(recognized.recognition_status, RecognitionStatus::Succeeded);
+        assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
+    }
+}
+
+#[test]
 fn amount_accepts_rmb_marker_whitespace_and_thousands_grouping() {
     let recognized = recognize(
         "价税合计（小写）： RMB 1,234.56",
@@ -211,6 +235,42 @@ fn company_prefers_the_buyer_name_segment_over_the_seller() {
 fn company_falls_back_to_the_seller_name_segment() {
     let recognized = recognize(
         "销售方名称：北京远方服务有限公司\n销售方税号：123",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(recognized.company.as_deref(), Some("北京远方服务有限公司"));
+}
+
+#[test]
+fn company_name_stops_at_inline_invoice_field_labels() {
+    for (text, expected) in [
+        (
+            "购买方名称：上海星河科技有限公司 纳税人识别号：91310000 地址：上海市浦东新区",
+            "上海星河科技有限公司",
+        ),
+        (
+            "购买方名称：上海星河科技有限公司 地址：上海市浦东新区",
+            "上海星河科技有限公司",
+        ),
+        (
+            "购买方名称：上海星河科技有限公司 销售方名称：北京远方服务有限公司",
+            "上海星河科技有限公司",
+        ),
+        (
+            "销售方名称：北京远方服务有限公司 纳税人识别号：91110000 地址：北京市朝阳区",
+            "北京远方服务有限公司",
+        ),
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+
+        assert_eq!(recognized.company.as_deref(), Some(expected), "{text}");
+    }
+}
+
+#[test]
+fn empty_buyer_line_falls_back_to_the_seller_without_consuming_the_next_line() {
+    let recognized = recognize(
+        "购买方名称：\n销售方名称：北京远方服务有限公司 纳税人识别号：91110000",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
     );
 
