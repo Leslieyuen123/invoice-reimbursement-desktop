@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool, Type};
+use sqlx::{FromRow, SqliteConnection, SqlitePool, Type};
 use uuid::Uuid;
 
 use crate::domain::error::AppError;
@@ -91,6 +91,78 @@ impl MailboxAccountRepository {
         self.get(id).await
     }
 
+    pub async fn save_metadata(
+        &self,
+        connection: &mut SqliteConnection,
+        id: Option<Uuid>,
+        account: NewMailboxAccount,
+    ) -> Result<MailboxAccount, AppError> {
+        validate_account(&account)?;
+        let is_update = id.is_some();
+        let id = id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now().to_rfc3339();
+        if id.is_nil() {
+            return Err(AppError::validation("id", "account ID must not be nil"));
+        }
+
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mailbox_accounts WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|error| map_database_error("failed to find mailbox account", error))?
+                != 0;
+
+        if is_update && !exists {
+            return Err(account_not_found(id));
+        }
+        if is_update {
+            sqlx::query(
+                "UPDATE mailbox_accounts SET provider = ?, email = ?, imap_host = ?, \
+                    imap_port = ?, enabled = ?, sync_interval_minutes = ?, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(provider_str(account.provider))
+            .bind(&account.email)
+            .bind(&account.imap_host)
+            .bind(account.imap_port)
+            .bind(account.enabled)
+            .bind(account.sync_interval_minutes)
+            .bind(&now)
+            .bind(id.to_string())
+            .execute(&mut *connection)
+            .await
+            .map_err(map_insert_error)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO mailbox_accounts (\
+                    id, provider, email, imap_host, imap_port, enabled, sync_interval_minutes, \
+                    created_at, updated_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(provider_str(account.provider))
+            .bind(&account.email)
+            .bind(&account.imap_host)
+            .bind(account.imap_port)
+            .bind(account.enabled)
+            .bind(account.sync_interval_minutes)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *connection)
+            .await
+            .map_err(map_insert_error)?;
+        }
+
+        let query = format!("SELECT {ACCOUNT_COLUMNS} FROM mailbox_accounts WHERE id = ?");
+        let row = sqlx::query_as::<_, DbMailboxAccountRow>(&query)
+            .bind(id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to read saved mailbox account", error))?;
+        MailboxAccount::try_from(row)
+    }
+
     pub async fn get(&self, id: Uuid) -> Result<MailboxAccount, AppError> {
         let query = format!("SELECT {ACCOUNT_COLUMNS} FROM mailbox_accounts WHERE id = ?");
         let row = sqlx::query_as::<_, DbMailboxAccountRow>(&query)
@@ -111,6 +183,49 @@ impl MailboxAccountRepository {
             .map_err(|error| map_database_error("failed to list mailbox accounts", error))?;
 
         rows.into_iter().map(MailboxAccount::try_from).collect()
+    }
+
+    pub async fn set_enabled(&self, id: Uuid, enabled: bool) -> Result<(), AppError> {
+        let result =
+            sqlx::query("UPDATE mailbox_accounts SET enabled = ?, updated_at = ? WHERE id = ?")
+                .bind(enabled)
+                .bind(Utc::now().to_rfc3339())
+                .bind(id.to_string())
+                .execute(&self.pool)
+                .await
+                .map_err(|error| map_database_error("failed to update mailbox account", error))?;
+        if result.rows_affected() != 1 {
+            return Err(account_not_found(id));
+        }
+        Ok(())
+    }
+
+    pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
+        let result = sqlx::query("DELETE FROM mailbox_accounts WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_database_error("failed to delete mailbox account", error))?;
+        if result.rows_affected() != 1 {
+            return Err(account_not_found(id));
+        }
+        Ok(())
+    }
+
+    pub async fn set_last_error(&self, id: Uuid, message: Option<&str>) -> Result<(), AppError> {
+        let message = message.map(sanitize_error_message);
+        let result =
+            sqlx::query("UPDATE mailbox_accounts SET last_error = ?, updated_at = ? WHERE id = ?")
+                .bind(message)
+                .bind(Utc::now().to_rfc3339())
+                .bind(id.to_string())
+                .execute(&self.pool)
+                .await
+                .map_err(|error| map_database_error("failed to update mailbox error", error))?;
+        if result.rows_affected() != 1 {
+            return Err(account_not_found(id));
+        }
+        Ok(())
     }
 
     pub async fn get_cursor(
