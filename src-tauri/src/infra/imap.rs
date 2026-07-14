@@ -54,10 +54,32 @@ pub struct RawMessage {
     pub received_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRejectionReason {
+    MessageTooLarge,
+}
+
+impl MessageRejectionReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MessageTooLarge => "message_too_large",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedMessage {
+    pub uid: u32,
+    pub mailbox: String,
+    pub received_at: DateTime<Utc>,
+    pub reason: MessageRejectionReason,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxDelta {
     pub uid_validity: u32,
     pub messages: Vec<RawMessage>,
+    pub rejected_messages: Vec<RejectedMessage>,
     pub highest_uid: u32,
 }
 
@@ -168,6 +190,7 @@ fn fetch_blocking(
         .map(|uid| uid.saturating_sub(1))
         .unwrap_or(0);
     let mut messages = Vec::new();
+    let mut rejected_messages = Vec::new();
     let mut budget = RawBudget::new(settings.max_message_bytes, settings.max_total_bytes);
     let (uids, mut high_water) = match uid_start(cursor, uid_validity) {
         Some(start_uid) if start_uid <= highest_uid => {
@@ -192,18 +215,30 @@ fn fetch_blocking(
             .ok_or_else(|| imap_error("IMAP response omitted UID"))?;
         let size = usize::try_from(metadata.size.unwrap_or(0))
             .map_err(|_| limit_error("IMAP message size is invalid"))?;
-        budget.check_message(size)?;
-        if !budget.can_fit(size)? {
-            let Some(processed) = processed_high_water else {
-                return Err(limit_error("IMAP delta exceeds total size limit"));
-            };
-            high_water = processed;
-            break;
-        }
         let received_at = metadata
             .internal_date()
             .map(|date| date.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
+        match budget.admission(size)? {
+            MessageAdmission::Admit => {}
+            MessageAdmission::Reject(reason) => {
+                rejected_messages.push(RejectedMessage {
+                    uid: actual_uid,
+                    mailbox: config.mailbox.clone(),
+                    received_at,
+                    reason,
+                });
+                processed_high_water = Some(uid);
+                continue;
+            }
+            MessageAdmission::StopBatch => {
+                let Some(processed) = processed_high_water else {
+                    return Err(limit_error("IMAP delta exceeds total size limit"));
+                };
+                high_water = processed;
+                break;
+            }
+        }
         let query = format!(
             "(UID BODY.PEEK[]<0.{}>)",
             settings.max_message_bytes.saturating_add(1)
@@ -218,13 +253,25 @@ fn fetch_blocking(
         let raw = fetched
             .body()
             .ok_or_else(|| imap_error("IMAP message body was omitted"))?;
-        budget.check_message(raw.len())?;
-        if !budget.can_fit(raw.len())? {
-            let Some(processed) = processed_high_water else {
-                return Err(limit_error("IMAP delta exceeds total size limit"));
-            };
-            high_water = processed;
-            break;
+        match budget.admission(raw.len())? {
+            MessageAdmission::Admit => {}
+            MessageAdmission::Reject(reason) => {
+                rejected_messages.push(RejectedMessage {
+                    uid: actual_uid,
+                    mailbox: config.mailbox.clone(),
+                    received_at,
+                    reason,
+                });
+                processed_high_water = Some(uid);
+                continue;
+            }
+            MessageAdmission::StopBatch => {
+                let Some(processed) = processed_high_water else {
+                    return Err(limit_error("IMAP delta exceeds total size limit"));
+                };
+                high_water = processed;
+                break;
+            }
         }
         budget.add_actual(raw.len())?;
         messages.push(RawMessage {
@@ -239,6 +286,7 @@ fn fetch_blocking(
     Ok(MailboxDelta {
         uid_validity,
         messages,
+        rejected_messages,
         highest_uid: high_water,
     })
 }
@@ -281,6 +329,13 @@ struct RawBudget {
     max_total: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageAdmission {
+    Admit,
+    Reject(MessageRejectionReason),
+    StopBatch,
+}
+
 impl RawBudget {
     fn new(max_message: usize, max_total: usize) -> Self {
         Self {
@@ -295,6 +350,19 @@ impl RawBudget {
             return Err(limit_error("IMAP message exceeds size limit"));
         }
         Ok(())
+    }
+
+    fn admission(&self, bytes: usize) -> Result<MessageAdmission, AppError> {
+        if bytes > self.max_message {
+            return Ok(MessageAdmission::Reject(
+                MessageRejectionReason::MessageTooLarge,
+            ));
+        }
+        if self.can_fit(bytes)? {
+            Ok(MessageAdmission::Admit)
+        } else {
+            Ok(MessageAdmission::StopBatch)
+        }
     }
 
     fn can_fit(&self, bytes: usize) -> Result<bool, AppError> {
@@ -395,8 +463,9 @@ fn limit_error(message: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImapAccountConfig, NativeTlsImapGateway, RawBudget, authentication_error, connect,
-        imap_error, limit_error, select_uid_batch, uid_start,
+        ImapAccountConfig, MessageAdmission, MessageRejectionReason, NativeTlsImapGateway,
+        RawBudget, authentication_error, connect, imap_error, limit_error, select_uid_batch,
+        uid_start,
     };
     use crate::db::accounts::{MailboxProvider, SyncCursor};
     use crate::domain::error::AppError;
@@ -478,6 +547,22 @@ mod tests {
         budget.add_actual(7).unwrap();
 
         assert!(!budget.can_fit(6).unwrap());
+        assert_eq!(budget.total, 7);
+    }
+
+    #[test]
+    fn message_admission_distinguishes_rejection_from_batch_exhaustion() {
+        let mut budget = RawBudget::new(10, 12);
+
+        assert_eq!(
+            budget.admission(11).unwrap(),
+            MessageAdmission::Reject(MessageRejectionReason::MessageTooLarge)
+        );
+        assert_eq!(budget.total, 0);
+
+        budget.add_actual(7).unwrap();
+        assert_eq!(budget.admission(6).unwrap(), MessageAdmission::StopBatch);
+        assert_eq!(budget.admission(5).unwrap(), MessageAdmission::Admit);
         assert_eq!(budget.total, 7);
     }
 

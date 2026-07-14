@@ -9,6 +9,7 @@ use crate::db::items::{InvoiceItem, ItemRepository, NewItemRecord};
 use crate::domain::error::AppError;
 use crate::domain::model::{ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType};
 use crate::infra::files::AppPaths;
+use crate::infra::imap::RejectedMessage;
 
 pub const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 const ALLOWED_EXTENSIONS: [&str; 9] = [
@@ -96,6 +97,40 @@ impl ImportService {
         .await
     }
 
+    pub(crate) async fn import_email_rejection(
+        &self,
+        account_id: Uuid,
+        uid_validity: u32,
+        rejected: &RejectedMessage,
+        rescan: bool,
+    ) -> Result<ImportOutcome, AppError> {
+        let reason = rejected.reason.code();
+        let original_name = format!("message-{}-rejected.txt", rejected.uid);
+        let placeholder = format!(
+            "Mailbox message UID {} was rejected.\nReason: {reason}\n",
+            rejected.uid
+        );
+        self.import_email_payload(EmailPayload {
+            original_name,
+            extension: "txt".to_owned(),
+            bytes: placeholder.as_bytes(),
+            mime_type: Some("text/plain".to_owned()),
+            recognition_status: RecognitionStatus::Failed,
+            note: Some(format!("mailbox message rejected: {reason}")),
+            source: EmailImportSource {
+                account_id,
+                mailbox: rejected.mailbox.clone(),
+                uid_validity,
+                uid: rejected.uid,
+                message_id: None,
+                part_id: "message.rejected".to_owned(),
+                received_at: rejected.received_at,
+                rescan,
+            },
+        })
+        .await
+    }
+
     async fn import_email_payload(
         &self,
         payload: EmailPayload<'_>,
@@ -122,6 +157,24 @@ impl ImportService {
             Ok(value) => value,
             Err(error) => return Err(staged.cleanup_after(error)),
         };
+        let legacy = match self
+            .items
+            .find_legacy_email_part(
+                payload.source.account_id,
+                &payload.source.mailbox,
+                payload.source.message_id.as_deref(),
+                &payload.source.part_id,
+                &sha256,
+            )
+            .await
+        {
+            Ok(legacy) => legacy,
+            Err(error) => return Err(staged.cleanup_after(error)),
+        };
+        if let Some(legacy) = legacy {
+            staged.discard()?;
+            return Ok(ImportOutcome::Existing(legacy));
+        }
         if payload.source.rescan {
             let existing = match self
                 .items

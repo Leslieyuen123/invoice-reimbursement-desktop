@@ -173,6 +173,119 @@ async fn mailbox_sync_repository_maps_real_sqlite_busy_errors_as_retryable() {
 }
 
 #[tokio::test]
+async fn item_email_lookups_map_real_sqlite_busy_errors_as_retryable() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("item-lookups-busy.sqlite3").display()
+    );
+    let options = SqliteConnectOptions::from_str(&database_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Delete)
+        .busy_timeout(Duration::ZERO);
+    let setup_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&setup_pool)
+        .await
+        .unwrap();
+    let account_id = Uuid::new_v4();
+    insert_mailbox_account(&setup_pool, account_id).await;
+    let setup_items = ItemRepository::new(setup_pool.clone());
+    let mut current = sample_item("busy-current", "sha256-busy-current");
+    current.source_type = SourceType::Email;
+    current.source_account_id = Some(account_id);
+    current.source_mailbox = Some("INBOX".to_owned());
+    current.source_uid_validity = Some(10);
+    current.source_uid = Some(42);
+    current.source_message_id = Some("busy-current@example.com".to_owned());
+    current.source_part_id = Some("2".to_owned());
+    setup_items.insert(&current).await.unwrap();
+    let mut legacy = sample_item("busy-legacy", "sha256-busy-legacy");
+    legacy.source_type = SourceType::Email;
+    legacy.source_account_id = Some(account_id);
+    legacy.source_mailbox = Some("INBOX".to_owned());
+    legacy.source_uid_validity = Some(11);
+    legacy.source_uid = Some(43);
+    legacy.source_message_id = Some("busy-legacy@example.com".to_owned());
+    legacy.source_part_id = Some("3".to_owned());
+    setup_items.insert(&legacy).await.unwrap();
+    sqlx::query("UPDATE items SET source_uid_validity = 0 WHERE id = ?")
+        .bind(legacy.id.to_string())
+        .execute(&setup_pool)
+        .await
+        .unwrap();
+    drop(setup_items);
+    setup_pool.close().await;
+
+    let lock_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let mut lock = lock_pool.acquire().await.unwrap();
+    let repository_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let items = ItemRepository::new(repository_pool);
+    sqlx::query("BEGIN EXCLUSIVE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let errors = [
+        items
+            .find_email_part(account_id, "INBOX", 10, 42, "2")
+            .await
+            .unwrap_err(),
+        items
+            .find_rescanned_email_part(
+                account_id,
+                "INBOX",
+                11,
+                Some("busy-current@example.com"),
+                "2",
+                "sha256-busy-current",
+            )
+            .await
+            .unwrap_err(),
+        items
+            .find_legacy_email_part(
+                account_id,
+                "INBOX",
+                Some("busy-legacy@example.com"),
+                "3",
+                "sha256-busy-legacy",
+            )
+            .await
+            .unwrap_err(),
+    ];
+
+    for error in errors {
+        assert!(
+            matches!(
+                error,
+                AppError::External {
+                    ref service,
+                    retryable: true,
+                    ..
+                } if service == "database"
+            ),
+            "unexpected busy mapping: {error:?}"
+        );
+    }
+
+    sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+}
+
+#[tokio::test]
 async fn private_memory_url_aliases_keep_schema_access_on_one_connection() {
     for database_url in ["sqlite://:memory:", "sqlite://?mode=memory"] {
         let pool = db::connect(database_url)

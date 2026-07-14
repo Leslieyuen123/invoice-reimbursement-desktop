@@ -264,7 +264,7 @@ impl ItemRepository {
             .bind(part_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|error| internal_error("failed to find email part", error))?;
+            .map_err(|error| map_database_error("failed to find email part", error))?;
         row.map(InvoiceItem::try_from).transpose()
     }
 
@@ -285,7 +285,7 @@ impl ItemRepository {
             .push_bind(account_id.to_string())
             .push(" AND source_mailbox = ")
             .push_bind(mailbox)
-            .push(" AND source_uid_validity != ")
+            .push(" AND source_uid_validity > 0 AND source_uid_validity != ")
             .push_bind(i64::from(current_uid_validity))
             .push(" AND source_part_id = ")
             .push_bind(part_id)
@@ -302,7 +302,42 @@ impl ItemRepository {
             .build_query_as::<DbItemRow>()
             .fetch_optional(&self.pool)
             .await
-            .map_err(|error| internal_error("failed to find rescanned email part", error))?;
+            .map_err(|error| map_database_error("failed to find rescanned email part", error))?;
+        row.map(InvoiceItem::try_from).transpose()
+    }
+
+    pub async fn find_legacy_email_part(
+        &self,
+        account_id: Uuid,
+        mailbox: &str,
+        message_id: Option<&str>,
+        part_id: &str,
+        sha256: &str,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
+        query
+            .push(ITEM_COLUMNS)
+            .push(" FROM items WHERE source_type = 'email' AND source_account_id = ");
+        query
+            .push_bind(account_id.to_string())
+            .push(" AND source_mailbox = ")
+            .push_bind(mailbox)
+            .push(" AND source_uid_validity = 0 AND source_part_id = ")
+            .push_bind(part_id)
+            .push(" AND sha256 = ")
+            .push_bind(sha256);
+        if let Some(message_id) = message_id {
+            query
+                .push(" AND source_message_id = ")
+                .push_bind(message_id);
+        }
+        query.push(" ORDER BY created_at ASC, id ASC LIMIT 1");
+
+        let row = query
+            .build_query_as::<DbItemRow>()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| map_database_error("failed to find legacy email part", error))?;
         row.map(InvoiceItem::try_from).transpose()
     }
 

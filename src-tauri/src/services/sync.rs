@@ -126,6 +126,20 @@ impl SyncService {
         validate_delta(&delta, &config.mailbox)?;
         let rescan = cursor.is_some_and(|cursor| cursor.uid_validity != delta.uid_validity);
         let mut imported_count = 0_u32;
+        for rejected in &delta.rejected_messages {
+            let outcome = self
+                .import
+                .import_email_rejection(account_id, delta.uid_validity, rejected, rescan)
+                .await?;
+            if matches!(outcome, ImportOutcome::New(_)) {
+                imported_count =
+                    imported_count
+                        .checked_add(1)
+                        .ok_or_else(|| AppError::Internal {
+                            message: "sync import count overflow".to_owned(),
+                        })?;
+            }
+        }
         for raw_message in &delta.messages {
             let parsed = parse_invoice_parts(raw_message)?;
             for part in parsed.files {
@@ -222,20 +236,24 @@ struct ParsedInvoiceParts {
 }
 
 fn validate_delta(delta: &MailboxDelta, expected_mailbox: &str) -> Result<(), AppError> {
-    if delta.messages.len() > MAX_MESSAGES_PER_SYNC {
+    let message_count = delta
+        .messages
+        .len()
+        .checked_add(delta.rejected_messages.len())
+        .ok_or_else(|| resource_limit_error("IMAP message count overflow"))?;
+    if message_count > MAX_MESSAGES_PER_SYNC {
         return Err(resource_limit_error("too many messages in IMAP delta"));
     }
     let mut total_bytes = 0_usize;
     let mut seen_uids = HashSet::new();
     for message in &delta.messages {
-        if message.mailbox != expected_mailbox {
-            return Err(external_error("IMAP delta contained an unexpected mailbox"));
-        }
-        if message.uid == 0 || message.uid > delta.highest_uid || !seen_uids.insert(message.uid) {
-            return Err(external_error(
-                "IMAP delta contained an invalid or duplicate UID",
-            ));
-        }
+        validate_message_identity(
+            message.uid,
+            &message.mailbox,
+            delta.highest_uid,
+            expected_mailbox,
+            &mut seen_uids,
+        )?;
         if message.raw.len() > MAX_RAW_MESSAGE_BYTES {
             return Err(resource_limit_error("IMAP message exceeds size limit"));
         }
@@ -245,6 +263,33 @@ fn validate_delta(delta: &MailboxDelta, expected_mailbox: &str) -> Result<(), Ap
         if total_bytes > MAX_TOTAL_RAW_BYTES {
             return Err(resource_limit_error("IMAP delta exceeds total size limit"));
         }
+    }
+    for message in &delta.rejected_messages {
+        validate_message_identity(
+            message.uid,
+            &message.mailbox,
+            delta.highest_uid,
+            expected_mailbox,
+            &mut seen_uids,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_message_identity(
+    uid: u32,
+    mailbox: &str,
+    highest_uid: u32,
+    expected_mailbox: &str,
+    seen_uids: &mut HashSet<u32>,
+) -> Result<(), AppError> {
+    if mailbox != expected_mailbox {
+        return Err(external_error("IMAP delta contained an unexpected mailbox"));
+    }
+    if uid == 0 || uid > highest_uid || !seen_uids.insert(uid) {
+        return Err(external_error(
+            "IMAP delta contained an invalid or duplicate UID",
+        ));
     }
     Ok(())
 }
@@ -447,5 +492,87 @@ fn resource_limit_error(message: &str) -> AppError {
         service: "imap".to_owned(),
         retryable: false,
         message: message.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::{MAX_MESSAGES_PER_SYNC, validate_delta};
+    use crate::infra::imap::{MailboxDelta, MessageRejectionReason, RawMessage, RejectedMessage};
+
+    fn rejected_message(uid: u32) -> RejectedMessage {
+        RejectedMessage {
+            uid,
+            mailbox: "INBOX".to_owned(),
+            received_at: Utc::now(),
+            reason: MessageRejectionReason::MessageTooLarge,
+        }
+    }
+
+    #[test]
+    fn rejected_messages_count_toward_the_delta_limit() {
+        let rejected_messages = (1..=MAX_MESSAGES_PER_SYNC as u32)
+            .map(rejected_message)
+            .collect();
+        let delta = MailboxDelta {
+            uid_validity: 1,
+            messages: vec![RawMessage {
+                uid: MAX_MESSAGES_PER_SYNC as u32 + 1,
+                mailbox: "INBOX".to_owned(),
+                raw: Vec::new(),
+                received_at: Utc::now(),
+            }],
+            rejected_messages,
+            highest_uid: MAX_MESSAGES_PER_SYNC as u32 + 1,
+        };
+
+        let error = validate_delta(&delta, "INBOX").unwrap_err();
+
+        assert!(error.to_string().contains("too many messages"));
+    }
+
+    #[test]
+    fn rejected_message_uids_must_be_unique_across_the_delta() {
+        let delta = MailboxDelta {
+            uid_validity: 1,
+            messages: vec![RawMessage {
+                uid: 7,
+                mailbox: "INBOX".to_owned(),
+                raw: Vec::new(),
+                received_at: Utc::now(),
+            }],
+            rejected_messages: vec![rejected_message(7)],
+            highest_uid: 7,
+        };
+
+        let error = validate_delta(&delta, "INBOX").unwrap_err();
+
+        assert!(error.to_string().contains("invalid or duplicate UID"));
+    }
+
+    #[test]
+    fn rejected_messages_must_match_the_mailbox_and_high_water() {
+        let mut wrong_mailbox = rejected_message(7);
+        wrong_mailbox.mailbox = "Archive".to_owned();
+        let mailbox_delta = MailboxDelta {
+            uid_validity: 1,
+            messages: vec![],
+            rejected_messages: vec![wrong_mailbox],
+            highest_uid: 7,
+        };
+        let uid_delta = MailboxDelta {
+            uid_validity: 1,
+            messages: vec![],
+            rejected_messages: vec![rejected_message(8)],
+            highest_uid: 7,
+        };
+
+        let mailbox_error = validate_delta(&mailbox_delta, "INBOX").unwrap_err();
+        let uid_error = validate_delta(&uid_delta, "INBOX").unwrap_err();
+
+        assert!(mailbox_error.to_string().contains("mailbox"));
+        assert!(uid_error.to_string().contains("invalid or duplicate UID"));
     }
 }

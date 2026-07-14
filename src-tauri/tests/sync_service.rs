@@ -16,7 +16,8 @@ use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentia
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::infra::imap::{
-    ImapAccountConfig, ImapGateway, MailboxDelta, NativeTlsImapGateway, RawMessage,
+    ImapAccountConfig, ImapGateway, MailboxDelta, MessageRejectionReason, NativeTlsImapGateway,
+    RawMessage, RejectedMessage,
 };
 use invoice_reimbursement::services::import::{EmailImportSource, ImportOutcome, ImportService};
 use invoice_reimbursement::services::recognition::RecognitionService;
@@ -190,6 +191,7 @@ async fn incremental_sync_imports_each_mail_part_once() {
         .set(&account.id.to_string(), "application-password")
         .unwrap();
     let first_delta = MailboxDelta {
+        rejected_messages: vec![],
         uid_validity: 10,
         highest_uid: 102,
         messages: vec![
@@ -198,6 +200,7 @@ async fn incremental_sync_imports_each_mail_part_once() {
         ],
     };
     let second_delta = MailboxDelta {
+        rejected_messages: vec![],
         uid_validity: 10,
         highest_uid: 102,
         messages: vec![],
@@ -321,6 +324,7 @@ async fn refetched_existing_pending_part_resumes_recognition_without_reimporting
     assert_eq!(confirmed.recognition_status, RecognitionStatus::Pending);
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 61,
             highest_uid: 102,
             messages: vec![
@@ -353,6 +357,100 @@ async fn refetched_existing_pending_part_resumes_recognition_without_reimporting
 }
 
 #[tokio::test]
+async fn first_sync_recovers_a_legacy_epoch_zero_pending_part() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "legacy-epoch@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let import = ImportService::new(items.clone(), paths.clone());
+    let legacy = import
+        .import_email_bytes(
+            "invoice-101.pdf",
+            b"%PDF-1.7\n1 0 obj\n<</Type/Catalog>>\nendobj\n%%EOF\n",
+            EmailImportSource {
+                account_id: account.id,
+                mailbox: "INBOX".to_owned(),
+                uid_validity: 10,
+                uid: 101,
+                message_id: Some("attachment-101@example.com".to_owned()),
+                part_id: "2".to_owned(),
+                received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                rescan: false,
+            },
+        )
+        .await
+        .unwrap();
+    let ImportOutcome::New(legacy) = legacy else {
+        panic!("legacy fixture should be newly persisted")
+    };
+    sqlx::query("UPDATE items SET source_uid_validity = 0 WHERE id = ?")
+        .bind(legacy.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        items
+            .get_by_id(legacy.id)
+            .await
+            .unwrap()
+            .source_uid_validity,
+        Some(0)
+    );
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        None
+    );
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 11,
+            highest_uid: 7,
+            messages: vec![raw_message(
+                7,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        })])),
+        credentials,
+        accounts.clone(),
+        import,
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+
+    assert_eq!(result.imported_count, 0);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, legacy.id);
+    assert_eq!(stored[0].source_uid_validity, Some(0));
+    assert_eq!(stored[0].recognition_status, RecognitionStatus::Succeeded);
+    assert_eq!(count_files(&paths.originals), 1);
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(SyncCursor {
+            uid_validity: 11,
+            last_uid: 7,
+        })
+    );
+}
+
+#[tokio::test]
 async fn cid_image_without_content_disposition_is_imported() {
     let directory = tempfile::tempdir().unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();
@@ -375,6 +473,7 @@ async fn cid_image_without_content_disposition_is_imported() {
         .unwrap();
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 11,
             highest_uid: 104,
             messages: vec![raw_message(
@@ -427,6 +526,7 @@ async fn https_download_link_becomes_a_local_pending_placeholder_without_network
         .set(&account.id.to_string(), "auth-code")
         .unwrap();
     let gateway = Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+        rejected_messages: vec![],
         uid_validity: 20,
         highest_uid: 103,
         messages: vec![raw_message(
@@ -502,6 +602,7 @@ async fn html_links_only_import_download_candidates_from_the_message_body() {
         .unwrap();
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 21,
             highest_uid: 201,
             messages: vec![raw_message(
@@ -569,6 +670,7 @@ async fn excessive_download_candidates_are_truncated_and_cursor_advances() {
     let raw = many_download_links_message(35);
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 22,
             highest_uid: 202,
             messages: vec![raw_message(202, raw.as_bytes())],
@@ -627,6 +729,7 @@ async fn authentication_failure_is_sanitized_and_does_not_advance_the_cursor() {
     credentials.set(&account.id.to_string(), secret).unwrap();
     let gateway = Arc::new(FakeImapGateway::new(vec![
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 9,
             highest_uid: 42,
             messages: vec![],
@@ -750,6 +853,7 @@ async fn infrastructure_failure_after_import_keeps_the_item_but_not_the_cursor()
         .set(&account.id.to_string(), "password")
         .unwrap();
     let delta = MailboxDelta {
+        rejected_messages: vec![],
         uid_validity: 30,
         highest_uid: 101,
         messages: vec![raw_message(
@@ -837,6 +941,7 @@ async fn cursor_database_failure_rolls_back_success_and_marks_the_run_failed() {
         .unwrap();
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 40,
             highest_uid: 0,
             messages: vec![],
@@ -957,6 +1062,7 @@ async fn damaged_document_is_marked_failed_while_later_parts_continue_with_prove
         .unwrap();
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 50,
             highest_uid: 102,
             messages: vec![
@@ -1047,6 +1153,7 @@ async fn empty_email_attachment_is_retained_as_failed_while_later_mail_continues
         .unwrap();
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 51,
             highest_uid: 102,
             messages: vec![
@@ -1102,6 +1209,96 @@ async fn empty_email_attachment_is_retained_as_failed_while_later_mail_continues
 }
 
 #[tokio::test]
+async fn oversized_message_creates_a_rejection_item_and_later_mail_continues_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "oversized-message@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let rejected = RejectedMessage {
+        uid: 101,
+        mailbox: "INBOX".to_owned(),
+        received_at: Utc.with_ymd_and_hms(2026, 7, 14, 9, 0, 0).unwrap(),
+        reason: MessageRejectionReason::MessageTooLarge,
+    };
+    let gateway = Arc::new(FakeImapGateway::new(vec![
+        Ok(MailboxDelta {
+            uid_validity: 71,
+            highest_uid: 102,
+            rejected_messages: vec![rejected.clone()],
+            messages: vec![raw_message(
+                102,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+        Ok(MailboxDelta {
+            uid_validity: 71,
+            highest_uid: 102,
+            rejected_messages: vec![rejected],
+            messages: vec![],
+        }),
+    ]));
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let service = SyncService::new(
+        gateway,
+        credentials,
+        accounts.clone(),
+        ImportService::new(items.clone(), paths.clone()),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let first = service.run(account.id).await.unwrap();
+    let second = service.run(account.id).await.unwrap();
+
+    assert_eq!(first.imported_count, 2);
+    assert_eq!(second.imported_count, 0);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    let rejected = stored
+        .iter()
+        .find(|item| item.source_uid == Some(101))
+        .unwrap();
+    let valid = stored
+        .iter()
+        .find(|item| item.source_uid == Some(102))
+        .unwrap();
+    assert_eq!(rejected.source_part_id.as_deref(), Some("message.rejected"));
+    assert_eq!(rejected.recognition_status, RecognitionStatus::Failed);
+    assert_eq!(rejected.confirmation_status, ConfirmationStatus::Pending);
+    assert_eq!(rejected.mime_type, "text/plain");
+    assert_eq!(
+        rejected.note.as_deref(),
+        Some("mailbox message rejected: message_too_large")
+    );
+    let placeholder = std::fs::read_to_string(&rejected.original_path).unwrap();
+    assert!(placeholder.contains("message_too_large"));
+    assert!(!placeholder.contains("server"));
+    assert_eq!(valid.recognition_status, RecognitionStatus::Succeeded);
+    assert_eq!(count_files(&paths.originals), 2);
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(SyncCursor {
+            uid_validity: 71,
+            last_uid: 102,
+        })
+    );
+}
+
+#[tokio::test]
 async fn uidvalidity_change_rescans_without_duplicating_a_mail_part() {
     let directory = tempfile::tempdir().unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();
@@ -1125,11 +1322,13 @@ async fn uidvalidity_change_rescans_without_duplicating_a_mail_part() {
     let message = raw_message(101, include_bytes!("fixtures/mail/attachment.eml"));
     let gateway = Arc::new(FakeImapGateway::new(vec![
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 10,
             highest_uid: 101,
             messages: vec![message.clone()],
         }),
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 11,
             highest_uid: 101,
             messages: vec![message],
@@ -1192,6 +1391,7 @@ async fn uidvalidity_change_reuses_the_same_message_part_at_a_new_uid() {
         .unwrap();
     let gateway = Arc::new(FakeImapGateway::new(vec![
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 10,
             highest_uid: 101,
             messages: vec![raw_message(
@@ -1200,6 +1400,7 @@ async fn uidvalidity_change_reuses_the_same_message_part_at_a_new_uid() {
             )],
         }),
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 11,
             highest_uid: 7,
             messages: vec![raw_message(
@@ -1249,6 +1450,7 @@ async fn uidvalidity_change_keeps_reused_uid_when_message_content_changes() {
         .unwrap();
     let gateway = Arc::new(FakeImapGateway::new(vec![
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 10,
             highest_uid: 101,
             messages: vec![raw_message(
@@ -1257,6 +1459,7 @@ async fn uidvalidity_change_keeps_reused_uid_when_message_content_changes() {
             )],
         }),
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 11,
             highest_uid: 101,
             messages: vec![raw_message(
@@ -1311,6 +1514,7 @@ async fn same_uidvalidity_same_content_at_a_new_uid_is_a_suspected_duplicate() {
         .unwrap();
     let gateway = Arc::new(FakeImapGateway::new(vec![
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 10,
             highest_uid: 101,
             messages: vec![raw_message(
@@ -1319,6 +1523,7 @@ async fn same_uidvalidity_same_content_at_a_new_uid_is_a_suspected_duplicate() {
             )],
         }),
         Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 10,
             highest_uid: 102,
             messages: vec![raw_message(
@@ -1386,6 +1591,7 @@ async fn concurrent_syncs_import_one_database_row_and_one_original() {
     let service = SyncService::new(
         Arc::new(ConcurrentGateway {
             delta: MailboxDelta {
+                rejected_messages: vec![],
                 uid_validity: 60,
                 highest_uid: 101,
                 messages: vec![raw_message(
@@ -1452,11 +1658,13 @@ async fn stale_concurrent_completion_cannot_overwrite_a_newer_cursor_epoch() {
         .unwrap();
     let gateway = Arc::new(OrderedCompletionGateway {
         stale_delta: MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 10,
             highest_uid: 100,
             messages: vec![],
         },
         newer_delta: MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 11,
             highest_uid: 7,
             messages: vec![],
@@ -1539,16 +1747,19 @@ async fn malformed_mail_and_raw_message_budgets_fail_without_a_cursor() {
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![
             Ok(MailboxDelta {
+                rejected_messages: vec![],
                 uid_validity: 70,
                 highest_uid: 1,
                 messages: vec![raw_message(1, b"")],
             }),
             Ok(MailboxDelta {
+                rejected_messages: vec![],
                 uid_validity: 70,
                 highest_uid: 1_001,
                 messages: too_many,
             }),
             Ok(MailboxDelta {
+                rejected_messages: vec![],
                 uid_validity: 70,
                 highest_uid: 1,
                 messages: vec![raw_message(1, &vec![b'x'; 50 * 1024 * 1024 + 1])],
@@ -1652,6 +1863,7 @@ async fn inconsistent_gateway_mailbox_is_rejected_before_import_or_cursor_update
     message.mailbox = "Archive".to_owned();
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
             uid_validity: 90,
             highest_uid: 101,
             messages: vec![message],
