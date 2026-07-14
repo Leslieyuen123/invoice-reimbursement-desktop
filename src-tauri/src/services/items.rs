@@ -124,11 +124,11 @@ impl ItemService {
                     suggested_period: review.suggested_period,
                     final_category: review.final_category,
                     amount_cents: review.amount_cents,
-                    city: normalize_optional_text("city", review.city, 200)?,
-                    company: normalize_optional_text("company", review.company, 200)?,
-                    note: normalize_optional_text("note", review.note, 1_000)?,
-                    event_tag: normalize_optional_text("event_tag", review.event_tag, 200)?,
-                    project_tag: normalize_optional_text("project_tag", review.project_tag, 200)?,
+                    city: normalize_optional_text(review.city),
+                    company: normalize_optional_text(review.company),
+                    note: normalize_optional_text(review.note),
+                    event_tag: normalize_optional_text(review.event_tag),
+                    project_tag: normalize_optional_text(review.project_tag),
                 },
             )
             .await
@@ -690,22 +690,8 @@ fn validate_period(value: &str) -> Result<(), AppError> {
         .ok_or_else(|| AppError::validation("suggested_period", "must be YYYY-MM"))
 }
 
-fn normalize_optional_text(
-    field: &str,
-    value: Option<String>,
-    max_chars: usize,
-) -> Result<Option<String>, AppError> {
-    let value = value
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
         .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    if value
-        .as_ref()
-        .is_some_and(|value| value.chars().count() > max_chars)
-    {
-        return Err(AppError::validation(
-            field,
-            format!("must not exceed {max_chars} characters"),
-        ));
-    }
-    Ok(value)
+        .filter(|value| !value.is_empty())
 }

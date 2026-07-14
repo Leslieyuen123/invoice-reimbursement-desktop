@@ -212,7 +212,7 @@ async fn explicit_retry_can_refresh_automatic_fields_after_review() {
 }
 
 #[tokio::test]
-async fn review_rejects_oversized_optional_text_without_leaking_its_value() {
+async fn review_persists_long_optional_text_after_trimming() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let paths = AppPaths::create(directory.path().join("storage"))
         .expect("application paths should create");
@@ -220,27 +220,28 @@ async fn review_rejects_oversized_optional_text_without_leaking_its_value() {
         .await
         .expect("in-memory database should connect");
     let repository = ItemRepository::new(pool);
-    let record = sample_item(&paths, "oversized-note");
+    let record = sample_item(&paths, "long-optional-text");
     repository
         .insert(&record)
         .await
         .expect("item should insert");
     let service = ItemService::new(repository, paths);
-    let secret = "private".repeat(200);
+    let long_note = "private".repeat(200);
+    let long_event_tag = "tag".repeat(100);
 
-    let error = service
+    let reviewed = service
         .review(ItemReview {
-            note: Some(secret.clone()),
+            note: Some(format!("  {long_note}  ")),
+            event_tag: Some(format!("\n{long_event_tag}\t")),
             ..valid_review(record.id)
         })
         .await
-        .expect_err("oversized note should be rejected");
+        .expect("long optional text should be accepted");
 
-    assert!(matches!(
-        error,
-        AppError::Validation { ref field, .. } if field == "note"
-    ));
-    assert!(!error.to_string().contains(&secret));
+    assert!(long_note.chars().count() > 1_000);
+    assert!(long_event_tag.chars().count() > 200);
+    assert_eq!(reviewed.note.as_deref(), Some(long_note.as_str()));
+    assert_eq!(reviewed.event_tag.as_deref(), Some(long_event_tag.as_str()));
 }
 
 #[tokio::test]
