@@ -1,0 +1,19 @@
+From: billing@example.com
+To: finance@example.com
+Date: Tue, 14 Jul 2026 10:00:00 +0800
+Message-ID: <empty-101@example.com>
+Subject: Empty invoice attachment
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="empty-boundary"
+
+--empty-boundary
+Content-Type: text/plain; charset=utf-8
+
+The attached invoice was empty.
+--empty-boundary
+Content-Type: application/pdf; name="empty.pdf"
+Content-Disposition: attachment; filename="empty.pdf"
+Content-Transfer-Encoding: base64
+
+
+--empty-boundary--

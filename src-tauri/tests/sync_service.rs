@@ -8,7 +8,7 @@ use invoice_reimbursement::db;
 use invoice_reimbursement::db::accounts::{
     MailboxAccountRepository, MailboxProvider, NewMailboxAccount, SyncCursor, SyncRun,
 };
-use invoice_reimbursement::db::items::{ItemFilter, ItemRepository};
+use invoice_reimbursement::db::items::{ItemFilter, ItemPatch, ItemRepository};
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::domain::model::{ConfirmationStatus, RecognitionStatus};
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
@@ -202,6 +202,114 @@ async fn incremental_sync_imports_each_mail_part_once() {
                 last_uid: 102,
             }),
         ]
+    );
+}
+
+#[tokio::test]
+async fn refetched_existing_pending_part_resumes_recognition_without_reimporting() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "pending-recovery@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let import = ImportService::new(items.clone(), paths);
+    let staged = import
+        .import_email_bytes(
+            "invoice-101.pdf",
+            b"%PDF-1.7\n1 0 obj\n<</Type/Catalog>>\nendobj\n%%EOF\n",
+            EmailImportSource {
+                account_id: account.id,
+                mailbox: "INBOX".to_owned(),
+                uid_validity: 61,
+                uid: 101,
+                message_id: Some("attachment-101@example.com".to_owned()),
+                part_id: "2".to_owned(),
+                received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                rescan: false,
+            },
+        )
+        .await
+        .unwrap();
+    let ImportOutcome::New(staged) = staged else {
+        panic!("crash fixture should be a newly persisted item")
+    };
+    assert_eq!(staged.recognition_status, RecognitionStatus::Pending);
+    let confirmed = import
+        .import_email_bytes(
+            "invoice-102.pdf",
+            b"%PDF-1.7\nconfirmed but pending\n%%EOF\n",
+            EmailImportSource {
+                account_id: account.id,
+                mailbox: "INBOX".to_owned(),
+                uid_validity: 61,
+                uid: 102,
+                message_id: Some("attachment-101@example.com".to_owned()),
+                part_id: "2".to_owned(),
+                received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                rescan: false,
+            },
+        )
+        .await
+        .unwrap();
+    let ImportOutcome::New(confirmed) = confirmed else {
+        panic!("confirmed fixture should be a newly persisted item")
+    };
+    let confirmed = items
+        .update_fields(
+            confirmed.id,
+            ItemPatch {
+                confirmation_status: Some(ConfirmationStatus::Confirmed),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(confirmed.recognition_status, RecognitionStatus::Pending);
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            uid_validity: 61,
+            highest_uid: 102,
+            messages: vec![
+                raw_message(101, include_bytes!("fixtures/mail/attachment.eml")),
+                raw_message(102, include_bytes!("fixtures/mail/attachment.eml")),
+            ],
+        })])),
+        credentials,
+        accounts.clone(),
+        import,
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+
+    assert_eq!(result.imported_count, 0);
+    let recovered = items.get_by_id(staged.id).await.unwrap();
+    assert_eq!(recovered.recognition_status, RecognitionStatus::Succeeded);
+    let preserved = items.get_by_id(confirmed.id).await.unwrap();
+    assert_eq!(preserved.recognition_status, RecognitionStatus::Pending);
+    assert_eq!(preserved.confirmation_status, ConfirmationStatus::Confirmed);
+    assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 2);
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(SyncCursor {
+            uid_validity: 61,
+            last_uid: 102,
+        })
     );
 }
 
@@ -407,6 +515,52 @@ async fn authentication_failure_is_sanitized_and_does_not_advance_the_cursor() {
     assert_eq!(runs[1].1, 0);
     assert!(runs[1].2.as_deref().unwrap().contains("[redacted]"));
     assert!(!runs[1].2.as_deref().unwrap().contains(secret));
+}
+
+#[tokio::test]
+async fn missing_mailbox_credential_is_not_retryable_and_does_not_fetch() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "missing-credential@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let gateway = Arc::new(FakeImapGateway::new(vec![]));
+    let service = SyncService::new(
+        gateway.clone(),
+        Arc::new(MemoryCredentialStore::default()),
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items, Arc::new(FakeExtractor)),
+    );
+
+    let error = service.run(account.id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::External {
+            ref service,
+            retryable: false,
+            ..
+        } if service == "imap"
+    ));
+    assert!(gateway.cursors().is_empty());
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -700,6 +854,83 @@ async fn damaged_document_is_marked_failed_while_later_parts_continue_with_prove
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         Some(SyncCursor {
             uid_validity: 50,
+            last_uid: 102,
+        })
+    );
+}
+
+#[tokio::test]
+async fn empty_email_attachment_is_retained_as_failed_while_later_mail_continues() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "empty-part@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            uid_validity: 51,
+            highest_uid: 102,
+            messages: vec![
+                raw_message(101, include_bytes!("fixtures/mail/empty-attachment.eml")),
+                raw_message(102, include_bytes!("fixtures/mail/attachment.eml")),
+            ],
+        })])),
+        credentials,
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+
+    assert_eq!(result.imported_count, 2);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    let empty = stored
+        .iter()
+        .find(|item| item.source_uid == Some(101))
+        .unwrap();
+    let valid = stored
+        .iter()
+        .find(|item| item.source_uid == Some(102))
+        .unwrap();
+    assert_eq!(empty.original_name, "empty.pdf");
+    assert_eq!(std::fs::read(&empty.original_path).unwrap(), b"");
+    assert_eq!(
+        empty.sha256,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(empty.mime_type, "application/octet-stream");
+    assert_eq!(empty.recognition_status, RecognitionStatus::Failed);
+    assert_eq!(empty.confirmation_status, ConfirmationStatus::Pending);
+    assert!(
+        empty
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("empty"))
+    );
+    assert_eq!(valid.recognition_status, RecognitionStatus::Succeeded);
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(SyncCursor {
+            uid_validity: 51,
             last_uid: 102,
         })
     );

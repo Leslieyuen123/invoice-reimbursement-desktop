@@ -56,13 +56,18 @@ impl ImportService {
     ) -> Result<ImportOutcome, AppError> {
         let original_name = sanitize_mail_filename(file_name)?;
         let extension = supported_extension(Path::new(&original_name))?;
+        let is_empty = bytes.is_empty();
         self.import_email_payload(EmailPayload {
             original_name,
             extension,
             bytes,
             mime_type: None,
-            recognition_status: RecognitionStatus::Pending,
-            note: None,
+            recognition_status: if is_empty {
+                RecognitionStatus::Failed
+            } else {
+                RecognitionStatus::Pending
+            },
+            note: is_empty.then(|| "email attachment was empty".to_owned()),
             source,
         })
         .await
@@ -112,7 +117,7 @@ impl ImportService {
         let id = Uuid::new_v4();
         let (staged, writer) = self.paths.begin_staged_original(id)?;
         let mut reader = payload.bytes;
-        let staged = copy_source_to_staging(&mut reader, staged, writer).await?;
+        let staged = copy_source_to_staging(&mut reader, staged, writer, true).await?;
         let sha256 = match sha256_file(staged.path()).await {
             Ok(value) => value,
             Err(error) => return Err(staged.cleanup_after(error)),
@@ -240,7 +245,7 @@ impl ImportService {
         let extension = supported_extension(source)?;
         let id = Uuid::new_v4();
         let (staged, writer) = self.paths.begin_staged_original(id)?;
-        let staged = copy_source_to_staging(&mut source_file, staged, writer).await?;
+        let staged = copy_source_to_staging(&mut source_file, staged, writer, false).await?;
 
         let sha256 = match sha256_file(staged.path()).await {
             Ok(sha256) => sha256,
@@ -370,6 +375,7 @@ async fn copy_source_to_staging<R>(
     source: &mut R,
     staged: crate::infra::files::StagedOriginal,
     writer: std::fs::File,
+    allow_empty: bool,
 ) -> Result<crate::infra::files::StagedOriginal, AppError>
 where
     R: AsyncRead + Unpin + ?Sized,
@@ -378,7 +384,7 @@ where
     let mut capped_source = source.take(MAX_FILE_SIZE + 1);
     let copy_result = tokio::io::copy(&mut capped_source, &mut writer).await;
     let result = match copy_result {
-        Ok(0) => Err(AppError::validation("file", "file must not be empty")),
+        Ok(0) if !allow_empty => Err(AppError::validation("file", "file must not be empty")),
         Ok(bytes_copied) if bytes_copied > MAX_FILE_SIZE => Err(AppError::validation(
             "file",
             format!("file must not exceed {MAX_FILE_SIZE} bytes"),
@@ -540,7 +546,7 @@ mod tests {
             let (staged, writer) = paths
                 .begin_staged_original(Uuid::new_v4())
                 .expect("staging should begin");
-            let error = copy_source_to_staging(reader, staged, writer)
+            let error = copy_source_to_staging(reader, staged, writer, false)
                 .await
                 .expect_err("invalid actual byte count should fail");
 

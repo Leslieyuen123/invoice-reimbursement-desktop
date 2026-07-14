@@ -325,10 +325,10 @@ fn connect(
     settings: ImapGatewaySettings,
 ) -> Result<imap::Session<native_tls::TlsStream<TcpStream>>, AppError> {
     if !config.tls {
-        return Err(imap_error("unencrypted IMAP is not supported"));
+        return Err(configuration_error("unencrypted IMAP is not supported"));
     }
     if secret.trim().is_empty() {
-        return Err(imap_error("mailbox credential is unavailable"));
+        return Err(authentication_error("mailbox credential is unavailable"));
     }
     let addresses = (config.host.as_str(), config.port)
         .to_socket_addrs()
@@ -358,7 +358,7 @@ fn connect(
             .map_err(|_| imap_error("IMAP server greeting failed"))?;
         return client
             .login(&config.email, secret)
-            .map_err(|_| imap_error("IMAP authentication failed"));
+            .map_err(|_| authentication_error("IMAP authentication failed"));
     }
     let _ = last_error;
     Err(imap_error("IMAP connection failed"))
@@ -372,7 +372,15 @@ fn imap_error(message: &str) -> AppError {
     }
 }
 
-fn limit_error(message: &str) -> AppError {
+fn authentication_error(message: &str) -> AppError {
+    permanent_imap_error(message)
+}
+
+fn configuration_error(message: &str) -> AppError {
+    permanent_imap_error(message)
+}
+
+fn permanent_imap_error(message: &str) -> AppError {
     AppError::External {
         service: "imap".to_owned(),
         retryable: false,
@@ -380,10 +388,56 @@ fn limit_error(message: &str) -> AppError {
     }
 }
 
+fn limit_error(message: &str) -> AppError {
+    permanent_imap_error(message)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RawBudget, select_uid_batch, uid_start};
-    use crate::db::accounts::SyncCursor;
+    use super::{
+        ImapAccountConfig, NativeTlsImapGateway, RawBudget, authentication_error, connect,
+        imap_error, limit_error, select_uid_batch, uid_start,
+    };
+    use crate::db::accounts::{MailboxProvider, SyncCursor};
+    use crate::domain::error::AppError;
+
+    fn assert_retryable(error: AppError, expected: bool) {
+        assert!(
+            matches!(
+                error,
+                AppError::External {
+                    ref service,
+                    retryable,
+                    ..
+                } if service == "imap" && retryable == expected
+            ),
+            "unexpected IMAP error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_auth_and_configuration_errors_are_not_retryable() {
+        let config =
+            ImapAccountConfig::provider_default(MailboxProvider::Gmail, "finance@example.com");
+        let settings = NativeTlsImapGateway::default().settings();
+        let blank_secret = match connect(&config, "   ", settings) {
+            Ok(_) => panic!("blank secret must be rejected before connecting"),
+            Err(error) => error,
+        };
+        assert_retryable(blank_secret, false);
+
+        let mut insecure = config;
+        insecure.tls = false;
+        let insecure_config = match connect(&insecure, "password", settings) {
+            Ok(_) => panic!("unencrypted configuration must be rejected before connecting"),
+            Err(error) => error,
+        };
+        assert_retryable(insecure_config, false);
+
+        assert_retryable(authentication_error("IMAP authentication failed"), false);
+        assert_retryable(imap_error("IMAP transport failed"), true);
+        assert_retryable(limit_error("IMAP resource limit"), false);
+    }
 
     #[test]
     fn sparse_uid_selection_uses_actual_messages_instead_of_numeric_span() {

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::db::accounts::{MailboxAccountRepository, SyncCursor};
 use crate::domain::error::AppError;
+use crate::domain::model::{ConfirmationStatus, RecognitionStatus};
 use crate::infra::credentials::CredentialStore;
 use crate::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta, RawMessage};
 use crate::services::import::{EmailImportSource, ImportOutcome, ImportService};
@@ -64,7 +65,7 @@ impl SyncService {
         let secret = match self.credentials.get(&account_id.to_string()) {
             Ok(Some(secret)) => secret,
             Ok(None) => {
-                let error = external_error("mailbox credential is unavailable");
+                let error = authentication_error("mailbox credential is unavailable");
                 self.accounts
                     .finish_sync_failure(&run, &error.to_string())
                     .await?;
@@ -139,18 +140,24 @@ impl SyncService {
                         },
                     )
                     .await?;
-                if let ImportOutcome::New(item) = outcome {
-                    imported_count =
-                        imported_count
-                            .checked_add(1)
-                            .ok_or_else(|| AppError::Internal {
-                                message: "sync import count overflow".to_owned(),
-                            })?;
-                    if let Err(error) = self.recognition.recognize_item(item.id).await
-                        && !is_document_recognition_failure(&error)
-                    {
-                        return Err(error);
+                let item = match outcome {
+                    ImportOutcome::New(item) => {
+                        imported_count =
+                            imported_count
+                                .checked_add(1)
+                                .ok_or_else(|| AppError::Internal {
+                                    message: "sync import count overflow".to_owned(),
+                                })?;
+                        item
                     }
+                    ImportOutcome::Existing(item) => item,
+                };
+                if item.recognition_status == RecognitionStatus::Pending
+                    && item.confirmation_status == ConfirmationStatus::Pending
+                    && let Err(error) = self.recognition.recognize_item(item.id).await
+                    && !is_document_recognition_failure(&error)
+                {
+                    return Err(error);
                 }
             }
             for link in parsed.links {
@@ -394,6 +401,14 @@ fn external_error(message: &str) -> AppError {
     AppError::External {
         service: "imap".to_owned(),
         retryable: true,
+        message: message.to_owned(),
+    }
+}
+
+fn authentication_error(message: &str) -> AppError {
+    AppError::External {
+        service: "imap".to_owned(),
+        retryable: false,
         message: message.to_owned(),
     }
 }
