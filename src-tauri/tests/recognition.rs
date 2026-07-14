@@ -449,7 +449,7 @@ async fn extraction_failure_clears_automatic_fields_before_returning_the_origina
     record.city = Some("北京".to_owned());
     record.company = Some("旧公司".to_owned());
     record.recognition_status = RecognitionStatus::Succeeded;
-    record.confirmation_status = ConfirmationStatus::Confirmed;
+    record.confirmation_status = ConfirmationStatus::Pending;
     record.final_category = Some(Category::Hospitality);
     record.note = Some("keep me".to_owned());
     record.dedupe_status = DedupeStatus::Resolved;

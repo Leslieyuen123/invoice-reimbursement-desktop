@@ -1,12 +1,14 @@
-#[cfg(unix)]
 use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::NaiveDate;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::db::items::{InvoiceItem, ItemRepository, ReviewedItemFields};
@@ -34,6 +36,7 @@ pub struct ItemReview {
 pub struct ItemService {
     items: ItemRepository,
     files: Arc<dyn FileLifecycle>,
+    recovery: Arc<OnceCell<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +59,10 @@ impl IsolatedItemFiles {
 }
 
 pub trait FileLifecycle: Send + Sync {
+    fn recover(&self, _referenced_paths: &HashSet<PathBuf>) -> Result<(), AppError> {
+        Ok(())
+    }
+
     fn isolate(
         &self,
         files: &ItemFiles,
@@ -95,14 +102,20 @@ impl ItemService {
         Self {
             items,
             files: Arc::new(StorageFileLifecycle::new(paths)),
+            recovery: Arc::new(OnceCell::new()),
         }
     }
 
     pub fn with_file_lifecycle(items: ItemRepository, files: Arc<dyn FileLifecycle>) -> Self {
-        Self { items, files }
+        Self {
+            items,
+            files,
+            recovery: Arc::new(OnceCell::new()),
+        }
     }
 
     pub async fn review(&self, review: ItemReview) -> Result<InvoiceItem, AppError> {
+        self.ensure_recovered().await?;
         let invoice_date = review
             .invoice_date
             .as_deref()
@@ -139,6 +152,7 @@ impl ItemService {
         id: Uuid,
         keep: bool,
     ) -> Result<Option<InvoiceItem>, AppError> {
+        self.ensure_recovered().await?;
         if keep {
             return self.items.keep_suspected_duplicate(id).await.map(Some);
         }
@@ -155,7 +169,22 @@ impl ItemService {
             original: PathBuf::from(&item.original_path),
             normalized: item.normalized_pdf_path.as_ref().map(PathBuf::from),
         };
-        let isolated = match self.files.isolate(&owned_files, &protected_paths) {
+        let file_lifecycle = self.files.clone();
+        let isolation = match tokio::task::spawn_blocking(move || {
+            file_lifecycle.isolate(&owned_files, &protected_paths)
+        })
+        .await
+        {
+            Ok(isolation) => isolation,
+            Err(task_error) => {
+                let error = filesystem_task_error("file isolation task failed", task_error);
+                return match claim.rollback().await {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(claim_rollback_error(error, rollback_error)),
+                };
+            }
+        };
+        let isolated = match isolation {
             Ok(isolated) => isolated,
             Err(error @ AppError::Validation { .. }) => {
                 return match claim.rollback().await {
@@ -177,7 +206,11 @@ impl ItemService {
         };
 
         if let Err(database_error) = claim.delete().await {
-            return match self.files.restore(&isolated) {
+            let file_lifecycle = self.files.clone();
+            let restore = tokio::task::spawn_blocking(move || file_lifecycle.restore(&isolated))
+                .await
+                .map_err(|error| filesystem_task_error("file restore task failed", error))?;
+            return match restore {
                 Ok(()) => Err(database_error),
                 Err(restore_error) => Err(AppError::External {
                     service: "filesystem_sync".to_owned(),
@@ -191,7 +224,11 @@ impl ItemService {
             };
         }
 
-        if let Err(purge_error) = self.files.purge(&isolated) {
+        let file_lifecycle = self.files.clone();
+        let purge = tokio::task::spawn_blocking(move || file_lifecycle.purge(&isolated))
+            .await
+            .map_err(|error| filesystem_task_error("file purge task failed", error))?;
+        if let Err(purge_error) = purge {
             return Err(AppError::External {
                 service: "filesystem_sync".to_owned(),
                 retryable: false,
@@ -202,6 +239,59 @@ impl ItemService {
             });
         }
         Ok(None)
+    }
+
+    async fn ensure_recovered(&self) -> Result<(), AppError> {
+        self.recovery
+            .get_or_try_init(|| async {
+                let claim = self.items.claim_file_recovery().await?;
+                let referenced_paths = claim
+                    .referenced_paths()
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<HashSet<_>>();
+                let file_lifecycle = self.files.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    file_lifecycle.recover(&referenced_paths)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(task_error) => {
+                        let error =
+                            filesystem_task_error("file recovery task failed", task_error);
+                        return match claim.rollback().await {
+                            Ok(()) => Err(error),
+                            Err(rollback_error) => Err(AppError::External {
+                                service: "filesystem_sync".to_owned(),
+                                retryable: false,
+                                message: format!(
+                                    "file recovery task failed and its database claim could not be \
+                                     released; manual recovery is required: task error: {error}; \
+                                     rollback error: {rollback_error}"
+                                ),
+                            }),
+                        };
+                    }
+                };
+                match result {
+                    Ok(()) => claim.commit().await,
+                    Err(error) => match claim.rollback().await {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(AppError::External {
+                            service: "filesystem_sync".to_owned(),
+                            retryable: false,
+                            message: format!(
+                                "file recovery failed and its database claim could not be released; \
+                                 manual recovery is required: recovery error: {error}; rollback \
+                                 error: {rollback_error}"
+                            ),
+                        }),
+                    },
+                }
+            })
+            .await
+            .map(|_| ())
     }
 }
 
@@ -222,7 +312,19 @@ fn claim_rollback_error(original: AppError, rollback: AppError) -> AppError {
     }
 }
 
+fn filesystem_task_error(context: &str, error: impl std::fmt::Display) -> AppError {
+    AppError::External {
+        service: "filesystem_sync".to_owned(),
+        retryable: false,
+        message: format!("{context}: {error}"),
+    }
+}
+
 impl FileLifecycle for StorageFileLifecycle {
+    fn recover(&self, referenced_paths: &HashSet<PathBuf>) -> Result<(), AppError> {
+        recover_storage(&self.paths, referenced_paths)
+    }
+
     fn isolate(
         &self,
         files: &ItemFiles,
@@ -273,6 +375,174 @@ impl FileLifecycle for StorageFileLifecycle {
                 ),
             })
         }
+    }
+}
+
+fn parse_recovery_token(file_name: &OsStr) -> Option<OsString> {
+    let file_name = file_name.to_str()?;
+    let encoded = file_name.strip_prefix('.')?;
+    let (original_name, token_id) = encoded.rsplit_once(".delete-")?;
+    if original_name.is_empty() || Uuid::parse_str(token_id).is_err() {
+        return None;
+    }
+    Some(OsString::from(original_name))
+}
+
+#[cfg(unix)]
+fn recover_storage(paths: &AppPaths, referenced_paths: &HashSet<PathBuf>) -> Result<(), AppError> {
+    recover_root_anchored(&paths.originals, referenced_paths)?;
+    recover_root_anchored(&paths.normalized, referenced_paths)
+}
+
+#[cfg(unix)]
+fn recover_root_anchored(root: &Path, referenced_paths: &HashSet<PathBuf>) -> Result<(), AppError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let directory = rustix::fs::open(root, flags, Mode::empty())
+        .map(File::from)
+        .map_err(|error| filesystem_error("failed to anchor recovery root", error))?;
+    recover_directory_anchored(&directory, root, referenced_paths)
+}
+
+#[cfg(unix)]
+fn recover_directory_anchored(
+    directory: &File,
+    directory_path: &Path,
+    referenced_paths: &HashSet<PathBuf>,
+) -> Result<(), AppError> {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, statat};
+
+    let mut entries = Dir::read_from(directory)
+        .map_err(|error| filesystem_error("failed to read recovery directory", error))?;
+    while let Some(entry) = entries.read() {
+        let entry =
+            entry.map_err(|error| filesystem_error("failed to read recovery entry", error))?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            continue;
+        }
+        let metadata = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| filesystem_error("failed to inspect recovery entry", error))?;
+        let file_type = FileType::from_raw_mode(metadata.st_mode);
+        if let Some(original_name) = parse_recovery_token(name) {
+            if file_type != FileType::RegularFile {
+                return Err(recovery_manual_error(
+                    "recovery token is not a regular file",
+                    "unsupported file type",
+                ));
+            }
+            recover_file_anchored(
+                directory,
+                directory_path,
+                name,
+                &original_name,
+                referenced_paths,
+            )?;
+            continue;
+        }
+        match file_type {
+            FileType::Directory => {
+                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                let child = rustix::fs::openat(directory, name, flags, Mode::empty())
+                    .map(File::from)
+                    .map_err(|error| {
+                        filesystem_error("failed to anchor recovery subdirectory", error)
+                    })?;
+                recover_directory_anchored(&child, &directory_path.join(name), referenced_paths)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recover_file_anchored(
+    directory: &File,
+    directory_path: &Path,
+    token_name: &OsStr,
+    original_name: &OsStr,
+    referenced_paths: &HashSet<PathBuf>,
+) -> Result<(), AppError> {
+    use rustix::fs::{AtFlags, statat};
+    use rustix::io::Errno;
+
+    let original_path = directory_path.join(original_name);
+    if referenced_paths.contains(&original_path) {
+        match statat(directory, original_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {
+                return Err(recovery_manual_error(
+                    "recovery target already exists",
+                    "refusing to overwrite an existing file",
+                ));
+            }
+            Err(error) if error == Errno::NOENT => {}
+            Err(error) => {
+                return Err(filesystem_error("failed to inspect recovery target", error));
+            }
+        }
+        move_file_anchored(directory, token_name, original_name)
+            .map_err(|error| recovery_manual_error("failed to restore recovery token", error))
+    } else {
+        purge_name_anchored(directory, token_name)
+    }
+}
+
+#[cfg(not(unix))]
+fn recover_storage(paths: &AppPaths, referenced_paths: &HashSet<PathBuf>) -> Result<(), AppError> {
+    recover_directory_portable(&paths.originals, referenced_paths)?;
+    recover_directory_portable(&paths.normalized, referenced_paths)
+}
+
+#[cfg(not(unix))]
+fn recover_directory_portable(
+    directory: &Path,
+    referenced_paths: &HashSet<PathBuf>,
+) -> Result<(), AppError> {
+    for entry in fs::read_dir(directory)
+        .map_err(|error| filesystem_error("failed to read recovery directory", error))?
+    {
+        let entry =
+            entry.map_err(|error| filesystem_error("failed to read recovery entry", error))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| filesystem_error("failed to inspect recovery entry", error))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            recover_directory_portable(&entry.path(), referenced_paths)?;
+            continue;
+        }
+        let Some(original_name) = parse_recovery_token(&entry.file_name()) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(recovery_manual_error(
+                "recovery token is not a regular file",
+                "unsupported file type",
+            ));
+        }
+        let original_path = directory.join(original_name);
+        if referenced_paths.contains(&original_path) {
+            if original_path.exists() {
+                return Err(recovery_manual_error(
+                    "recovery target already exists",
+                    "refusing to overwrite an existing file",
+                ));
+            }
+            move_file_durably(&entry.path(), &original_path).map_err(|error| {
+                recovery_manual_error("failed to restore recovery token", error)
+            })?;
+        } else {
+            remove_file_durably(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn recovery_manual_error(context: &str, error: impl std::fmt::Display) -> AppError {
+    AppError::External {
+        service: "filesystem_sync".to_owned(),
+        retryable: false,
+        message: format!("{context}; manual recovery is required: {error}"),
     }
 }
 
@@ -631,14 +901,19 @@ fn restore_isolated_file(entry: &IsolatedFile) -> Result<(), AppError> {
 
 #[cfg(unix)]
 fn purge_isolated_file(entry: &IsolatedFile) -> Result<(), AppError> {
-    use rustix::fs::{AtFlags, fsync, unlinkat};
-    use rustix::io::Errno;
-
     let Some(anchor) = &entry.anchor else {
         return Ok(());
     };
-    match unlinkat(&anchor.parent, &anchor.isolated_name, AtFlags::empty()) {
-        Ok(()) => fsync(&anchor.parent)
+    purge_name_anchored(&anchor.parent, &anchor.isolated_name)
+}
+
+#[cfg(unix)]
+fn purge_name_anchored(directory: &File, file_name: &OsStr) -> Result<(), AppError> {
+    use rustix::fs::{AtFlags, fsync, unlinkat};
+    use rustix::io::Errno;
+
+    match unlinkat(directory, file_name, AtFlags::empty()) {
+        Ok(()) => fsync(directory)
             .map_err(|error| filesystem_error("failed to sync purged file parent", error)),
         Err(error) if error == Errno::NOENT => Ok(()),
         Err(error) => Err(filesystem_error("failed to purge isolated file", error)),
@@ -695,3 +970,4 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
+use std::collections::HashSet;

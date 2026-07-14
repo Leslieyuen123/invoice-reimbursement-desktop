@@ -177,6 +177,77 @@ async fn completed_review_is_not_overwritten_by_inflight_recognition_failure() {
 }
 
 #[tokio::test]
+async fn completed_review_is_not_overwritten_by_recognition_started_later() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(&paths, "review-before-recognition");
+    repository
+        .insert(&record)
+        .await
+        .expect("item should insert");
+    let review_service = ItemService::new(repository.clone(), paths);
+    let reviewed = review_service
+        .review(valid_review(record.id))
+        .await
+        .expect("manual review should succeed");
+    let recognition = RecognitionService::new(repository, Arc::new(ReviewImmediateExtractor));
+
+    let recognized = recognition
+        .recognize_item(record.id)
+        .await
+        .expect("background recognition should preserve reviewed item");
+
+    assert_eq!(recognized, reviewed);
+}
+
+#[tokio::test]
+async fn completed_review_is_not_overwritten_by_recognition_failure_started_later() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(&paths, "review-before-recognition-failure");
+    repository
+        .insert(&record)
+        .await
+        .expect("item should insert");
+    let review_service = ItemService::new(repository.clone(), paths);
+    let reviewed = review_service
+        .review(valid_review(record.id))
+        .await
+        .expect("manual review should succeed");
+    let recognition = RecognitionService::new(
+        repository.clone(),
+        Arc::new(ReviewImmediateFailingExtractor),
+    );
+
+    let error = recognition
+        .recognize_item(record.id)
+        .await
+        .expect_err("extraction failure should still be returned");
+
+    assert!(matches!(
+        error,
+        AppError::External { ref service, .. } if service == "document_extraction"
+    ));
+    assert_eq!(
+        repository
+            .get_by_id(record.id)
+            .await
+            .expect("reviewed item should remain"),
+        reviewed
+    );
+}
+
+#[tokio::test]
 async fn explicit_retry_can_refresh_automatic_fields_after_review() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
     let paths = AppPaths::create(directory.path().join("storage"))
@@ -209,6 +280,166 @@ async fn explicit_retry_can_refresh_automatic_fields_after_review() {
     assert_eq!(retried.company.as_deref(), Some("Late Recognition Co"));
     assert_eq!(retried.final_category, Some(Category::Hospitality));
     assert_eq!(retried.status(), ItemStatus::Ready);
+}
+
+#[tokio::test]
+async fn first_service_use_restores_crash_tokens_still_referenced_by_a_row() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(&paths, "recovery-restore");
+    repository
+        .insert(&record)
+        .await
+        .expect("item should insert");
+    let original = PathBuf::from(&record.original_path);
+    let normalized = PathBuf::from(record.normalized_pdf_path.as_deref().unwrap());
+    let original_token = crash_token_path(&original);
+    let normalized_token = crash_token_path(&normalized);
+    fs::rename(&original, &original_token).expect("original should isolate");
+    fs::rename(&normalized, &normalized_token).expect("normalized should isolate");
+    let service = ItemService::new(repository, paths);
+
+    service
+        .review(valid_review(record.id))
+        .await
+        .expect("first use should recover before review");
+
+    assert_eq!(fs::read(&original).unwrap(), b"original");
+    assert_eq!(fs::read(&normalized).unwrap(), b"normalized");
+    assert!(!original_token.exists());
+    assert!(!normalized_token.exists());
+}
+
+#[tokio::test]
+async fn first_service_use_recovers_a_partial_two_file_isolation() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(&paths, "recovery-partial");
+    repository
+        .insert(&record)
+        .await
+        .expect("item should insert");
+    let original = PathBuf::from(&record.original_path);
+    let normalized = PathBuf::from(record.normalized_pdf_path.as_deref().unwrap());
+    let original_token = crash_token_path(&original);
+    fs::rename(&original, &original_token).expect("original should isolate");
+    let service = ItemService::new(repository, paths);
+
+    service
+        .review(valid_review(record.id))
+        .await
+        .expect("partial isolation should recover before review");
+
+    assert_eq!(fs::read(&original).unwrap(), b"original");
+    assert_eq!(fs::read(&normalized).unwrap(), b"normalized");
+    assert!(!original_token.exists());
+}
+
+#[tokio::test]
+async fn first_service_use_purges_crash_tokens_without_database_references() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(&paths, "recovery-purge-trigger");
+    repository
+        .insert(&record)
+        .await
+        .expect("item should insert");
+    let orphan_target = paths.originals.join("orphan.pdf");
+    fs::write(&orphan_target, b"orphan").expect("orphan should write");
+    let orphan_token = crash_token_path(&orphan_target);
+    fs::rename(&orphan_target, &orphan_token).expect("orphan should isolate");
+    let service = ItemService::new(repository, paths);
+
+    service
+        .review(valid_review(record.id))
+        .await
+        .expect("first use should purge before review");
+
+    assert!(!orphan_target.exists());
+    assert!(!orphan_token.exists());
+}
+
+#[tokio::test]
+async fn recovery_collision_does_not_clobber_the_recreated_target() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(&paths, "recovery-collision");
+    repository
+        .insert(&record)
+        .await
+        .expect("item should insert");
+    let target = PathBuf::from(&record.original_path);
+    let token = crash_token_path(&target);
+    fs::write(&token, b"isolated original").expect("token should write");
+    fs::write(&target, b"replacement").expect("replacement should write");
+    let before = repository
+        .get_by_id(record.id)
+        .await
+        .expect("item snapshot should load");
+    let service = ItemService::new(repository.clone(), paths);
+
+    let error = service
+        .review(valid_review(record.id))
+        .await
+        .expect_err("collision should block service use");
+
+    assert!(matches!(
+        error,
+        AppError::External {
+            ref service,
+            retryable: false,
+            ..
+        } if service == "filesystem_sync"
+    ));
+    assert_eq!(fs::read(&target).unwrap(), b"replacement");
+    assert_eq!(fs::read(&token).unwrap(), b"isolated original");
+    assert_eq!(repository.get_by_id(record.id).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn recovery_leaves_malformed_tokens_untouched() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(&paths, "recovery-malformed");
+    repository
+        .insert(&record)
+        .await
+        .expect("item should insert");
+    let malformed = paths.originals.join(".invoice.pdf.delete-not-a-uuid");
+    fs::write(&malformed, b"unknown").expect("malformed token should write");
+    let service = ItemService::new(repository, paths);
+
+    service
+        .review(valid_review(record.id))
+        .await
+        .expect("malformed token should not block review");
+
+    assert_eq!(fs::read(&malformed).unwrap(), b"unknown");
 }
 
 #[tokio::test]
@@ -1260,6 +1491,18 @@ impl DocumentExtractor for ReviewImmediateExtractor {
     }
 }
 
+struct ReviewImmediateFailingExtractor;
+
+impl DocumentExtractor for ReviewImmediateFailingExtractor {
+    fn extract(&self, _path: &std::path::Path) -> Result<ExtractedDocument, AppError> {
+        Err(AppError::External {
+            service: "document_extraction".to_owned(),
+            retryable: false,
+            message: "injected extraction failure".to_owned(),
+        })
+    }
+}
+
 impl DocumentExtractor for ReviewGatedExtractor {
     fn extract(&self, _path: &std::path::Path) -> Result<ExtractedDocument, AppError> {
         self.started
@@ -1486,6 +1729,14 @@ fn valid_review(id: Uuid) -> ItemReview {
         event_tag: Some("summit".to_owned()),
         project_tag: Some("P-2026".to_owned()),
     }
+}
+
+fn crash_token_path(target: &std::path::Path) -> PathBuf {
+    target.with_file_name(format!(
+        ".{}.delete-{}",
+        target.file_name().unwrap().to_string_lossy(),
+        Uuid::new_v4()
+    ))
 }
 
 fn sample_item(paths: &AppPaths, suffix: &str) -> NewItemRecord {

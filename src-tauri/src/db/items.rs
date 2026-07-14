@@ -150,6 +150,11 @@ pub(crate) struct DuplicateDiscardClaim {
     protected_paths: Vec<String>,
 }
 
+pub(crate) struct FileRecoveryClaim {
+    transaction: Transaction<'static, Sqlite>,
+    referenced_paths: Vec<String>,
+}
+
 impl ItemRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -310,24 +315,22 @@ impl ItemRepository {
     }
 
     pub async fn update_fields(&self, id: Uuid, patch: ItemPatch) -> Result<InvoiceItem, AppError> {
-        self.update_fields_internal(id, patch, None).await
+        self.update_fields_internal(id, patch, false).await
     }
 
     pub(crate) async fn update_recognition_fields(
         &self,
         id: Uuid,
-        expected_updated_at: DateTime<Utc>,
         patch: ItemPatch,
     ) -> Result<InvoiceItem, AppError> {
-        self.update_fields_internal(id, patch, Some(expected_updated_at))
-            .await
+        self.update_fields_internal(id, patch, true).await
     }
 
     async fn update_fields_internal(
         &self,
         id: Uuid,
         patch: ItemPatch,
-        recognition_started_at_version: Option<DateTime<Utc>>,
+        preserve_manual_confirmation: bool,
     ) -> Result<InvoiceItem, AppError> {
         if let Some(amount_cents) = patch.amount_cents {
             validate_amount(amount_cents)?;
@@ -350,7 +353,7 @@ impl ItemRepository {
             })?;
         let mut item = InvoiceItem::try_from(row)?;
 
-        if recognition_started_at_version.is_some_and(|version| item.updated_at != version)
+        if preserve_manual_confirmation
             && item.confirmation_status == ConfirmationStatus::Confirmed
             && item.final_category.is_some()
         {
@@ -589,6 +592,42 @@ impl ItemRepository {
             },
         }
     }
+
+    pub(crate) async fn claim_file_recovery(&self) -> Result<FileRecoveryClaim, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to claim file recovery", error))?;
+        let result = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT original_path, normalized_pdf_path FROM items",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .flat_map(|(original, normalized)| [Some(original), normalized])
+                .flatten()
+                .collect()
+        })
+        .map_err(|error| map_database_error("failed to load file recovery references", error));
+
+        match result {
+            Ok(referenced_paths) => Ok(FileRecoveryClaim {
+                transaction,
+                referenced_paths,
+            }),
+            Err(error) => match transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AppError::Internal {
+                    message: format!(
+                        "file recovery claim failed and rollback also failed: original error: \
+                         {error}; rollback error: {rollback_error}"
+                    ),
+                }),
+            },
+        }
+    }
 }
 
 impl DuplicateDiscardClaim {
@@ -629,6 +668,26 @@ impl DuplicateDiscardClaim {
         self.transaction.rollback().await.map_err(|error| {
             map_database_error("failed to release duplicate deletion claim", error)
         })
+    }
+}
+
+impl FileRecoveryClaim {
+    pub fn referenced_paths(&self) -> &[String] {
+        &self.referenced_paths
+    }
+
+    pub async fn commit(self) -> Result<(), AppError> {
+        self.transaction
+            .commit()
+            .await
+            .map_err(|error| map_database_error("failed to commit file recovery", error))
+    }
+
+    pub async fn rollback(self) -> Result<(), AppError> {
+        self.transaction
+            .rollback()
+            .await
+            .map_err(|error| map_database_error("failed to rollback file recovery", error))
     }
 }
 

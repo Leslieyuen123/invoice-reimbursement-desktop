@@ -94,7 +94,6 @@ impl RecognitionService {
         preserve_manual_confirmation: bool,
     ) -> Result<InvoiceItem, AppError> {
         let item = self.items.get_by_id(id).await?;
-        let recognition_started_at_version = item.updated_at;
         let received_date = item.fetched_at.date_naive();
         let path = PathBuf::from(&item.original_path);
         let extractor = self.extractor.clone();
@@ -121,7 +120,6 @@ impl RecognitionService {
                         ..ItemPatch::default()
                     },
                     preserve_manual_confirmation,
-                    recognition_started_at_version,
                 )
                 .await?;
                 return Err(extraction_error);
@@ -144,7 +142,6 @@ impl RecognitionService {
                 ..ItemPatch::default()
             },
             preserve_manual_confirmation,
-            recognition_started_at_version,
         )
         .await
     }
@@ -158,12 +155,9 @@ impl RecognitionService {
         id: uuid::Uuid,
         patch: ItemPatch,
         preserve_manual_confirmation: bool,
-        recognition_started_at_version: chrono::DateTime<chrono::Utc>,
     ) -> Result<InvoiceItem, AppError> {
         if preserve_manual_confirmation {
-            self.items
-                .update_recognition_fields(id, recognition_started_at_version, patch)
-                .await
+            self.items.update_recognition_fields(id, patch).await
         } else {
             self.items.update_fields(id, patch).await
         }
