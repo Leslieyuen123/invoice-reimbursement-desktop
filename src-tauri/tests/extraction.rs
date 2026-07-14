@@ -643,20 +643,30 @@ fn process_gateway_restarts_after_a_timeout() {
 fn process_gateway_lock_wait_respects_each_call_deadline() {
     let _guard = sidecar_timing_test_guard();
     let directory = tempfile::tempdir().unwrap();
-    let executable = no_stdin_ocr_helper(directory.path());
+    let executable = lock_holder_ocr_helper(directory.path());
+    let ready_socket = executable.with_extension("ready.sock");
+    let ready_listener = std::os::unix::net::UnixListener::bind(&ready_socket).unwrap();
     let gateway = Arc::new(ProcessOcrGateway::with_timeout(
         executable,
         Duration::from_secs(1),
     ));
-    let _descendant_pid = gateway
-        .recognize(Path::new("arm-no-stdin.pdf"))
-        .expect("helper should arm before it stops reading stdin")
-        .text
-        .parse::<u32>()
-        .expect("arm response should contain the descendant PID");
+    gateway
+        .recognize_with_timeout(Path::new("arm-lock-holder.pdf"), Duration::from_secs(5))
+        .expect("helper should arm before the setup deadline");
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let ready = std::thread::spawn(move || {
+        ready_tx
+            .send(ready_listener.accept().map(|(connection, _)| connection))
+            .unwrap();
+    });
     let first_gateway = gateway.clone();
-    let first = std::thread::spawn(move || first_gateway.recognize(&backpressure_path()));
-    std::thread::sleep(Duration::from_millis(100));
+    let first =
+        std::thread::spawn(move || first_gateway.recognize(Path::new("hold-session-lock.pdf")));
+    let _ready_connection = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("helper should signal readiness before the setup deadline")
+        .expect("helper readiness socket should accept");
+    ready.join().unwrap();
     let started = Instant::now();
 
     let error = gateway
@@ -667,6 +677,10 @@ fn process_gateway_lock_wait_respects_each_call_deadline() {
 
     assert_external(&error, "ocr_sidecar");
     assert!(first_result.is_err());
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "second request failed before its admission deadline: elapsed={elapsed:?}"
+    );
     assert!(
         elapsed < Duration::from_millis(1_500),
         "second request waited beyond its own deadline: elapsed={elapsed:?}"
@@ -969,6 +983,13 @@ fn ocr_helper() -> PathBuf {
 #[cfg(unix)]
 fn no_stdin_ocr_helper(directory: &Path) -> PathBuf {
     let executable = directory.join("ocr-sidecar-no-stdin");
+    std::fs::copy(ocr_helper(), &executable).unwrap();
+    executable
+}
+
+#[cfg(unix)]
+fn lock_holder_ocr_helper(directory: &Path) -> PathBuf {
+    let executable = directory.join("ocr-sidecar-lock-holder");
     std::fs::copy(ocr_helper(), &executable).unwrap();
     executable
 }

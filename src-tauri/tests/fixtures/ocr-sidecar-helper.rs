@@ -44,6 +44,22 @@ fn main() {
 }
 
 fn handle_request(request: &str) {
+    if request.contains("hold-session-lock.pdf") {
+        #[cfg(unix)]
+        {
+            use std::io::Read as _;
+            use std::os::unix::net::UnixStream;
+
+            let ready_socket = std::env::current_exe().unwrap().with_extension("ready.sock");
+            let mut ready = UnixStream::connect(ready_socket).unwrap();
+            ready.write_all(b"ready").unwrap();
+            let mut release = [0_u8];
+            let _ = ready.read_exact(&mut release);
+        }
+        println!(r#"{{"ok":true,"text":"lock released","warnings":[]}}"#);
+        return;
+    }
+
     if request.contains(r#""operation":"extract_pdf_text""#) {
         if request.contains("compressed-text-bomb.pdf") {
             println!(

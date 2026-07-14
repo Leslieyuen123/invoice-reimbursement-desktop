@@ -78,6 +78,14 @@ impl ProcessOcrGateway {
     pub fn default_timeout() -> Duration {
         DEFAULT_OCR_TIMEOUT
     }
+
+    pub fn recognize_with_timeout(
+        &self,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<OcrResult, AppError> {
+        self.run_with_timeout(path, SidecarOperation::Recognize, timeout)
+    }
 }
 
 impl OcrGateway for ProcessOcrGateway {
@@ -114,9 +122,16 @@ impl SidecarOperation {
 
 impl ProcessOcrGateway {
     fn run(&self, path: &Path, operation: SidecarOperation) -> Result<OcrResult, AppError> {
-        let deadline = Instant::now()
-            .checked_add(self.timeout)
-            .ok_or_else(ocr_error)?;
+        self.run_with_timeout(path, operation, self.timeout)
+    }
+
+    fn run_with_timeout(
+        &self,
+        path: &Path,
+        operation: SidecarOperation,
+        timeout: Duration,
+    ) -> Result<OcrResult, AppError> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(ocr_error)?;
         let mut session = self.lock_session_until(deadline)?;
         if session
             .as_mut()
