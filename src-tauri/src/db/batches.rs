@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::domain::error::AppError;
@@ -82,6 +82,47 @@ impl BatchRepository {
         Batch::try_from(row)
     }
 
+    pub async fn update(&self, id: Uuid, batch: NewBatch) -> Result<Batch, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| stable_internal_error("failed to begin batch update"))?;
+        let result = async {
+            let current = get_with_transaction(&mut transaction, id).await?;
+            let export_fields_changed = current.name != batch.name()
+                || current.start_date != batch.start_date()
+                || current.end_date != batch.end_date();
+            let any_changed = export_fields_changed || current.note.as_deref() != batch.note();
+            if !any_changed {
+                return Ok(current);
+            }
+            let status = if export_fields_changed {
+                BatchStatus::Draft
+            } else {
+                current.status
+            };
+            sqlx::query(
+                "UPDATE batches SET name = ?, start_date = ?, end_date = ?, note = ?, \
+                    status = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(batch.name())
+            .bind(batch.start_date().to_string())
+            .bind(batch.end_date().to_string())
+            .bind(batch.note())
+            .bind(batch_status_str(status))
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| stable_internal_error("failed to update batch"))?;
+            get_with_transaction(&mut transaction, id).await
+        }
+        .await;
+
+        finish_batch_transaction(transaction, result).await
+    }
+
     pub async fn list(&self) -> Result<Vec<BatchSummary>, AppError> {
         let rows = sqlx::query_as::<_, DbBatchSummaryRow>(
             "SELECT \
@@ -115,6 +156,39 @@ impl BatchRepository {
         }
 
         Ok(())
+    }
+}
+
+async fn get_with_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: Uuid,
+) -> Result<Batch, AppError> {
+    let query = format!("SELECT {BATCH_COLUMNS} FROM batches WHERE id = ?");
+    let row = sqlx::query_as::<_, DbBatchRow>(&query)
+        .bind(id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| stable_internal_error("failed to get batch for update"))?
+        .ok_or_else(|| batch_not_found(id))?;
+    Batch::try_from(row)
+}
+
+async fn finish_batch_transaction(
+    transaction: Transaction<'_, Sqlite>,
+    result: Result<Batch, AppError>,
+) -> Result<Batch, AppError> {
+    match result {
+        Ok(batch) => transaction
+            .commit()
+            .await
+            .map(|()| batch)
+            .map_err(|_| stable_internal_error("failed to commit batch update")),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(_) => Err(stable_internal_error(
+                "batch update failed and rollback also failed",
+            )),
+        },
     }
 }
 
@@ -243,5 +317,11 @@ fn map_create_error(error: sqlx::Error) -> AppError {
 fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
     AppError::Internal {
         message: format!("{context}: {error}"),
+    }
+}
+
+fn stable_internal_error(message: &str) -> AppError {
+    AppError::Internal {
+        message: message.to_owned(),
     }
 }

@@ -314,6 +314,31 @@ impl ItemRepository {
         rows.into_iter().map(InvoiceItem::try_from).collect()
     }
 
+    pub async fn recommend_unassigned(
+        &self,
+        start_period: &str,
+        end_period: &str,
+    ) -> Result<Vec<InvoiceItem>, AppError> {
+        let query = format!(
+            "SELECT {ITEM_COLUMNS} FROM items \
+             WHERE batch_id IS NULL \
+               AND suggested_period BETWEEN ? AND ? \
+               AND dedupe_status != 'suspected_duplicate' \
+               AND recognition_status != 'failed' \
+             ORDER BY suggested_period ASC, \
+                      CASE WHEN invoice_date IS NULL THEN 1 ELSE 0 END ASC, \
+                      invoice_date ASC, created_at ASC, id ASC"
+        );
+        let rows = sqlx::query_as::<_, DbItemRow>(&query)
+            .bind(start_period)
+            .bind(end_period)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| map_database_error("failed to recommend items", error))?;
+
+        rows.into_iter().map(InvoiceItem::try_from).collect()
+    }
+
     pub async fn update_fields(&self, id: Uuid, patch: ItemPatch) -> Result<InvoiceItem, AppError> {
         self.update_fields_internal(id, patch, false).await
     }
@@ -338,9 +363,9 @@ impl ItemRepository {
 
         let mut transaction = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| internal_error("failed to begin item update", error))?;
+            .map_err(|error| map_database_error("failed to begin item update", error))?;
         let select = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?");
         let row = sqlx::query_as::<_, DbItemRow>(&select)
             .bind(id.to_string())
@@ -352,6 +377,7 @@ impl ItemRepository {
                 message: format!("item {id} was not found"),
             })?;
         let mut item = InvoiceItem::try_from(row)?;
+        let original = item.clone();
 
         if preserve_manual_confirmation
             && item.confirmation_status == ConfirmationStatus::Confirmed
@@ -416,6 +442,12 @@ impl ItemRepository {
             item.project_tag = value;
         }
         validate_amount(item.amount_cents)?;
+        if item == original {
+            transaction.commit().await.map_err(|error| {
+                map_database_error("failed to finish unchanged item update", error)
+            })?;
+            return Ok(item);
+        }
         item.updated_at = Utc::now();
 
         sqlx::query(
@@ -450,6 +482,14 @@ impl ItemRepository {
         .await
         .map_err(|error| internal_error("failed to update item", error))?;
 
+        reset_affected_batches(
+            &mut transaction,
+            original.batch_id,
+            item.batch_id,
+            item.updated_at,
+        )
+        .await?;
+
         let refreshed_row = sqlx::query_as::<_, DbItemRow>(&select)
             .bind(id.to_string())
             .fetch_one(&mut *transaction)
@@ -483,6 +523,19 @@ impl ItemRepository {
                 });
             }
 
+            let export_fields_changed = item.invoice_date != fields.invoice_date
+                || item.suggested_period.as_deref() != Some(fields.suggested_period.as_str())
+                || item.final_category != Some(fields.final_category)
+                || item.amount_cents != Some(fields.amount_cents)
+                || item.city != fields.city
+                || item.company != fields.company
+                || item.note != fields.note
+                || item.event_tag != fields.event_tag
+                || item.project_tag != fields.project_tag
+                || item.recognition_status != RecognitionStatus::Succeeded
+                || item.confirmation_status != ConfirmationStatus::Confirmed;
+            let updated_at = Utc::now();
+
             sqlx::query(
                 "UPDATE items SET \
                     invoice_date = ?, suggested_period = ?, final_category = ?, \
@@ -500,11 +553,16 @@ impl ItemRepository {
             .bind(fields.note)
             .bind(fields.event_tag)
             .bind(fields.project_tag)
-            .bind(Utc::now().to_rfc3339())
+            .bind(updated_at.to_rfc3339())
             .bind(id.to_string())
             .execute(&mut *transaction)
             .await
             .map_err(|error| map_database_error("failed to review item", error))?;
+
+            if export_fields_changed {
+                reset_affected_batches(&mut transaction, item.batch_id, item.batch_id, updated_at)
+                    .await?;
+            }
 
             get_with_connection(&mut transaction, id).await
         }
@@ -628,6 +686,51 @@ impl ItemRepository {
             },
         }
     }
+}
+
+async fn reset_affected_batches(
+    connection: &mut SqliteConnection,
+    original_batch_id: Option<Uuid>,
+    current_batch_id: Option<Uuid>,
+    updated_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let mut batch_ids = [original_batch_id, current_batch_id]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    batch_ids.sort_unstable();
+    batch_ids.dedup();
+    for batch_id in batch_ids {
+        validate_batch_summary_total(connection, batch_id).await?;
+        sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
+            .bind(updated_at.to_rfc3339())
+            .bind(batch_id.to_string())
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to refresh item batch", error))?;
+    }
+    Ok(())
+}
+
+async fn validate_batch_summary_total(
+    connection: &mut SqliteConnection,
+    batch_id: Uuid,
+) -> Result<(), AppError> {
+    let amounts =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT amount_cents FROM items WHERE batch_id = ?")
+            .bind(batch_id.to_string())
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to validate batch summary", error))?;
+    amounts
+        .into_iter()
+        .try_fold(0_i64, |total, amount| {
+            total.checked_add(amount.unwrap_or(0))
+        })
+        .map(|_| ())
+        .ok_or_else(|| AppError::Internal {
+            message: "batch summary amount overflow".to_owned(),
+        })
 }
 
 impl DuplicateDiscardClaim {
