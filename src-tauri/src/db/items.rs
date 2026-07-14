@@ -136,6 +136,20 @@ impl ItemRepository {
         Self { pool }
     }
 
+    pub async fn get_by_id(&self, id: Uuid) -> Result<InvoiceItem, AppError> {
+        let query = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?");
+        let row = sqlx::query_as::<_, DbItemRow>(&query)
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| map_database_error("failed to get item", error))?
+            .ok_or_else(|| AppError::NotFound {
+                entity: "item".to_owned(),
+                message: format!("item {id} was not found"),
+            })?;
+        InvoiceItem::try_from(row)
+    }
+
     pub async fn insert(&self, item: &NewItemRecord) -> Result<InvoiceItem, AppError> {
         validate_amount(item.amount_cents)?;
         validate_source(item)?;

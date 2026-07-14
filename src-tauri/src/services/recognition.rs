@@ -1,0 +1,341 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::{Datelike, NaiveDate};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+
+use crate::db::items::{InvoiceItem, ItemPatch, ItemRepository};
+use crate::domain::error::AppError;
+use crate::domain::model::{
+    Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, derive_item_status,
+};
+use crate::infra::extraction::DocumentExtractor;
+
+const CITY_NAMES: &[&str] = &[
+    "北京",
+    "上海",
+    "天津",
+    "重庆",
+    "石家庄",
+    "太原",
+    "呼和浩特",
+    "沈阳",
+    "大连",
+    "长春",
+    "吉林",
+    "哈尔滨",
+    "南京",
+    "苏州",
+    "无锡",
+    "杭州",
+    "宁波",
+    "温州",
+    "合肥",
+    "福州",
+    "厦门",
+    "泉州",
+    "南昌",
+    "济南",
+    "青岛",
+    "郑州",
+    "武汉",
+    "长沙",
+    "广州",
+    "深圳",
+    "珠海",
+    "佛山",
+    "东莞",
+    "南宁",
+    "海口",
+    "三亚",
+    "成都",
+    "贵阳",
+    "昆明",
+    "拉萨",
+    "西安",
+    "兰州",
+    "西宁",
+    "银川",
+    "乌鲁木齐",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecognitionOutcome {
+    pub invoice_date: Option<NaiveDate>,
+    pub suggested_period: String,
+    pub category: Option<Category>,
+    pub amount_cents: Option<i64>,
+    pub city: Option<String>,
+    pub company: Option<String>,
+    pub warnings: Vec<String>,
+    pub recognition_status: RecognitionStatus,
+    pub confirmation_status: ConfirmationStatus,
+}
+
+#[derive(Clone)]
+pub struct RecognitionService {
+    items: ItemRepository,
+    extractor: Arc<dyn DocumentExtractor>,
+}
+
+impl RecognitionService {
+    pub fn new(items: ItemRepository, extractor: Arc<dyn DocumentExtractor>) -> Self {
+        Self { items, extractor }
+    }
+
+    pub async fn recognize_item(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
+        let item = self.items.get_by_id(id).await?;
+        let received_date = item.fetched_at.date_naive();
+        let path = PathBuf::from(&item.original_path);
+        let extractor = self.extractor.clone();
+        let extraction = tokio::task::spawn_blocking(move || extractor.extract(&path))
+            .await
+            .map_err(|error| AppError::Internal {
+                message: format!("document extraction task failed: {error}"),
+            })
+            .and_then(|result| result);
+        let extracted = match extraction {
+            Ok(extracted) => extracted,
+            Err(extraction_error) => {
+                self.items
+                    .update_fields(
+                        id,
+                        ItemPatch {
+                            invoice_date: Some(None),
+                            suggested_period: Some(None),
+                            suggested_category: Some(None),
+                            amount_cents: Some(None),
+                            city: Some(None),
+                            company: Some(None),
+                            recognition_status: Some(RecognitionStatus::Failed),
+                            confirmation_status: Some(ConfirmationStatus::Pending),
+                            ..ItemPatch::default()
+                        },
+                    )
+                    .await?;
+                return Err(extraction_error);
+            }
+        };
+        let recognized =
+            recognize_with_warnings(&extracted.text, received_date, &extracted.warnings);
+
+        self.items
+            .update_fields(
+                id,
+                ItemPatch {
+                    invoice_date: Some(recognized.invoice_date),
+                    suggested_period: Some(Some(recognized.suggested_period)),
+                    suggested_category: Some(recognized.category),
+                    amount_cents: Some(recognized.amount_cents),
+                    city: Some(recognized.city),
+                    company: Some(recognized.company),
+                    recognition_status: Some(recognized.recognition_status),
+                    confirmation_status: Some(recognized.confirmation_status),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+    }
+
+    pub async fn retry(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
+        self.recognize_item(id).await
+    }
+}
+
+impl RecognitionOutcome {
+    pub fn status(&self) -> ItemStatus {
+        derive_item_status(
+            self.recognition_status,
+            self.confirmation_status,
+            DedupeStatus::Unique,
+        )
+    }
+}
+
+pub fn recognize(text: &str, received_date: NaiveDate) -> RecognitionOutcome {
+    recognize_with_warnings(text, received_date, &[])
+}
+
+pub fn recognize_with_warnings(
+    text: &str,
+    received_date: NaiveDate,
+    extraction_warnings: &[String],
+) -> RecognitionOutcome {
+    let (invoice_date, mut warnings) = match labeled_date(text) {
+        Ok(date) => (date.or(Some(received_date)), extraction_warnings.to_vec()),
+        Err(()) => {
+            let mut warnings = extraction_warnings.to_vec();
+            warnings.push("invalid_invoice_date".to_owned());
+            (Some(received_date), warnings)
+        }
+    };
+    let amount_cents = match labeled_amount(text) {
+        Ok(amount) => amount,
+        Err(()) => {
+            warnings.push("invalid_amount".to_owned());
+            None
+        }
+    };
+    let category = scored_category(text);
+    let company =
+        labeled_line_value(text, "购买方名称").or_else(|| labeled_line_value(text, "销售方名称"));
+    let city = recognized_city(text);
+    let suggested_period = invoice_date
+        .map(|date| format!("{:04}-{:02}", date.year(), date.month()))
+        .unwrap_or_else(|| format!("{:04}-{:02}", received_date.year(), received_date.month()));
+    let confirmation_status = if invoice_date.is_some()
+        && amount_cents.is_some()
+        && category.is_some()
+        && warnings.is_empty()
+    {
+        ConfirmationStatus::Confirmed
+    } else {
+        ConfirmationStatus::Pending
+    };
+
+    RecognitionOutcome {
+        invoice_date,
+        suggested_period,
+        category,
+        amount_cents,
+        city,
+        company,
+        warnings,
+        recognition_status: RecognitionStatus::Succeeded,
+        confirmation_status,
+    }
+}
+
+fn recognized_city(text: &str) -> Option<String> {
+    CITY_NAMES
+        .iter()
+        .filter_map(|city| {
+            let explicit = text.contains(&format!("{city}市"));
+            (explicit || text.contains(city)).then_some((explicit, city.chars().count(), *city))
+        })
+        .max_by_key(|(explicit, length, _)| (*explicit, *length))
+        .map(|(_, _, city)| city.to_owned())
+}
+
+fn labeled_line_value(text: &str, label: &str) -> Option<String> {
+    text.split_once(label)
+        .map(|(_, value)| value)
+        .map(|value| value.trim_start_matches(['：', ':']).trim_start())
+        .and_then(|value| value.lines().next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn labeled_date(text: &str) -> Result<Option<NaiveDate>, ()> {
+    let Some(after_label) = text
+        .split_once("开票日期")
+        .or_else(|| text.split_once("日期"))
+        .map(|(_, after_label)| after_label)
+    else {
+        return Ok(None);
+    };
+    let value = after_label.trim_start_matches(['：', ':']).trim_start();
+    parse_date_prefix(value).map(Some).ok_or(())
+}
+
+fn parse_date_prefix(value: &str) -> Option<NaiveDate> {
+    [(11, "%Y年%m月%d日"), (10, "%Y-%m-%d")]
+        .into_iter()
+        .find_map(|(length, format)| {
+            let candidate: String = value.chars().take(length).collect();
+            (candidate.chars().count() == length)
+                .then(|| NaiveDate::parse_from_str(&candidate, format).ok())
+                .flatten()
+        })
+}
+
+fn labeled_amount(text: &str) -> Result<Option<i64>, ()> {
+    let Some(after_label) = ["价税合计（小写）", "价税合计(小写)", "价税合计", "合计"]
+        .into_iter()
+        .find_map(|label| text.split_once(label).map(|(_, value)| value))
+    else {
+        return Ok(None);
+    };
+    let value = after_label
+        .trim_start_matches(['：', ':'])
+        .trim_start()
+        .trim_start_matches("RMB")
+        .trim_start()
+        .trim_start_matches(['¥', '￥'])
+        .trim_start();
+    let token: String = value
+        .chars()
+        .take_while(|character| {
+            character.is_ascii_digit() || matches!(*character, '.' | ',' | '-' | '+')
+        })
+        .collect();
+    parse_amount_cents(&token).map(Some).ok_or(())
+}
+
+fn parse_amount_cents(token: &str) -> Option<i64> {
+    let mut decimal_parts = token.split('.');
+    let integer = decimal_parts.next()?;
+    let fraction = decimal_parts.next();
+    if decimal_parts.next().is_some()
+        || integer.is_empty()
+        || !fraction.is_none_or(|fraction| {
+            (1..=2).contains(&fraction.len())
+                && fraction.chars().all(|value| value.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+
+    let groups: Vec<_> = integer.split(',').collect();
+    let valid_integer = if groups.len() == 1 {
+        integer.chars().all(|value| value.is_ascii_digit())
+    } else {
+        (1..=3).contains(&groups[0].len())
+            && groups[0].chars().all(|value| value.is_ascii_digit())
+            && groups[1..]
+                .iter()
+                .all(|group| group.len() == 3 && group.chars().all(|value| value.is_ascii_digit()))
+    };
+    if !valid_integer {
+        return None;
+    }
+
+    let amount = token.replace(',', "").parse::<Decimal>().ok()?;
+    amount.checked_mul(Decimal::from(100))?.to_i64()
+}
+
+fn scored_category(text: &str) -> Option<Category> {
+    const RULES: [(Category, &[&str]); 4] = [
+        (
+            Category::Transport,
+            &["出租车", "网约车", "铁路", "航空", "客运", "滴滴"],
+        ),
+        (Category::Dining, &["餐饮", "食品", "饭店", "餐厅"]),
+        (Category::Accommodation, &["住宿", "酒店", "宾馆"]),
+        (Category::Hospitality, &["招待", "礼品", "会务"]),
+    ];
+
+    let mut best = None;
+    let mut best_score = 0;
+    let mut tied = false;
+    for (category, keywords) in RULES {
+        let mut score = keywords
+            .iter()
+            .filter(|keyword| text.contains(**keyword))
+            .count();
+        if category == Category::Dining && text.contains("餐饮服务") {
+            score += 1;
+        }
+        if score > best_score {
+            best = Some(category);
+            best_score = score;
+            tied = false;
+        } else if score == best_score {
+            tied = true;
+        }
+    }
+
+    (best_score >= 2 && !tied).then_some(best).flatten()
+}
