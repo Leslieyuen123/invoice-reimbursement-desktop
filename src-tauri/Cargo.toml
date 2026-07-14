@@ -44,6 +44,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 wait-timeout = "0.2"
 zip = "4"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 

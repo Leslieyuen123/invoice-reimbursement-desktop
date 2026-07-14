@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::extraction::{
-    DocumentExtractor, LocalExtractor, OcrGateway, ProcessOcrGateway,
+    DocumentExtractor, LocalExtractor, OcrGateway, OcrResult, ProcessOcrGateway,
 };
 use printpdf::{BuiltinFont, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, TextItem};
 
@@ -14,6 +14,7 @@ use printpdf::{BuiltinFont, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, Te
 struct FakeOcr {
     calls: AtomicUsize,
     text: String,
+    warnings: Vec<String>,
 }
 
 impl FakeOcr {
@@ -21,6 +22,18 @@ impl FakeOcr {
         Self {
             calls: AtomicUsize::new(0),
             text: text.into(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn returning_with_warnings(text: impl Into<String>, warnings: &[&str]) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            text: text.into(),
+            warnings: warnings
+                .iter()
+                .map(|warning| (*warning).to_owned())
+                .collect(),
         }
     }
 
@@ -30,9 +43,12 @@ impl FakeOcr {
 }
 
 impl OcrGateway for FakeOcr {
-    fn recognize(&self, _path: &Path) -> Result<String, AppError> {
+    fn recognize(&self, _path: &Path) -> Result<OcrResult, AppError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.text.clone())
+        Ok(OcrResult {
+            text: self.text.clone(),
+            warnings: self.warnings.clone(),
+        })
     }
 }
 
@@ -97,6 +113,25 @@ fn blank_pdf_calls_ocr_and_preserves_the_valid_original_bytes() {
     assert_eq!(extracted.text, "scanned invoice text");
     assert_eq!(extracted.normalized_pdf, Some(bytes));
     assert_eq!(ocr.call_count(), 1);
+}
+
+#[test]
+fn scanned_pdf_propagates_ocr_warnings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scan.pdf");
+    let bytes = PdfDocument::new("blank scan")
+        .with_pages(vec![PdfPage::new(Mm(10.0), Mm(10.0), Vec::new())])
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    std::fs::write(&path, bytes).unwrap();
+    let extractor = LocalExtractor::new(Arc::new(FakeOcr::returning_with_warnings(
+        "scan text",
+        &["low_confidence"],
+    )));
+
+    let extracted = extractor.extract(&path).unwrap();
+
+    assert_eq!(extracted.text, "scan text");
+    assert_eq!(extracted.warnings, ["low_confidence"]);
 }
 
 #[test]
@@ -232,6 +267,7 @@ fn corrupt_pdf_is_rejected_without_ocr_or_path_disclosure() {
 
     assert_external(&error, "document_extractor");
     assert!(!error.to_string().contains("private-secret"));
+    assert!(!error.to_string().contains("broken.pdf"));
     assert_eq!(ocr.call_count(), 0);
 }
 
@@ -251,7 +287,82 @@ fn corrupt_image_is_rejected_without_ocr_or_path_disclosure() {
 
     assert_external(&error, "document_extractor");
     assert!(!error.to_string().contains("private-secret"));
+    assert!(!error.to_string().contains("broken.JPEG"));
     assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn pdfs_over_one_hundred_pages_are_rejected_before_text_extraction_or_ocr() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("too-many-pages.pdf");
+    let pages = (0..101)
+        .map(|_| PdfPage::new(Mm(10.0), Mm(10.0), Vec::new()))
+        .collect();
+    let bytes = PdfDocument::new("too many pages")
+        .with_pages(pages)
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    std::fs::write(&path, bytes).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("page budget should reject PDF");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn images_over_the_dimension_budget_are_rejected_before_ocr() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("too-wide.png");
+    image::RgbImage::new(20_001, 1).save(&path).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("dimension budget should reject image");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn image_headers_over_the_pixel_budget_are_rejected_without_decoding_pixels() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("too-many-pixels.png");
+    std::fs::write(&path, png_header(10_000, 4_001)).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("pixel budget should reject image header");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn normalized_image_pages_fit_the_pdf_point_limit_without_changing_aspect() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("long-receipt.png");
+    image::RgbImage::new(20_000, 100).save(&path).unwrap();
+    let extractor = LocalExtractor::new(Arc::new(FakeOcr::returning("receipt")));
+
+    let extracted = extractor.extract(&path).unwrap();
+    let pdf = lopdf::Document::load_mem(&extracted.normalized_pdf.unwrap()).unwrap();
+    let page_id = *pdf.get_pages().values().next().unwrap();
+    let page = pdf.get_object(page_id).unwrap().as_dict().unwrap();
+    let media_box = page.get(b"MediaBox").unwrap().as_array().unwrap();
+    let width = media_box[2].as_float().unwrap() - media_box[0].as_float().unwrap();
+    let height = media_box[3].as_float().unwrap() - media_box[1].as_float().unwrap();
+
+    assert!(width <= 14_400.0, "page width was {width}");
+    assert!(height <= 14_400.0, "page height was {height}");
+    assert!((width / height - 200.0).abs() < 0.1);
 }
 
 fn assert_external(error: &AppError, expected_service: &str) {
@@ -268,14 +379,98 @@ fn assert_external(error: &AppError, expected_service: &str) {
     );
 }
 
+fn assert_resource_error(error: &AppError) {
+    assert_external(error, "document_extractor");
+    assert_eq!(
+        error.to_string(),
+        "Document exceeds extraction resource limits."
+    );
+}
+
+fn png_header(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    append_png_chunk(&mut bytes, b"IHDR", &ihdr);
+    append_png_chunk(
+        &mut bytes,
+        b"IDAT",
+        &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+    append_png_chunk(&mut bytes, b"IEND", &[]);
+    bytes
+}
+
+fn append_png_chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(kind);
+    bytes.extend_from_slice(data);
+    let mut crc_input = kind.to_vec();
+    crc_input.extend_from_slice(data);
+    bytes.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 #[test]
 fn process_ocr_sends_a_json_line_and_parses_success() {
     let gateway = ProcessOcrGateway::new(ocr_helper());
     let path = Path::new("success invoice.pdf");
 
-    let text = gateway.recognize(path).expect("sidecar should succeed");
+    let result = gateway.recognize(path).expect("sidecar should succeed");
 
-    assert_eq!(text, "北京 出租车 价税合计 ¥128.50");
+    assert_eq!(result.text, "北京 出租车 价税合计 ¥128.50");
+    assert_eq!(result.warnings, ["low_confidence"]);
+}
+
+#[test]
+fn local_extractor_propagates_process_sidecar_warnings_end_to_end() {
+    let gateway = Arc::new(ProcessOcrGateway::new(ocr_helper()));
+    let extractor = LocalExtractor::new(gateway);
+
+    let extracted = extractor.extract(&fixture("image-invoice.png")).unwrap();
+
+    assert_eq!(extracted.warnings, ["low_confidence"]);
+}
+
+#[test]
+fn process_ocr_bounds_and_sanitizes_warning_codes() {
+    let gateway = ProcessOcrGateway::new(ocr_helper());
+
+    let result = gateway
+        .recognize(Path::new("warning-sanitize.pdf"))
+        .unwrap();
+
+    assert!(result.warnings.len() <= 16);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .all(|warning| warning.chars().count() <= 64)
+    );
+    assert!(
+        result.warnings.iter().all(|warning| warning
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || character == '_'
+                || character == '-'))
+    );
+    assert!(!result.warnings.join(" ").contains("secret"));
 }
 
 #[test]
@@ -327,6 +522,47 @@ fn process_ocr_kills_a_hung_sidecar_after_the_timeout() {
 
     assert_external(&error, "ocr_sidecar");
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn process_ocr_timeout_kills_descendants_holding_output_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_path = directory.path().join("descendant-timeout.pid");
+    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_millis(500));
+    let started = Instant::now();
+
+    let error = gateway
+        .recognize(&pid_path)
+        .expect_err("sidecar process tree should time out");
+
+    assert_external(&error, "ocr_sidecar");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let descendant_pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let gone = (0..50).any(|_| {
+        if !process_exists(descendant_pid) {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        }
+    });
+    assert!(gone, "descendant {descendant_pid} survived timeout");
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[test]

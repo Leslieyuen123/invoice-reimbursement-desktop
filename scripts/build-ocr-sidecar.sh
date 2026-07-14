@@ -6,6 +6,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_DIR="${REPO_ROOT}/sidecars/ocr"
 BINARY_DIR="${REPO_ROOT}/src-tauri/binaries"
 HOST_TRIPLE="$(rustc -Vv | sed -n 's/^host: //p')"
+UV_ARGS=(run --locked)
+
+if [[ "${OFFLINE:-0}" == "1" ]]; then
+  UV_ARGS+=(--offline)
+fi
 
 if [[ -z "${HOST_TRIPLE}" ]]; then
   echo "Unable to determine the Rust host triple." >&2
@@ -26,7 +31,7 @@ esac
 rm -rf "${PROJECT_DIR}/build" "${PROJECT_DIR}/dist"
 (
   cd "${PROJECT_DIR}"
-  uv run --project . pyinstaller --clean --noconfirm invoice-ocr.spec
+  uv "${UV_ARGS[@]}" --project . pyinstaller --clean --noconfirm invoice-ocr.spec
 )
 
 mkdir -p "${BINARY_DIR}"

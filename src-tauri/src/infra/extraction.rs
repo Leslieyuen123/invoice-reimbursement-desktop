@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use image::GenericImageView;
+use image::{ImageReader, Limits};
 use printpdf::{
     Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, RawImageData, RawImageFormat,
     XObjectTransform,
@@ -18,9 +18,17 @@ use wait_timeout::ChildExt;
 use crate::domain::error::AppError;
 
 const NORMALIZED_IMAGE_DPI: f32 = 96.0;
+// Keep these document budgets aligned with sidecars/ocr/main.py.
+const MAX_PDF_PAGES: usize = 100;
+const MAX_IMAGE_DIMENSION: u32 = 20_000;
+const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+const MAX_NORMALIZED_PAGE_POINTS: f32 = 14_400.0;
+const MAX_IMAGE_DECODE_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
 const DEFAULT_OCR_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OCR_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_OCR_STDERR_BYTES: usize = 8 * 1024;
+const MAX_OCR_WARNINGS: usize = 16;
+const MAX_OCR_WARNING_CHARS: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExtractedDocument {
@@ -33,8 +41,14 @@ pub trait DocumentExtractor: Send + Sync {
     fn extract(&self, path: &Path) -> Result<ExtractedDocument, AppError>;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct OcrResult {
+    pub text: String,
+    pub warnings: Vec<String>,
+}
+
 pub trait OcrGateway: Send + Sync {
-    fn recognize(&self, path: &Path) -> Result<String, AppError>;
+    fn recognize(&self, path: &Path) -> Result<OcrResult, AppError>;
 }
 
 pub struct ProcessOcrGateway {
@@ -56,13 +70,14 @@ impl ProcessOcrGateway {
 }
 
 impl OcrGateway for ProcessOcrGateway {
-    fn recognize(&self, path: &Path) -> Result<String, AppError> {
-        let mut child = Command::new(&self.executable)
+    fn recognize(&self, path: &Path) -> Result<OcrResult, AppError> {
+        let mut command = Command::new(&self.executable);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| ocr_error())?;
+            .stderr(Stdio::piped());
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().map_err(|_| ocr_error())?;
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -104,14 +119,35 @@ impl OcrGateway for ProcessOcrGateway {
         }
 
         let response: OcrResponse = serde_json::from_slice(&stdout).map_err(|_| ocr_error())?;
-        let _ = response.warnings;
         if response.ok {
-            response.text.ok_or_else(ocr_error)
+            Ok(OcrResult {
+                text: response.text.ok_or_else(ocr_error)?,
+                warnings: sanitize_warnings(response.warnings),
+            })
         } else {
             let _ = response.error;
             Err(ocr_error())
         }
     }
+}
+
+fn sanitize_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .take(MAX_OCR_WARNINGS)
+        .filter_map(|warning| {
+            let warning = warning.trim();
+            if warning.is_empty() {
+                return None;
+            }
+            if !warning.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '-'
+            }) {
+                return Some("ocr_warning".to_owned());
+            }
+            Some(warning.chars().take(MAX_OCR_WARNING_CHARS).collect())
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -159,6 +195,41 @@ fn join_reader(
         .map_err(|_| ocr_error())
 }
 
+#[cfg(unix)]
+fn configure_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate(child: &mut Child) {
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        // The child is its process-group leader, so a negative PID targets its descendants too.
+        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(windows)]
+fn terminate(child: &mut Child) {
+    // Exercise taskkill tree semantics on Windows CI; no command shell is involved.
+    let pid = child.id().to_string();
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -208,31 +279,44 @@ impl DocumentExtractor for LocalExtractor {
 
 impl LocalExtractor {
     fn extract_pdf(&self, path: &Path) -> Result<ExtractedDocument, AppError> {
-        let bytes = fs::read(path).map_err(|_| document_error(path))?;
-        let text = pdf_extract::extract_text_from_mem(&bytes).map_err(|_| document_error(path))?;
-        let text = if useful_character_count(&text) >= 20 {
-            text
+        let bytes = fs::read(path).map_err(|_| document_error())?;
+        let document = lopdf::Document::load_mem(&bytes).map_err(|_| document_error())?;
+        if document.get_pages().len() > MAX_PDF_PAGES {
+            return Err(resource_limit_error());
+        }
+        drop(document);
+        let text = pdf_extract::extract_text_from_mem(&bytes).map_err(|_| document_error())?;
+        let (text, warnings) = if useful_character_count(&text) >= 20 {
+            (text, Vec::new())
         } else {
-            self.ocr.recognize(path)?
+            let result = self.ocr.recognize(path)?;
+            (result.text, result.warnings)
         };
 
         Ok(ExtractedDocument {
             text,
             normalized_pdf: Some(bytes),
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
     fn extract_image(&self, path: &Path) -> Result<ExtractedDocument, AppError> {
-        let image = image::open(path).map_err(|_| document_error(path))?;
-        let (width, height) = image.dimensions();
+        let (width, height) = ImageReader::open(path)
+            .map_err(|_| document_error())?
+            .into_dimensions()
+            .map_err(|_| document_error())?;
+        validate_image_dimensions(width, height)?;
+
+        let mut reader = ImageReader::open(path).map_err(|_| document_error())?;
+        reader.limits(image_decode_limits());
+        let image = reader.decode().map_err(|_| document_error())?;
         let normalized_pdf = normalize_image(image, width, height);
-        let text = self.ocr.recognize(path)?;
+        let result = self.ocr.recognize(path)?;
 
         Ok(ExtractedDocument {
-            text,
+            text: result.text,
             normalized_pdf: Some(normalized_pdf),
-            warnings: Vec::new(),
+            warnings: result.warnings,
         })
     }
 }
@@ -248,8 +332,11 @@ fn normalize_image(image: image::DynamicImage, width: u32, height: u32) -> Vec<u
     };
     let mut document = PdfDocument::new("Normalized invoice image");
     let image_id = document.add_image(&raw_image);
-    let width_mm = Mm(width as f32 * 25.4 / NORMALIZED_IMAGE_DPI);
-    let height_mm = Mm(height as f32 * 25.4 / NORMALIZED_IMAGE_DPI);
+    let width_points = width as f32 * 72.0 / NORMALIZED_IMAGE_DPI;
+    let height_points = height as f32 * 72.0 / NORMALIZED_IMAGE_DPI;
+    let page_scale = (MAX_NORMALIZED_PAGE_POINTS / width_points.max(height_points)).min(1.0);
+    let width_mm = Mm(width_points * page_scale * 25.4 / 72.0);
+    let height_mm = Mm(height_points * page_scale * 25.4 / 72.0);
     let page = PdfPage::new(
         width_mm,
         height_mm,
@@ -257,6 +344,8 @@ fn normalize_image(image: image::DynamicImage, width: u32, height: u32) -> Vec<u
             id: image_id,
             transform: XObjectTransform {
                 dpi: Some(NORMALIZED_IMAGE_DPI),
+                scale_x: Some(page_scale),
+                scale_y: Some(page_scale),
                 ..XObjectTransform::default()
             },
         }],
@@ -267,20 +356,40 @@ fn normalize_image(image: image::DynamicImage, width: u32, height: u32) -> Vec<u
         .save(&PdfSaveOptions::default(), &mut Vec::new())
 }
 
+fn validate_image_dimensions(width: u32, height: u32) -> Result<(), AppError> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION || pixels > MAX_IMAGE_PIXELS {
+        return Err(resource_limit_error());
+    }
+    Ok(())
+}
+
+fn image_decode_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
+    limits
+}
+
 fn useful_character_count(text: &str) -> usize {
     text.chars()
         .filter(|character| !character.is_whitespace())
         .count()
 }
 
-fn document_error(path: &Path) -> AppError {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("document");
+fn document_error() -> AppError {
     AppError::External {
         service: "document_extractor".to_owned(),
         retryable: false,
-        message: format!("Unable to read document {file_name:?}."),
+        message: "Unable to read document.".to_owned(),
+    }
+}
+
+fn resource_limit_error() -> AppError {
+    AppError::External {
+        service: "document_extractor".to_owned(),
+        retryable: false,
+        message: "Document exceeds extraction resource limits.".to_owned(),
     }
 }
