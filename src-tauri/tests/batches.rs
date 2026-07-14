@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use invoice_reimbursement::db;
-use invoice_reimbursement::db::batches::BatchRepository;
+use invoice_reimbursement::db::batches::{Batch, BatchRepository};
 use invoice_reimbursement::db::items::{ItemPatch, ItemRepository, NewItemRecord};
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::domain::model::{
@@ -97,15 +97,14 @@ impl DocumentExtractor for SuccessfulExtractor {
 async fn create_month_uses_the_full_calendar_month_and_expected_name() {
     let service = service().await;
 
-    let detail = service
+    let batch: Batch = service
         .create_month(2026, 7)
         .await
         .expect("monthly batch should create");
 
-    assert_eq!(detail.batch.name, "2026 年 7 月报销");
-    assert_eq!(detail.batch.start_date, date(2026, 7, 1));
-    assert_eq!(detail.batch.end_date, date(2026, 7, 31));
-    assert!(detail.items.is_empty());
+    assert_eq!(batch.name, "2026 年 7 月报销");
+    assert_eq!(batch.start_date, date(2026, 7, 1));
+    assert_eq!(batch.end_date, date(2026, 7, 31));
 }
 
 #[tokio::test]
@@ -121,8 +120,8 @@ async fn create_month_handles_leap_february_and_december() {
         .await
         .expect("December should create");
 
-    assert_eq!(leap.batch.end_date, date(2024, 2, 29));
-    assert_eq!(december.batch.end_date, date(2026, 12, 31));
+    assert_eq!(leap.end_date, date(2024, 2, 29));
+    assert_eq!(december.end_date, date(2026, 12, 31));
 }
 
 #[tokio::test]
@@ -150,7 +149,7 @@ async fn create_month_rejects_invalid_years_and_months_stably() {
 async fn create_custom_validates_dates_and_normalizes_text() {
     let service = service().await;
 
-    let detail = service
+    let batch: Batch = service
         .create(NewBatchInput {
             name: "  补开跨月报销  ".to_owned(),
             start_date: "2026-01-31".to_owned(),
@@ -160,10 +159,10 @@ async fn create_custom_validates_dates_and_normalizes_text() {
         .await
         .expect("custom batch should create");
 
-    assert_eq!(detail.batch.name, "补开跨月报销");
-    assert_eq!(detail.batch.start_date, date(2026, 1, 31));
-    assert_eq!(detail.batch.end_date, date(2026, 3, 1));
-    assert_eq!(detail.batch.note.as_deref(), Some("客户项目"));
+    assert_eq!(batch.name, "补开跨月报销");
+    assert_eq!(batch.start_date, date(2026, 1, 31));
+    assert_eq!(batch.end_date, date(2026, 3, 1));
+    assert_eq!(batch.note.as_deref(), Some("客户项目"));
 
     let invalid = service
         .create(NewBatchInput {
@@ -178,7 +177,7 @@ async fn create_custom_validates_dates_and_normalizes_text() {
 }
 
 #[tokio::test]
-async fn recommend_includes_boundary_months_and_filters_unassignable_items() {
+async fn recommend_includes_boundary_months_and_all_unassigned_item_states() {
     let pool = db::connect("sqlite::memory:")
         .await
         .expect("in-memory database should connect");
@@ -200,7 +199,7 @@ async fn recommend_includes_boundary_months_and_filters_unassignable_items() {
         .await
         .expect("batch should create");
     let mut assigned = sample_item(4, Some("2026-02"));
-    assigned.batch_id = Some(batch.batch.id);
+    assigned.batch_id = Some(batch.id);
     let mut duplicate = sample_item(5, Some("2026-02"));
     duplicate.dedupe_status = DedupeStatus::SuspectedDuplicate;
     let mut failed = sample_item(6, Some("2026-02"));
@@ -222,11 +221,20 @@ async fn recommend_includes_boundary_months_and_filters_unassignable_items() {
 
     assert_eq!(
         recommended.iter().map(|item| item.id).collect::<Vec<_>>(),
-        vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+        vec![
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(5),
+            Uuid::from_u128(6),
+            Uuid::from_u128(3),
+        ]
     );
-    assert!(recommended.iter().all(|item| {
-        item.confirmation_status == ConfirmationStatus::Pending && item.batch_id.is_none()
-    }));
+    assert!(recommended.iter().all(|item| item.batch_id.is_none()));
+    assert_eq!(
+        recommended[2].dedupe_status,
+        DedupeStatus::SuspectedDuplicate
+    );
+    assert_eq!(recommended[3].recognition_status, RecognitionStatus::Failed);
 }
 
 #[tokio::test]
@@ -275,7 +283,7 @@ async fn assign_is_idempotent_deduplicates_input_and_warns_only_for_outside_date
         .expect("dateless item should insert");
 
     let detail = service
-        .assign_items(batch.batch.id, &[outside.id, outside.id, no_date.id])
+        .assign_items(batch.id, &[outside.id, outside.id, no_date.id])
         .await
         .expect("valid items should assign");
 
@@ -285,12 +293,12 @@ async fn assign_is_idempotent_deduplicates_input_and_warns_only_for_outside_date
         vec![format!("outside_date_range:{}", outside.id)]
     );
     let again = service
-        .assign_items(batch.batch.id, &[outside.id])
+        .assign_items(batch.id, &[outside.id])
         .await
         .expect("same-batch assignment should be idempotent");
     assert_eq!(again.items.len(), 2);
     let empty = service
-        .assign_items(batch.batch.id, &[])
+        .assign_items(batch.id, &[])
         .await
         .expect("empty assignment should be a no-op for an existing batch");
     assert_eq!(empty.items.len(), 2);
@@ -317,14 +325,14 @@ async fn assign_rejects_invalid_states_and_rolls_back_every_item() {
     let mut failed = sample_item(32, Some("2026-02"));
     failed.recognition_status = RecognitionStatus::Failed;
     let mut elsewhere = sample_item(33, Some("2026-02"));
-    elsewhere.batch_id = Some(other.batch.id);
+    elsewhere.batch_id = Some(other.id);
     for item in [&valid, &duplicate, &failed, &elsewhere] {
         items.insert(item).await.expect("item should insert");
     }
 
-    for invalid_id in [duplicate.id, failed.id, elsewhere.id, Uuid::from_u128(99)] {
+    for invalid_id in [duplicate.id, failed.id, Uuid::from_u128(99)] {
         let error = service
-            .assign_items(target.batch.id, &[valid.id, invalid_id])
+            .assign_items(target.id, &[valid.id, elsewhere.id, invalid_id])
             .await
             .expect_err("one invalid item should reject the whole assignment");
         assert!(matches!(
@@ -346,8 +354,65 @@ async fn assign_rejects_invalid_states_and_rolls_back_every_item() {
             .await
             .expect("other item should remain")
             .batch_id,
-        Some(other.batch.id)
+        Some(other.id)
     );
+}
+
+#[tokio::test]
+async fn assign_moves_items_from_another_batch_and_falls_back_both_exported_batches() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let old_batch = service
+        .create_month(2026, 1)
+        .await
+        .expect("old batch should create");
+    let new_batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("new batch should create");
+    let mut moved = sample_item(34, Some("2026-01"));
+    moved.batch_id = Some(old_batch.id);
+    let fresh = sample_item(35, Some("2026-02"));
+    items
+        .insert(&moved)
+        .await
+        .expect("moved item should insert");
+    items
+        .insert(&fresh)
+        .await
+        .expect("fresh item should insert");
+    mark_exported(&pool, old_batch.id).await;
+    mark_exported(&pool, new_batch.id).await;
+
+    let detail = service
+        .assign_items(new_batch.id, &[moved.id, fresh.id])
+        .await
+        .expect("cross-batch assignment should move the item");
+
+    assert_eq!(detail.batch.id, new_batch.id);
+    assert_eq!(detail.items.len(), 2);
+    assert!(
+        detail
+            .items
+            .iter()
+            .all(|item| item.batch_id == Some(new_batch.id))
+    );
+    let repository = BatchRepository::new(pool);
+    let persisted_old = repository
+        .get(old_batch.id)
+        .await
+        .expect("old batch should reload");
+    let persisted_new = repository
+        .get(new_batch.id)
+        .await
+        .expect("new batch should reload");
+    assert_eq!(persisted_old.status, BatchStatus::Draft);
+    assert_eq!(persisted_new.status, BatchStatus::Draft);
+    assert!(persisted_old.last_exported_at.is_some());
+    assert!(persisted_new.last_exported_at.is_some());
 }
 
 #[tokio::test]
@@ -394,17 +459,17 @@ async fn remove_item_only_removes_an_item_owned_by_the_batch() {
     let owned = sample_item(50, Some("2026-02"));
     let unassigned = sample_item(51, Some("2026-02"));
     let mut elsewhere = sample_item(52, Some("2026-02"));
-    elsewhere.batch_id = Some(other.batch.id);
+    elsewhere.batch_id = Some(other.id);
     for item in [&owned, &unassigned, &elsewhere] {
         items.insert(item).await.expect("item should insert");
     }
     service
-        .assign_items(owner.batch.id, &[owned.id])
+        .assign_items(owner.id, &[owned.id])
         .await
         .expect("owned item should assign");
 
     let detail = service
-        .remove_item(owner.batch.id, owned.id)
+        .remove_item(owner.id, owned.id)
         .await
         .expect("owned item should remove");
 
@@ -419,9 +484,9 @@ async fn remove_item_only_removes_an_item_owned_by_the_batch() {
     );
     for (batch_id, item_id, expected_entity) in [
         (Uuid::from_u128(404), unassigned.id, Some("batch")),
-        (owner.batch.id, Uuid::from_u128(405), Some("item")),
-        (owner.batch.id, unassigned.id, None),
-        (owner.batch.id, elsewhere.id, None),
+        (owner.id, Uuid::from_u128(405), Some("item")),
+        (owner.id, unassigned.id, None),
+        (owner.id, elsewhere.id, None),
     ] {
         let error = service
             .remove_item(batch_id, item_id)
@@ -440,7 +505,7 @@ async fn remove_item_only_removes_an_item_owned_by_the_batch() {
             .await
             .expect("other item should remain")
             .batch_id,
-        Some(other.batch.id)
+        Some(other.id)
     );
 }
 
@@ -497,7 +562,7 @@ async fn summary_counts_total_unconfirmed_and_only_final_categories() {
     }
 
     let detail = service
-        .assign_items(batch.batch.id, &ids)
+        .assign_items(batch.id, &ids)
         .await
         .expect("summary items should assign");
 
@@ -539,7 +604,7 @@ async fn summary_reports_amount_overflow_without_panicking() {
         .expect("one-cent item should insert");
 
     let error = service
-        .assign_items(batch.batch.id, &[maximum.id, one.id])
+        .assign_items(batch.id, &[maximum.id, one.id])
         .await
         .expect_err("overflowing summary should return an error");
 
@@ -569,15 +634,15 @@ async fn updating_exported_batch_name_or_dates_falls_back_and_preserves_export_t
         .create_month(2026, 2)
         .await
         .expect("batch should create");
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
 
     let unchanged = service
         .update(
-            batch.batch.id,
+            batch.id,
             NewBatchInput {
-                name: batch.batch.name.clone(),
-                start_date: batch.batch.start_date.to_string(),
-                end_date: batch.batch.end_date.to_string(),
+                name: batch.name.clone(),
+                start_date: batch.start_date.to_string(),
+                end_date: batch.end_date.to_string(),
                 note: None,
             },
         )
@@ -587,7 +652,7 @@ async fn updating_exported_batch_name_or_dates_falls_back_and_preserves_export_t
 
     let renamed = service
         .update(
-            batch.batch.id,
+            batch.id,
             NewBatchInput {
                 name: "  February amended  ".to_owned(),
                 start_date: "2026-02-01".to_owned(),
@@ -609,10 +674,10 @@ async fn updating_exported_batch_name_or_dates_falls_back_and_preserves_export_t
         "2026-07-14T08:00:00+00:00"
     );
 
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
     let redated = service
         .update(
-            batch.batch.id,
+            batch.id,
             NewBatchInput {
                 name: renamed.batch.name,
                 start_date: "2026-01-31".to_owned(),
@@ -652,19 +717,19 @@ async fn exported_batch_falls_back_only_for_actual_assignment_changes() {
         .expect("batch should create");
     let item = sample_item(70, Some("2026-02"));
     items.insert(&item).await.expect("item should insert");
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
 
     let assigned = service
-        .assign_items(batch.batch.id, &[item.id])
+        .assign_items(batch.id, &[item.id])
         .await
         .expect("assignment should succeed");
     assert_eq!(assigned.batch.status, BatchStatus::Draft);
     assert!(assigned.batch.last_exported_at.is_some());
 
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
     assert_eq!(
         service
-            .assign_items(batch.batch.id, &[item.id])
+            .assign_items(batch.id, &[item.id])
             .await
             .expect("idempotent assignment should succeed")
             .batch
@@ -673,7 +738,7 @@ async fn exported_batch_falls_back_only_for_actual_assignment_changes() {
     );
     assert_eq!(
         service
-            .assign_items(batch.batch.id, &[])
+            .assign_items(batch.id, &[])
             .await
             .expect("empty assignment should succeed")
             .batch
@@ -682,7 +747,7 @@ async fn exported_batch_falls_back_only_for_actual_assignment_changes() {
     );
 
     let removed = service
-        .remove_item(batch.batch.id, item.id)
+        .remove_item(batch.id, item.id)
         .await
         .expect("removal should succeed");
     assert_eq!(removed.batch.status, BatchStatus::Draft);
@@ -706,10 +771,10 @@ async fn item_review_and_repository_updates_fall_back_the_exported_batch() {
     let item = sample_item(71, Some("2026-02"));
     items.insert(&item).await.expect("item should insert");
     batches
-        .assign_items(batch.batch.id, &[item.id])
+        .assign_items(batch.id, &[item.id])
         .await
         .expect("item should assign");
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
 
     ItemService::new(items.clone(), paths)
         .review(ItemReview {
@@ -727,13 +792,13 @@ async fn item_review_and_repository_updates_fall_back_the_exported_batch() {
         .await
         .expect("review should succeed");
     let reviewed_batch = BatchRepository::new(pool.clone())
-        .get(batch.batch.id)
+        .get(batch.id)
         .await
         .expect("batch should reload");
     assert_eq!(reviewed_batch.status, BatchStatus::Draft);
     assert!(reviewed_batch.last_exported_at.is_some());
 
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
     items
         .update_fields(
             item.id,
@@ -745,7 +810,7 @@ async fn item_review_and_repository_updates_fall_back_the_exported_batch() {
         .await
         .expect("repository update should succeed");
     let updated_batch = BatchRepository::new(pool)
-        .get(batch.batch.id)
+        .get(batch.id)
         .await
         .expect("batch should reload");
     assert_eq!(updated_batch.status, BatchStatus::Draft);
@@ -769,10 +834,10 @@ async fn recognition_updates_fall_back_the_exported_batch() {
     item.suggested_category = None;
     items.insert(&item).await.expect("item should insert");
     batches
-        .assign_items(batch.batch.id, &[item.id])
+        .assign_items(batch.id, &[item.id])
         .await
         .expect("item should assign");
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
 
     RecognitionService::new(items, Arc::new(SuccessfulExtractor))
         .recognize_item(item.id)
@@ -780,7 +845,7 @@ async fn recognition_updates_fall_back_the_exported_batch() {
         .expect("recognition should succeed");
 
     let persisted = BatchRepository::new(pool)
-        .get(batch.batch.id)
+        .get(batch.id)
         .await
         .expect("batch should reload");
     assert_eq!(persisted.status, BatchStatus::Draft);
@@ -808,19 +873,19 @@ async fn database_failure_rolls_back_assignments_and_export_status_without_sql_l
         .insert(&second)
         .await
         .expect("second item should insert");
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
     sqlx::query(&format!(
         "CREATE TRIGGER fail_batch_refresh BEFORE UPDATE ON batches \
          WHEN OLD.id = '{}' AND NEW.status = 'draft' \
          BEGIN SELECT RAISE(ABORT, 'forced batch refresh failure'); END",
-        batch.batch.id
+        batch.id
     ))
     .execute(&pool)
     .await
     .expect("failure trigger should create");
 
     let error = service
-        .assign_items(batch.batch.id, &[first.id, second.id])
+        .assign_items(batch.id, &[first.id, second.id])
         .await
         .expect_err("injected database failure should fail assignment");
 
@@ -842,7 +907,7 @@ async fn database_failure_rolls_back_assignments_and_export_status_without_sql_l
         );
     }
     let persisted = BatchRepository::new(pool)
-        .get(batch.batch.id)
+        .get(batch.id)
         .await
         .expect("batch should reload");
     assert_eq!(persisted.status, BatchStatus::Exported);
@@ -867,15 +932,15 @@ async fn item_review_rolls_back_when_export_fallback_cannot_be_persisted() {
     let original_amount = item.amount_cents;
     items.insert(&item).await.expect("item should insert");
     batches
-        .assign_items(batch.batch.id, &[item.id])
+        .assign_items(batch.id, &[item.id])
         .await
         .expect("item should assign");
-    mark_exported(&pool, batch.batch.id).await;
+    mark_exported(&pool, batch.id).await;
     sqlx::query(&format!(
         "CREATE TRIGGER fail_review_fallback BEFORE UPDATE ON batches \
          WHEN OLD.id = '{}' AND NEW.status = 'draft' \
          BEGIN SELECT RAISE(ABORT, 'forced review fallback failure'); END",
-        batch.batch.id
+        batch.id
     ))
     .execute(&pool)
     .await
@@ -904,7 +969,7 @@ async fn item_review_rolls_back_when_export_fallback_cannot_be_persisted() {
         ConfirmationStatus::Pending
     );
     let persisted_batch = BatchRepository::new(pool)
-        .get(batch.batch.id)
+        .get(batch.id)
         .await
         .expect("batch should reload");
     assert_eq!(persisted_batch.status, BatchStatus::Exported);
@@ -935,14 +1000,14 @@ async fn concurrent_assignments_cannot_give_one_item_to_two_batches() {
     let barrier = Arc::new(Barrier::new(2));
     let first_service = service.clone();
     let first_barrier = barrier.clone();
-    let first_id = first_batch.batch.id;
+    let first_id = first_batch.id;
     let item_id = item.id;
     let first = tokio::spawn(async move {
         first_barrier.wait().await;
         first_service.assign_items(first_id, &[item_id]).await
     });
     let second_service = service.clone();
-    let second_id = second_batch.batch.id;
+    let second_id = second_batch.id;
     let second = tokio::spawn(async move {
         barrier.wait().await;
         second_service.assign_items(second_id, &[item_id]).await
@@ -950,14 +1015,16 @@ async fn concurrent_assignments_cannot_give_one_item_to_two_batches() {
 
     let first_result = first.await.expect("first assignment should join");
     let second_result = second.await.expect("second assignment should join");
-    let successful_batch = match (&first_result, &second_result) {
-        (Ok(detail), Err(AppError::Conflict { .. })) => detail.batch.id,
-        (Err(AppError::Conflict { .. }), Ok(detail)) => detail.batch.id,
-        outcomes => panic!("expected one success and one conflict, got {outcomes:?}"),
-    };
+    assert!(
+        first_result.is_ok() && second_result.is_ok(),
+        "serialized cross-batch assignments should both succeed: {first_result:?}, {second_result:?}"
+    );
     let persisted = ItemRepository::new(pool)
         .get_by_id(item.id)
         .await
         .expect("item should reload");
-    assert_eq!(persisted.batch_id, Some(successful_batch));
+    assert!(matches!(
+        persisted.batch_id,
+        Some(id) if id == first_id || id == second_id
+    ));
 }

@@ -323,8 +323,6 @@ impl ItemRepository {
             "SELECT {ITEM_COLUMNS} FROM items \
              WHERE batch_id IS NULL \
                AND suggested_period BETWEEN ? AND ? \
-               AND dedupe_status != 'suspected_duplicate' \
-               AND recognition_status != 'failed' \
              ORDER BY suggested_period ASC, \
                       CASE WHEN invoice_date IS NULL THEN 1 ELSE 0 END ASC, \
                       invoice_date ASC, created_at ASC, id ASC"

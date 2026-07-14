@@ -54,7 +54,7 @@ impl BatchService {
         Self { pool }
     }
 
-    pub async fn create_month(&self, year: i32, month: u32) -> Result<BatchDetail, AppError> {
+    pub async fn create_month(&self, year: i32, month: u32) -> Result<Batch, AppError> {
         if !(1..=9999).contains(&year) {
             return Err(AppError::validation(
                 "year",
@@ -86,17 +86,14 @@ impl BatchService {
         .await
     }
 
-    pub async fn create(&self, input: NewBatchInput) -> Result<BatchDetail, AppError> {
+    pub async fn create(&self, input: NewBatchInput) -> Result<Batch, AppError> {
         let batch = NewBatch::try_new(
             input.name,
             input.start_date,
             input.end_date,
             normalize_optional_text(input.note),
         )?;
-        let batch = BatchRepository::new(self.pool.clone())
-            .create(batch)
-            .await?;
-        Ok(empty_detail(batch))
+        BatchRepository::new(self.pool.clone()).create(batch).await
     }
 
     pub async fn update(
@@ -169,7 +166,7 @@ impl BatchService {
                 return Err(batch_not_found(batch_id));
             }
 
-            let mut to_assign = Vec::new();
+            let mut assignments = Vec::new();
             for item_id in item_ids {
                 let state = sqlx::query_as::<_, (String, String, Option<String>)>(
                     "SELECT recognition_status, dedupe_status, batch_id FROM items WHERE id = ?",
@@ -195,33 +192,46 @@ impl BatchService {
                     });
                 }
                 match current_batch_id {
-                    None => to_assign.push(item_id),
+                    None => assignments.push((item_id, None)),
                     Some(current) if current == batch_id.to_string() => {}
-                    Some(_) => {
-                        return Err(AppError::Conflict {
-                            message: format!("item {item_id} already belongs to another batch"),
-                        });
-                    }
+                    Some(current) => assignments.push((
+                        item_id,
+                        Some(Uuid::parse_str(&current).map_err(|_| AppError::Internal {
+                            message: "invalid item batch reference".to_owned(),
+                        })?),
+                    )),
                 }
             }
 
-            for item_id in &to_assign {
+            let updated_at = Utc::now();
+            for (item_id, _) in &assignments {
                 sqlx::query("UPDATE items SET batch_id = ?, updated_at = ? WHERE id = ?")
                     .bind(batch_id.to_string())
-                    .bind(Utc::now().to_rfc3339())
+                    .bind(updated_at.to_rfc3339())
                     .bind(item_id.to_string())
                     .execute(&mut *transaction)
                     .await
                     .map_err(|error| database_error("failed to assign item", error))?;
             }
-            if !to_assign.is_empty() {
-                sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
-                    .bind(Utc::now().to_rfc3339())
-                    .bind(batch_id.to_string())
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|error| database_error("failed to refresh assigned batch", error))?;
-                validate_summary_total(&mut transaction, batch_id).await?;
+            if !assignments.is_empty() {
+                let mut affected_batches = assignments
+                    .iter()
+                    .filter_map(|(_, old_batch_id)| *old_batch_id)
+                    .chain(std::iter::once(batch_id))
+                    .collect::<Vec<_>>();
+                affected_batches.sort_unstable();
+                affected_batches.dedup();
+                for affected_batch_id in affected_batches {
+                    sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
+                        .bind(updated_at.to_rfc3339())
+                        .bind(affected_batch_id.to_string())
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|error| {
+                            database_error("failed to refresh assigned batch", error)
+                        })?;
+                    validate_summary_total(&mut transaction, affected_batch_id).await?;
+                }
             }
             Ok(())
         }
@@ -328,15 +338,6 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-}
-
-fn empty_detail(batch: Batch) -> BatchDetail {
-    BatchDetail {
-        batch,
-        items: Vec::new(),
-        summary: BatchDetailSummary::default(),
-        warnings: Vec::new(),
-    }
 }
 
 fn build_summary(items: &[InvoiceItem]) -> Result<BatchDetailSummary, AppError> {
