@@ -488,7 +488,7 @@ fn classify_completed_rollback(
     target_os = "visionos",
     target_os = "watchos",
 ))]
-fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppError> {
+pub(crate) fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppError> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     use rustix::io::Errno;
 
@@ -505,7 +505,7 @@ fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppE
 }
 
 #[cfg(windows)]
-fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppError> {
+pub(crate) fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppError> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
@@ -549,13 +549,13 @@ fn rename_staged_original(staging: &Path, destination: &Path) -> Result<(), AppE
     target_os = "watchos",
     windows,
 )))]
-fn rename_staged_original(_staging: &Path, _destination: &Path) -> Result<(), AppError> {
+pub(crate) fn rename_staged_original(_staging: &Path, _destination: &Path) -> Result<(), AppError> {
     Err(AppError::Internal {
         message: "atomic no-replace promotion is unsupported on this platform".to_owned(),
     })
 }
 
-fn remove_file_durably(path: &Path) -> Result<(), AppError> {
+pub(crate) fn remove_file_durably(path: &Path) -> Result<(), AppError> {
     remove_file_durably_with_sync(path, sync_directory)
 }
 
@@ -578,12 +578,12 @@ fn remove_file_durably_with_sync(
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
     // std cannot portably open/sync Windows directories; this is the best available no-op.
     Ok(())
 }

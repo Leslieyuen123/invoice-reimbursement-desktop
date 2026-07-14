@@ -126,9 +126,28 @@ pub struct ItemPatch {
     pub project_tag: Option<Option<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewedItemFields {
+    pub invoice_date: Option<NaiveDate>,
+    pub suggested_period: String,
+    pub final_category: Category,
+    pub amount_cents: i64,
+    pub city: Option<String>,
+    pub company: Option<String>,
+    pub note: Option<String>,
+    pub event_tag: Option<String>,
+    pub project_tag: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ItemRepository {
     pool: SqlitePool,
+}
+
+pub(crate) struct DuplicateDiscardClaim {
+    transaction: Transaction<'static, Sqlite>,
+    item: InvoiceItem,
+    protected_paths: Vec<String>,
 }
 
 impl ItemRepository {
@@ -291,6 +310,25 @@ impl ItemRepository {
     }
 
     pub async fn update_fields(&self, id: Uuid, patch: ItemPatch) -> Result<InvoiceItem, AppError> {
+        self.update_fields_internal(id, patch, None).await
+    }
+
+    pub(crate) async fn update_recognition_fields(
+        &self,
+        id: Uuid,
+        expected_updated_at: DateTime<Utc>,
+        patch: ItemPatch,
+    ) -> Result<InvoiceItem, AppError> {
+        self.update_fields_internal(id, patch, Some(expected_updated_at))
+            .await
+    }
+
+    async fn update_fields_internal(
+        &self,
+        id: Uuid,
+        patch: ItemPatch,
+        recognition_started_at_version: Option<DateTime<Utc>>,
+    ) -> Result<InvoiceItem, AppError> {
         if let Some(amount_cents) = patch.amount_cents {
             validate_amount(amount_cents)?;
         }
@@ -311,6 +349,17 @@ impl ItemRepository {
                 message: format!("item {id} was not found"),
             })?;
         let mut item = InvoiceItem::try_from(row)?;
+
+        if recognition_started_at_version.is_some_and(|version| item.updated_at != version)
+            && item.confirmation_status == ConfirmationStatus::Confirmed
+            && item.final_category.is_some()
+        {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| internal_error("failed to finish guarded item update", error))?;
+            return Ok(item);
+        }
 
         if let Some(value) = patch.normalized_pdf_path {
             item.normalized_pdf_path = value;
@@ -410,6 +459,176 @@ impl ItemRepository {
             .map_err(|error| internal_error("failed to commit item update", error))?;
 
         Ok(refreshed)
+    }
+
+    pub(crate) async fn review_item(
+        &self,
+        id: Uuid,
+        fields: ReviewedItemFields,
+    ) -> Result<InvoiceItem, AppError> {
+        validate_amount(Some(fields.amount_cents))?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin item review", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if item.dedupe_status == DedupeStatus::SuspectedDuplicate {
+                return Err(AppError::Conflict {
+                    message: "resolve the suspected duplicate before reviewing it".to_owned(),
+                });
+            }
+
+            sqlx::query(
+                "UPDATE items SET \
+                    invoice_date = ?, suggested_period = ?, final_category = ?, \
+                    amount_cents = ?, city = ?, company = ?, note = ?, event_tag = ?, \
+                    project_tag = ?, recognition_status = 'succeeded', \
+                    confirmation_status = 'confirmed', updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(fields.invoice_date.map(|date| date.to_string()))
+            .bind(fields.suggested_period)
+            .bind(category_str(fields.final_category))
+            .bind(fields.amount_cents)
+            .bind(fields.city)
+            .bind(fields.company)
+            .bind(fields.note)
+            .bind(fields.event_tag)
+            .bind(fields.project_tag)
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to review item", error))?;
+
+            get_with_connection(&mut transaction, id).await
+        }
+        .await;
+
+        finish_transaction(transaction, result).await
+    }
+
+    pub(crate) async fn keep_suspected_duplicate(&self, id: Uuid) -> Result<InvoiceItem, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin duplicate resolution", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if item.dedupe_status != DedupeStatus::SuspectedDuplicate {
+                return Err(AppError::Conflict {
+                    message: "item is not awaiting duplicate resolution".to_owned(),
+                });
+            }
+
+            sqlx::query(
+                "UPDATE items SET dedupe_status = 'resolved', duplicate_of_id = NULL, \
+                    updated_at = ? WHERE id = ?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to keep duplicate item", error))?;
+            get_with_connection(&mut transaction, id).await
+        }
+        .await;
+
+        finish_transaction(transaction, result).await
+    }
+
+    pub(crate) async fn claim_duplicate_discard(
+        &self,
+        id: Uuid,
+    ) -> Result<DuplicateDiscardClaim, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to claim duplicate deletion", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if item.dedupe_status != DedupeStatus::SuspectedDuplicate {
+                return Err(AppError::Conflict {
+                    message: "item is not awaiting duplicate resolution".to_owned(),
+                });
+            }
+            let rows = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT original_path, normalized_pdf_path FROM items WHERE id != ?",
+            )
+            .bind(id.to_string())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to load protected item paths", error))?;
+            let protected_paths = rows
+                .into_iter()
+                .flat_map(|(original, normalized)| [Some(original), normalized])
+                .flatten()
+                .collect();
+            Ok((item, protected_paths))
+        }
+        .await;
+
+        match result {
+            Ok((item, protected_paths)) => Ok(DuplicateDiscardClaim {
+                transaction,
+                item,
+                protected_paths,
+            }),
+            Err(error) => match transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AppError::Internal {
+                    message: format!(
+                        "duplicate deletion claim failed and rollback also failed: original error: \
+                         {error}; rollback error: {rollback_error}"
+                    ),
+                }),
+            },
+        }
+    }
+}
+
+impl DuplicateDiscardClaim {
+    pub fn item(&self) -> &InvoiceItem {
+        &self.item
+    }
+
+    pub fn protected_paths(&self) -> &[String] {
+        &self.protected_paths
+    }
+
+    pub async fn delete(mut self) -> Result<(), AppError> {
+        let result = sqlx::query("DELETE FROM items WHERE id = ?")
+            .bind(self.item.id.to_string())
+            .execute(&mut *self.transaction)
+            .await
+            .map(|_| ())
+            .map_err(|error| map_database_error("failed to delete duplicate item", error));
+        match result {
+            Ok(()) => {
+                self.transaction.commit().await.map_err(|error| {
+                    map_database_error("failed to commit duplicate deletion", error)
+                })
+            }
+            Err(error) => match self.transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AppError::Internal {
+                    message: format!(
+                        "duplicate deletion failed and rollback also failed: original error: \
+                         {error}; rollback error: {rollback_error}"
+                    ),
+                }),
+            },
+        }
+    }
+
+    pub async fn rollback(self) -> Result<(), AppError> {
+        self.transaction.rollback().await.map_err(|error| {
+            map_database_error("failed to release duplicate deletion claim", error)
+        })
     }
 }
 

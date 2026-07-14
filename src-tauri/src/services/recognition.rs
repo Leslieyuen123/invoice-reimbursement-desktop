@@ -85,7 +85,16 @@ impl RecognitionService {
     }
 
     pub async fn recognize_item(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
+        self.recognize_item_with_policy(id, true).await
+    }
+
+    async fn recognize_item_with_policy(
+        &self,
+        id: uuid::Uuid,
+        preserve_manual_confirmation: bool,
+    ) -> Result<InvoiceItem, AppError> {
         let item = self.items.get_by_id(id).await?;
+        let recognition_started_at_version = item.updated_at;
         let received_date = item.fetched_at.date_naive();
         let path = PathBuf::from(&item.original_path);
         let extractor = self.extractor.clone();
@@ -98,48 +107,66 @@ impl RecognitionService {
         let extracted = match extraction {
             Ok(extracted) => extracted,
             Err(extraction_error) => {
-                self.items
-                    .update_fields(
-                        id,
-                        ItemPatch {
-                            invoice_date: Some(None),
-                            suggested_period: Some(None),
-                            suggested_category: Some(None),
-                            amount_cents: Some(None),
-                            city: Some(None),
-                            company: Some(None),
-                            recognition_status: Some(RecognitionStatus::Failed),
-                            confirmation_status: Some(ConfirmationStatus::Pending),
-                            ..ItemPatch::default()
-                        },
-                    )
-                    .await?;
+                self.persist_recognition_patch(
+                    id,
+                    ItemPatch {
+                        invoice_date: Some(None),
+                        suggested_period: Some(None),
+                        suggested_category: Some(None),
+                        amount_cents: Some(None),
+                        city: Some(None),
+                        company: Some(None),
+                        recognition_status: Some(RecognitionStatus::Failed),
+                        confirmation_status: Some(ConfirmationStatus::Pending),
+                        ..ItemPatch::default()
+                    },
+                    preserve_manual_confirmation,
+                    recognition_started_at_version,
+                )
+                .await?;
                 return Err(extraction_error);
             }
         };
         let recognized =
             recognize_with_warnings(&extracted.text, received_date, &extracted.warnings);
 
-        self.items
-            .update_fields(
-                id,
-                ItemPatch {
-                    invoice_date: Some(recognized.invoice_date),
-                    suggested_period: Some(Some(recognized.suggested_period)),
-                    suggested_category: Some(recognized.category),
-                    amount_cents: Some(recognized.amount_cents),
-                    city: Some(recognized.city),
-                    company: Some(recognized.company),
-                    recognition_status: Some(recognized.recognition_status),
-                    confirmation_status: Some(recognized.confirmation_status),
-                    ..ItemPatch::default()
-                },
-            )
-            .await
+        self.persist_recognition_patch(
+            id,
+            ItemPatch {
+                invoice_date: Some(recognized.invoice_date),
+                suggested_period: Some(Some(recognized.suggested_period)),
+                suggested_category: Some(recognized.category),
+                amount_cents: Some(recognized.amount_cents),
+                city: Some(recognized.city),
+                company: Some(recognized.company),
+                recognition_status: Some(recognized.recognition_status),
+                confirmation_status: Some(recognized.confirmation_status),
+                ..ItemPatch::default()
+            },
+            preserve_manual_confirmation,
+            recognition_started_at_version,
+        )
+        .await
     }
 
     pub async fn retry(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
-        self.recognize_item(id).await
+        self.recognize_item_with_policy(id, false).await
+    }
+
+    async fn persist_recognition_patch(
+        &self,
+        id: uuid::Uuid,
+        patch: ItemPatch,
+        preserve_manual_confirmation: bool,
+        recognition_started_at_version: chrono::DateTime<chrono::Utc>,
+    ) -> Result<InvoiceItem, AppError> {
+        if preserve_manual_confirmation {
+            self.items
+                .update_recognition_fields(id, recognition_started_at_version, patch)
+                .await
+        } else {
+            self.items.update_fields(id, patch).await
+        }
     }
 }
 
