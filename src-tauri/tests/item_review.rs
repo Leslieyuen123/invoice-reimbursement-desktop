@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -796,6 +796,131 @@ async fn concurrent_discards_claim_the_item_before_any_file_isolation() {
         1,
         "the losing discard must not touch files"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_discard_still_completes_the_internal_delete_protocol() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let canonical = sample_item(&paths, "cancel-delete-canonical");
+    repository
+        .insert(&canonical)
+        .await
+        .expect("canonical item should insert");
+    let mut duplicate = sample_item(&paths, "cancel-delete-duplicate");
+    duplicate.dedupe_status = DedupeStatus::SuspectedDuplicate;
+    duplicate.duplicate_of_id = Some(canonical.id);
+    repository
+        .insert(&duplicate)
+        .await
+        .expect("duplicate should insert");
+    let (started_tx, started_rx) = sync_channel(1);
+    let (proceed_tx, proceed_rx) = sync_channel(1);
+    let finished = Arc::new(AtomicBool::new(false));
+    let lifecycle = CancellationGatedLifecycle {
+        inner: StorageFileLifecycle::new(paths.clone()),
+        started: started_tx,
+        proceed: Mutex::new(proceed_rx),
+        fail_isolation: false,
+        isolate_finished: finished.clone(),
+    };
+    let service = ItemService::with_file_lifecycle(repository.clone(), Arc::new(lifecycle));
+    let caller = tokio::spawn(async move { service.resolve_duplicate(duplicate.id, false).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+        .await
+        .expect("isolation start should be observed");
+
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    proceed_tx.send(()).expect("isolation should resume");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let row_deleted = matches!(
+                repository.get_by_id(duplicate.id).await,
+                Err(AppError::NotFound { .. })
+            );
+            let files_purged = !std::path::Path::new(&duplicate.original_path).exists()
+                && !std::path::Path::new(duplicate.normalized_pdf_path.as_deref().unwrap())
+                    .exists();
+            if row_deleted && files_purged {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached delete protocol should finish");
+    assert!(finished.load(Ordering::SeqCst));
+    assert!(std::path::Path::new(&canonical.original_path).is_file());
+    assert!(std::path::Path::new(canonical.normalized_pdf_path.as_deref().unwrap()).is_file());
+    assert_no_isolated_files(&paths.originals);
+    assert_no_isolated_files(&paths.normalized);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_discard_with_isolation_failure_releases_claim_and_keeps_files() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let paths = AppPaths::create(directory.path().join("storage"))
+        .expect("application paths should create");
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool.clone());
+    let canonical = sample_item(&paths, "cancel-failure-canonical");
+    repository
+        .insert(&canonical)
+        .await
+        .expect("canonical item should insert");
+    let mut duplicate = sample_item(&paths, "cancel-failure-duplicate");
+    duplicate.dedupe_status = DedupeStatus::SuspectedDuplicate;
+    duplicate.duplicate_of_id = Some(canonical.id);
+    repository
+        .insert(&duplicate)
+        .await
+        .expect("duplicate should insert");
+    let (started_tx, started_rx) = sync_channel(1);
+    let (proceed_tx, proceed_rx) = sync_channel(1);
+    let finished = Arc::new(AtomicBool::new(false));
+    let lifecycle = CancellationGatedLifecycle {
+        inner: StorageFileLifecycle::new(paths.clone()),
+        started: started_tx,
+        proceed: Mutex::new(proceed_rx),
+        fail_isolation: true,
+        isolate_finished: finished.clone(),
+    };
+    let service = ItemService::with_file_lifecycle(repository.clone(), Arc::new(lifecycle));
+    let caller = tokio::spawn(async move { service.resolve_duplicate(duplicate.id, false).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+        .await
+        .expect("isolation start should be observed");
+
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    proceed_tx.send(()).expect("isolation should resume");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !finished.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let transaction = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("detached failure protocol should release its claim");
+        transaction.rollback().await.unwrap();
+    })
+    .await
+    .expect("detached failure protocol should finish");
+    assert!(repository.get_by_id(duplicate.id).await.is_ok());
+    assert!(std::path::Path::new(&duplicate.original_path).is_file());
+    assert!(std::path::Path::new(duplicate.normalized_pdf_path.as_deref().unwrap()).is_file());
+    assert_no_isolated_files(&paths.originals);
+    assert_no_isolated_files(&paths.normalized);
 }
 
 #[tokio::test]
@@ -1595,6 +1720,57 @@ struct PathChangesDuringIsolation {
 #[derive(Default)]
 struct SlowCountingLifecycle {
     isolate_calls: AtomicUsize,
+}
+
+struct CancellationGatedLifecycle {
+    inner: StorageFileLifecycle,
+    started: SyncSender<()>,
+    proceed: Mutex<Receiver<()>>,
+    fail_isolation: bool,
+    isolate_finished: Arc<AtomicBool>,
+}
+
+impl FileLifecycle for CancellationGatedLifecycle {
+    fn recover(
+        &self,
+        referenced_paths: &std::collections::HashSet<PathBuf>,
+    ) -> Result<(), AppError> {
+        self.inner.recover(referenced_paths)
+    }
+
+    fn isolate(
+        &self,
+        files: &ItemFiles,
+        protected_paths: &[PathBuf],
+    ) -> Result<IsolatedItemFiles, AppError> {
+        self.started
+            .send(())
+            .expect("isolation should announce start");
+        self.proceed
+            .lock()
+            .expect("isolation gate should lock")
+            .recv()
+            .expect("isolation should be released");
+        let result = if self.fail_isolation {
+            Err(AppError::External {
+                service: "filesystem_sync".to_owned(),
+                retryable: false,
+                message: "injected isolation failure".to_owned(),
+            })
+        } else {
+            self.inner.isolate(files, protected_paths)
+        };
+        self.isolate_finished.store(true, Ordering::SeqCst);
+        result
+    }
+
+    fn restore(&self, isolated: &IsolatedItemFiles) -> Result<(), AppError> {
+        self.inner.restore(isolated)
+    }
+
+    fn purge(&self, isolated: &IsolatedItemFiles) -> Result<(), AppError> {
+        self.inner.purge(isolated)
+    }
 }
 
 impl FileLifecycle for SlowCountingLifecycle {

@@ -152,11 +152,19 @@ impl ItemService {
         id: Uuid,
         keep: bool,
     ) -> Result<Option<InvoiceItem>, AppError> {
-        self.ensure_recovered().await?;
         if keep {
+            self.ensure_recovered().await?;
             return self.items.keep_suspected_duplicate(id).await.map(Some);
         }
 
+        let service = self.clone();
+        tokio::spawn(async move { service.discard_duplicate(id).await })
+            .await
+            .map_err(|error| filesystem_task_error("duplicate resolution task failed", error))?
+    }
+
+    async fn discard_duplicate(&self, id: Uuid) -> Result<Option<InvoiceItem>, AppError> {
+        self.ensure_recovered().await?;
         let claim = self.items.claim_duplicate_discard(id).await?;
         let item = claim.item().clone();
         let protected_paths = claim
