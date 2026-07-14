@@ -5,7 +5,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::db::batches::{Batch, BatchRepository};
-use crate::db::items::{InvoiceItem, ItemFilter, ItemRepository};
+use crate::db::items::{InvoiceItem, ItemRepository};
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, NewBatch, RecognitionStatus,
@@ -107,10 +107,17 @@ impl BatchService {
             input.end_date,
             normalize_optional_text(input.note),
         )?;
-        BatchRepository::new(self.pool.clone())
-            .update(batch_id, batch)
-            .await?;
-        self.detail(batch_id).await
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| database_error("failed to begin batch update", error))?;
+        let result = async {
+            BatchRepository::update_with_connection(&mut transaction, batch_id, &batch).await?;
+            Self::detail_with_connection(&mut transaction, batch_id).await
+        }
+        .await;
+        finish_detail_transaction(transaction, result).await
     }
 
     pub async fn recommend(
@@ -299,15 +306,21 @@ impl BatchService {
     }
 
     async fn detail(&self, batch_id: Uuid) -> Result<BatchDetail, AppError> {
-        let batch = BatchRepository::new(self.pool.clone())
-            .get(batch_id)
-            .await?;
-        let items = ItemRepository::new(self.pool.clone())
-            .list(ItemFilter {
-                batch_id: Some(batch_id),
-                ..ItemFilter::default()
-            })
-            .await?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| database_error("failed to begin batch detail", error))?;
+        let result = Self::detail_with_connection(&mut transaction, batch_id).await;
+        finish_detail_transaction(transaction, result).await
+    }
+
+    async fn detail_with_connection(
+        connection: &mut SqliteConnection,
+        batch_id: Uuid,
+    ) -> Result<BatchDetail, AppError> {
+        let batch = BatchRepository::get_with_connection(connection, batch_id).await?;
+        let items = ItemRepository::list_by_batch_with_connection(connection, batch_id).await?;
         let warnings = items
             .iter()
             .filter(|item| {
@@ -415,6 +428,25 @@ async fn finish_unit_transaction(
             Ok(()) => Err(error),
             Err(_) => Err(AppError::Internal {
                 message: "batch transaction failed and rollback also failed".to_owned(),
+            }),
+        },
+    }
+}
+
+async fn finish_detail_transaction(
+    transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
+    result: Result<BatchDetail, AppError>,
+) -> Result<BatchDetail, AppError> {
+    match result {
+        Ok(detail) => transaction
+            .commit()
+            .await
+            .map(|()| detail)
+            .map_err(|error| database_error("failed to commit batch detail transaction", error)),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(_) => Err(AppError::Internal {
+                message: "batch detail transaction failed and rollback also failed".to_owned(),
             }),
         },
     }

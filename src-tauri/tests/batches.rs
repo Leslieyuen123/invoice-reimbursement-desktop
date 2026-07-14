@@ -705,6 +705,113 @@ async fn updating_exported_batch_name_or_dates_falls_back_and_preserves_export_t
 }
 
 #[tokio::test]
+async fn update_rolls_back_batch_fields_when_detail_amounts_overflow() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+    let mut maximum = sample_item(68, Some("2026-02"));
+    maximum.amount_cents = Some(i64::MAX);
+    let mut one = sample_item(69, Some("2026-02"));
+    one.amount_cents = Some(1);
+    items
+        .insert(&maximum)
+        .await
+        .expect("maximum item should insert");
+    items
+        .insert(&one)
+        .await
+        .expect("one-cent item should insert");
+    sqlx::query("UPDATE items SET batch_id = ? WHERE id IN (?, ?)")
+        .bind(batch.id.to_string())
+        .bind(maximum.id.to_string())
+        .bind(one.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("overflow fixture should assign directly");
+    mark_exported(&pool, batch.id).await;
+
+    let error = service
+        .update(
+            batch.id,
+            NewBatchInput {
+                name: "Must roll back".to_owned(),
+                start_date: "2026-01-31".to_owned(),
+                end_date: "2026-03-01".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .expect_err("overflowing detail should fail the update");
+
+    assert_eq!(
+        error,
+        AppError::Internal {
+            message: "batch summary amount overflow".to_owned(),
+        }
+    );
+    let persisted = BatchRepository::new(pool)
+        .get(batch.id)
+        .await
+        .expect("batch should reload");
+    assert_eq!(persisted.name, batch.name);
+    assert_eq!(persisted.start_date, batch.start_date);
+    assert_eq!(persisted.end_date, batch.end_date);
+    assert_eq!(persisted.status, BatchStatus::Exported);
+    assert!(persisted.last_exported_at.is_some());
+}
+
+#[tokio::test]
+async fn update_rolls_back_batch_fields_when_an_item_row_cannot_decode() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+    let mut item = sample_item(73, Some("2026-02"));
+    item.batch_id = Some(batch.id);
+    items.insert(&item).await.expect("item should insert");
+    mark_exported(&pool, batch.id).await;
+    sqlx::query("UPDATE items SET invoice_date = 'not-a-date' WHERE id = ?")
+        .bind(item.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("bad item row should be injected");
+
+    service
+        .update(
+            batch.id,
+            NewBatchInput {
+                name: "Must also roll back".to_owned(),
+                start_date: "2026-01-31".to_owned(),
+                end_date: "2026-03-01".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .expect_err("undecodable detail should fail the update");
+
+    let persisted = BatchRepository::new(pool)
+        .get(batch.id)
+        .await
+        .expect("batch should reload");
+    assert_eq!(persisted.name, batch.name);
+    assert_eq!(persisted.start_date, batch.start_date);
+    assert_eq!(persisted.end_date, batch.end_date);
+    assert_eq!(persisted.status, BatchStatus::Exported);
+    assert!(persisted.last_exported_at.is_some());
+}
+
+#[tokio::test]
 async fn exported_batch_falls_back_only_for_actual_assignment_changes() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -997,6 +1104,17 @@ async fn concurrent_assignments_cannot_give_one_item_to_two_batches() {
         .insert(&item)
         .await
         .expect("item should insert");
+    mark_exported(&pool, first_batch.id).await;
+    mark_exported(&pool, second_batch.id).await;
+    let batch_repository = BatchRepository::new(pool.clone());
+    let first_before = batch_repository
+        .get(first_batch.id)
+        .await
+        .expect("first batch should load before assignment");
+    let second_before = batch_repository
+        .get(second_batch.id)
+        .await
+        .expect("second batch should load before assignment");
     let barrier = Arc::new(Barrier::new(2));
     let first_service = service.clone();
     let first_barrier = barrier.clone();
@@ -1015,16 +1133,54 @@ async fn concurrent_assignments_cannot_give_one_item_to_two_batches() {
 
     let first_result = first.await.expect("first assignment should join");
     let second_result = second.await.expect("second assignment should join");
-    assert!(
-        first_result.is_ok() && second_result.is_ok(),
-        "serialized cross-batch assignments should both succeed: {first_result:?}, {second_result:?}"
-    );
-    let persisted = ItemRepository::new(pool)
+    let first_detail = first_result.expect("first assignment should succeed");
+    let second_detail = second_result.expect("second assignment should succeed");
+    for (detail, expected_id) in [(&first_detail, first_id), (&second_detail, second_id)] {
+        assert_eq!(detail.batch.id, expected_id);
+        assert_eq!(detail.batch.status, BatchStatus::Draft);
+        assert!(detail.batch.last_exported_at.is_some());
+        assert_eq!(detail.summary.item_count, detail.items.len() as u64);
+        assert!(
+            detail
+                .items
+                .iter()
+                .all(|item| item.batch_id == Some(expected_id))
+        );
+    }
+    let persisted = ItemRepository::new(pool.clone())
         .get_by_id(item.id)
         .await
         .expect("item should reload");
-    assert!(matches!(
-        persisted.batch_id,
-        Some(id) if id == first_id || id == second_id
-    ));
+    let winner = persisted.batch_id.expect("item should remain assigned");
+    assert!(winner == first_id || winner == second_id);
+    let first_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items WHERE batch_id = ?")
+        .bind(first_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("first batch count should load");
+    let second_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items WHERE batch_id = ?")
+            .bind(second_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("second batch count should load");
+    assert_eq!(first_count + second_count, 1);
+    assert_eq!(first_count, i64::from(winner == first_id));
+    assert_eq!(second_count, i64::from(winner == second_id));
+
+    let first_after = batch_repository
+        .get(first_id)
+        .await
+        .expect("first batch should reload");
+    let second_after = batch_repository
+        .get(second_id)
+        .await
+        .expect("second batch should reload");
+    assert_eq!(first_after.status, BatchStatus::Draft);
+    assert_eq!(second_after.status, BatchStatus::Draft);
+    assert!(first_after.last_exported_at.is_some());
+    assert!(second_after.last_exported_at.is_some());
+    assert!(first_after.updated_at > first_before.updated_at);
+    assert!(second_after.updated_at > second_before.updated_at);
+    assert_eq!(first_after.updated_at, second_after.updated_at);
 }

@@ -1143,6 +1143,54 @@ async fn batch_repository_list_aggregates_only_assigned_items() {
 }
 
 #[tokio::test]
+async fn batch_repository_list_reports_stable_rust_amount_overflow() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let batches = BatchRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    batches
+        .create(sample_batch("Healthy batch"))
+        .await
+        .expect("healthy batch should create");
+    let overflowing = batches
+        .create(sample_batch("Overflowing batch"))
+        .await
+        .expect("overflowing batch should create");
+    let mut maximum = sample_item("list-overflow-max", "sha-list-overflow-max");
+    maximum.amount_cents = Some(i64::MAX);
+    let mut one = sample_item("list-overflow-one", "sha-list-overflow-one");
+    one.amount_cents = Some(1);
+    items
+        .insert(&maximum)
+        .await
+        .expect("maximum item should insert");
+    items
+        .insert(&one)
+        .await
+        .expect("one-cent item should insert");
+    sqlx::query("UPDATE items SET batch_id = ? WHERE id IN (?, ?)")
+        .bind(overflowing.id.to_string())
+        .bind(maximum.id.to_string())
+        .bind(one.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("overflow fixture should assign directly");
+
+    let error = batches
+        .list()
+        .await
+        .expect_err("one overflowing batch should fail the full list");
+
+    assert_eq!(
+        error,
+        AppError::Internal {
+            message: "batch summary amount overflow".to_owned(),
+        }
+    );
+}
+
+#[tokio::test]
 async fn batch_repository_list_orders_by_updated_at_then_id_descending() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -1214,6 +1262,187 @@ async fn deleting_a_batch_keeps_assigned_items_and_clears_their_batch_id() {
         batches.get(batch.id).await,
         Err(AppError::NotFound { ref entity, .. }) if entity == "batch"
     ));
+}
+
+#[tokio::test]
+async fn assigned_public_inserts_fall_back_exported_batches_and_preserve_export_time() {
+    for mode in [InsertMode::Plain, InsertMode::Deduplicated] {
+        let pool = db::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should connect");
+        let batches = BatchRepository::new(pool.clone());
+        let items = ItemRepository::new(pool.clone());
+        let batch = batches
+            .create(sample_batch("Exported insert target"))
+            .await
+            .expect("batch should create");
+        sqlx::query("UPDATE batches SET status = 'exported', last_exported_at = ? WHERE id = ?")
+            .bind("2026-07-14T08:00:00Z")
+            .bind(batch.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("batch should mark exported");
+        let mut item = sample_item(mode.label(), &format!("sha-assigned-{}", mode.label()));
+        item.batch_id = Some(batch.id);
+
+        insert_with_mode(&items, item, mode)
+            .await
+            .expect("assigned item should insert");
+
+        let persisted = batches.get(batch.id).await.expect("batch should reload");
+        assert_eq!(persisted.status, BatchStatus::Draft);
+        assert_eq!(
+            persisted
+                .last_exported_at
+                .expect("export time should remain")
+                .to_rfc3339(),
+            "2026-07-14T08:00:00+00:00"
+        );
+    }
+}
+
+#[tokio::test]
+async fn assigned_public_inserts_report_missing_batches_and_roll_back_rows() {
+    for mode in [InsertMode::Plain, InsertMode::Deduplicated] {
+        let pool = db::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should connect");
+        let items = ItemRepository::new(pool);
+        let mut item = sample_item(
+            &format!("missing-{}", mode.label()),
+            &format!("sha-missing-{}", mode.label()),
+        );
+        item.batch_id = Some(Uuid::from_u128(404));
+        let item_id = item.id;
+
+        let error = insert_with_mode(&items, item, mode)
+            .await
+            .expect_err("missing batch should reject assigned insert");
+
+        assert!(matches!(
+            error,
+            AppError::NotFound { ref entity, .. } if entity == "batch"
+        ));
+        assert!(matches!(
+            items.get_by_id(item_id).await,
+            Err(AppError::NotFound { ref entity, .. }) if entity == "item"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn assigned_public_inserts_reject_invalid_item_states_without_partial_writes() {
+    for mode in [InsertMode::Plain, InsertMode::Deduplicated] {
+        for invalid_state in ["duplicate", "failed"] {
+            let pool = db::connect("sqlite::memory:")
+                .await
+                .expect("in-memory database should connect");
+            let batches = BatchRepository::new(pool.clone());
+            let items = ItemRepository::new(pool.clone());
+            let batch = batches
+                .create(sample_batch("Invalid insert target"))
+                .await
+                .expect("batch should create");
+            let shared_hash = format!("sha-{}-{invalid_state}", mode.label());
+            if matches!(mode, InsertMode::Deduplicated) && invalid_state == "duplicate" {
+                let canonical = sample_item(&format!("canonical-{}", mode.label()), &shared_hash);
+                items
+                    .insert(&canonical)
+                    .await
+                    .expect("canonical item should insert");
+            }
+            sqlx::query(
+                "UPDATE batches SET status = 'exported', last_exported_at = ? WHERE id = ?",
+            )
+            .bind("2026-07-14T08:00:00Z")
+            .bind(batch.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("batch should mark exported");
+            let mut candidate = sample_item(
+                &format!("invalid-{}-{invalid_state}", mode.label()),
+                &shared_hash,
+            );
+            candidate.batch_id = Some(batch.id);
+            match invalid_state {
+                "duplicate" if matches!(mode, InsertMode::Plain) => {
+                    candidate.dedupe_status = DedupeStatus::SuspectedDuplicate;
+                }
+                "failed" => candidate.recognition_status = RecognitionStatus::Failed,
+                _ => {}
+            }
+            let candidate_id = candidate.id;
+
+            let error = insert_with_mode(&items, candidate, mode)
+                .await
+                .expect_err("invalid assigned item should not insert");
+
+            assert!(matches!(error, AppError::Conflict { .. }));
+            assert!(matches!(
+                items.get_by_id(candidate_id).await,
+                Err(AppError::NotFound { ref entity, .. }) if entity == "item"
+            ));
+            let persisted = batches.get(batch.id).await.expect("batch should reload");
+            assert_eq!(persisted.status, BatchStatus::Exported);
+            assert!(persisted.last_exported_at.is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn assigned_public_inserts_roll_back_batch_total_overflow() {
+    for mode in [InsertMode::Plain, InsertMode::Deduplicated] {
+        let pool = db::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should connect");
+        let batches = BatchRepository::new(pool.clone());
+        let items = ItemRepository::new(pool.clone());
+        let batch = batches
+            .create(sample_batch("Overflow insert target"))
+            .await
+            .expect("batch should create");
+        let mut maximum = sample_item(
+            &format!("maximum-{}", mode.label()),
+            &format!("sha-maximum-{}", mode.label()),
+        );
+        maximum.batch_id = Some(batch.id);
+        maximum.amount_cents = Some(i64::MAX);
+        items
+            .insert(&maximum)
+            .await
+            .expect("maximum item should insert");
+        sqlx::query("UPDATE batches SET status = 'exported', last_exported_at = ? WHERE id = ?")
+            .bind("2026-07-14T08:00:00Z")
+            .bind(batch.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("batch should mark exported");
+        let mut candidate = sample_item(
+            &format!("overflow-{}", mode.label()),
+            &format!("sha-overflow-{}", mode.label()),
+        );
+        candidate.batch_id = Some(batch.id);
+        candidate.amount_cents = Some(1);
+        let candidate_id = candidate.id;
+
+        let error = insert_with_mode(&items, candidate, mode)
+            .await
+            .expect_err("overflowing assigned item should not insert");
+
+        assert_eq!(
+            error,
+            AppError::Internal {
+                message: "batch summary amount overflow".to_owned(),
+            }
+        );
+        assert!(matches!(
+            items.get_by_id(candidate_id).await,
+            Err(AppError::NotFound { ref entity, .. }) if entity == "item"
+        ));
+        let persisted = batches.get(batch.id).await.expect("batch should reload");
+        assert_eq!(persisted.status, BatchStatus::Exported);
+        assert!(persisted.last_exported_at.is_some());
+    }
 }
 
 #[tokio::test]
@@ -1568,6 +1797,32 @@ async fn persisted_domain_enums_round_trip_through_repository_rows() {
 
 fn sample_batch(name: &str) -> NewBatch {
     NewBatch::try_new(name, "2026-07-01", "2026-07-31", None).expect("sample batch should validate")
+}
+
+#[derive(Clone, Copy)]
+enum InsertMode {
+    Plain,
+    Deduplicated,
+}
+
+impl InsertMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Deduplicated => "deduplicated",
+        }
+    }
+}
+
+async fn insert_with_mode(
+    repository: &ItemRepository,
+    item: NewItemRecord,
+    mode: InsertMode,
+) -> Result<invoice_reimbursement::db::items::InvoiceItem, AppError> {
+    match mode {
+        InsertMode::Plain => repository.insert(&item).await,
+        InsertMode::Deduplicated => repository.insert_deduplicated(item).await,
+    }
 }
 
 fn sample_account(email: &str) -> NewMailboxAccount {

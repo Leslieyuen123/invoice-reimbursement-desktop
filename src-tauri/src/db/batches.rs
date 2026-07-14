@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::domain::error::AppError;
@@ -88,60 +88,134 @@ impl BatchRepository {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|_| stable_internal_error("failed to begin batch update"))?;
-        let result = async {
-            let current = get_with_transaction(&mut transaction, id).await?;
-            let export_fields_changed = current.name != batch.name()
-                || current.start_date != batch.start_date()
-                || current.end_date != batch.end_date();
-            let any_changed = export_fields_changed || current.note.as_deref() != batch.note();
-            if !any_changed {
-                return Ok(current);
-            }
-            let status = if export_fields_changed {
-                BatchStatus::Draft
-            } else {
-                current.status
-            };
-            sqlx::query(
-                "UPDATE batches SET name = ?, start_date = ?, end_date = ?, note = ?, \
-                    status = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(batch.name())
-            .bind(batch.start_date().to_string())
-            .bind(batch.end_date().to_string())
-            .bind(batch.note())
-            .bind(batch_status_str(status))
-            .bind(Utc::now().to_rfc3339())
-            .bind(id.to_string())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| stable_internal_error("failed to update batch"))?;
-            get_with_transaction(&mut transaction, id).await
-        }
-        .await;
+        let result =
+            async { Self::update_with_connection(&mut transaction, id, &batch).await }.await;
 
         finish_batch_transaction(transaction, result).await
     }
 
+    pub(crate) async fn update_with_connection(
+        connection: &mut SqliteConnection,
+        id: Uuid,
+        batch: &NewBatch,
+    ) -> Result<Batch, AppError> {
+        let current = Self::get_with_connection(connection, id).await?;
+        let export_fields_changed = current.name != batch.name()
+            || current.start_date != batch.start_date()
+            || current.end_date != batch.end_date();
+        let any_changed = export_fields_changed || current.note.as_deref() != batch.note();
+        if !any_changed {
+            return Ok(current);
+        }
+        let status = if export_fields_changed {
+            BatchStatus::Draft
+        } else {
+            current.status
+        };
+        sqlx::query(
+            "UPDATE batches SET name = ?, start_date = ?, end_date = ?, note = ?, \
+                status = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(batch.name())
+        .bind(batch.start_date().to_string())
+        .bind(batch.end_date().to_string())
+        .bind(batch.note())
+        .bind(batch_status_str(status))
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.to_string())
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| stable_internal_error("failed to update batch"))?;
+        Self::get_with_connection(connection, id).await
+    }
+
+    pub(crate) async fn get_with_connection(
+        connection: &mut SqliteConnection,
+        id: Uuid,
+    ) -> Result<Batch, AppError> {
+        let query = format!("SELECT {BATCH_COLUMNS} FROM batches WHERE id = ?");
+        let row = sqlx::query_as::<_, DbBatchRow>(&query)
+            .bind(id.to_string())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|_| stable_internal_error("failed to get batch in transaction"))?
+            .ok_or_else(|| batch_not_found(id))?;
+        Batch::try_from(row)
+    }
+
     pub async fn list(&self) -> Result<Vec<BatchSummary>, AppError> {
-        let rows = sqlx::query_as::<_, DbBatchSummaryRow>(
+        let rows = sqlx::query_as::<_, DbBatchListRow>(
             "SELECT \
                 b.id, b.name, b.start_date, b.end_date, b.status, b.note, \
                 b.created_at, b.updated_at, b.last_exported_at, \
-                COUNT(i.id) AS item_count, \
-                COALESCE(SUM(COALESCE(i.amount_cents, 0)), 0) AS total_amount_cents \
+                i.id AS item_id, i.amount_cents AS item_amount_cents \
              FROM batches b \
              LEFT JOIN items i ON i.batch_id = b.id \
-             GROUP BY \
-                b.id, b.name, b.start_date, b.end_date, b.status, b.note, \
-                b.created_at, b.updated_at, b.last_exported_at \
-             ORDER BY b.updated_at DESC, b.id DESC",
+             ORDER BY b.updated_at DESC, b.id DESC, i.id ASC",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|error| internal_error("failed to list batches", error))?;
 
-        rows.into_iter().map(BatchSummary::try_from).collect()
+        let mut summaries = Vec::<BatchSummary>::new();
+        for row in rows {
+            let DbBatchListRow {
+                id,
+                name,
+                start_date,
+                end_date,
+                status,
+                note,
+                created_at,
+                updated_at,
+                last_exported_at,
+                item_id,
+                item_amount_cents,
+            } = row;
+            let batch = Batch::try_from(DbBatchRow {
+                id,
+                name,
+                start_date,
+                end_date,
+                status,
+                note,
+                created_at,
+                updated_at,
+                last_exported_at,
+            })?;
+            if summaries
+                .last()
+                .is_none_or(|summary| summary.id != batch.id)
+            {
+                summaries.push(BatchSummary {
+                    id: batch.id,
+                    name: batch.name,
+                    start_date: batch.start_date,
+                    end_date: batch.end_date,
+                    status: batch.status,
+                    note: batch.note,
+                    created_at: batch.created_at,
+                    updated_at: batch.updated_at,
+                    last_exported_at: batch.last_exported_at,
+                    item_count: 0,
+                    total_amount_cents: 0,
+                });
+            }
+            if item_id.is_some() {
+                let summary = summaries
+                    .last_mut()
+                    .ok_or_else(|| stable_internal_error("failed to build batch summary"))?;
+                summary.item_count = summary
+                    .item_count
+                    .checked_add(1)
+                    .ok_or_else(|| stable_internal_error("batch summary item count overflow"))?;
+                summary.total_amount_cents = summary
+                    .total_amount_cents
+                    .checked_add(item_amount_cents.unwrap_or(0))
+                    .ok_or_else(|| stable_internal_error("batch summary amount overflow"))?;
+            }
+        }
+        Ok(summaries)
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
@@ -157,20 +231,6 @@ impl BatchRepository {
 
         Ok(())
     }
-}
-
-async fn get_with_transaction(
-    transaction: &mut Transaction<'_, Sqlite>,
-    id: Uuid,
-) -> Result<Batch, AppError> {
-    let query = format!("SELECT {BATCH_COLUMNS} FROM batches WHERE id = ?");
-    let row = sqlx::query_as::<_, DbBatchRow>(&query)
-        .bind(id.to_string())
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(|_| stable_internal_error("failed to get batch for update"))?
-        .ok_or_else(|| batch_not_found(id))?;
-    Batch::try_from(row)
 }
 
 async fn finish_batch_transaction(
@@ -206,7 +266,7 @@ struct DbBatchRow {
 }
 
 #[derive(FromRow)]
-struct DbBatchSummaryRow {
+struct DbBatchListRow {
     id: String,
     name: String,
     start_date: String,
@@ -216,8 +276,8 @@ struct DbBatchSummaryRow {
     created_at: String,
     updated_at: String,
     last_exported_at: Option<String>,
-    item_count: i64,
-    total_amount_cents: i64,
+    item_id: Option<String>,
+    item_amount_cents: Option<i64>,
 }
 
 impl TryFrom<DbBatchRow> for Batch {
@@ -234,26 +294,6 @@ impl TryFrom<DbBatchRow> for Batch {
             created_at: parse_datetime(&row.created_at, "created_at")?,
             updated_at: parse_datetime(&row.updated_at, "updated_at")?,
             last_exported_at: parse_optional_datetime(row.last_exported_at, "last_exported_at")?,
-        })
-    }
-}
-
-impl TryFrom<DbBatchSummaryRow> for BatchSummary {
-    type Error = AppError;
-
-    fn try_from(row: DbBatchSummaryRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: parse_uuid(&row.id, "id")?,
-            name: row.name,
-            start_date: parse_date(&row.start_date, "start_date")?,
-            end_date: parse_date(&row.end_date, "end_date")?,
-            status: parse_batch_status(&row.status)?,
-            note: row.note,
-            created_at: parse_datetime(&row.created_at, "created_at")?,
-            updated_at: parse_datetime(&row.updated_at, "updated_at")?,
-            last_exported_at: parse_optional_datetime(row.last_exported_at, "last_exported_at")?,
-            item_count: row.item_count,
-            total_amount_cents: row.total_amount_cents,
         })
     }
 }

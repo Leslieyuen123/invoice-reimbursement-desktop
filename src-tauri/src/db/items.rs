@@ -183,7 +183,10 @@ impl ItemRepository {
             .await
             .map_err(|error| map_database_error("failed to begin item transaction", error))?;
         let result = async {
+            validate_assigned_batch_exists(&mut transaction, item.batch_id).await?;
+            validate_assigned_item_state(item)?;
             insert_with_connection(&mut transaction, item).await?;
+            draft_inserted_item_batch(&mut transaction, item.batch_id, Utc::now()).await?;
             get_with_connection(&mut transaction, item.id).await
         }
         .await;
@@ -202,6 +205,7 @@ impl ItemRepository {
             .await
             .map_err(|error| map_database_error("failed to begin item transaction", error))?;
         let result = async {
+            validate_assigned_batch_exists(&mut transaction, item.batch_id).await?;
             let canonical_id =
                 find_canonical_id_with_connection(&mut transaction, &item.sha256).await?;
             match canonical_id {
@@ -214,7 +218,9 @@ impl ItemRepository {
                     item.duplicate_of_id = None;
                 }
             }
+            validate_assigned_item_state(&item)?;
             insert_with_connection(&mut transaction, &item).await?;
+            draft_inserted_item_batch(&mut transaction, item.batch_id, Utc::now()).await?;
             get_with_connection(&mut transaction, item.id).await
         }
         .await;
@@ -334,6 +340,22 @@ impl ItemRepository {
             .await
             .map_err(|error| map_database_error("failed to recommend items", error))?;
 
+        rows.into_iter().map(InvoiceItem::try_from).collect()
+    }
+
+    pub(crate) async fn list_by_batch_with_connection(
+        connection: &mut SqliteConnection,
+        batch_id: Uuid,
+    ) -> Result<Vec<InvoiceItem>, AppError> {
+        let query = format!(
+            "SELECT {ITEM_COLUMNS} FROM items WHERE batch_id = ? \
+             ORDER BY created_at DESC, id DESC"
+        );
+        let rows = sqlx::query_as::<_, DbItemRow>(&query)
+            .bind(batch_id.to_string())
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to list batch items", error))?;
         rows.into_iter().map(InvoiceItem::try_from).collect()
     }
 
@@ -686,6 +708,61 @@ impl ItemRepository {
     }
 }
 
+fn validate_assigned_item_state(item: &NewItemRecord) -> Result<(), AppError> {
+    if item.batch_id.is_none() {
+        return Ok(());
+    }
+    if item.dedupe_status == DedupeStatus::SuspectedDuplicate {
+        return Err(AppError::Conflict {
+            message: format!(
+                "item {} is a suspected duplicate and cannot be assigned",
+                item.id
+            ),
+        });
+    }
+    if item.recognition_status == RecognitionStatus::Failed {
+        return Err(AppError::Conflict {
+            message: format!(
+                "item {} has failed recognition and cannot be assigned",
+                item.id
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn validate_assigned_batch_exists(
+    connection: &mut SqliteConnection,
+    batch_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    if let Some(batch_id) = batch_id {
+        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM batches WHERE id = ?")
+            .bind(batch_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to validate item batch", error))?
+            != 0;
+        if !exists {
+            return Err(AppError::NotFound {
+                entity: "batch".to_owned(),
+                message: format!("batch {batch_id} was not found"),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn draft_inserted_item_batch(
+    connection: &mut SqliteConnection,
+    batch_id: Option<Uuid>,
+    updated_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    if let Some(batch_id) = batch_id {
+        validate_and_draft_batch(connection, batch_id, &updated_at).await?;
+    }
+    Ok(())
+}
+
 async fn reset_affected_batches(
     connection: &mut SqliteConnection,
     original_batch_id: Option<Uuid>,
@@ -699,15 +776,24 @@ async fn reset_affected_batches(
     batch_ids.sort_unstable();
     batch_ids.dedup();
     for batch_id in batch_ids {
-        validate_batch_summary_total(connection, batch_id).await?;
-        sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
-            .bind(updated_at.to_rfc3339())
-            .bind(batch_id.to_string())
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| map_database_error("failed to refresh item batch", error))?;
+        validate_and_draft_batch(connection, batch_id, &updated_at).await?;
     }
     Ok(())
+}
+
+async fn validate_and_draft_batch(
+    connection: &mut SqliteConnection,
+    batch_id: Uuid,
+    updated_at: &DateTime<Utc>,
+) -> Result<(), AppError> {
+    validate_batch_summary_total(connection, batch_id).await?;
+    sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
+        .bind(updated_at.to_rfc3339())
+        .bind(batch_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .map(|_| ())
+        .map_err(|error| map_database_error("failed to refresh item batch", error))
 }
 
 async fn validate_batch_summary_total(

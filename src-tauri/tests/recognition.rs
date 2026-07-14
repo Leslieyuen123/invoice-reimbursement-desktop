@@ -500,7 +500,7 @@ async fn retry_clears_or_replaces_old_automatic_fields_and_preserves_everything_
         })
         .await
         .unwrap();
-    let batch = BatchRepository::new(pool)
+    let batch = BatchRepository::new(pool.clone())
         .create(
             NewBatch::try_new(
                 "July claims",
@@ -530,12 +530,18 @@ async fn retry_clears_or_replaces_old_automatic_fields_and_preserves_everything_
     record.city = Some("上海".to_owned());
     record.company = Some("旧公司".to_owned());
     record.recognition_status = RecognitionStatus::Failed;
-    record.batch_id = Some(batch.id);
     record.final_category = Some(Category::Hospitality);
     record.note = Some("manual note".to_owned());
     record.event_tag = Some("client visit".to_owned());
     record.project_tag = Some("P-88".to_owned());
-    let before = repository.insert_deduplicated(record).await.unwrap();
+    let inserted = repository.insert_deduplicated(record).await.unwrap();
+    sqlx::query("UPDATE items SET batch_id = ? WHERE id = ?")
+        .bind(batch.id.to_string())
+        .bind(inserted.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = repository.get_by_id(inserted.id).await.unwrap();
     assert_eq!(before.duplicate_of_id, Some(canonical.id));
     let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
         text: "开票日期：2026-06-18 价税合计 ￥500.00".to_owned(),
