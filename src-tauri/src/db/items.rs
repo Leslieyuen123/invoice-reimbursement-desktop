@@ -241,6 +241,29 @@ impl ItemRepository {
         row.map(InvoiceItem::try_from).transpose()
     }
 
+    pub async fn find_email_part(
+        &self,
+        account_id: Uuid,
+        mailbox: &str,
+        uid: u32,
+        part_id: &str,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        let query = format!(
+            "SELECT {ITEM_COLUMNS} FROM items WHERE source_type = 'email' \
+             AND source_account_id = ? AND source_mailbox = ? AND source_uid = ? \
+             AND source_part_id = ? LIMIT 1"
+        );
+        let row = sqlx::query_as::<_, DbItemRow>(&query)
+            .bind(account_id.to_string())
+            .bind(mailbox)
+            .bind(i64::from(uid))
+            .bind(part_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to find email part", error))?;
+        row.map(InvoiceItem::try_from).transpose()
+    }
+
     pub async fn list(&self, filter: ItemFilter) -> Result<Vec<InvoiceItem>, AppError> {
         let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
         query.push(ITEM_COLUMNS).push(" FROM items WHERE 1 = 1");

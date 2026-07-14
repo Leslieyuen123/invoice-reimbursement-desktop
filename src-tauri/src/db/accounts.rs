@@ -42,6 +42,18 @@ pub struct NewMailboxAccount {
     pub sync_interval_minutes: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncCursor {
+    pub uid_validity: u32,
+    pub last_uid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRun {
+    pub id: Uuid,
+    pub account_id: Uuid,
+}
+
 #[derive(Clone)]
 pub struct MailboxAccountRepository {
     pool: SqlitePool,
@@ -100,6 +112,219 @@ impl MailboxAccountRepository {
 
         rows.into_iter().map(MailboxAccount::try_from).collect()
     }
+
+    pub async fn get_cursor(
+        &self,
+        account_id: Uuid,
+        mailbox: &str,
+    ) -> Result<Option<SyncCursor>, AppError> {
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT uid_validity, last_uid FROM sync_cursors \
+             WHERE account_id = ? AND mailbox = ?",
+        )
+        .bind(account_id.to_string())
+        .bind(mailbox)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| internal_error("failed to get sync cursor", error))?;
+
+        row.map(|(uid_validity, last_uid)| {
+            Ok(SyncCursor {
+                uid_validity: u32::try_from(uid_validity)
+                    .map_err(|error| internal_error("invalid cursor UIDVALIDITY", error))?,
+                last_uid: u32::try_from(last_uid)
+                    .map_err(|error| internal_error("invalid cursor UID", error))?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn upsert_cursor(
+        &self,
+        account_id: Uuid,
+        mailbox: &str,
+        cursor: SyncCursor,
+    ) -> Result<(), AppError> {
+        if mailbox.trim().is_empty() {
+            return Err(AppError::validation("mailbox", "mailbox must not be blank"));
+        }
+        self.get(account_id).await?;
+        sqlx::query(
+            "INSERT INTO sync_cursors (account_id, mailbox, uid_validity, last_uid) \
+             VALUES (?, ?, ?, ?) ON CONFLICT(account_id, mailbox) DO UPDATE SET \
+                uid_validity = excluded.uid_validity, last_uid = excluded.last_uid",
+        )
+        .bind(account_id.to_string())
+        .bind(mailbox)
+        .bind(i64::from(cursor.uid_validity))
+        .bind(i64::from(cursor.last_uid))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|error| internal_error("failed to upsert sync cursor", error))
+    }
+
+    pub async fn begin_sync_run(&self, account_id: Uuid) -> Result<SyncRun, AppError> {
+        self.get(account_id).await?;
+        let run = SyncRun {
+            id: Uuid::new_v4(),
+            account_id,
+        };
+        sqlx::query(
+            "INSERT INTO sync_runs (id, account_id, started_at, status) \
+             VALUES (?, ?, ?, 'running')",
+        )
+        .bind(run.id.to_string())
+        .bind(account_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| internal_error("failed to begin sync run", error))?;
+        Ok(run)
+    }
+
+    pub async fn finish_sync_success(
+        &self,
+        run: &SyncRun,
+        mailbox: &str,
+        cursor: SyncCursor,
+        imported_count: u32,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| internal_error("failed to begin sync completion", error))?;
+        let result = async {
+            let run_update = sqlx::query(
+                "UPDATE sync_runs SET finished_at = ?, status = 'succeeded', imported_count = ?, \
+                    error_message = NULL WHERE id = ? AND account_id = ? AND status = 'running'",
+            )
+            .bind(&now)
+            .bind(i64::from(imported_count))
+            .bind(run.id.to_string())
+            .bind(run.account_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| internal_error("failed to finish sync run", error))?;
+            if run_update.rows_affected() != 1 {
+                return Err(AppError::Conflict {
+                    message: "sync run is missing or is no longer running".to_owned(),
+                });
+            }
+            sqlx::query(
+                "INSERT INTO sync_cursors (account_id, mailbox, uid_validity, last_uid) \
+                 VALUES (?, ?, ?, ?) ON CONFLICT(account_id, mailbox) DO UPDATE SET \
+                    uid_validity = excluded.uid_validity, last_uid = excluded.last_uid",
+            )
+            .bind(run.account_id.to_string())
+            .bind(mailbox)
+            .bind(i64::from(cursor.uid_validity))
+            .bind(i64::from(cursor.last_uid))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| internal_error("failed to update sync cursor", error))?;
+            let account_update = sqlx::query(
+                "UPDATE mailbox_accounts SET last_synced_at = ?, last_error = NULL, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(run.account_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| internal_error("failed to update synced account", error))?;
+            if account_update.rows_affected() != 1 {
+                return Err(account_not_found(run.account_id));
+            }
+            Ok::<_, AppError>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(|error| internal_error("failed to commit sync completion", error)),
+            Err(error) => {
+                transaction.rollback().await.map_err(|rollback| {
+                    internal_error("failed to roll back sync completion", rollback)
+                })?;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn finish_sync_failure(&self, run: &SyncRun, message: &str) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let message = sanitize_error_message(message);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| internal_error("failed to begin sync failure update", error))?;
+        let result = async {
+            let run_update = sqlx::query(
+                "UPDATE sync_runs SET finished_at = ?, status = 'failed', error_message = ? \
+                 WHERE id = ? AND account_id = ? AND status = 'running'",
+            )
+            .bind(&now)
+            .bind(&message)
+            .bind(run.id.to_string())
+            .bind(run.account_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| internal_error("failed to mark sync run failed", error))?;
+            if run_update.rows_affected() != 1 {
+                return Err(AppError::Conflict {
+                    message: "sync run is missing or is no longer running".to_owned(),
+                });
+            }
+            let account_update = sqlx::query(
+                "UPDATE mailbox_accounts SET last_error = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&message)
+            .bind(&now)
+            .bind(run.account_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| internal_error("failed to update account sync error", error))?;
+            if account_update.rows_affected() != 1 {
+                return Err(account_not_found(run.account_id));
+            }
+            Ok::<_, AppError>(())
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(|error| internal_error("failed to commit sync failure", error)),
+            Err(error) => {
+                transaction.rollback().await.map_err(|rollback| {
+                    internal_error("failed to roll back sync failure", rollback)
+                })?;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn sanitize_error_message(message: &str) -> String {
+    message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 #[derive(FromRow)]

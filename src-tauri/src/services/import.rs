@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
@@ -15,6 +15,22 @@ const ALLOWED_EXTENSIONS: [&str; 9] = [
     "pdf", "jpg", "jpeg", "png", "doc", "docx", "xls", "xlsx", "zip",
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailImportSource {
+    pub account_id: Uuid,
+    pub mailbox: String,
+    pub uid: u32,
+    pub message_id: Option<String>,
+    pub part_id: String,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportOutcome {
+    New(InvoiceItem),
+    Existing(InvoiceItem),
+}
+
 #[derive(Clone)]
 pub struct ImportService {
     items: ItemRepository,
@@ -28,6 +44,145 @@ impl ImportService {
 
     pub async fn import_manual(&self, source: &Path) -> Result<InvoiceItem, AppError> {
         self.import_manual_after_open(source, || Ok(())).await
+    }
+
+    pub async fn import_email_bytes(
+        &self,
+        file_name: &str,
+        bytes: &[u8],
+        source: EmailImportSource,
+    ) -> Result<ImportOutcome, AppError> {
+        let original_name = sanitize_mail_filename(file_name)?;
+        let extension = supported_extension(Path::new(&original_name))?;
+        self.import_email_payload(EmailPayload {
+            original_name,
+            extension,
+            bytes,
+            mime_type: None,
+            recognition_status: RecognitionStatus::Pending,
+            note: None,
+            source,
+        })
+        .await
+    }
+
+    pub(crate) async fn import_email_link(
+        &self,
+        url: &str,
+        source: EmailImportSource,
+    ) -> Result<ImportOutcome, AppError> {
+        let original_name = format!(
+            "download-{}-{}.url",
+            source.uid,
+            source.part_id.replace('.', "-")
+        );
+        let payload = format!("{url}\r\n");
+        self.import_email_payload(EmailPayload {
+            original_name,
+            extension: "url".to_owned(),
+            bytes: payload.as_bytes(),
+            mime_type: Some("text/uri-list".to_owned()),
+            recognition_status: RecognitionStatus::Succeeded,
+            note: Some(url.to_owned()),
+            source,
+        })
+        .await
+    }
+
+    async fn import_email_payload(
+        &self,
+        payload: EmailPayload<'_>,
+    ) -> Result<ImportOutcome, AppError> {
+        if let Some(existing) = self
+            .items
+            .find_email_part(
+                payload.source.account_id,
+                &payload.source.mailbox,
+                payload.source.uid,
+                &payload.source.part_id,
+            )
+            .await?
+        {
+            return Ok(ImportOutcome::Existing(existing));
+        }
+        let id = Uuid::new_v4();
+        let (staged, writer) = self.paths.begin_staged_original(id)?;
+        let mut reader = payload.bytes;
+        let staged = copy_source_to_staging(&mut reader, staged, writer).await?;
+        let sha256 = match sha256_file(staged.path()).await {
+            Ok(value) => value,
+            Err(error) => return Err(staged.cleanup_after(error)),
+        };
+        let mime_type = match payload.mime_type {
+            Some(mime_type) => mime_type,
+            None => match detect_mime(staged.path(), &payload.extension).await {
+                Ok(mime_type) => mime_type,
+                Err(error) => return Err(staged.cleanup_after(error)),
+            },
+        };
+        let promoted = staged.promote(
+            payload.source.received_at.date_naive(),
+            id,
+            &payload.extension,
+        )?;
+        let original_path = promoted.path().to_path_buf();
+        let now = Utc::now();
+        let item = NewItemRecord {
+            id,
+            original_name: payload.original_name,
+            original_path: original_path.to_string_lossy().into_owned(),
+            normalized_pdf_path: None,
+            sha256,
+            mime_type,
+            source_type: SourceType::Email,
+            source_account_id: Some(payload.source.account_id),
+            source_mailbox: Some(payload.source.mailbox.clone()),
+            source_uid: Some(i64::from(payload.source.uid)),
+            source_message_id: payload.source.message_id.clone(),
+            source_part_id: Some(payload.source.part_id.clone()),
+            fetched_at: payload.source.received_at,
+            invoice_date: None,
+            suggested_period: None,
+            batch_id: None,
+            suggested_category: None,
+            final_category: None,
+            amount_cents: None,
+            currency: "CNY".to_owned(),
+            city: None,
+            company: None,
+            recognition_status: payload.recognition_status,
+            confirmation_status: ConfirmationStatus::Pending,
+            dedupe_status: DedupeStatus::Unique,
+            duplicate_of_id: None,
+            note: payload.note,
+            event_tag: None,
+            project_tag: None,
+            created_at: now,
+            updated_at: now,
+        };
+        match self.items.insert_deduplicated(item).await {
+            Ok(item) => {
+                promoted.commit();
+                Ok(ImportOutcome::New(item))
+            }
+            Err(database_error) => {
+                promoted.rollback()?;
+                if matches!(database_error, AppError::Conflict { .. })
+                    && let Some(existing) = self
+                        .items
+                        .find_email_part(
+                            payload.source.account_id,
+                            &payload.source.mailbox,
+                            payload.source.uid,
+                            &payload.source.part_id,
+                        )
+                        .await?
+                {
+                    return Ok(ImportOutcome::Existing(existing));
+                }
+                Err(database_error)
+            }
+        }
     }
 
     async fn import_manual_after_open<F>(
@@ -123,6 +278,32 @@ impl ImportService {
             },
         }
     }
+}
+
+struct EmailPayload<'a> {
+    original_name: String,
+    extension: String,
+    bytes: &'a [u8],
+    mime_type: Option<String>,
+    recognition_status: RecognitionStatus,
+    note: Option<String>,
+    source: EmailImportSource,
+}
+
+fn sanitize_mail_filename(file_name: &str) -> Result<String, AppError> {
+    let basename = file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| AppError::validation("file", "email file name is required"))?;
+    let sanitized = sanitize_filename::sanitize(basename);
+    if sanitized.trim().is_empty() || sanitized == "." || sanitized == ".." {
+        return Err(AppError::validation(
+            "file",
+            "email file name is not usable",
+        ));
+    }
+    Ok(sanitized)
 }
 
 fn validate_source_metadata(metadata: &std::fs::Metadata) -> Result<(), AppError> {

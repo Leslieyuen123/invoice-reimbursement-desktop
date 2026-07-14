@@ -1,0 +1,19 @@
+From: billing@example.com
+To: finance@example.com
+Date: Tue, 14 Jul 2026 10:00:00 +0800
+Message-ID: <attachment-101@example.com>
+Subject: Invoice attachment
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="attachment-boundary"
+
+--attachment-boundary
+Content-Type: text/plain; charset=utf-8
+
+Please find the invoice attached.
+--attachment-boundary
+Content-Type: application/pdf; name="invoice-101.pdf"
+Content-Disposition: attachment; filename="invoice-101.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjcKMSAwIG9iago8PC9UeXBlL0NhdGFsb2c+PgplbmRvYmoKJSVFT0YK
+--attachment-boundary--

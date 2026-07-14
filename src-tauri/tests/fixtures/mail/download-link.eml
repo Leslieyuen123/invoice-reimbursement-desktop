@@ -1,0 +1,14 @@
+From: portal@example.com
+To: finance@example.com
+Date: Tue, 14 Jul 2026 12:00:00 +0800
+Message-ID: <link-103@example.com>
+Subject: Download invoice
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+  <a href="https://127.0.0.1:1/invoices/103.pdf">Download invoice</a>
+  <a href="http://example.com/not-allowed.pdf">HTTP is ignored</a>
+  <a href="cid:receipt-103">CID is ignored</a>
+  <a href="javascript:alert(1)">JavaScript is ignored</a>
+</body></html>

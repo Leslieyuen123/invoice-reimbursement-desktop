@@ -1,0 +1,20 @@
+From: receipts@example.com
+To: finance@example.com
+Date: Tue, 14 Jul 2026 11:00:00 +0800
+Message-ID: <inline-102@example.com>
+Subject: Inline receipt
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="inline-boundary"
+
+--inline-boundary
+Content-Type: text/html; charset=utf-8
+
+<html><body><img src="cid:receipt-102"></body></html>
+--inline-boundary
+Content-Type: image/png; name="receipt-102.png"
+Content-Disposition: inline; filename="receipt-102.png"
+Content-ID: <receipt-102>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=
+--inline-boundary--
