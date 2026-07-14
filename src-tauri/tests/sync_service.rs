@@ -206,6 +206,59 @@ async fn incremental_sync_imports_each_mail_part_once() {
 }
 
 #[tokio::test]
+async fn cid_image_without_content_disposition_is_imported() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "cid-without-disposition@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "application-password")
+        .unwrap();
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            uid_validity: 11,
+            highest_uid: 104,
+            messages: vec![raw_message(
+                104,
+                include_bytes!("fixtures/mail/inline-cid-no-disposition.eml"),
+            )],
+        })])),
+        credentials,
+        accounts,
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+
+    assert_eq!(result.imported_count, 1);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].original_name, "inline-2.png");
+    assert_eq!(stored[0].source_uid, Some(104));
+    assert_eq!(
+        stored[0].source_message_id.as_deref(),
+        Some("inline-cid-104@example.com")
+    );
+    assert_eq!(stored[0].source_part_id.as_deref(), Some("2"));
+}
+
+#[tokio::test]
 async fn https_download_link_becomes_a_local_pending_placeholder_without_network_access() {
     let directory = tempfile::tempdir().unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();

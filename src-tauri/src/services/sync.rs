@@ -247,8 +247,8 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
     for (index, part) in message.parts.iter().enumerate() {
         let disposition = part.content_disposition();
         let is_attachment = disposition.is_some_and(|value| value.is_attachment());
-        let is_inline_image = disposition.is_some_and(|value| value.is_inline())
-            && (part.is_content_type("image", "jpeg") || part.is_content_type("image", "png"))
+        let is_inline_image = (part.is_content_type("image", "jpeg")
+            || part.is_content_type("image", "png"))
             && (part.attachment_name().is_some() || part.content_id().is_some());
         if let Some(html) = part
             .text_contents()

@@ -1,0 +1,19 @@
+From: receipts@example.com
+To: finance@example.com
+Date: Tue, 14 Jul 2026 11:30:00 +0800
+Message-ID: <inline-cid-104@example.com>
+Subject: Inline CID receipt without disposition
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="inline-cid-boundary"
+
+--inline-cid-boundary
+Content-Type: text/html; charset=utf-8
+
+<html><body><img src="cid:receipt-104"></body></html>
+--inline-cid-boundary
+Content-Type: image/png
+Content-ID: <receipt-104>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=
+--inline-cid-boundary--
