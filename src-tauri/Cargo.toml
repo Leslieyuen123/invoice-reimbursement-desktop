@@ -21,7 +21,6 @@ keyring = "3"
 lopdf = "0.36"
 mail-parser = "0.11"
 native-tls = "0.2"
-pdf-extract = "0.9"
 printpdf = "0.8"
 rust_decimal = "1"
 rustix = { version = "1", features = ["fs"] }
@@ -48,7 +47,7 @@ zip = "4"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 pretty_assertions = "1"

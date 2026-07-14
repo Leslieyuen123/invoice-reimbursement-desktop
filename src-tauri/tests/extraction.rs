@@ -13,7 +13,9 @@ use printpdf::{BuiltinFont, Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Pt, Te
 #[derive(Default)]
 struct FakeOcr {
     calls: AtomicUsize,
+    pdf_text_calls: AtomicUsize,
     text: String,
+    pdf_text: String,
     warnings: Vec<String>,
 }
 
@@ -21,7 +23,19 @@ impl FakeOcr {
     fn returning(text: impl Into<String>) -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            pdf_text_calls: AtomicUsize::new(0),
             text: text.into(),
+            pdf_text: String::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn returning_pdf_text(text: impl Into<String>) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            pdf_text_calls: AtomicUsize::new(0),
+            text: "must not OCR".to_owned(),
+            pdf_text: text.into(),
             warnings: Vec::new(),
         }
     }
@@ -29,7 +43,9 @@ impl FakeOcr {
     fn returning_with_warnings(text: impl Into<String>, warnings: &[&str]) -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            pdf_text_calls: AtomicUsize::new(0),
             text: text.into(),
+            pdf_text: String::new(),
             warnings: warnings
                 .iter()
                 .map(|warning| (*warning).to_owned())
@@ -39,6 +55,10 @@ impl FakeOcr {
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn pdf_text_call_count(&self) -> usize {
+        self.pdf_text_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -50,6 +70,26 @@ impl OcrGateway for FakeOcr {
             warnings: self.warnings.clone(),
         })
     }
+
+    fn extract_pdf_text(&self, path: &Path) -> Result<OcrResult, AppError> {
+        self.pdf_text_calls.fetch_add(1, Ordering::SeqCst);
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("malformed-content.pdf") => Err(AppError::External {
+                service: "document_extractor".to_owned(),
+                retryable: false,
+                message: "Unable to read document.".to_owned(),
+            }),
+            Some("compressed-text-bomb.pdf") => Err(AppError::External {
+                service: "document_extractor".to_owned(),
+                retryable: false,
+                message: "Document exceeds extraction resource limits.".to_owned(),
+            }),
+            _ => Ok(OcrResult {
+                text: self.pdf_text.clone(),
+                warnings: Vec::new(),
+            }),
+        }
+    }
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -60,7 +100,9 @@ fn fixture(name: &str) -> PathBuf {
 
 #[test]
 fn text_pdf_is_extracted_without_calling_ocr() {
-    let ocr = Arc::new(FakeOcr::returning("should not be used"));
+    let ocr = Arc::new(FakeOcr::returning_pdf_text(
+        "开票日期：2026年06月18日\n价税合计（小写）¥128.50",
+    ));
     let extractor = LocalExtractor::new(ocr.clone());
     let path = fixture("text-invoice.pdf");
 
@@ -71,6 +113,7 @@ fn text_pdf_is_extracted_without_calling_ocr() {
     assert_eq!(extracted.normalized_pdf, Some(std::fs::read(path).unwrap()));
     assert!(extracted.warnings.is_empty());
     assert_eq!(ocr.call_count(), 0);
+    assert_eq!(ocr.pdf_text_call_count(), 1);
 }
 
 #[test]
@@ -158,13 +201,14 @@ fn exactly_twenty_non_whitespace_pdf_characters_skip_ocr() {
         )])
         .save(&PdfSaveOptions::default(), &mut Vec::new());
     std::fs::write(&path, bytes).unwrap();
-    let ocr = Arc::new(FakeOcr::returning("unused"));
+    let ocr = Arc::new(FakeOcr::returning_pdf_text("12345678901234567890"));
     let extractor = LocalExtractor::new(ocr.clone());
 
     let extracted = extractor.extract(&path).unwrap();
 
     assert!(extracted.text.contains("12345678901234567890"));
     assert_eq!(ocr.call_count(), 0);
+    assert_eq!(ocr.pdf_text_call_count(), 1);
 }
 
 #[test]
@@ -269,6 +313,43 @@ fn corrupt_pdf_is_rejected_without_ocr_or_path_disclosure() {
     assert!(!error.to_string().contains("private-secret"));
     assert!(!error.to_string().contains("broken.pdf"));
     assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn malformed_pdf_content_cannot_panic_the_tauri_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("malformed-content.pdf");
+    std::fs::write(&path, malformed_content_pdf()).unwrap();
+    let extractor = LocalExtractor::new(Arc::new(FakeOcr::returning("must not run")));
+
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extractor.extract(&path)));
+
+    assert!(outcome.is_ok(), "untrusted PDF parser panicked in-process");
+    let error = outcome.unwrap().expect_err("malformed content should fail");
+    assert_external(&error, "document_extractor");
+}
+
+#[test]
+fn compressed_pdf_text_bomb_is_rejected_without_expanding_in_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("compressed-text-bomb.pdf");
+    let bytes = compressed_text_pdf(2_000_000);
+    assert!(
+        bytes.len() < 100_000,
+        "fixture did not compress: {}",
+        bytes.len()
+    );
+    std::fs::write(&path, bytes).unwrap();
+    let extractor = LocalExtractor::new(Arc::new(FakeOcr::returning("must not run")));
+    let started = Instant::now();
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("compressed text bomb should be rejected");
+
+    assert_external(&error, "document_extractor");
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
@@ -427,6 +508,63 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+fn malformed_content_pdf() -> Vec<u8> {
+    let bytes = PdfDocument::new("malformed content")
+        .with_pages(vec![PdfPage::new(Mm(10.0), Mm(10.0), Vec::new())])
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    let mut document = lopdf::Document::load_mem(&bytes).unwrap();
+    let page_id = *document.get_pages().values().next().unwrap();
+    let stream_id = document.add_object(lopdf::Stream::new(
+        lopdf::dictionary! {},
+        b"BT [(unterminated".to_vec(),
+    ));
+    document
+        .get_object_mut(page_id)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Contents", stream_id);
+    let mut output = Vec::new();
+    document.save_to(&mut output).unwrap();
+    output
+}
+
+fn compressed_text_pdf(character_count: usize) -> Vec<u8> {
+    let text = "A".repeat(character_count);
+    let bytes = PdfDocument::new("compressed text bomb")
+        .with_pages(vec![PdfPage::new(
+            Mm(10.0),
+            Mm(10.0),
+            vec![
+                Op::StartTextSection,
+                Op::SetFontSizeBuiltinFont {
+                    size: Pt(8.0),
+                    font: BuiltinFont::Helvetica,
+                },
+                Op::WriteTextBuiltinFont {
+                    items: vec![TextItem::Text(text)],
+                    font: BuiltinFont::Helvetica,
+                },
+                Op::EndTextSection,
+            ],
+        )])
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    let mut document = lopdf::Document::load_mem(&bytes).unwrap();
+    let page_id = *document.get_pages().values().next().unwrap();
+    for content_id in document.get_page_contents(page_id) {
+        document
+            .get_object_mut(content_id)
+            .unwrap()
+            .as_stream_mut()
+            .unwrap()
+            .compress()
+            .unwrap();
+    }
+    let mut output = Vec::new();
+    document.save_to(&mut output).unwrap();
+    output
+}
+
 #[test]
 fn process_ocr_sends_a_json_line_and_parses_success() {
     let gateway = ProcessOcrGateway::new(ocr_helper());
@@ -436,6 +574,68 @@ fn process_ocr_sends_a_json_line_and_parses_success() {
 
     assert_eq!(result.text, "北京 出租车 价税合计 ¥128.50");
     assert_eq!(result.warnings, ["low_confidence"]);
+}
+
+#[test]
+fn process_gateway_uses_a_distinct_pdf_text_operation() {
+    let gateway = ProcessOcrGateway::new(ocr_helper());
+
+    let result = gateway
+        .extract_pdf_text(&fixture("text-invoice.pdf"))
+        .unwrap();
+
+    assert!(result.text.contains("开票日期：2026年06月18日"));
+    assert!(result.text.contains("价税合计（小写）¥128.50"));
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn process_gateway_reuses_one_sidecar_for_sequential_requests() {
+    let gateway = ProcessOcrGateway::new(ocr_helper());
+    let path = Path::new("persistent-session.pdf");
+
+    let first_process = gateway.recognize(path).unwrap().text;
+    let second_process = gateway.recognize(path).unwrap().text;
+
+    assert_eq!(first_process, second_process);
+}
+
+#[test]
+fn process_gateway_restarts_after_a_protocol_error() {
+    let gateway = ProcessOcrGateway::new(ocr_helper());
+
+    gateway
+        .recognize(Path::new("malformed.pdf"))
+        .expect_err("malformed response should fail");
+    let recovered = gateway.recognize(Path::new("success invoice.pdf")).unwrap();
+
+    assert_eq!(recovered.text, "北京 出租车 价税合计 ¥128.50");
+}
+
+#[test]
+fn process_gateway_keeps_its_session_after_a_resource_error() {
+    let gateway = ProcessOcrGateway::new(ocr_helper());
+    let session_path = Path::new("persistent-session.pdf");
+    let first_process = gateway.recognize(session_path).unwrap().text;
+
+    gateway
+        .extract_pdf_text(Path::new("compressed-text-bomb.pdf"))
+        .expect_err("oversized PDF text should fail");
+    let second_process = gateway.recognize(session_path).unwrap().text;
+
+    assert_eq!(first_process, second_process);
+}
+
+#[test]
+fn process_gateway_restarts_after_a_timeout() {
+    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_millis(500));
+
+    gateway
+        .recognize(Path::new("timeout.pdf"))
+        .expect_err("hung response should time out");
+    let recovered = gateway.recognize(Path::new("success invoice.pdf")).unwrap();
+
+    assert_eq!(recovered.text, "北京 出租车 价税合计 ¥128.50");
 }
 
 #[test]
@@ -554,6 +754,35 @@ fn process_ocr_timeout_kills_descendants_holding_output_open() {
 }
 
 #[cfg(unix)]
+#[test]
+fn process_ocr_cleans_descendants_when_the_leader_exits_before_pipe_eof() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_path = directory.path().join("orphan-pipe.pid");
+    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_millis(500));
+    let started = Instant::now();
+
+    let error = gateway
+        .recognize(&pid_path)
+        .expect_err("leader exit without a response should fail promptly");
+
+    assert_external(&error, "ocr_sidecar");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let descendant_pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let gone = (0..50).any(|_| {
+        if !process_exists(descendant_pid) {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        }
+    });
+    assert!(gone, "descendant {descendant_pid} survived leader exit");
+}
+
+#[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
     std::process::Command::new("kill")
         .arg("-0")
@@ -576,6 +805,69 @@ fn process_ocr_maps_an_unstartable_sidecar_to_a_sanitized_error() {
 
     assert_external(&error, "ocr_sidecar");
     assert!(!error.to_string().contains("private-missing-sidecar"));
+}
+
+#[test]
+fn default_process_timeout_has_a_cold_start_and_work_budget() {
+    let timeout = ProcessOcrGateway::default_timeout();
+    let reported_cold_start = Duration::from_millis(22_230);
+
+    assert_eq!(timeout, Duration::from_secs(80));
+    assert!(timeout.saturating_sub(reported_cold_start) >= Duration::from_secs(45));
+}
+
+#[test]
+#[ignore = "requires INVOICE_OCR_BIN pointing to a packaged one-file sidecar"]
+fn packaged_sidecar_runs_through_process_gateway_with_cold_start_margin() {
+    let executable = std::env::var_os("INVOICE_OCR_BIN").expect("INVOICE_OCR_BIN is required");
+    let gateway = ProcessOcrGateway::new(executable);
+    let total_started = Instant::now();
+    let pdf_started = Instant::now();
+
+    let pdf_text = gateway
+        .extract_pdf_text(&fixture("text-invoice.pdf"))
+        .unwrap();
+    let pdf_elapsed = pdf_started.elapsed();
+
+    assert!(pdf_text.text.contains("开票日期：2026年06月18日"));
+    assert!(pdf_text.text.contains("价税合计（小写）¥128.50"));
+    assert!(pdf_text.warnings.is_empty());
+    assert!(
+        ProcessOcrGateway::default_timeout().saturating_sub(pdf_elapsed) >= Duration::from_secs(45),
+        "packaged PDF text sidecar left insufficient margin: elapsed={pdf_elapsed:?}"
+    );
+
+    let first_ocr_started = Instant::now();
+
+    let result = gateway.recognize(&fixture("image-invoice.png")).unwrap();
+    let first_ocr_elapsed = first_ocr_started.elapsed();
+    let total_elapsed = total_started.elapsed();
+
+    assert!(result.text.contains("北京"));
+    assert!(result.text.contains("128.50"));
+    assert!(
+        first_ocr_elapsed < Duration::from_secs(45),
+        "packaged first OCR exceeded its measured engine-start budget: elapsed={first_ocr_elapsed:?}"
+    );
+    assert!(
+        ProcessOcrGateway::default_timeout().saturating_sub(first_ocr_elapsed)
+            >= Duration::from_secs(35),
+        "packaged first OCR left insufficient timeout margin: elapsed={first_ocr_elapsed:?}"
+    );
+
+    let steady_ocr_started = Instant::now();
+    let steady_result = gateway.recognize(&fixture("image-invoice.png")).unwrap();
+    let steady_ocr_elapsed = steady_ocr_started.elapsed();
+
+    assert!(steady_result.text.contains("北京"));
+    assert!(steady_result.text.contains("128.50"));
+    eprintln!(
+        "packaged sidecar timings: cold_pdf={pdf_elapsed:?}, first_ocr={first_ocr_elapsed:?}, first_workflow={total_elapsed:?}, steady_ocr={steady_ocr_elapsed:?}"
+    );
+    assert!(
+        steady_ocr_elapsed < Duration::from_secs(10),
+        "persistent OCR session did not reach steady-state performance: elapsed={steady_ocr_elapsed:?}"
+    );
 }
 
 fn ocr_helper() -> PathBuf {

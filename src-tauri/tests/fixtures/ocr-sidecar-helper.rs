@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, BufRead, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -8,12 +8,34 @@ fn main() {
         return;
     }
 
-    let mut request = String::new();
-    io::stdin().read_to_string(&mut request).unwrap();
-    assert!(request.ends_with('\n'));
-    assert!(request.contains("\"path\""));
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let request = line.unwrap();
+        assert!(request.contains("\"path\""));
+        handle_request(&request);
+        io::stdout().flush().unwrap();
+    }
+}
 
-    if request.contains("descendant-timeout") {
+fn handle_request(request: &str) {
+    if request.contains(r#""operation":"extract_pdf_text""#) {
+        if request.contains("compressed-text-bomb.pdf") {
+            println!(
+                r#"{{"ok":false,"error":"document exceeds OCR resource limits"}}"#
+            );
+        } else if request.contains("malformed-content.pdf") {
+            println!(r#"{{"ok":false,"error":"Unable to extract PDF text."}}"#);
+        } else if request.contains("text-invoice.pdf") {
+            println!(
+                r#"{{"ok":true,"text":"开票日期：2026年06月18日\n价税合计（小写）¥128.50","warnings":[]}}"#
+            );
+        } else {
+            println!(r#"{{"ok":true,"text":"","warnings":[]}}"#);
+        }
+        return;
+    }
+
+    if request.contains("orphan-pipe") {
         let descendant = Command::new(std::env::current_exe().unwrap())
             .arg("--descendant")
             .stdin(Stdio::null())
@@ -21,7 +43,17 @@ fn main() {
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
-        std::fs::write(request_path(&request), descendant.id().to_string()).unwrap();
+        std::fs::write(request_path(request), descendant.id().to_string()).unwrap();
+        std::process::exit(0);
+    } else if request.contains("descendant-timeout") {
+        let descendant = Command::new(std::env::current_exe().unwrap())
+            .arg("--descendant")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        std::fs::write(request_path(request), descendant.id().to_string()).unwrap();
         std::thread::sleep(Duration::from_secs(3));
     } else if request.contains("timeout.pdf") {
         std::thread::sleep(Duration::from_secs(3));
@@ -49,6 +81,11 @@ fn main() {
             .join(",");
         println!(
             r#"{{"ok":true,"text":"warning text","warnings":[{warnings}]}}"#
+        );
+    } else if request.contains("persistent-session.pdf") {
+        println!(
+            r#"{{"ok":true,"text":"{}","warnings":[]}}"#,
+            std::process::id()
         );
     } else {
         println!(

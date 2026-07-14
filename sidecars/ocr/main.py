@@ -12,6 +12,7 @@ MAX_PDF_PAGES = 100
 MAX_IMAGE_DIMENSION = 20_000
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_TOTAL_PDF_RENDERED_PIXELS = 100_000_000
+MAX_PDF_TEXT_CHARACTERS = 200_000
 RESOURCE_LIMIT_MESSAGE = "document exceeds OCR resource limits"
 _engine: Any | None = None
 
@@ -102,6 +103,39 @@ def recognize_pdf(path: Path) -> str:
     return "\n".join(text for text in page_text if text)
 
 
+def extract_pdf_text(path: Path) -> str:
+    with contextlib.redirect_stdout(sys.stderr):
+        import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(str(path))
+    page_text: list[str] = []
+    total_characters = 0
+    try:
+        if len(document) > MAX_PDF_PAGES:
+            raise ResourceLimitError
+
+        for page_number in range(len(document)):
+            page = document[page_number]
+            text_page = None
+            try:
+                text_page = page.get_textpage()
+                character_count = text_page.count_chars()
+                total_characters += character_count
+                if total_characters > MAX_PDF_TEXT_CHARACTERS:
+                    raise ResourceLimitError
+                text = text_page.get_text_range(force_this=True)
+                page_text.append(text)
+            finally:
+                if text_page is not None:
+                    text_page.close()
+                page.close()
+                text_page = None
+                page = None
+    finally:
+        document.close()
+    return "\n".join(text for text in page_text if text)
+
+
 def recognize_raster_image(path: Path) -> str:
     with contextlib.redirect_stdout(sys.stderr):
         import numpy as np
@@ -157,14 +191,25 @@ def handle_line(line: str) -> dict[str, object]:
     path = request.get("path")
     if not isinstance(path, str) or not path.strip():
         return error_response("Request path must be a non-empty string.")
+    operation = request.get("operation", "ocr")
+    if operation not in ("ocr", "extract_pdf_text"):
+        return error_response("Unsupported operation.")
 
     try:
-        text = recognize_path(path)
+        if operation == "extract_pdf_text":
+            pdf_path = Path(path)
+            if not pdf_path.is_file():
+                raise InputFileMissingError
+            text = extract_pdf_text(pdf_path)
+        else:
+            text = recognize_path(path)
     except InputFileMissingError:
         return error_response("Input file does not exist.")
     except ResourceLimitError:
         return error_response(RESOURCE_LIMIT_MESSAGE)
     except Exception:
+        if operation == "extract_pdf_text":
+            return error_response("Unable to extract PDF text.")
         return error_response("Unable to recognize input file.")
     return {"ok": True, "text": text, "warnings": []}
 

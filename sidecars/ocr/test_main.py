@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import re
 import struct
 import subprocess
@@ -112,13 +113,156 @@ def test_pdf_is_rendered_and_recognized() -> None:
     assert responses[0]["text"].strip()
 
 
-def test_build_script_uses_locked_dependencies_and_supports_offline_mode() -> None:
-    script = BUILD_SCRIPT.read_text()
+def test_pdf_text_operation_extracts_embedded_text() -> None:
+    request = json.dumps(
+        {"operation": "extract_pdf_text", "path": str(PDF_FIXTURE)},
+        ensure_ascii=False,
+    )
 
-    assert "UV_ARGS=(run --locked)" in script
-    assert 'if [[ "${OFFLINE:-0}" == "1" ]]' in script
-    assert "UV_ARGS+=(--offline)" in script
-    assert 'uv "${UV_ARGS[@]}" --project . pyinstaller' in script
+    responses, _ = run_worker([request])
+
+    assert responses[0]["ok"] is True
+    assert responses[0]["warnings"] == []
+    assert "开票日期：2026年06月18日" in responses[0]["text"]
+    assert "价税合计（小写）¥128.50" in responses[0]["text"]
+
+
+def test_pdf_text_budget_is_checked_before_allocating_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text_page = FakePdfTextPage(worker.MAX_PDF_TEXT_CHARACTERS + 1)
+    page = FakePdfPage((10.0, 10.0), text_page=text_page)
+    document = FakePdfDocument([page])
+    install_fake_pdfium(monkeypatch, document)
+
+    with pytest.raises(worker.ResourceLimitError):
+        worker.extract_pdf_text(Path("compressed-text-bomb.pdf"))
+
+    assert not text_page.range_requested
+    assert text_page.closed
+    assert page.closed
+    assert document.closed
+
+
+def test_pdf_text_page_count_is_rejected_before_any_page_is_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pages = [FakePdfPage((10.0, 10.0)) for _ in range(101)]
+    document = FakePdfDocument(pages)
+    install_fake_pdfium(monkeypatch, document)
+
+    with pytest.raises(worker.ResourceLimitError):
+        worker.extract_pdf_text(Path("too-many-pages.pdf"))
+
+    assert not any(page.opened for page in pages)
+    assert document.closed
+
+
+def test_pdf_text_resource_error_does_not_stop_next_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "too-large.pdf"
+    second = tmp_path / "valid.pdf"
+    first.write_bytes(b"placeholder")
+    second.write_bytes(b"placeholder")
+
+    def fake_extract(path: Path) -> str:
+        if path == first:
+            raise worker.ResourceLimitError
+        return "开票日期：2026年06月18日"
+
+    monkeypatch.setattr(worker, "extract_pdf_text", fake_extract, raising=False)
+    responses = [
+        worker.handle_line(
+            json.dumps({"operation": "extract_pdf_text", "path": str(path)})
+        )
+        for path in [first, second]
+    ]
+
+    assert responses[0] == {
+        "ok": False,
+        "error": "document exceeds OCR resource limits",
+    }
+    assert responses[1] == {
+        "ok": True,
+        "text": "开票日期：2026年06月18日",
+        "warnings": [],
+    }
+
+
+def test_unknown_operation_is_rejected_without_touching_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker,
+        "recognize_path",
+        lambda _path: pytest.fail("unknown operation must not read the file"),
+    )
+
+    response = worker.handle_line(
+        json.dumps({"operation": "delete_everything", "path": "/private/invoice.pdf"})
+    )
+
+    assert response == {"ok": False, "error": "Unsupported operation."}
+
+
+def test_build_script_runs_locked_offline_and_copies_the_host_artifact(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    uv_arguments = tmp_path / "uv-arguments"
+    host_triple = "aarch64-test-darwin"
+    destination = (
+        REPO_ROOT / "src-tauri" / "binaries" / f"invoice-ocr-{host_triple}"
+    )
+    write_executable(
+        fake_bin / "rustc",
+        f'#!/bin/sh\nprintf "host: {host_triple}\\n"\n',
+    )
+    write_executable(
+        fake_bin / "uv",
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" > "$FAKE_UV_ARGUMENTS"\n'
+        "mkdir -p dist\n"
+        "printf packaged-sidecar > dist/invoice-ocr\n",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "FAKE_UV_ARGUMENTS": str(uv_arguments),
+            "OFFLINE": "1",
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+        }
+    )
+
+    try:
+        completed = subprocess.run(
+            ["bash", str(BUILD_SCRIPT)],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert uv_arguments.read_text().splitlines() == [
+            "run",
+            "--locked",
+            "--offline",
+            "--project",
+            ".",
+            "pyinstaller",
+            "--clean",
+            "--noconfirm",
+            "invoice-ocr.spec",
+        ]
+        assert destination.read_bytes() == b"packaged-sidecar"
+        assert destination.stat().st_mode & 0o111
+    finally:
+        destination.unlink(missing_ok=True)
 
 
 def test_oversized_image_headers_are_rejected_before_load_and_worker_continues(
@@ -226,6 +370,11 @@ def png_header(width: int, height: int) -> bytes:
     ) + png_chunk(b"IEND", b"")
 
 
+def write_executable(path: Path, contents: str) -> None:
+    path.write_text(contents)
+    path.chmod(0o755)
+
+
 def png_chunk(kind: bytes, data: bytes) -> bytes:
     return (
         struct.pack(">I", len(data))
@@ -235,9 +384,32 @@ def png_chunk(kind: bytes, data: bytes) -> bytes:
     )
 
 
+class FakePdfTextPage:
+    def __init__(self, character_count: int, text: str = "") -> None:
+        self.character_count = character_count
+        self.text = text
+        self.range_requested = False
+        self.closed = False
+
+    def count_chars(self) -> int:
+        return self.character_count
+
+    def get_text_range(self, **_kwargs) -> str:
+        self.range_requested = True
+        return self.text
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakePdfPage:
-    def __init__(self, size: tuple[float, float]) -> None:
+    def __init__(
+        self,
+        size: tuple[float, float],
+        text_page: FakePdfTextPage | None = None,
+    ) -> None:
         self.size = size
+        self.text_page = text_page
         self.opened = False
         self.rendered = False
         self.closed = False
@@ -249,6 +421,11 @@ class FakePdfPage:
     def render(self, **_kwargs):
         self.rendered = True
         raise AssertionError("render must not run for a rejected PDF")
+
+    def get_textpage(self) -> FakePdfTextPage:
+        self.opened = True
+        assert self.text_page is not None
+        return self.text_page
 
     def close(self) -> None:
         self.closed = True
