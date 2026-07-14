@@ -10,4 +10,8 @@ src-tauri/gen/
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
 sidecars/ocr/.venv/
+sidecars/ocr/.pytest_cache/
+sidecars/ocr/__pycache__/
+sidecars/ocr/build/
+sidecars/ocr/dist/
 *.part
