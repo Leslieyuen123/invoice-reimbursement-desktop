@@ -641,16 +641,19 @@ fn process_gateway_restarts_after_a_timeout() {
 #[cfg(unix)]
 #[test]
 fn process_gateway_lock_wait_respects_each_call_deadline() {
+    let _guard = sidecar_timing_test_guard();
     let directory = tempfile::tempdir().unwrap();
-    let (executable, pid_path) = no_stdin_ocr_helper(directory.path());
+    let executable = no_stdin_ocr_helper(directory.path());
     let gateway = Arc::new(ProcessOcrGateway::with_timeout(
         executable,
         Duration::from_secs(1),
     ));
-    gateway
+    let _descendant_pid = gateway
         .recognize(Path::new("arm-no-stdin.pdf"))
-        .expect("helper should arm before it stops reading stdin");
-    assert!(wait_for_file(&pid_path, Duration::from_secs(2)));
+        .expect("helper should arm before it stops reading stdin")
+        .text
+        .parse::<u32>()
+        .expect("arm response should contain the descendant PID");
     let first_gateway = gateway.clone();
     let first = std::thread::spawn(move || first_gateway.recognize(&backpressure_path()));
     std::thread::sleep(Duration::from_millis(100));
@@ -673,13 +676,16 @@ fn process_gateway_lock_wait_respects_each_call_deadline() {
 #[cfg(unix)]
 #[test]
 fn process_ocr_write_respects_deadline_when_sidecar_does_not_read_stdin() {
+    let _guard = sidecar_timing_test_guard();
     let directory = tempfile::tempdir().unwrap();
-    let (executable, pid_path) = no_stdin_ocr_helper(directory.path());
+    let executable = no_stdin_ocr_helper(directory.path());
     let gateway = ProcessOcrGateway::with_timeout(executable, Duration::from_secs(1));
-    gateway
+    let descendant_pid = gateway
         .recognize(Path::new("arm-no-stdin.pdf"))
-        .expect("helper should arm before it stops reading stdin");
-    assert!(wait_for_file(&pid_path, Duration::from_secs(2)));
+        .expect("helper should arm before it stops reading stdin")
+        .text
+        .parse::<u32>()
+        .expect("arm response should contain the descendant PID");
     let started = Instant::now();
 
     let error = gateway
@@ -692,10 +698,6 @@ fn process_ocr_write_respects_deadline_when_sidecar_does_not_read_stdin() {
         elapsed < Duration::from_millis(1_500),
         "stdin write ignored the request deadline: elapsed={elapsed:?}"
     );
-    let descendant_pid = std::fs::read_to_string(pid_path)
-        .unwrap()
-        .parse::<u32>()
-        .unwrap();
     let gone = (0..50).any(|_| {
         if !process_exists(descendant_pid) {
             true
@@ -796,21 +798,22 @@ fn process_ocr_kills_a_hung_sidecar_after_the_timeout() {
 #[cfg(unix)]
 #[test]
 fn process_ocr_timeout_kills_descendants_holding_output_open() {
-    let directory = tempfile::tempdir().unwrap();
-    let pid_path = directory.path().join("descendant-timeout.pid");
-    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_millis(500));
+    let _guard = sidecar_timing_test_guard();
+    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_secs(1));
+    let descendant_pid = gateway
+        .recognize(Path::new("arm-descendant.pdf"))
+        .expect("helper should return the descendant PID before the timeout trigger")
+        .text
+        .parse::<u32>()
+        .expect("arm response should contain the descendant PID");
     let started = Instant::now();
 
     let error = gateway
-        .recognize(&pid_path)
+        .recognize(Path::new("trigger-descendant-timeout.pdf"))
         .expect_err("sidecar process tree should time out");
 
     assert_external(&error, "ocr_sidecar");
     assert!(started.elapsed() < Duration::from_secs(2));
-    let descendant_pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .parse::<u32>()
-        .unwrap();
     let gone = (0..50).any(|_| {
         if !process_exists(descendant_pid) {
             true
@@ -825,21 +828,22 @@ fn process_ocr_timeout_kills_descendants_holding_output_open() {
 #[cfg(unix)]
 #[test]
 fn process_ocr_cleans_descendants_when_the_leader_exits_before_pipe_eof() {
-    let directory = tempfile::tempdir().unwrap();
-    let pid_path = directory.path().join("orphan-pipe.pid");
-    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_millis(500));
+    let _guard = sidecar_timing_test_guard();
+    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_secs(1));
+    let descendant_pid = gateway
+        .recognize(Path::new("arm-descendant.pdf"))
+        .expect("helper should return the descendant PID before the exit trigger")
+        .text
+        .parse::<u32>()
+        .expect("arm response should contain the descendant PID");
     let started = Instant::now();
 
     let error = gateway
-        .recognize(&pid_path)
+        .recognize(Path::new("trigger-orphan-pipe.pdf"))
         .expect_err("leader exit without a response should fail promptly");
 
     assert_external(&error, "ocr_sidecar");
     assert!(started.elapsed() < Duration::from_secs(2));
-    let descendant_pid = std::fs::read_to_string(&pid_path)
-        .unwrap()
-        .parse::<u32>()
-        .unwrap();
     let gone = (0..50).any(|_| {
         if !process_exists(descendant_pid) {
             true
@@ -963,11 +967,10 @@ fn ocr_helper() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn no_stdin_ocr_helper(directory: &Path) -> (PathBuf, PathBuf) {
+fn no_stdin_ocr_helper(directory: &Path) -> PathBuf {
     let executable = directory.join("ocr-sidecar-no-stdin");
     std::fs::copy(ocr_helper(), &executable).unwrap();
-    let pid_path = executable.with_extension("pid");
-    (executable, pid_path)
+    executable
 }
 
 #[cfg(unix)]
@@ -976,13 +979,9 @@ fn backpressure_path() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn wait_for_file(path: &Path, timeout: Duration) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if path.is_file() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    path.is_file()
+fn sidecar_timing_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

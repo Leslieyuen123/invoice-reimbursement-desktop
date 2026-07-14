@@ -18,8 +18,6 @@ fn main() {
         let mut lines = stdin.lock().lines();
         let request = lines.next().unwrap().unwrap();
         assert!(request.contains("arm-no-stdin.pdf"));
-        println!(r#"{{"ok":true,"text":"armed","warnings":[]}}"#);
-        io::stdout().flush().unwrap();
         let descendant = Command::new(&executable)
             .arg("--descendant")
             .stdin(Stdio::null())
@@ -27,7 +25,11 @@ fn main() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        std::fs::write(executable.with_extension("pid"), descendant.id().to_string()).unwrap();
+        println!(
+            r#"{{"ok":true,"text":"{}","warnings":[]}}"#,
+            descendant.id()
+        );
+        io::stdout().flush().unwrap();
         std::thread::sleep(Duration::from_secs(3));
         return;
     }
@@ -59,7 +61,7 @@ fn handle_request(request: &str) {
         return;
     }
 
-    if request.contains("orphan-pipe") {
+    if request.contains("arm-descendant.pdf") {
         let descendant = Command::new(std::env::current_exe().unwrap())
             .arg("--descendant")
             .stdin(Stdio::null())
@@ -67,17 +69,13 @@ fn handle_request(request: &str) {
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
-        std::fs::write(request_path(request), descendant.id().to_string()).unwrap();
+        println!(
+            r#"{{"ok":true,"text":"{}","warnings":[]}}"#,
+            descendant.id()
+        );
+    } else if request.contains("trigger-orphan-pipe.pdf") {
         std::process::exit(0);
-    } else if request.contains("descendant-timeout") {
-        let descendant = Command::new(std::env::current_exe().unwrap())
-            .arg("--descendant")
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        std::fs::write(request_path(request), descendant.id().to_string()).unwrap();
+    } else if request.contains("trigger-descendant-timeout.pdf") {
         std::thread::sleep(Duration::from_secs(3));
     } else if request.contains("timeout.pdf") {
         std::thread::sleep(Duration::from_secs(3));
@@ -116,12 +114,4 @@ fn handle_request(request: &str) {
             r#"{{"ok":true,"text":"北京 出租车 价税合计 ¥128.50","warnings":["low_confidence"]}}"#
         );
     }
-}
-
-fn request_path(request: &str) -> &str {
-    let marker = r#""path":""#;
-    let start = request.find(marker).unwrap() + marker.len();
-    let remaining = &request[start..];
-    let end = remaining.find('"').unwrap();
-    &remaining[..end]
 }
