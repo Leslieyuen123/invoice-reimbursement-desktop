@@ -19,10 +19,12 @@ const ALLOWED_EXTENSIONS: [&str; 9] = [
 pub struct EmailImportSource {
     pub account_id: Uuid,
     pub mailbox: String,
+    pub uid_validity: u32,
     pub uid: u32,
     pub message_id: Option<String>,
     pub part_id: String,
     pub received_at: DateTime<Utc>,
+    pub rescan: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,11 +95,13 @@ impl ImportService {
         &self,
         payload: EmailPayload<'_>,
     ) -> Result<ImportOutcome, AppError> {
+        validate_email_source(&payload.source)?;
         if let Some(existing) = self
             .items
             .find_email_part(
                 payload.source.account_id,
                 &payload.source.mailbox,
+                payload.source.uid_validity,
                 payload.source.uid,
                 &payload.source.part_id,
             )
@@ -113,6 +117,27 @@ impl ImportService {
             Ok(value) => value,
             Err(error) => return Err(staged.cleanup_after(error)),
         };
+        if payload.source.rescan {
+            let existing = match self
+                .items
+                .find_rescanned_email_part(
+                    payload.source.account_id,
+                    &payload.source.mailbox,
+                    payload.source.uid_validity,
+                    payload.source.message_id.as_deref(),
+                    &payload.source.part_id,
+                    &sha256,
+                )
+                .await
+            {
+                Ok(existing) => existing,
+                Err(error) => return Err(staged.cleanup_after(error)),
+            };
+            if let Some(existing) = existing {
+                staged.discard()?;
+                return Ok(ImportOutcome::Existing(existing));
+            }
+        }
         let mime_type = match payload.mime_type {
             Some(mime_type) => mime_type,
             None => match detect_mime(staged.path(), &payload.extension).await {
@@ -137,6 +162,7 @@ impl ImportService {
             source_type: SourceType::Email,
             source_account_id: Some(payload.source.account_id),
             source_mailbox: Some(payload.source.mailbox.clone()),
+            source_uid_validity: Some(i64::from(payload.source.uid_validity)),
             source_uid: Some(i64::from(payload.source.uid)),
             source_message_id: payload.source.message_id.clone(),
             source_part_id: Some(payload.source.part_id.clone()),
@@ -173,6 +199,7 @@ impl ImportService {
                         .find_email_part(
                             payload.source.account_id,
                             &payload.source.mailbox,
+                            payload.source.uid_validity,
                             payload.source.uid,
                             &payload.source.part_id,
                         )
@@ -236,6 +263,7 @@ impl ImportService {
             source_type: SourceType::ManualUpload,
             source_account_id: None,
             source_mailbox: None,
+            source_uid_validity: None,
             source_uid: None,
             source_message_id: None,
             source_part_id: None,
@@ -288,6 +316,21 @@ struct EmailPayload<'a> {
     recognition_status: RecognitionStatus,
     note: Option<String>,
     source: EmailImportSource,
+}
+
+fn validate_email_source(source: &EmailImportSource) -> Result<(), AppError> {
+    if source.account_id.is_nil()
+        || source.mailbox.trim().is_empty()
+        || source.uid_validity == 0
+        || source.uid == 0
+        || source.part_id.trim().is_empty()
+    {
+        return Err(AppError::validation(
+            "source",
+            "email source requires an account, mailbox, positive UIDVALIDITY and UID, and part ID",
+        ));
+    }
+    Ok(())
 }
 
 fn sanitize_mail_filename(file_name: &str) -> Result<String, AppError> {

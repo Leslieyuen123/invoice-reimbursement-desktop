@@ -1936,6 +1936,7 @@ fn sample_item(paths: &AppPaths, suffix: &str) -> NewItemRecord {
         source_type: SourceType::ManualUpload,
         source_account_id: None,
         source_mailbox: None,
+        source_uid_validity: None,
         source_uid: None,
         source_message_id: Some(format!("message-{suffix}")),
         source_part_id: None,

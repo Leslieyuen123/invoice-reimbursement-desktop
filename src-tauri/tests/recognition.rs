@@ -520,6 +520,7 @@ async fn retry_clears_or_replaces_old_automatic_fields_and_preserves_everything_
     record.source_type = SourceType::Email;
     record.source_account_id = Some(account.id);
     record.source_mailbox = Some("INBOX".to_owned());
+    record.source_uid_validity = Some(10);
     record.source_uid = Some(77);
     record.source_message_id = Some("message-77".to_owned());
     record.source_part_id = Some("2".to_owned());
@@ -702,6 +703,7 @@ fn sample_item(id: Uuid) -> NewItemRecord {
         source_type: SourceType::ManualUpload,
         source_account_id: None,
         source_mailbox: None,
+        source_uid_validity: None,
         source_uid: None,
         source_message_id: None,
         source_part_id: None,

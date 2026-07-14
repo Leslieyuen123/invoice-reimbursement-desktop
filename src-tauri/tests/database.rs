@@ -440,6 +440,7 @@ async fn item_repository_inserts_and_finds_a_fully_typed_item_by_hash() {
     assert_eq!(found.source_type, SourceType::ManualUpload);
     assert_eq!(found.source_account_id, new_item.source_account_id);
     assert_eq!(found.source_mailbox, new_item.source_mailbox);
+    assert_eq!(found.source_uid_validity, new_item.source_uid_validity);
     assert_eq!(found.source_uid, new_item.source_uid);
     assert_eq!(found.source_message_id, new_item.source_message_id);
     assert_eq!(found.source_part_id, new_item.source_part_id);
@@ -537,6 +538,7 @@ async fn item_repository_maps_duplicate_email_parts_to_an_actionable_conflict() 
     first.source_type = SourceType::Email;
     first.source_account_id = Some(account_id);
     first.source_mailbox = Some("INBOX".to_owned());
+    first.source_uid_validity = Some(10);
     first.source_uid = Some(42);
     first.source_message_id = Some("message-first".to_owned());
     first.source_part_id = Some("2".to_owned());
@@ -544,6 +546,7 @@ async fn item_repository_maps_duplicate_email_parts_to_an_actionable_conflict() 
     duplicate.source_type = SourceType::Email;
     duplicate.source_account_id = Some(account_id);
     duplicate.source_mailbox = Some("INBOX".to_owned());
+    duplicate.source_uid_validity = Some(10);
     duplicate.source_uid = Some(42);
     duplicate.source_message_id = Some("message-duplicate".to_owned());
     duplicate.source_part_id = Some("2".to_owned());
@@ -575,6 +578,7 @@ async fn deleting_mailbox_account_preserves_imported_email_provenance() {
     email_item.source_type = SourceType::Email;
     email_item.source_account_id = Some(account_id);
     email_item.source_mailbox = Some("INBOX".to_owned());
+    email_item.source_uid_validity = Some(10);
     email_item.source_uid = Some(42);
     email_item.source_part_id = Some("2".to_owned());
     repository
@@ -596,6 +600,7 @@ async fn deleting_mailbox_account_preserves_imported_email_provenance() {
     assert_eq!(deleted.rows_affected(), 1);
     assert_eq!(retained.source_account_id, Some(account_id));
     assert_eq!(retained.source_mailbox.as_deref(), Some("INBOX"));
+    assert_eq!(retained.source_uid_validity, Some(10));
     assert_eq!(retained.source_uid, Some(42));
     assert_eq!(retained.source_part_id.as_deref(), Some("2"));
 }
@@ -612,6 +617,7 @@ async fn item_repository_validates_email_provenance_before_sql() {
     valid_email.source_type = SourceType::Email;
     valid_email.source_account_id = Some(Uuid::new_v4());
     valid_email.source_mailbox = Some("INBOX".to_owned());
+    valid_email.source_uid_validity = Some(10);
     valid_email.source_uid = Some(42);
     valid_email.source_part_id = Some("2".to_owned());
 
@@ -634,6 +640,16 @@ async fn item_repository_validates_email_provenance_before_sql() {
     invalid_items.push({
         let mut item = valid_email.clone();
         item.source_mailbox = Some("   ".to_owned());
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_uid_validity = None;
+        item
+    });
+    invalid_items.push({
+        let mut item = valid_email.clone();
+        item.source_uid_validity = Some(0);
         item
     });
     invalid_items.push({
@@ -666,8 +682,9 @@ async fn item_repository_validates_email_provenance_before_sql() {
             error,
             AppError::Validation {
                 field: "source".to_owned(),
-                message: "email source requires an account, mailbox, positive UID, and part ID"
-                    .to_owned(),
+                message:
+                    "email source requires an account, mailbox, positive UIDVALIDITY and UID, and part ID"
+                        .to_owned(),
             }
         );
     }
@@ -755,6 +772,7 @@ async fn item_repository_combines_typed_filters_text_search_and_deterministic_or
     target.source_type = SourceType::Email;
     target.source_account_id = Some(account_id);
     target.source_mailbox = Some("INBOX".to_owned());
+    target.source_uid_validity = Some(10);
     target.source_uid = Some(3);
     target.source_part_id = Some("1".to_owned());
     target.suggested_period = Some("2026-Q3".to_owned());
@@ -1675,6 +1693,7 @@ async fn persisted_domain_enums_round_trip_through_repository_rows() {
         if item.source_type == SourceType::Email {
             item.source_account_id = Some(account.id);
             item.source_mailbox = Some("INBOX".to_owned());
+            item.source_uid_validity = Some(10);
             item.source_uid = Some(index as i64 + 1);
             item.source_part_id = Some("1".to_owned());
         }
@@ -1900,6 +1919,7 @@ fn sample_item(suffix: &str, sha256: &str) -> NewItemRecord {
         source_type: SourceType::ManualUpload,
         source_account_id: None,
         source_mailbox: None,
+        source_uid_validity: None,
         source_uid: None,
         source_message_id: None,
         source_part_id: None,

@@ -117,6 +117,7 @@ impl SyncService {
     ) -> Result<(SyncResult, SyncCursor), AppError> {
         let delta = self.gateway.fetch_since(config, secret, cursor).await?;
         validate_delta(&delta, &config.mailbox)?;
+        let rescan = cursor.is_some_and(|cursor| cursor.uid_validity != delta.uid_validity);
         let mut imported_count = 0_u32;
         for raw_message in &delta.messages {
             let parsed = parse_invoice_parts(raw_message)?;
@@ -129,10 +130,12 @@ impl SyncService {
                         EmailImportSource {
                             account_id,
                             mailbox: raw_message.mailbox.clone(),
+                            uid_validity: delta.uid_validity,
                             uid: raw_message.uid,
                             message_id: part.message_id.clone(),
                             part_id: part.part_id,
                             received_at: raw_message.received_at,
+                            rescan,
                         },
                     )
                     .await?;
@@ -158,10 +161,12 @@ impl SyncService {
                         EmailImportSource {
                             account_id,
                             mailbox: raw_message.mailbox.clone(),
+                            uid_validity: delta.uid_validity,
                             uid: raw_message.uid,
                             message_id: link.message_id,
                             part_id: link.part_id,
                             received_at: raw_message.received_at,
+                            rescan,
                         },
                     )
                     .await?;

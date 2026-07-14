@@ -774,6 +774,194 @@ async fn uidvalidity_change_rescans_without_duplicating_a_mail_part() {
 }
 
 #[tokio::test]
+async fn uidvalidity_change_reuses_the_same_message_part_at_a_new_uid() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "epoch-renumber@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let gateway = Arc::new(FakeImapGateway::new(vec![
+        Ok(MailboxDelta {
+            uid_validity: 10,
+            highest_uid: 101,
+            messages: vec![raw_message(
+                101,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+        Ok(MailboxDelta {
+            uid_validity: 11,
+            highest_uid: 7,
+            messages: vec![raw_message(
+                7,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+    ]));
+    let service = SyncService::new(
+        gateway,
+        credentials,
+        accounts,
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
+    assert_eq!(service.run(account.id).await.unwrap().imported_count, 0);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].source_uid_validity, Some(10));
+}
+
+#[tokio::test]
+async fn uidvalidity_change_keeps_reused_uid_when_message_content_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "epoch-reuse@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let gateway = Arc::new(FakeImapGateway::new(vec![
+        Ok(MailboxDelta {
+            uid_validity: 10,
+            highest_uid: 101,
+            messages: vec![raw_message(
+                101,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+        Ok(MailboxDelta {
+            uid_validity: 11,
+            highest_uid: 101,
+            messages: vec![raw_message(
+                101,
+                include_bytes!("fixtures/mail/inline-image.eml"),
+            )],
+        }),
+    ]));
+    let service = SyncService::new(
+        gateway,
+        credentials,
+        accounts,
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
+    assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    let mut identities = stored
+        .iter()
+        .map(|item| (item.source_uid_validity, item.source_uid))
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    assert_eq!(identities, [(Some(10), Some(101)), (Some(11), Some(101))]);
+}
+
+#[tokio::test]
+async fn same_uidvalidity_same_content_at_a_new_uid_is_a_suspected_duplicate() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "same-epoch-duplicate@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let gateway = Arc::new(FakeImapGateway::new(vec![
+        Ok(MailboxDelta {
+            uid_validity: 10,
+            highest_uid: 101,
+            messages: vec![raw_message(
+                101,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+        Ok(MailboxDelta {
+            uid_validity: 10,
+            highest_uid: 102,
+            messages: vec![raw_message(
+                102,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+    ]));
+    let service = SyncService::new(
+        gateway,
+        credentials,
+        accounts,
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
+    assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    let duplicate = stored
+        .iter()
+        .find(|item| item.source_uid == Some(102))
+        .expect("new UID should be stored");
+    assert_eq!(
+        duplicate.dedupe_status,
+        invoice_reimbursement::domain::model::DedupeStatus::SuspectedDuplicate
+    );
+    assert!(
+        stored
+            .iter()
+            .all(|item| item.source_uid_validity == Some(10))
+    );
+}
+
+#[tokio::test]
 async fn concurrent_syncs_import_one_database_row_and_one_original() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -1085,10 +1273,12 @@ async fn email_filename_is_a_sanitized_cross_platform_basename_and_url_stays_int
             EmailImportSource {
                 account_id: account.id,
                 mailbox: "INBOX".to_owned(),
+                uid_validity: 10,
                 uid: 1,
                 message_id: Some("filename@example.com".to_owned()),
                 part_id: "1".to_owned(),
                 received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                rescan: false,
             },
         )
         .await

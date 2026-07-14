@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use crate::db::accounts::{MailboxAccount, MailboxProvider, SyncCursor};
@@ -170,12 +169,22 @@ fn fetch_blocking(
         .unwrap_or(0);
     let mut messages = Vec::new();
     let mut budget = RawBudget::new(settings.max_message_bytes, settings.max_total_bytes);
-    let window = uid_window(cursor, uid_validity, highest_uid, settings.max_messages)?;
-    for uid in window.into_iter().flatten() {
+    let (uids, mut high_water) = match uid_start(cursor, uid_validity) {
+        Some(start_uid) if start_uid <= highest_uid => {
+            let found = session
+                .uid_search(format!("UID {start_uid}:*"))
+                .map_err(|_| imap_error("IMAP UID search failed"))?;
+            select_uid_batch(found, highest_uid, settings.max_messages)?
+        }
+        _ => (Vec::new(), highest_uid),
+    };
+    let mut processed_high_water = None;
+    for uid in uids {
         let metadata = session
             .uid_fetch(uid.to_string(), "(UID RFC822.SIZE INTERNALDATE)")
             .map_err(|_| imap_error("IMAP message metadata fetch failed"))?;
         let Some(metadata) = metadata.iter().next() else {
+            processed_high_water = Some(uid);
             continue;
         };
         let actual_uid = metadata
@@ -183,7 +192,14 @@ fn fetch_blocking(
             .ok_or_else(|| imap_error("IMAP response omitted UID"))?;
         let size = usize::try_from(metadata.size.unwrap_or(0))
             .map_err(|_| limit_error("IMAP message size is invalid"))?;
-        budget.check_declared(size)?;
+        budget.check_message(size)?;
+        if !budget.can_fit(size)? {
+            let Some(processed) = processed_high_water else {
+                return Err(limit_error("IMAP delta exceeds total size limit"));
+            };
+            high_water = processed;
+            break;
+        }
         let received_at = metadata
             .internal_date()
             .map(|date| date.with_timezone(&Utc))
@@ -202,6 +218,14 @@ fn fetch_blocking(
         let raw = fetched
             .body()
             .ok_or_else(|| imap_error("IMAP message body was omitted"))?;
+        budget.check_message(raw.len())?;
+        if !budget.can_fit(raw.len())? {
+            let Some(processed) = processed_high_water else {
+                return Err(limit_error("IMAP delta exceeds total size limit"));
+            };
+            high_water = processed;
+            break;
+        }
         budget.add_actual(raw.len())?;
         messages.push(RawMessage {
             uid: actual_uid,
@@ -209,38 +233,46 @@ fn fetch_blocking(
             raw: raw.to_vec(),
             received_at,
         });
+        processed_high_water = Some(uid);
     }
     let _ = session.logout();
     Ok(MailboxDelta {
         uid_validity,
         messages,
-        highest_uid,
+        highest_uid: high_water,
     })
 }
 
-fn uid_window(
-    cursor: Option<SyncCursor>,
-    uid_validity: u32,
-    highest_uid: u32,
+fn uid_start(cursor: Option<SyncCursor>, uid_validity: u32) -> Option<u32> {
+    match cursor {
+        Some(cursor) if cursor.uid_validity == uid_validity => cursor.last_uid.checked_add(1),
+        _ => Some(1),
+    }
+}
+
+fn select_uid_batch(
+    uids: impl IntoIterator<Item = u32>,
+    mailbox_highest: u32,
     max_messages: usize,
-) -> Result<Option<RangeInclusive<u32>>, AppError> {
-    let start_uid = match cursor {
-        Some(cursor) if cursor.uid_validity == uid_validity => {
-            let Some(next) = cursor.last_uid.checked_add(1) else {
-                return Ok(None);
-            };
-            next
-        }
-        _ => 1,
-    };
-    if start_uid > highest_uid {
-        return Ok(None);
+) -> Result<(Vec<u32>, u32), AppError> {
+    if max_messages == 0 {
+        return Err(limit_error("IMAP message count limit is zero"));
     }
-    let candidate_count = u64::from(highest_uid) - u64::from(start_uid) + 1;
-    if candidate_count > max_messages as u64 {
-        return Err(limit_error("IMAP delta exceeds message count limit"));
+    let mut selected = uids
+        .into_iter()
+        .filter(|uid| *uid != 0 && *uid <= mailbox_highest)
+        .collect::<Vec<_>>();
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.len() > max_messages {
+        selected.truncate(max_messages);
+        let high_water = *selected
+            .last()
+            .ok_or_else(|| limit_error("IMAP UID batch was unexpectedly empty"))?;
+        Ok((selected, high_water))
+    } else {
+        Ok((selected, mailbox_highest))
     }
-    Ok(Some(start_uid..=highest_uid))
 }
 
 struct RawBudget {
@@ -258,10 +290,23 @@ impl RawBudget {
         }
     }
 
-    fn check_declared(&self, bytes: usize) -> Result<(), AppError> {
+    fn check_message(&self, bytes: usize) -> Result<(), AppError> {
         if bytes > self.max_message {
             return Err(limit_error("IMAP message exceeds size limit"));
         }
+        Ok(())
+    }
+
+    fn can_fit(&self, bytes: usize) -> Result<bool, AppError> {
+        let projected = self
+            .total
+            .checked_add(bytes)
+            .ok_or_else(|| limit_error("IMAP delta size overflow"))?;
+        Ok(projected <= self.max_total)
+    }
+
+    fn add_actual(&mut self, bytes: usize) -> Result<(), AppError> {
+        self.check_message(bytes)?;
         let projected = self
             .total
             .checked_add(bytes)
@@ -269,20 +314,7 @@ impl RawBudget {
         if projected > self.max_total {
             return Err(limit_error("IMAP delta exceeds total size limit"));
         }
-        Ok(())
-    }
-
-    fn add_actual(&mut self, bytes: usize) -> Result<(), AppError> {
-        if bytes > self.max_message {
-            return Err(limit_error("IMAP message exceeds size limit"));
-        }
-        self.total = self
-            .total
-            .checked_add(bytes)
-            .ok_or_else(|| limit_error("IMAP delta size overflow"))?;
-        if self.total > self.max_total {
-            return Err(limit_error("IMAP delta exceeds total size limit"));
-        }
+        self.total = projected;
         Ok(())
     }
 }
@@ -350,44 +382,91 @@ fn limit_error(message: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawBudget, uid_window};
+    use super::{RawBudget, select_uid_batch, uid_start};
     use crate::db::accounts::SyncCursor;
+
+    #[test]
+    fn sparse_uid_selection_uses_actual_messages_instead_of_numeric_span() {
+        let (uids, high_water) = select_uid_batch(vec![50_000, 7], 50_000, 1_000)
+            .expect("sparse batch should select and sort");
+
+        assert_eq!(uids, [7, 50_000]);
+        assert_eq!(high_water, 50_000);
+    }
+
+    #[test]
+    fn empty_uid_selection_advances_to_the_mailbox_high_water() {
+        let (uids, high_water) =
+            select_uid_batch(Vec::<u32>::new(), 50_000, 1_000).expect("empty search should select");
+
+        assert!(uids.is_empty());
+        assert_eq!(high_water, 50_000);
+    }
+
+    #[test]
+    fn uid_selection_pages_large_backlogs_without_skipping_the_next_batch() {
+        let (first_uids, first_high_water) =
+            select_uid_batch(1..=1_001, 1_001, 1_000).expect("first batch should select");
+        let (second_uids, second_high_water) =
+            select_uid_batch(vec![1_001], 1_001, 1_000).expect("second batch should select");
+
+        assert_eq!(first_uids.len(), 1_000);
+        assert_eq!(first_uids.first(), Some(&1));
+        assert_eq!(first_uids.last(), Some(&1_000));
+        assert_eq!(first_high_water, 1_000);
+        assert_eq!(second_uids, [1_001]);
+        assert_eq!(second_high_water, 1_001);
+    }
+
+    #[test]
+    fn total_budget_can_stop_a_nonempty_batch_before_overflow() {
+        let mut budget = RawBudget::new(10, 12);
+        budget.add_actual(7).unwrap();
+
+        assert!(!budget.can_fit(6).unwrap());
+        assert_eq!(budget.total, 7);
+    }
+
+    #[test]
+    fn a_single_message_over_the_total_budget_is_rejected() {
+        let mut budget = RawBudget::new(20, 12);
+
+        let error = budget.add_actual(13).unwrap_err();
+
+        assert!(error.to_string().contains("total size limit"));
+        assert_eq!(budget.total, 0);
+    }
 
     #[test]
     fn max_uid_cursor_has_no_incremental_window_but_uidvalidity_change_rescans() {
         assert_eq!(
-            uid_window(
+            uid_start(
                 Some(SyncCursor {
                     uid_validity: 10,
                     last_uid: u32::MAX,
                 }),
                 10,
-                u32::MAX,
-                1_000,
-            )
-            .unwrap(),
+            ),
             None
         );
-        let changed = uid_window(
-            Some(SyncCursor {
-                uid_validity: 10,
-                last_uid: u32::MAX,
-            }),
-            11,
-            2,
-            1_000,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(changed.collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(
+            uid_start(
+                Some(SyncCursor {
+                    uid_validity: 10,
+                    last_uid: u32::MAX,
+                }),
+                11,
+            ),
+            Some(1)
+        );
     }
 
     #[test]
     fn actual_raw_bytes_enforce_total_even_when_server_declares_smaller_sizes() {
         let mut budget = RawBudget::new(10, 12);
-        budget.check_declared(1).unwrap();
+        budget.check_message(1).unwrap();
         budget.add_actual(7).unwrap();
-        budget.check_declared(1).unwrap();
+        budget.check_message(1).unwrap();
 
         let error = budget.add_actual(6).unwrap_err();
 

@@ -143,6 +143,11 @@ impl StagedOriginal {
         })
     }
 
+    pub(crate) fn discard(mut self) -> Result<(), AppError> {
+        self.owned = false;
+        remove_file_durably(&self.path)
+    }
+
     pub(crate) fn cleanup_after(mut self, error: AppError) -> AppError {
         self.owned = false;
         match remove_file_durably(&self.path) {

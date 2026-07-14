@@ -9,11 +9,11 @@ use crate::domain::model::{
 };
 
 const ITEM_COLUMNS: &str = "id, original_name, original_path, normalized_pdf_path, sha256, \
-    mime_type, source_type, source_account_id, source_mailbox, source_uid, source_message_id, \
-    source_part_id, fetched_at, invoice_date, suggested_period, batch_id, suggested_category, \
-    final_category, amount_cents, currency, city, company, recognition_status, \
-    confirmation_status, dedupe_status, duplicate_of_id, note, event_tag, project_tag, \
-    created_at, updated_at";
+    mime_type, source_type, source_account_id, source_mailbox, source_uid_validity, source_uid, \
+    source_message_id, source_part_id, fetched_at, invoice_date, suggested_period, batch_id, \
+    suggested_category, final_category, amount_cents, currency, city, company, \
+    recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, event_tag, \
+    project_tag, created_at, updated_at";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceItem {
@@ -26,6 +26,7 @@ pub struct InvoiceItem {
     pub source_type: SourceType,
     pub source_account_id: Option<Uuid>,
     pub source_mailbox: Option<String>,
+    pub source_uid_validity: Option<i64>,
     pub source_uid: Option<i64>,
     pub source_message_id: Option<String>,
     pub source_part_id: Option<String>,
@@ -71,6 +72,7 @@ pub struct NewItemRecord {
     pub source_type: SourceType,
     pub source_account_id: Option<Uuid>,
     pub source_mailbox: Option<String>,
+    pub source_uid_validity: Option<i64>,
     pub source_uid: Option<i64>,
     pub source_message_id: Option<String>,
     pub source_part_id: Option<String>,
@@ -245,22 +247,62 @@ impl ItemRepository {
         &self,
         account_id: Uuid,
         mailbox: &str,
+        uid_validity: u32,
         uid: u32,
         part_id: &str,
     ) -> Result<Option<InvoiceItem>, AppError> {
         let query = format!(
             "SELECT {ITEM_COLUMNS} FROM items WHERE source_type = 'email' \
-             AND source_account_id = ? AND source_mailbox = ? AND source_uid = ? \
-             AND source_part_id = ? LIMIT 1"
+             AND source_account_id = ? AND source_mailbox = ? AND source_uid_validity = ? \
+             AND source_uid = ? AND source_part_id = ? LIMIT 1"
         );
         let row = sqlx::query_as::<_, DbItemRow>(&query)
             .bind(account_id.to_string())
             .bind(mailbox)
+            .bind(i64::from(uid_validity))
             .bind(i64::from(uid))
             .bind(part_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|error| internal_error("failed to find email part", error))?;
+        row.map(InvoiceItem::try_from).transpose()
+    }
+
+    pub async fn find_rescanned_email_part(
+        &self,
+        account_id: Uuid,
+        mailbox: &str,
+        current_uid_validity: u32,
+        message_id: Option<&str>,
+        part_id: &str,
+        sha256: &str,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
+        query
+            .push(ITEM_COLUMNS)
+            .push(" FROM items WHERE source_type = 'email' AND source_account_id = ");
+        query
+            .push_bind(account_id.to_string())
+            .push(" AND source_mailbox = ")
+            .push_bind(mailbox)
+            .push(" AND source_uid_validity != ")
+            .push_bind(i64::from(current_uid_validity))
+            .push(" AND source_part_id = ")
+            .push_bind(part_id)
+            .push(" AND sha256 = ")
+            .push_bind(sha256);
+        if let Some(message_id) = message_id {
+            query
+                .push(" AND source_message_id = ")
+                .push_bind(message_id);
+        }
+        query.push(" ORDER BY created_at ASC, id ASC LIMIT 1");
+
+        let row = query
+            .build_query_as::<DbItemRow>()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to find rescanned email part", error))?;
         row.map(InvoiceItem::try_from).transpose()
     }
 
@@ -947,13 +989,13 @@ async fn insert_with_connection(
     sqlx::query(
         "INSERT INTO items (\
             id, original_name, original_path, normalized_pdf_path, sha256, mime_type, \
-            source_type, source_account_id, source_mailbox, source_uid, source_message_id, \
-            source_part_id, fetched_at, invoice_date, suggested_period, batch_id, \
+            source_type, source_account_id, source_mailbox, source_uid_validity, source_uid, \
+            source_message_id, source_part_id, fetched_at, invoice_date, suggested_period, batch_id, \
             suggested_category, final_category, amount_cents, currency, city, company, \
             recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, \
             event_tag, project_tag, created_at, updated_at\
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-            ?, ?, ?, ?, ?, ?, ?, ?)",
+            ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(item.id.to_string())
     .bind(&item.original_name)
@@ -964,6 +1006,7 @@ async fn insert_with_connection(
     .bind(source_type_str(item.source_type))
     .bind(item.source_account_id.map(|id| id.to_string()))
     .bind(&item.source_mailbox)
+    .bind(item.source_uid_validity)
     .bind(item.source_uid)
     .bind(&item.source_message_id)
     .bind(&item.source_part_id)
@@ -1020,6 +1063,7 @@ struct DbItemRow {
     source_type: String,
     source_account_id: Option<String>,
     source_mailbox: Option<String>,
+    source_uid_validity: Option<i64>,
     source_uid: Option<i64>,
     source_message_id: Option<String>,
     source_part_id: Option<String>,
@@ -1058,6 +1102,7 @@ impl TryFrom<DbItemRow> for InvoiceItem {
             source_type: parse_source_type(&row.source_type)?,
             source_account_id: parse_optional_uuid(row.source_account_id, "source_account_id")?,
             source_mailbox: row.source_mailbox,
+            source_uid_validity: row.source_uid_validity,
             source_uid: row.source_uid,
             source_message_id: row.source_message_id,
             source_part_id: row.source_part_id,
@@ -1101,6 +1146,9 @@ fn validate_source(item: &NewItemRecord) -> Result<(), AppError> {
                 .source_mailbox
                 .as_deref()
                 .is_none_or(|mailbox| mailbox.trim().is_empty())
+            || item
+                .source_uid_validity
+                .is_none_or(|uid_validity| uid_validity <= 0)
             || item.source_uid.is_none_or(|uid| uid <= 0)
             || item
                 .source_part_id
@@ -1109,7 +1157,13 @@ fn validate_source(item: &NewItemRecord) -> Result<(), AppError> {
     {
         return Err(AppError::validation(
             "source",
-            "email source requires an account, mailbox, positive UID, and part ID",
+            "email source requires an account, mailbox, positive UIDVALIDITY and UID, and part ID",
+        ));
+    }
+    if item.source_type == SourceType::ManualUpload && item.source_uid_validity.is_some() {
+        return Err(AppError::validation(
+            "source_uid_validity",
+            "manual uploads must not have IMAP UIDVALIDITY",
         ));
     }
 
