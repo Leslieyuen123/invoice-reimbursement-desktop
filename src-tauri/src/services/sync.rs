@@ -92,7 +92,13 @@ impl SyncService {
             Ok((result, next_cursor)) => {
                 if let Err(error) = self
                     .accounts
-                    .finish_sync_success(&run, &config.mailbox, next_cursor, result.imported_count)
+                    .finish_sync_success(
+                        &run,
+                        &config.mailbox,
+                        cursor,
+                        next_cursor,
+                        result.imported_count,
+                    )
                     .await
                 {
                     let sanitized = sanitize_error(&error.to_string(), &secret);
@@ -262,12 +268,6 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
         let is_inline_image = (part.is_content_type("image", "jpeg")
             || part.is_content_type("image", "png"))
             && (part.attachment_name().is_some() || part.content_id().is_some());
-        if let Some(html) = part
-            .text_contents()
-            .filter(|_| part.is_content_type("text", "html"))
-        {
-            collect_https_links(html, index, &message_id, &mut seen_links, &mut links)?;
-        }
         if is_attachment || is_inline_image {
             let Some(file_name) = part
                 .attachment_name()
@@ -287,6 +287,21 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
             });
         }
     }
+    for part_id in &message.html_body {
+        if links.len() >= MAX_DOWNLOAD_LINKS_PER_MESSAGE {
+            break;
+        }
+        let Some(html) = message.part(*part_id).and_then(|part| part.text_contents()) else {
+            continue;
+        };
+        collect_https_links(
+            html,
+            *part_id as usize,
+            &message_id,
+            &mut seen_links,
+            &mut links,
+        )?;
+    }
     Ok(ParsedInvoiceParts { files, links })
 }
 
@@ -302,10 +317,15 @@ fn collect_https_links(
         message: "failed to prepare HTML link selector".to_owned(),
     })?;
     for anchor in anchors {
+        if links.len() >= MAX_DOWNLOAD_LINKS_PER_MESSAGE {
+            break;
+        }
+        let visible_text = anchor.text_contents();
         let attributes = anchor.attributes.borrow();
         let Some(href) = attributes.get("href") else {
             continue;
         };
+        let has_download_attribute = attributes.get("download").is_some();
         if href.len() > MAX_DOWNLOAD_URL_LENGTH {
             continue;
         }
@@ -315,14 +335,15 @@ fn collect_https_links(
         if url.scheme() != "https" || url.host_str().is_none() {
             continue;
         }
+        if !is_supported_file_name(url.path())
+            && !has_download_attribute
+            && !has_download_text(&visible_text)
+        {
+            continue;
+        }
         let normalized = url.to_string();
         if !seen.insert(normalized.clone()) {
             continue;
-        }
-        if links.len() >= MAX_DOWNLOAD_LINKS_PER_MESSAGE {
-            return Err(resource_limit_error(
-                "mailbox message has too many HTTPS download links",
-            ));
         }
         links.push(DownloadLink {
             part_id: format!("{mime_index}.link.{}", links.len()),
@@ -331,6 +352,13 @@ fn collect_https_links(
         });
     }
     Ok(())
+}
+
+fn has_download_text(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    ["download", "invoice", "receipt", "下载", "发票", "票据"]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
 }
 
 fn inline_file_name(part: &mail_parser::MessagePart<'_>, index: usize) -> Option<String> {
@@ -393,6 +421,7 @@ fn sanitized_external_error(error: &AppError, message: String) -> AppError {
             retryable: *retryable,
             message,
         },
+        AppError::Conflict { .. } => AppError::Conflict { message },
         _ => AppError::Internal { message },
     }
 }

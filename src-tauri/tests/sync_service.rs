@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -70,6 +71,15 @@ struct ConcurrentGateway {
     barrier: tokio::sync::Barrier,
 }
 
+struct OrderedCompletionGateway {
+    stale_delta: MailboxDelta,
+    newer_delta: MailboxDelta,
+    calls: AtomicUsize,
+    cursors: Mutex<Vec<Option<SyncCursor>>>,
+    stale_started: tokio::sync::Notify,
+    release_stale: tokio::sync::Notify,
+}
+
 #[async_trait]
 impl ImapGateway for ConcurrentGateway {
     async fn test_connection(
@@ -88,6 +98,35 @@ impl ImapGateway for ConcurrentGateway {
     ) -> Result<MailboxDelta, AppError> {
         self.barrier.wait().await;
         Ok(self.delta.clone())
+    }
+}
+
+#[async_trait]
+impl ImapGateway for OrderedCompletionGateway {
+    async fn test_connection(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn fetch_since(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+        cursor: Option<SyncCursor>,
+    ) -> Result<MailboxDelta, AppError> {
+        self.cursors.lock().unwrap().push(cursor);
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                self.stale_started.notify_one();
+                self.release_stale.notified().await;
+                Ok(self.stale_delta.clone())
+            }
+            1 => Ok(self.newer_delta.clone()),
+            _ => panic!("ordered gateway received an unexpected fetch"),
+        }
     }
 }
 
@@ -436,6 +475,132 @@ async fn https_download_link_becomes_a_local_pending_placeholder_without_network
         Some(SyncCursor {
             uid_validity: 20,
             last_uid: 103,
+        })
+    );
+}
+
+#[tokio::test]
+async fn html_links_only_import_download_candidates_from_the_message_body() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "link-policy@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            uid_validity: 21,
+            highest_uid: 201,
+            messages: vec![raw_message(
+                201,
+                include_bytes!("fixtures/mail/link-policy.eml"),
+            )],
+        })])),
+        credentials,
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+
+    assert_eq!(result.imported_count, 3);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 3);
+    let mut urls = stored
+        .iter()
+        .map(|item| item.note.clone().unwrap())
+        .collect::<Vec<_>>();
+    urls.sort();
+    assert_eq!(
+        urls,
+        [
+            "https://example.com/materials/invoice-201.pdf",
+            "https://example.com/secure/material?id=202",
+            "https://example.com/secure/receipt?id=203",
+        ]
+    );
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(SyncCursor {
+            uid_validity: 21,
+            last_uid: 201,
+        })
+    );
+}
+
+#[tokio::test]
+async fn excessive_download_candidates_are_truncated_and_cursor_advances() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "link-budget@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let raw = many_download_links_message(35);
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            uid_validity: 22,
+            highest_uid: 202,
+            messages: vec![raw_message(202, raw.as_bytes())],
+        })])),
+        credentials,
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+
+    assert_eq!(result.imported_count, 32);
+    let stored = items.list(ItemFilter::default()).await.unwrap();
+    assert_eq!(stored.len(), 32);
+    assert!(stored.iter().any(|item| {
+        item.note.as_deref() == Some("https://example.com/invoices/invoice-00.pdf")
+    }));
+    assert!(stored.iter().any(|item| {
+        item.note.as_deref() == Some("https://example.com/invoices/invoice-31.pdf")
+    }));
+    assert!(!stored.iter().any(|item| {
+        item.note.as_deref() == Some("https://example.com/invoices/invoice-32.pdf")
+    }));
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(SyncCursor {
+            uid_validity: 22,
+            last_uid: 202,
         })
     );
 }
@@ -1237,10 +1402,10 @@ async fn concurrent_syncs_import_one_database_row_and_one_original() {
     );
 
     let (first, second) = tokio::join!(service.run(account.id), service.run(account.id));
-    let first = first.unwrap();
-    let second = second.unwrap();
+    let results = [first, second];
 
-    assert_eq!(first.imported_count + second.imported_count, 1);
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
     assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 1);
     assert_eq!(count_files(&paths.originals), 1);
     assert_eq!(
@@ -1250,6 +1415,101 @@ async fn concurrent_syncs_import_one_database_row_and_one_original() {
             last_uid: 101,
         })
     );
+}
+
+#[tokio::test]
+async fn stale_concurrent_completion_cannot_overwrite_a_newer_cursor_epoch() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("cursor-cas.sqlite3").display()
+    );
+    let pool = db::connect(&database_url).await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "cursor-cas@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let expected = SyncCursor {
+        uid_validity: 10,
+        last_uid: 50,
+    };
+    accounts
+        .upsert_cursor(account.id, "INBOX", expected)
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let gateway = Arc::new(OrderedCompletionGateway {
+        stale_delta: MailboxDelta {
+            uid_validity: 10,
+            highest_uid: 100,
+            messages: vec![],
+        },
+        newer_delta: MailboxDelta {
+            uid_validity: 11,
+            highest_uid: 7,
+            messages: vec![],
+        },
+        calls: AtomicUsize::new(0),
+        cursors: Mutex::new(Vec::new()),
+        stale_started: tokio::sync::Notify::new(),
+        release_stale: tokio::sync::Notify::new(),
+    });
+    let service = SyncService::new(
+        gateway.clone(),
+        credentials,
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+    let stale_service = service.clone();
+    let stale_run = tokio::spawn(async move { stale_service.run(account.id).await });
+    gateway.stale_started.notified().await;
+
+    let newer_result = service.run(account.id).await;
+    gateway.release_stale.notify_one();
+    let stale_result = stale_run.await.unwrap();
+
+    assert_eq!(newer_result.unwrap().imported_count, 0);
+    assert!(
+        matches!(stale_result, Err(AppError::Conflict { .. })),
+        "stale completion must conflict"
+    );
+    assert_eq!(
+        gateway.cursors.lock().unwrap().as_slice(),
+        [Some(expected), Some(expected)]
+    );
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(SyncCursor {
+            uid_validity: 11,
+            last_uid: 7,
+        })
+    );
+    assert!(items.list(ItemFilter::default()).await.unwrap().is_empty());
+    let mut statuses = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM sync_runs WHERE account_id = ? ORDER BY status",
+    )
+    .bind(account.id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    statuses.sort();
+    assert_eq!(statuses, ["failed", "succeeded"]);
 }
 
 #[tokio::test]
@@ -1347,6 +1607,7 @@ async fn missing_sync_run_cannot_commit_cursor_or_account_success() {
         .finish_sync_success(
             &missing_run,
             "INBOX",
+            None,
             SyncCursor {
                 uid_validity: 80,
                 last_uid: 9,
@@ -1534,6 +1795,27 @@ fn raw_message(uid: u32, raw: &[u8]) -> RawMessage {
         raw: raw.to_vec(),
         received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
     }
+}
+
+fn many_download_links_message(count: usize) -> String {
+    let mut body = String::from("<html><body>\n");
+    for index in 0..count {
+        body.push_str(&format!(
+            "<a href=\"https://example.com/invoices/invoice-{index:02}.pdf\">Invoice {index:02}</a>\n"
+        ));
+    }
+    body.push_str("</body></html>");
+    format!(
+        "From: portal@example.com\r\n\
+         To: finance@example.com\r\n\
+         Date: Tue, 14 Jul 2026 12:00:00 +0800\r\n\
+         Message-ID: <link-budget-202@example.com>\r\n\
+         Subject: Invoice downloads\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         \r\n\
+         {body}"
+    )
 }
 
 fn count_files(path: &Path) -> usize {

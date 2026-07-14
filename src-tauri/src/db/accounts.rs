@@ -97,7 +97,7 @@ impl MailboxAccountRepository {
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await
-            .map_err(|error| internal_error("failed to get mailbox account", error))?
+            .map_err(|error| map_database_error("failed to get mailbox account", error))?
             .ok_or_else(|| account_not_found(id))?;
 
         MailboxAccount::try_from(row)
@@ -108,7 +108,7 @@ impl MailboxAccountRepository {
         let rows = sqlx::query_as::<_, DbMailboxAccountRow>(&query)
             .fetch_all(&self.pool)
             .await
-            .map_err(|error| internal_error("failed to list mailbox accounts", error))?;
+            .map_err(|error| map_database_error("failed to list mailbox accounts", error))?;
 
         rows.into_iter().map(MailboxAccount::try_from).collect()
     }
@@ -126,7 +126,7 @@ impl MailboxAccountRepository {
         .bind(mailbox)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|error| internal_error("failed to get sync cursor", error))?;
+        .map_err(|error| map_database_error("failed to get sync cursor", error))?;
 
         row.map(|(uid_validity, last_uid)| {
             Ok(SyncCursor {
@@ -161,7 +161,7 @@ impl MailboxAccountRepository {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|error| internal_error("failed to upsert sync cursor", error))
+        .map_err(|error| map_database_error("failed to upsert sync cursor", error))
     }
 
     pub async fn begin_sync_run(&self, account_id: Uuid) -> Result<SyncRun, AppError> {
@@ -179,7 +179,7 @@ impl MailboxAccountRepository {
         .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await
-        .map_err(|error| internal_error("failed to begin sync run", error))?;
+        .map_err(|error| map_database_error("failed to begin sync run", error))?;
         Ok(run)
     }
 
@@ -187,16 +187,40 @@ impl MailboxAccountRepository {
         &self,
         run: &SyncRun,
         mailbox: &str,
+        expected_cursor: Option<SyncCursor>,
         cursor: SyncCursor,
         imported_count: u32,
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
         let mut transaction = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| internal_error("failed to begin sync completion", error))?;
+            .map_err(|error| map_database_error("failed to begin sync completion", error))?;
         let result = async {
+            let current_cursor = sqlx::query_as::<_, (i64, i64)>(
+                "SELECT uid_validity, last_uid FROM sync_cursors \
+                 WHERE account_id = ? AND mailbox = ?",
+            )
+            .bind(run.account_id.to_string())
+            .bind(mailbox)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to validate sync cursor", error))?
+            .map(|(uid_validity, last_uid)| {
+                Ok(SyncCursor {
+                    uid_validity: u32::try_from(uid_validity)
+                        .map_err(|error| internal_error("invalid cursor UIDVALIDITY", error))?,
+                    last_uid: u32::try_from(last_uid)
+                        .map_err(|error| internal_error("invalid cursor UID", error))?,
+                })
+            })
+            .transpose()?;
+            if current_cursor != expected_cursor {
+                return Err(AppError::Conflict {
+                    message: "sync cursor changed while this run was in progress".to_owned(),
+                });
+            }
             let run_update = sqlx::query(
                 "UPDATE sync_runs SET finished_at = ?, status = 'succeeded', imported_count = ?, \
                     error_message = NULL WHERE id = ? AND account_id = ? AND status = 'running'",
@@ -207,7 +231,7 @@ impl MailboxAccountRepository {
             .bind(run.account_id.to_string())
             .execute(&mut *transaction)
             .await
-            .map_err(|error| internal_error("failed to finish sync run", error))?;
+            .map_err(|error| map_database_error("failed to finish sync run", error))?;
             if run_update.rows_affected() != 1 {
                 return Err(AppError::Conflict {
                     message: "sync run is missing or is no longer running".to_owned(),
@@ -224,7 +248,7 @@ impl MailboxAccountRepository {
             .bind(i64::from(cursor.last_uid))
             .execute(&mut *transaction)
             .await
-            .map_err(|error| internal_error("failed to update sync cursor", error))?;
+            .map_err(|error| map_database_error("failed to update sync cursor", error))?;
             let account_update = sqlx::query(
                 "UPDATE mailbox_accounts SET last_synced_at = ?, last_error = NULL, updated_at = ? \
                  WHERE id = ?",
@@ -234,7 +258,7 @@ impl MailboxAccountRepository {
             .bind(run.account_id.to_string())
             .execute(&mut *transaction)
             .await
-            .map_err(|error| internal_error("failed to update synced account", error))?;
+            .map_err(|error| map_database_error("failed to update synced account", error))?;
             if account_update.rows_affected() != 1 {
                 return Err(account_not_found(run.account_id));
             }
@@ -246,10 +270,10 @@ impl MailboxAccountRepository {
             Ok(()) => transaction
                 .commit()
                 .await
-                .map_err(|error| internal_error("failed to commit sync completion", error)),
+                .map_err(|error| map_database_error("failed to commit sync completion", error)),
             Err(error) => {
                 transaction.rollback().await.map_err(|rollback| {
-                    internal_error("failed to roll back sync completion", rollback)
+                    map_database_error("failed to roll back sync completion", rollback)
                 })?;
                 Err(error)
             }
@@ -259,11 +283,10 @@ impl MailboxAccountRepository {
     pub async fn finish_sync_failure(&self, run: &SyncRun, message: &str) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
         let message = sanitize_error_message(message);
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| internal_error("failed to begin sync failure update", error))?;
+        let mut transaction =
+            self.pool.begin().await.map_err(|error| {
+                map_database_error("failed to begin sync failure update", error)
+            })?;
         let result = async {
             let run_update = sqlx::query(
                 "UPDATE sync_runs SET finished_at = ?, status = 'failed', error_message = ? \
@@ -275,7 +298,7 @@ impl MailboxAccountRepository {
             .bind(run.account_id.to_string())
             .execute(&mut *transaction)
             .await
-            .map_err(|error| internal_error("failed to mark sync run failed", error))?;
+            .map_err(|error| map_database_error("failed to mark sync run failed", error))?;
             if run_update.rows_affected() != 1 {
                 return Err(AppError::Conflict {
                     message: "sync run is missing or is no longer running".to_owned(),
@@ -289,7 +312,7 @@ impl MailboxAccountRepository {
             .bind(run.account_id.to_string())
             .execute(&mut *transaction)
             .await
-            .map_err(|error| internal_error("failed to update account sync error", error))?;
+            .map_err(|error| map_database_error("failed to update account sync error", error))?;
             if account_update.rows_affected() != 1 {
                 return Err(account_not_found(run.account_id));
             }
@@ -300,10 +323,10 @@ impl MailboxAccountRepository {
             Ok(()) => transaction
                 .commit()
                 .await
-                .map_err(|error| internal_error("failed to commit sync failure", error)),
+                .map_err(|error| map_database_error("failed to commit sync failure", error)),
             Err(error) => {
                 transaction.rollback().await.map_err(|rollback| {
-                    internal_error("failed to roll back sync failure", rollback)
+                    map_database_error("failed to roll back sync failure", rollback)
                 })?;
                 Err(error)
             }
@@ -445,7 +468,24 @@ fn map_insert_error(error: sqlx::Error) -> AppError {
         };
     }
 
-    internal_error("failed to insert mailbox account", error)
+    map_database_error("failed to insert mailbox account", error)
+}
+
+fn map_database_error(context: &str, error: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(database_error) = &error
+        && database_error
+            .code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+    {
+        return AppError::External {
+            service: "database".to_owned(),
+            retryable: true,
+            message: format!("{context}: {error}"),
+        };
+    }
+
+    internal_error(context, error)
 }
 
 fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {

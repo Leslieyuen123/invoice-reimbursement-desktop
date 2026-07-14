@@ -1,7 +1,7 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use invoice_reimbursement::db;
 use invoice_reimbursement::db::accounts::{
-    MailboxAccountRepository, MailboxProvider, NewMailboxAccount,
+    MailboxAccountRepository, MailboxProvider, NewMailboxAccount, SyncCursor,
 };
 use invoice_reimbursement::db::batches::BatchRepository;
 use invoice_reimbursement::db::items::{ItemFilter, ItemPatch, ItemRepository, NewItemRecord};
@@ -10,7 +10,10 @@ use invoice_reimbursement::domain::model::{
     BatchStatus, Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch,
     RecognitionStatus, SourceType,
 };
-use sqlx::{Row, SqlitePool, sqlite::SqliteQueryResult};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteQueryResult};
+use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -53,6 +56,120 @@ async fn connect_enables_foreign_key_enforcement() {
         .expect("foreign key pragma should be queryable");
 
     assert_eq!(foreign_keys, 1);
+}
+
+#[tokio::test]
+async fn mailbox_sync_repository_maps_real_sqlite_busy_errors_as_retryable() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("accounts-busy.sqlite3").display()
+    );
+    let options = SqliteConnectOptions::from_str(&database_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Delete)
+        .busy_timeout(Duration::ZERO);
+    let setup_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&setup_pool)
+        .await
+        .unwrap();
+    let setup_accounts = MailboxAccountRepository::new(setup_pool.clone());
+    let account = setup_accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "busy@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let cursor = SyncCursor {
+        uid_validity: 10,
+        last_uid: 50,
+    };
+    setup_accounts
+        .upsert_cursor(account.id, "INBOX", cursor)
+        .await
+        .unwrap();
+    let run = setup_accounts.begin_sync_run(account.id).await.unwrap();
+    drop(setup_accounts);
+    setup_pool.close().await;
+
+    let lock_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let mut lock = lock_pool.acquire().await.unwrap();
+    let repository_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let accounts = MailboxAccountRepository::new(repository_pool.clone());
+    sqlx::query("BEGIN EXCLUSIVE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let errors = [
+        accounts.get_cursor(account.id, "INBOX").await.unwrap_err(),
+        accounts.begin_sync_run(account.id).await.unwrap_err(),
+        accounts
+            .finish_sync_success(
+                &run,
+                "INBOX",
+                Some(cursor),
+                SyncCursor {
+                    uid_validity: 10,
+                    last_uid: 60,
+                },
+                0,
+            )
+            .await
+            .unwrap_err(),
+        accounts
+            .finish_sync_failure(&run, "locked")
+            .await
+            .unwrap_err(),
+    ];
+
+    for error in errors {
+        assert!(
+            matches!(
+                error,
+                AppError::External {
+                    ref service,
+                    retryable: true,
+                    ..
+                } if service == "database"
+            ),
+            "unexpected busy mapping: {error:?}"
+        );
+    }
+
+    sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(cursor)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM sync_runs WHERE id = ?")
+            .bind(run.id.to_string())
+            .fetch_one(&repository_pool)
+            .await
+            .unwrap(),
+        "running"
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,27 @@
+From: portal@example.com
+To: finance@example.com
+Date: Tue, 14 Jul 2026 12:00:00 +0800
+Message-ID: <link-policy-201@example.com>
+Subject: Invoice portal
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="link-policy-boundary"
+
+--link-policy-boundary
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+  <nav><a href="https://example.com/account">Account navigation</a></nav>
+  <a href="https://example.com/unsubscribe">Unsubscribe</a>
+  <a href="https://example.com/privacy">Privacy policy</a>
+  <a href="https://example.com/materials/invoice-201.pdf">View material</a>
+  <a href="https://example.com/secure/material?id=202" download>Get material</a>
+  <a href="https://example.com/secure/receipt?id=203">Download receipt</a>
+</body></html>
+--link-policy-boundary
+Content-Type: text/html; name="attached-links.html"
+Content-Disposition: attachment; filename="attached-links.html"
+
+<html><body>
+  <a href="https://example.com/materials/attached-invoice.pdf">Download invoice</a>
+</body></html>
+--link-policy-boundary--
