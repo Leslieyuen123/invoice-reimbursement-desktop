@@ -87,7 +87,10 @@ fn incomplete_metadata_falls_back_to_received_month_and_needs_confirmation() {
     assert_eq!(recognized.invoice_date, NaiveDate::from_ymd_opt(2026, 7, 2));
     assert_eq!(recognized.suggested_period, "2026-07");
     assert_eq!(recognized.category, None);
-    assert_eq!(recognized.status(), ItemStatus::PendingConfirmation);
+    assert_eq!(
+        recognized.status(DedupeStatus::Unique),
+        ItemStatus::PendingConfirmation
+    );
 }
 
 #[test]
@@ -118,15 +121,35 @@ fn generic_date_label_is_used_when_invoice_date_label_is_absent() {
 }
 
 #[test]
-fn invalid_calendar_date_falls_back_and_blocks_auto_confirmation() {
+fn invalid_invoice_date_uses_an_earlier_explicit_generic_date() {
     let recognized = recognize(
         "日期：2026-06-18 开票日期：2026-02-31 餐饮服务 价税合计 ¥128.50",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
     );
 
-    assert_eq!(recognized.invoice_date, NaiveDate::from_ymd_opt(2026, 7, 2));
+    assert_eq!(
+        recognized.invoice_date,
+        NaiveDate::from_ymd_opt(2026, 6, 18)
+    );
+    assert_eq!(recognized.suggested_period, "2026-06");
     assert_eq!(recognized.warnings, ["invalid_invoice_date"]);
-    assert_eq!(recognized.status(), ItemStatus::PendingConfirmation);
+    assert_eq!(
+        recognized.status(DedupeStatus::Unique),
+        ItemStatus::PendingConfirmation
+    );
+}
+
+#[test]
+fn recognition_outcome_status_uses_the_supplied_dedupe_status() {
+    let recognized = recognize(
+        "开票日期：2026-06-18 餐饮服务 价税合计 ¥128.50",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(
+        recognized.status(DedupeStatus::SuspectedDuplicate),
+        ItemStatus::SuspectedDuplicate
+    );
 }
 
 #[test]
@@ -278,12 +301,58 @@ fn empty_buyer_line_falls_back_to_the_seller_without_consuming_the_next_line() {
 }
 
 #[test]
+fn company_scans_field_candidates_past_explanations_and_empty_templates() {
+    for text in [
+        "说明：此处的购买方名称用于展示字段含义\n购买方名称：上海星河科技有限公司",
+        "购买方名称：\n购买方名称：上海星河科技有限公司",
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+
+        assert_eq!(
+            recognized.company.as_deref(),
+            Some("上海星河科技有限公司"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn city_dictionary_prefers_explicit_and_longest_city_names() {
     for (text, expected) in [
         ("购买方地址：北京市朝阳区", "北京"),
         ("销售方地址：上海市浦东新区", "上海"),
         ("项目地点：广东省广州市天河区", "广州"),
         ("服务地点：广东省深圳市南山区", "深圳"),
+        ("收货地址：江苏省南京市鼓楼区", "南京"),
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+
+        assert_eq!(recognized.city.as_deref(), Some(expected), "{text}");
+    }
+}
+
+#[test]
+fn bare_city_names_do_not_match_roads_companies_or_product_names() {
+    for text in [
+        "南京路",
+        "北京远方公司",
+        "商品：上海牌",
+        "地址：南京路100号",
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+
+        assert_eq!(recognized.city, None, "{text}");
+    }
+}
+
+#[test]
+fn bare_city_names_require_an_explicit_location_context() {
+    for (text, expected) in [
+        ("地址：江苏省南京鼓楼区", "南京"),
+        ("项目地点：北京朝阳区", "北京"),
+        ("城市：上海", "上海"),
+        ("出发地：广州白云机场", "广州"),
+        ("到达地：深圳宝安机场", "深圳"),
     ] {
         let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
 

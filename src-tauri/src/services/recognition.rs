@@ -144,11 +144,11 @@ impl RecognitionService {
 }
 
 impl RecognitionOutcome {
-    pub fn status(&self) -> ItemStatus {
+    pub fn status(&self, dedupe_status: DedupeStatus) -> ItemStatus {
         derive_item_status(
             self.recognition_status,
             self.confirmation_status,
-            DedupeStatus::Unique,
+            dedupe_status,
         )
     }
 }
@@ -206,14 +206,64 @@ pub fn recognize_with_warnings(
 }
 
 fn recognized_city(text: &str) -> Option<String> {
+    if let Some(city) = CITY_NAMES
+        .iter()
+        .filter(|city| text.contains(&format!("{city}市")))
+        .max_by_key(|city| city.chars().count())
+    {
+        return Some((*city).to_owned());
+    }
+
     CITY_NAMES
         .iter()
-        .filter_map(|city| {
-            let explicit = text.contains(&format!("{city}市"));
-            (explicit || text.contains(city)).then_some((explicit, city.chars().count(), *city))
+        .filter(|city| {
+            text.match_indices(*city)
+                .any(|(index, _)| bare_city_has_location_context(text, index, city))
         })
-        .max_by_key(|(explicit, length, _)| (*explicit, *length))
-        .map(|(_, _, city)| city.to_owned())
+        .max_by_key(|city| city.chars().count())
+        .map(|city| (*city).to_owned())
+}
+
+fn bare_city_has_location_context(text: &str, start: usize, city: &str) -> bool {
+    const CONTEXT_LABELS: &[&str] = &[
+        "地址",
+        "地点",
+        "城市",
+        "所在地",
+        "出发地",
+        "到达地",
+        "出发",
+        "到达",
+    ];
+    const NON_CITY_SUFFIXES: &[&str] =
+        &["路", "街", "道", "巷", "弄", "大道", "公路", "高速", "牌"];
+
+    let end = start + city.len();
+    let after_city = &text[end..];
+    if NON_CITY_SUFFIXES
+        .iter()
+        .any(|suffix| after_city.starts_with(suffix))
+    {
+        return false;
+    }
+
+    let line_start = text[..start].rfind('\n').map_or(0, |newline| newline + 1);
+    let line_end = after_city
+        .find('\n')
+        .map_or(text.len(), |newline| end + newline);
+    let before_city = &text[line_start..start];
+    let context_before = CONTEXT_LABELS.iter().any(|label| {
+        before_city.rfind(label).is_some_and(|label_start| {
+            before_city[label_start + label.len()..].chars().count() <= 12
+        })
+    });
+    let after_city_on_line =
+        after_city[..line_end - end].trim_start_matches([' ', '\t', '：', ':']);
+    let context_after = ["出发", "到达"]
+        .iter()
+        .any(|label| after_city_on_line.starts_with(label));
+
+    context_before || context_after
 }
 
 fn labeled_company_value(text: &str, label: &str) -> Option<String> {
@@ -236,13 +286,28 @@ fn labeled_company_value(text: &str, label: &str) -> Option<String> {
         "账号",
     ];
 
-    let (_, after_label) = text.split_once(label)?;
+    text.match_indices(label)
+        .filter(|(index, _)| company_label_has_field_boundary(text, *index, label))
+        .find_map(|(index, _)| company_value_after_label(&text[index + label.len()..], END_LABELS))
+}
+
+fn company_label_has_field_boundary(text: &str, index: usize, label: &str) -> bool {
+    let starts_field = text[..index]
+        .chars()
+        .next_back()
+        .is_none_or(|character| character.is_whitespace() || character == '|');
+    let after_label = text[index + label.len()..].trim_start_matches([' ', '\t']);
+    starts_field && after_label.starts_with(['：', ':'])
+}
+
+fn company_value_after_label(after_label: &str, end_labels: &[&str]) -> Option<String> {
     let line = after_label
+        .trim_start_matches([' ', '\t'])
         .trim_start_matches(['：', ':'])
         .lines()
         .next()?
         .trim_start_matches([' ', '\t']);
-    let end = END_LABELS
+    let end = end_labels
         .iter()
         .filter_map(|end_label| line.find(end_label))
         .min()
@@ -256,7 +321,7 @@ fn labeled_date(text: &str) -> (Option<NaiveDate>, bool) {
         if let Some(date) = parse_labeled_date_value(after_invoice_label) {
             return (Some(date), false);
         }
-        let (generic_date, _) = generic_labeled_date(after_invoice_label);
+        let (generic_date, _) = generic_labeled_date(text);
         return (generic_date, true);
     }
 
