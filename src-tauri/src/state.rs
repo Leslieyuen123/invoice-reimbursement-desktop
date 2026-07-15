@@ -2,16 +2,24 @@ use std::sync::Arc;
 
 use sqlx::SqlitePool;
 
+use crate::db::accounts::MailboxAccountRepository;
+use crate::db::items::ItemRepository;
 use crate::infra::credentials::CredentialStore;
+use crate::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use crate::infra::files::AppPaths;
 use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
 use crate::services::account_saves::{
     AccountSagaShutdown, AccountSaveCoordinator, AccountSaveReconciliationReport,
 };
+use crate::services::dashboard::DashboardService;
 use crate::services::export::{ExportCoordinator, ExportService};
+use crate::services::import::ImportService;
+use crate::services::items::ItemService;
 use crate::services::operations::AccountOperationCoordinator;
+use crate::services::recognition::RecognitionService;
 use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
 use crate::services::settings::{BackgroundSyncGate, SettingsService};
+use crate::services::sync::SyncService;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,10 +27,14 @@ pub struct AppState {
     paths: AppPaths,
     credentials: Arc<dyn CredentialStore>,
     gateway: Arc<dyn ImapGateway>,
+    import_service: ImportService,
+    item_service: ItemService,
+    recognition_service: RecognitionService,
     account_operations: AccountOperationCoordinator,
     account_saves: AccountSaveCoordinator,
     export_coordinator: ExportCoordinator,
     background_sync_gate: BackgroundSyncGate,
+    application_scheduler: Scheduler,
 }
 
 impl AppState {
@@ -41,21 +53,60 @@ impl AppState {
         credentials: Arc<dyn CredentialStore>,
         gateway: Arc<dyn ImapGateway>,
     ) -> Self {
+        Self::with_gateway_and_extractor(
+            pool,
+            paths,
+            credentials,
+            gateway,
+            Arc::new(UnavailableExtractor),
+        )
+    }
+
+    pub fn with_gateway_and_extractor(
+        pool: SqlitePool,
+        paths: AppPaths,
+        credentials: Arc<dyn CredentialStore>,
+        gateway: Arc<dyn ImapGateway>,
+        extractor: Arc<dyn DocumentExtractor>,
+    ) -> Self {
         let account_operations = AccountOperationCoordinator::default();
         let account_saves = AccountSaveCoordinator::new(
             pool.clone(),
             credentials.clone(),
             account_operations.clone(),
         );
+        let background_sync_gate = BackgroundSyncGate::default();
+        let items = ItemRepository::new(pool.clone());
+        let import_service = ImportService::new(items.clone(), paths.clone());
+        let item_service = ItemService::new(items.clone(), paths.clone());
+        let recognition_service = RecognitionService::new(items, extractor);
+        let sync_service = SyncService::new(
+            gateway.clone(),
+            credentials.clone(),
+            MailboxAccountRepository::new(pool.clone()),
+            import_service.clone(),
+            recognition_service.clone(),
+        );
+        let application_scheduler = Scheduler::with_operations_and_gate(
+            pool.clone(),
+            Arc::new(sync_service),
+            account_operations.clone(),
+            account_saves.clone(),
+            background_sync_gate.clone(),
+        );
         Self {
             pool,
             paths,
             credentials,
             gateway,
+            import_service,
+            item_service,
+            recognition_service,
             account_operations,
             account_saves,
             export_coordinator: ExportCoordinator::default(),
-            background_sync_gate: BackgroundSyncGate::default(),
+            background_sync_gate,
+            application_scheduler,
         }
     }
 
@@ -88,6 +139,26 @@ impl AppState {
             self.paths.clone(),
             self.export_coordinator.clone(),
         )
+    }
+
+    pub fn import_service(&self) -> ImportService {
+        self.import_service.clone()
+    }
+
+    pub fn item_service(&self) -> ItemService {
+        self.item_service.clone()
+    }
+
+    pub fn recognition_service(&self) -> RecognitionService {
+        self.recognition_service.clone()
+    }
+
+    pub fn dashboard_service(&self) -> DashboardService {
+        DashboardService::new(self.pool.clone())
+    }
+
+    pub fn application_scheduler(&self) -> Scheduler {
+        self.application_scheduler.clone()
     }
 
     pub fn scheduler(&self, runner: Arc<dyn SyncRunner>) -> Scheduler {
@@ -140,5 +211,20 @@ impl AppState {
 
     pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {
         self.account_saves.begin_shutdown()
+    }
+}
+
+struct UnavailableExtractor;
+
+impl DocumentExtractor for UnavailableExtractor {
+    fn extract(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<ExtractedDocument, crate::domain::error::AppError> {
+        Err(crate::domain::error::AppError::External {
+            service: "ocr_sidecar".to_owned(),
+            retryable: false,
+            message: "OCR runtime is unavailable".to_owned(),
+        })
     }
 }

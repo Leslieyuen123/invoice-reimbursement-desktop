@@ -54,6 +54,15 @@ impl BatchService {
         Self { pool }
     }
 
+    pub async fn list(&self) -> Result<Vec<BatchDetail>, AppError> {
+        let batches = BatchRepository::new(self.pool.clone()).list().await?;
+        let mut details = Vec::with_capacity(batches.len());
+        for batch in batches {
+            details.push(self.get(batch.id).await?);
+        }
+        Ok(details)
+    }
+
     pub async fn create_month(&self, year: i32, month: u32) -> Result<Batch, AppError> {
         if !(1..=9999).contains(&year) {
             return Err(AppError::validation(
@@ -245,7 +254,7 @@ impl BatchService {
         .await;
 
         finish_unit_transaction(transaction, result).await?;
-        self.detail(batch_id).await
+        self.get(batch_id).await
     }
 
     pub async fn remove_item(
@@ -302,10 +311,10 @@ impl BatchService {
         .await;
 
         finish_unit_transaction(transaction, result).await?;
-        self.detail(batch_id).await
+        self.get(batch_id).await
     }
 
-    async fn detail(&self, batch_id: Uuid) -> Result<BatchDetail, AppError> {
+    pub async fn get(&self, batch_id: Uuid) -> Result<BatchDetail, AppError> {
         let mut transaction = self
             .pool
             .begin()

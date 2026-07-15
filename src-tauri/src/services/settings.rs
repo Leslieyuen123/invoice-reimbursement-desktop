@@ -106,6 +106,10 @@ impl SettingsService {
         }
     }
 
+    pub async fn list_accounts(&self) -> Result<Vec<MailboxAccount>, AppError> {
+        self.accounts.list().await
+    }
+
     pub async fn save_account(&self, input: SaveAccountInput) -> Result<MailboxAccount, AppError> {
         self.account_saves.ensure_open()?;
         let is_update = input.id.is_some();

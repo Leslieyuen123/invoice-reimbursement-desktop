@@ -11,7 +11,7 @@ use chrono::NaiveDate;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use crate::db::items::{InvoiceItem, ItemRepository, ReviewedItemFields};
+use crate::db::items::{InvoiceItem, ItemFilter, ItemRepository, ReviewedItemFields};
 use crate::domain::error::AppError;
 use crate::domain::model::Category;
 use crate::infra::files::AppPaths;
@@ -112,6 +112,14 @@ impl ItemService {
             files,
             recovery: Arc::new(OnceCell::new()),
         }
+    }
+
+    pub async fn list(&self, filter: ItemFilter) -> Result<Vec<InvoiceItem>, AppError> {
+        self.items.list(filter).await
+    }
+
+    pub async fn get(&self, id: Uuid) -> Result<InvoiceItem, AppError> {
+        self.items.get_by_id(id).await
     }
 
     pub async fn review(&self, review: ItemReview) -> Result<InvoiceItem, AppError> {

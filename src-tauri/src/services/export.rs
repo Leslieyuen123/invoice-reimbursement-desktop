@@ -476,9 +476,9 @@ struct PendingExportItem {
     archive_name: String,
 }
 
-struct OpenedSourceFile {
-    file: File,
-    length: u64,
+pub(crate) struct OpenedSourceFile {
+    pub(crate) file: File,
+    pub(crate) length: u64,
 }
 
 fn prepare_export_items(
@@ -606,7 +606,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn open_contained_regular_file(
+pub(crate) fn open_contained_regular_file(
     path: &Path,
     root: &Path,
     field: &str,
