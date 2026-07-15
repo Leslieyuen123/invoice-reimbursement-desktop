@@ -1505,6 +1505,43 @@ git commit -m "feat: expose secure desktop application commands"
 
 ---
 
+### 前端视觉基线（Task 14-18）
+
+**参考图：** `docs/design/references/dark-three-pane-workbench.png`
+
+**Design Read：** 这是面向单人财务操作的高密度 macOS 桌面工作台，使用近黑石墨灰、三栏信息架构、克制材质和少量紫橙选中光，优先服务扫描、对比和重复操作，不做营销页式构图。
+
+**Taste / PPVI 参数：** `DESIGN_VARIANCE: 4` / `MOTION_INTENSITY: 3` / `VISUAL_DENSITY: 8`。只实现用户明确选定的暗色主题；使用 React + 原生 CSS 语义 token 和项目已有 Lucide 图标，不新增或混用第二套设计系统。
+
+**语义颜色：**
+
+- 底层 `#0d0d0f`，导航 `#111113`，主面板 `#171719`，抬高面 `#202023`，控件 `#2a2a2d`；禁止纯黑大底。
+- 一级文字 `rgba(255,255,255,.92)`，二级 `.62`，辅助 `.42`，低对比边界 `rgba(255,255,255,.08)`。
+- 紫橙过渡是一个“当前选中”语义，只允许出现在选中票据、选中导航和极少量主操作焦点，不作页面背景、大面积卡片或外发光。
+- 成功、警告、失败使用独立低饱和功能色，必须同时有文字或图标，不得仅靠颜色表意。
+
+**排版与形状：**
+
+- 使用 `-apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif`，数字金额和计数使用 `ui-monospace`。
+- 单视图最多四个固定字号：24px 关键计数、18px 页面标题、14px 正文/控件、13px 辅助信息；字号不随视口缩放。
+- 面板圆角统一 8px，输入和按钮 6px，状态标签可使用 pill；图标按钮固定 36×36px，不允许动态内容改变工具栏尺寸。
+- 工具栏和右侧抽屉可使用 24px 左右的局部模糊、内高光和实色 fallback；列表行和数据面板不使用泛滥玻璃或卡片套卡片。
+
+**桌面布局：**
+
+- `>=1280px`：184px 导航 + 320px 列表 + `minmax(440px, 1fr)` 主内容 + 360px 右侧编辑器，需要时同时显示四个纵向层级。
+- `900-1279px`：导航收窄为 64px 图标栏，列表 288px，右侧编辑器改为 360px overlay，不挤压主内容。
+- `800-899px`：最小窗口 800×700；56px 图标导航 + 264px 列表 + 其余主内容，票据编辑以 overlay 抽屉显示。不允许水平滚动、按钮文字换行、文字溢出或不可关闭的遮挡。
+- 左栏映射控制台/待处理池/报销批次/设置，中栏映射票据或批次列表，主内容映射预览与详情，右侧抽屉只承担人工修正或属性设置。
+
+**交互与验收：**
+
+- 动效只用于 hover/active、选中变化、overlay 进出和操作反馈，时长 120-180ms，只变化 `transform`/`opacity`；无自动循环、无装饰性光斑，支持 `prefers-reduced-motion` 和实色 reduced-transparency fallback。
+- 每个数据视图都实现 loading skeleton、empty、error/retry、disabled 和 keyboard focus 状态；表单标签在控件上方，错误在字段下方。
+- Task 18 使用 Playwright 在 800×700、1440×900、1728×1117 三个视口截图，对控制台、待处理池、票据详情、批次详情和设置页做人工视觉审查，并检查水平滚动、重叠、截断、对比度、焦点和 reduced-motion。
+
+---
+
 ### Task 14: 构建前端 API、应用壳和控制台
 
 **Files:**
@@ -1559,7 +1596,7 @@ export const api = {
 
 - [ ] **Step 3: 实现安静、密集的桌面工作台壳**
 
-左侧固定导航：控制台、待处理池、报销批次、设置；顶部状态区显示“同步中/正常/需处理”。使用 Lucide 图标和 tooltip，窗口宽度低于 900px 时收窄为图标导航。不要做营销 hero、渐变背景或嵌套卡片。
+左侧固定导航：控制台、待处理池、报销批次、设置；顶部状态区显示“同步中/正常/需处理”。严格使用上述参考图和语义 token；使用 Lucide 图标和 tooltip，窗口宽度低于 900px 时收窄为图标导航。不要做营销 hero、全屏渐变背景、装饰性外发光或嵌套卡片。
 
 控制台包含：邮箱状态与上次同步、最近新增、待确认、识别失败、疑似重复、最近批次、立即同步、新建月度/自定义批次入口。所有计数可点击跳到已带 filter 的待处理池。
 
@@ -1780,7 +1817,7 @@ test("manual invoice to exported reimbursement package", async ({ page }) => {
 
 Run: `npm run test:e2e`
 
-Expected: Chromium 桌面视口和 800×700 最小窗口视口均 PASS，无水平滚动、遮挡或文字溢出。
+Expected: Chromium 在 800×700、1440×900、1728×1117 视口均 PASS；保存五个核心视图截图，无水平滚动、遮挡、文字溢出、按钮换行或焦点不可见。
 
 - [ ] **Step 2: 添加 CI 质量门**
 
@@ -1822,7 +1859,7 @@ Expected: 所有测试 PASS；`src-tauri/target/release/bundle/` 生成当前平
 
 - [ ] **Step 5: 执行人工验收**
 
-按 `docs/operations/release-checklist.md` 使用一个真实 QQ 测试邮箱和一个真实 Gmail 测试邮箱。截图记录控制台、待处理池、跨月批次、票据详情和导出结果；用解压/Excel/PDF 阅读器分别打开四个导出文件，核对 item 数、总金额和 SHA-256。
+按 `docs/operations/release-checklist.md` 使用一个真实 QQ 测试邮箱和一个真实 Gmail 测试邮箱。截图记录控制台、待处理池、跨月批次、票据详情和导出结果，并与 `docs/design/references/dark-three-pane-workbench.png` 对照检查灰阶层级、三栏密度、选中光效和控件圆角规则；用解压/Excel/PDF 阅读器分别打开四个导出文件，核对 item 数、总金额和 SHA-256。
 
 - [ ] **Step 6: 提交发布门和文档**
 
