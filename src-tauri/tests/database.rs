@@ -34,6 +34,7 @@ async fn connect_runs_migrations_and_creates_application_tables() {
         "batches",
         "items",
         "mailbox_accounts",
+        "pending_account_save_cleanups",
         "pending_account_saves",
         "settings",
         "sync_cursors",
@@ -44,6 +45,63 @@ async fn connect_runs_migrations_and_creates_application_tables() {
             "missing table {table}; found {tables:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn migration_0006_moves_legacy_committed_markers_to_independent_cleanup_rows() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let current = sqlx::migrate!("./migrations");
+    let through_0005 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(current.iter().take(5).cloned().collect()),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0005.run(&pool).await.unwrap();
+    let account_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    insert_mailbox_account(&pool, account_id).await;
+    sqlx::query(
+        "INSERT INTO pending_account_saves (\
+            operation_id, account_id, phase, is_update, provider, email, imap_host, imap_port, \
+            enabled, sync_interval_minutes, created_at, updated_at\
+         ) VALUES (?, ?, 'committed', 1, 'gmail', 'legacy-cleanup@example.com', \
+            'imap.gmail.com', 993, 1, 15, '2026-07-15T10:00:00Z', \
+            '2026-07-15T10:01:00Z')",
+    )
+    .bind(operation_id.to_string())
+    .bind(account_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    current.run(&pool).await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT operation_id FROM pending_account_save_cleanups",)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        operation_id.to_string()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_table_info('pending_account_save_cleanups') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap(),
+        vec!["operation_id", "created_at", "updated_at"]
+    );
 }
 
 #[tokio::test]

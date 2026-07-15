@@ -18,23 +18,35 @@ use crate::services::operations::AccountOperationCoordinator;
 
 use registry::AccountSagaRegistry;
 pub use registry::AccountSagaShutdown;
-use repository::{PendingAccountSave, PendingAccountSaveRepository, PendingSavePhase};
+use repository::{
+    PendingAccountSave, PendingAccountSaveCleanupRepository, PendingAccountSaveRepository,
+    PendingSavePhase,
+};
 
 const PENDING_KEY_PREFIX: &str = "pending-save:";
 
 #[derive(Debug, Default)]
-pub(crate) struct AccountSaveReconciliationReport {
+pub struct AccountSaveReconciliationReport {
     failed_accounts: Vec<Uuid>,
     skipped_accounts: Vec<Uuid>,
+    failed_cleanups: Vec<Uuid>,
 }
 
 impl AccountSaveReconciliationReport {
-    pub(crate) fn failure_count(&self) -> usize {
-        self.failed_accounts.len()
+    pub fn failure_count(&self) -> usize {
+        self.failed_accounts.len() + self.failed_cleanups.len()
     }
 
-    pub(crate) fn skipped_count(&self) -> usize {
+    pub fn skipped_count(&self) -> usize {
         self.skipped_accounts.len()
+    }
+
+    pub fn cleanup_failure_count(&self) -> usize {
+        self.failed_cleanups.len()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.failure_count() + self.skipped_count()
     }
 }
 
@@ -92,6 +104,13 @@ impl AccountSaveCoordinator {
                     log_reconciliation_failure(&diagnostic);
                     report.failed_accounts.push(diagnostic.account_id);
                 }
+            }
+        }
+        for operation_id in self.worker.cleanups.list().await? {
+            self.registry.ensure_open()?;
+            if self.worker.reconcile_cleanup(operation_id).await.is_err() {
+                log_cleanup_failure(operation_id);
+                report.failed_cleanups.push(operation_id);
             }
         }
         Ok(report)
@@ -174,6 +193,7 @@ struct AccountSaveWorker {
     credentials: Arc<dyn CredentialStore>,
     accounts: MailboxAccountRepository,
     pending: PendingAccountSaveRepository,
+    cleanups: PendingAccountSaveCleanupRepository,
 }
 
 impl AccountSaveWorker {
@@ -181,6 +201,7 @@ impl AccountSaveWorker {
         Self {
             accounts: MailboxAccountRepository::new(pool.clone()),
             pending: PendingAccountSaveRepository::new(pool.clone()),
+            cleanups: PendingAccountSaveCleanupRepository::new(pool.clone()),
             pool,
             credentials,
         }
@@ -232,10 +253,8 @@ impl AccountSaveWorker {
     ) -> Result<Option<MailboxAccount>, AppError> {
         let temp_key = pending_save_key(pending.operation_id);
         if pending.phase == PendingSavePhase::Committed {
-            let account = self.accounts.get(pending.account_id).await?;
-            delete_credential(self.credentials.clone(), temp_key).await?;
-            self.pending.delete(pending.operation_id).await?;
-            return Ok(Some(account));
+            self.move_committed_to_cleanup(pending.operation_id).await?;
+            return Ok(None);
         }
 
         let secret = get_credential(self.credentials.clone(), temp_key.clone()).await?;
@@ -265,8 +284,33 @@ impl AccountSaveWorker {
         .await?;
         let account = self.publish(&pending).await?;
         delete_credential(self.credentials.clone(), temp_key).await?;
-        self.pending.delete(pending.operation_id).await?;
+        self.cleanups.delete(pending.operation_id).await?;
         Ok(Some(account))
+    }
+
+    async fn reconcile_cleanup(&self, operation_id: Uuid) -> Result<(), AppError> {
+        delete_credential(self.credentials.clone(), pending_save_key(operation_id)).await?;
+        self.cleanups.delete(operation_id).await
+    }
+
+    async fn move_committed_to_cleanup(&self, operation_id: Uuid) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let result = async {
+            self.cleanups
+                .insert_in_transaction(&mut transaction, operation_id)
+                .await?;
+            self.pending
+                .delete_in_transaction(&mut transaction, operation_id)
+                .await
+        }
+        .await;
+        match result {
+            Ok(()) => transaction.commit().await.map_err(database_error),
+            Err(error) => {
+                transaction.rollback().await.map_err(database_error)?;
+                Err(error)
+            }
+        }
     }
 
     async fn publish(&self, pending: &PendingAccountSave) -> Result<MailboxAccount, AppError> {
@@ -285,12 +329,11 @@ impl AccountSaveWorker {
                 .accounts
                 .clear_retry_state_in_transaction(&mut transaction, account.id)
                 .await?;
+            self.cleanups
+                .insert_in_transaction(&mut transaction, pending.operation_id)
+                .await?;
             self.pending
-                .set_phase_in_transaction(
-                    &mut transaction,
-                    pending.operation_id,
-                    PendingSavePhase::Committed,
-                )
+                .delete_in_transaction(&mut transaction, pending.operation_id)
                 .await?;
             Ok::<_, AppError>(account)
         }
@@ -318,6 +361,13 @@ fn log_reconciliation_failure(pending: &PendingAccountSave) {
         operation_id = %pending.operation_id,
         phase = pending.phase.as_str(),
         "mailbox account save reconciliation failed"
+    );
+}
+
+fn log_cleanup_failure(operation_id: Uuid) {
+    tracing::warn!(
+        operation_id = %operation_id,
+        "mailbox account save credential cleanup failed"
     );
 }
 

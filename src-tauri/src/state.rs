@@ -5,7 +5,9 @@ use sqlx::SqlitePool;
 use crate::infra::credentials::CredentialStore;
 use crate::infra::files::AppPaths;
 use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
-use crate::services::account_saves::{AccountSagaShutdown, AccountSaveCoordinator};
+use crate::services::account_saves::{
+    AccountSagaShutdown, AccountSaveCoordinator, AccountSaveReconciliationReport,
+};
 use crate::services::operations::AccountOperationCoordinator;
 use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
 use crate::services::settings::{BackgroundSyncGate, SettingsService};
@@ -119,8 +121,10 @@ impl AppState {
         )
     }
 
-    pub async fn reconcile_account_saves(&self) -> Result<(), crate::domain::error::AppError> {
-        self.account_saves.reconcile_all().await.map(|_| ())
+    pub async fn reconcile_account_saves(
+        &self,
+    ) -> Result<AccountSaveReconciliationReport, crate::domain::error::AppError> {
+        self.account_saves.reconcile_all().await
     }
 
     pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {

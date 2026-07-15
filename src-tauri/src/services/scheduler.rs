@@ -203,7 +203,7 @@ impl Scheduler {
         let reconciliation = self.account_saves.reconcile_all().await?;
         if reconciliation.failure_count() != 0 || reconciliation.skipped_count() != 0 {
             tracing::debug!(
-                failed_accounts = reconciliation.failure_count(),
+                failed_recoveries = reconciliation.failure_count(),
                 skipped_accounts = reconciliation.skipped_count(),
                 "background mailbox reconciliation completed with pending work"
             );

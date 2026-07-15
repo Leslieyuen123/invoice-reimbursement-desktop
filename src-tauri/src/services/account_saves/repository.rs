@@ -47,6 +47,11 @@ pub(super) struct PendingAccountSaveRepository {
     pool: SqlitePool,
 }
 
+#[derive(Clone)]
+pub(super) struct PendingAccountSaveCleanupRepository {
+    pool: SqlitePool,
+}
+
 impl PendingAccountSaveRepository {
     pub(super) fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -185,26 +190,68 @@ impl PendingAccountSaveRepository {
         require_updated_marker(result.rows_affected())
     }
 
-    pub(super) async fn set_phase_in_transaction(
+    pub(super) async fn delete(&self, operation_id: Uuid) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM pending_account_saves WHERE operation_id = ?")
+            .bind(operation_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub(super) async fn delete_in_transaction(
         &self,
         connection: &mut SqliteConnection,
         operation_id: Uuid,
-        phase: PendingSavePhase,
     ) -> Result<(), AppError> {
-        let result = sqlx::query(
-            "UPDATE pending_account_saves SET phase = ?, updated_at = ? WHERE operation_id = ?",
+        let result = sqlx::query("DELETE FROM pending_account_saves WHERE operation_id = ?")
+            .bind(operation_id.to_string())
+            .execute(connection)
+            .await
+            .map_err(database_error)?;
+        require_updated_marker(result.rows_affected())
+    }
+}
+
+impl PendingAccountSaveCleanupRepository {
+    pub(super) fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    pub(super) async fn list(&self) -> Result<Vec<Uuid>, AppError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT operation_id FROM pending_account_save_cleanups \
+             ORDER BY created_at, operation_id",
         )
-        .bind(phase.as_str())
-        .bind(Utc::now().to_rfc3339())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|operation_id| parse_uuid(&operation_id))
+        .collect()
+    }
+
+    pub(super) async fn insert_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        operation_id: Uuid,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO pending_account_save_cleanups (operation_id, created_at, updated_at) \
+             VALUES (?, ?, ?)",
+        )
         .bind(operation_id.to_string())
+        .bind(&now)
+        .bind(&now)
         .execute(connection)
         .await
         .map_err(database_error)?;
-        require_updated_marker(result.rows_affected())
+        Ok(())
     }
 
     pub(super) async fn delete(&self, operation_id: Uuid) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM pending_account_saves WHERE operation_id = ?")
+        sqlx::query("DELETE FROM pending_account_save_cleanups WHERE operation_id = ?")
             .bind(operation_id.to_string())
             .execute(&self.pool)
             .await

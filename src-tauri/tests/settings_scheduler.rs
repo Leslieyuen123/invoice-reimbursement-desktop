@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,6 +21,7 @@ use invoice_reimbursement::services::settings::{
     Preferences, PreferencesInput, SaveAccountInput, SettingsService, TestAccountInput,
 };
 use invoice_reimbursement::state::AppState;
+use sqlx::sqlite::SqlitePoolOptions;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -194,11 +196,21 @@ struct FailNextLiveCredentialStore {
 struct PermanentTempDeleteFailureStore {
     secrets: RwLock<HashMap<String, String>>,
     failed_temp_key: RwLock<Option<String>>,
+    fail_all_temp_deletes: AtomicBool,
+    failed_delete_attempts: AtomicUsize,
 }
 
 impl PermanentTempDeleteFailureStore {
     fn fail_delete_for(&self, key: String) {
         *self.failed_temp_key.write().unwrap() = Some(key);
+    }
+
+    fn fail_all_temp_deletes(&self, fail: bool) {
+        self.fail_all_temp_deletes.store(fail, Ordering::SeqCst);
+    }
+
+    fn failed_delete_attempts(&self) -> usize {
+        self.failed_delete_attempts.load(Ordering::SeqCst)
     }
 }
 
@@ -216,7 +228,11 @@ impl CredentialStore for PermanentTempDeleteFailureStore {
     }
 
     fn delete(&self, account_id: &str) -> Result<(), AppError> {
-        if self.failed_temp_key.read().unwrap().as_deref() == Some(account_id) {
+        if self.failed_temp_key.read().unwrap().as_deref() == Some(account_id)
+            || (account_id.starts_with("pending-save:")
+                && self.fail_all_temp_deletes.load(Ordering::SeqCst))
+        {
+            self.failed_delete_attempts.fetch_add(1, Ordering::SeqCst);
             return Err(AppError::External {
                 service: "keyring".to_owned(),
                 retryable: false,
@@ -2345,21 +2361,101 @@ async fn staged_missing_temp_for_one_account_does_not_block_other_scheduled_sync
 }
 
 #[tokio::test]
-async fn committed_cleanup_failure_allows_sync_and_other_account_save() {
+async fn committed_cleanup_survives_live_delete_without_reserving_account_or_email() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(PermanentTempDeleteFailureStore::default());
+    credentials.fail_all_temp_deletes(true);
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let settings = state.settings_service();
+
+    let initial_error = settings
+        .save_account(save_input(
+            None,
+            "cleanup-reservation@example.com",
+            "initial-cleanup-secret",
+        ))
+        .await
+        .unwrap_err();
+    let account_id = Uuid::parse_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT id FROM mailbox_accounts WHERE email = 'cleanup-reservation@example.com'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(initial_error, AppError::External { .. }));
+    assert_eq!(pending_save_count(&pool).await, 0);
+    assert_eq!(pending_cleanup_count(&pool).await, 1);
+    assert!(!cleanup_rows(&pool).await.contains("initial-cleanup-secret"));
+
+    let edit_error = settings
+        .save_account(save_input(
+            Some(account_id),
+            "cleanup-reusable@example.com",
+            "edited-cleanup-secret",
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(edit_error, AppError::External { .. }));
+    assert_eq!(
+        MailboxAccountRepository::new(pool.clone())
+            .get(account_id)
+            .await
+            .unwrap()
+            .email,
+        "cleanup-reusable@example.com"
+    );
+    assert_eq!(pending_save_count(&pool).await, 0);
+    assert_eq!(pending_cleanup_count(&pool).await, 2);
+
+    settings.delete_account(account_id).await.unwrap();
+    let replacement_error = settings
+        .save_account(save_input(
+            None,
+            "cleanup-reusable@example.com",
+            "replacement-cleanup-secret",
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(replacement_error, AppError::External { .. }));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mailbox_accounts WHERE email = 'cleanup-reusable@example.com'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(pending_save_count(&pool).await, 0);
+    let operation_ids = cleanup_operation_ids(&pool).await;
+    assert_eq!(operation_ids.len(), 3);
+
+    credentials.fail_all_temp_deletes(false);
+    state.reconcile_account_saves().await.unwrap();
+
+    assert_eq!(pending_cleanup_count(&pool).await, 0);
+    for operation_id in operation_ids {
+        assert_eq!(
+            credentials.get(&pending_save_key(operation_id)).unwrap(),
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn cleanup_failure_does_not_block_account_sync_save_or_delete() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let accounts = MailboxAccountRepository::new(pool.clone());
     let committed = insert_account(&accounts, "a-committed-cleanup@example.com", true).await;
     let free = insert_account(&accounts, "b-committed-free@example.com", true).await;
     let operation_id = Uuid::new_v4();
-    insert_pending_save(
-        &pool,
-        operation_id,
-        committed,
-        "committed",
-        true,
-        "a-committed-cleanup@example.com",
-    )
-    .await;
+    insert_pending_cleanup(&pool, operation_id).await;
     let credentials = Arc::new(PermanentTempDeleteFailureStore::default());
     let temp_key = pending_save_key(operation_id);
     credentials.set(&temp_key, "cleanup-secret").unwrap();
@@ -2382,19 +2478,24 @@ async fn committed_cleanup_failure_allows_sync_and_other_account_save() {
         ))
         .await
         .unwrap();
+    state
+        .settings_service()
+        .delete_account(committed)
+        .await
+        .unwrap();
+    let recovery = state.reconcile_account_saves().await.unwrap();
 
     assert_eq!(*runner.account_ids.lock().unwrap(), vec![committed, free]);
     assert_eq!(saved_free.email, "b-committed-free-updated@example.com");
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT phase FROM pending_account_saves WHERE account_id = ?",
-        )
-        .bind(committed.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        "committed"
-    );
+    assert!(matches!(
+        accounts.get(committed).await,
+        Err(AppError::NotFound { .. })
+    ));
+    assert_eq!(pending_save_count(&pool).await, 0);
+    assert_eq!(pending_cleanup_count(&pool).await, 1);
+    assert_eq!(recovery.cleanup_failure_count(), 1);
+    assert_eq!(recovery.pending_count(), 1);
+    assert!(credentials.failed_delete_attempts() >= 2);
 }
 
 #[test]
@@ -2407,24 +2508,14 @@ fn best_effort_reconciliation_log_identifies_account_without_secret() {
         .with_writer(move || CaptureWriter(writer_output.clone()))
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
-    let account_id = tokio::runtime::Builder::new_current_thread()
+    let operation_id = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
             let pool = db::connect("sqlite::memory:").await.unwrap();
-            let accounts = MailboxAccountRepository::new(pool.clone());
-            let account_id = insert_account(&accounts, "cleanup-log@example.com", true).await;
             let operation_id = Uuid::new_v4();
-            insert_pending_save(
-                &pool,
-                operation_id,
-                account_id,
-                "committed",
-                true,
-                "cleanup-log@example.com",
-            )
-            .await;
+            insert_pending_cleanup(&pool, operation_id).await;
             let credentials = Arc::new(PermanentTempDeleteFailureStore::default());
             let temp_key = pending_save_key(operation_id);
             credentials
@@ -2434,11 +2525,11 @@ fn best_effort_reconciliation_log_identifies_account_without_secret() {
             let state = mailbox_state(pool, Arc::new(PassingGateway), credentials);
 
             state.reconcile_account_saves().await.unwrap();
-            account_id
+            operation_id
         });
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
 
-    assert!(logs.contains(&account_id.to_string()));
+    assert!(logs.contains(&operation_id.to_string()));
     assert!(!logs.contains("cleanup-secret-must-not-leak"));
     assert!(!logs.chars().any(|character| character == '\0'));
 }
@@ -2567,8 +2658,18 @@ async fn staged_edit_with_live_credential_switched_rolls_forward_after_restart()
 }
 
 #[tokio::test]
-async fn committed_marker_only_cleans_temp_and_marker_after_restart() {
-    let pool = db::connect("sqlite::memory:").await.unwrap();
+async fn legacy_committed_marker_migrates_and_cleans_without_live_account_dependency() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let current = sqlx::migrate!("./migrations");
+    let through_0005 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(current.iter().take(5).cloned().collect()),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0005.run(&pool).await.unwrap();
     let credentials = Arc::new(MemoryCredentialStore::default());
     let accounts = MailboxAccountRepository::new(pool.clone());
     let account_id = insert_account(&accounts, "committed@example.com", true).await;
@@ -2588,19 +2689,23 @@ async fn committed_marker_only_cleans_temp_and_marker_after_restart() {
     credentials
         .set(&account_id.to_string(), "final-secret")
         .unwrap();
-    drop(mailbox_state(
-        pool.clone(),
-        Arc::new(PassingGateway),
-        credentials.clone(),
-    ));
+    current.run(&pool).await.unwrap();
+
+    assert_eq!(pending_save_count(&pool).await, 0);
+    assert_eq!(pending_cleanup_count(&pool).await, 1);
+    sqlx::query("DELETE FROM mailbox_accounts WHERE id = ?")
+        .bind(account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
     restarted.reconcile_account_saves().await.unwrap();
 
-    assert_eq!(
-        accounts.get(account_id).await.unwrap().email,
-        "committed@example.com"
-    );
+    assert!(matches!(
+        accounts.get(account_id).await,
+        Err(AppError::NotFound { .. })
+    ));
     assert_eq!(
         credentials.get(&account_id.to_string()).unwrap().as_deref(),
         Some("final-secret")
@@ -2827,6 +2932,56 @@ async fn insert_pending_save(
     .unwrap();
 }
 
+async fn insert_pending_cleanup(pool: &sqlx::SqlitePool, operation_id: Uuid) {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO pending_account_save_cleanups (operation_id, created_at, updated_at) \
+         VALUES (?, ?, ?)",
+    )
+    .bind(operation_id.to_string())
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn pending_save_count(pool: &sqlx::SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM pending_account_saves")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn pending_cleanup_count(pool: &sqlx::SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM pending_account_save_cleanups")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn cleanup_operation_ids(pool: &sqlx::SqlitePool) -> Vec<Uuid> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT operation_id FROM pending_account_save_cleanups ORDER BY created_at, operation_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|operation_id| Uuid::parse_str(&operation_id).unwrap())
+    .collect()
+}
+
+async fn cleanup_rows(pool: &sqlx::SqlitePool) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT COALESCE(group_concat(operation_id || created_at || updated_at, ''), '') \
+         FROM pending_account_save_cleanups",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 fn pending_save_key(operation_id: Uuid) -> String {
     format!("pending-save:{operation_id}")
 }
@@ -2849,5 +3004,15 @@ async fn assert_pending_save_cleaned(
     assert_eq!(
         credentials.get(&pending_save_key(operation_id)).unwrap(),
         None
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_account_save_cleanups WHERE operation_id = ?",
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
     );
 }
