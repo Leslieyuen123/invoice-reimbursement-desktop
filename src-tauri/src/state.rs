@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 use crate::infra::credentials::CredentialStore;
 use crate::infra::files::AppPaths;
 use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
-use crate::services::account_saves::{AccountSagaRegistry, AccountSaveCoordinator};
+use crate::services::account_saves::{AccountSagaShutdown, AccountSaveCoordinator};
 use crate::services::operations::AccountOperationCoordinator;
 use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
 use crate::services::settings::{BackgroundSyncGate, SettingsService};
@@ -38,12 +38,10 @@ impl AppState {
         gateway: Arc<dyn ImapGateway>,
     ) -> Self {
         let account_operations = AccountOperationCoordinator::default();
-        let account_sagas = AccountSagaRegistry::default();
         let account_saves = AccountSaveCoordinator::new(
             pool.clone(),
             credentials.clone(),
             account_operations.clone(),
-            account_sagas,
         );
         Self {
             pool,
@@ -122,10 +120,10 @@ impl AppState {
     }
 
     pub async fn reconcile_account_saves(&self) -> Result<(), crate::domain::error::AppError> {
-        self.account_saves.reconcile_all().await
+        self.account_saves.reconcile_all().await.map(|_| ())
     }
 
-    pub fn account_sagas(&self) -> &AccountSagaRegistry {
-        self.account_saves.registry()
+    pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {
+        self.account_saves.begin_shutdown()
     }
 }

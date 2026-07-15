@@ -107,10 +107,18 @@ impl SettingsService {
     }
 
     pub async fn save_account(&self, input: SaveAccountInput) -> Result<MailboxAccount, AppError> {
-        self.account_saves.reconcile_all().await?;
+        self.account_saves.ensure_open()?;
         let is_update = input.id.is_some();
         let account_id = input.id.unwrap_or_else(Uuid::new_v4);
+        if is_update {
+            let _ = self.account_saves.reconcile_account(account_id).await?;
+        }
         let operation_guard = self.operations.try_lock(account_id)?;
+        if is_update {
+            self.account_saves
+                .ensure_no_blocking_pending(account_id)
+                .await?;
+        }
         let config = account_config(
             input.provider,
             &input.email,
@@ -139,17 +147,16 @@ impl SettingsService {
     }
 
     pub async fn test_account(&self, input: TestAccountInput) -> Result<(), AppError> {
+        self.account_saves.ensure_open()?;
         if let Some(id) = input.id {
-            self.account_saves.reconcile_account(id).await?;
-        } else {
-            self.account_saves.reconcile_all().await?;
+            let _ = self.account_saves.reconcile_account(id).await?;
         }
         let _operation_guard = input
             .id
             .map(|id| self.operations.try_lock(id))
             .transpose()?;
         if let Some(id) = input.id {
-            self.account_saves.ensure_no_pending(id).await?;
+            self.account_saves.ensure_no_blocking_pending(id).await?;
         }
         let config = account_config(
             input.provider,
@@ -165,9 +172,10 @@ impl SettingsService {
     }
 
     pub async fn delete_account(&self, id: Uuid) -> Result<(), AppError> {
-        self.account_saves.reconcile_account(id).await?;
+        self.account_saves.ensure_open()?;
+        let _ = self.account_saves.reconcile_account(id).await?;
         let _operation_guard = self.operations.try_lock(id)?;
-        self.account_saves.ensure_no_pending(id).await?;
+        self.account_saves.ensure_no_blocking_pending(id).await?;
         self.accounts.get(id).await?;
         self.accounts.set_enabled(id, false).await?;
         delete_credential(self.credentials.clone(), id.to_string()).await?;

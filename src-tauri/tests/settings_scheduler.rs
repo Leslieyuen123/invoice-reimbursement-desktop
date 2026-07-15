@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -12,7 +13,6 @@ use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
 use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta};
-use invoice_reimbursement::services::account_saves::AccountSagaRegistry;
 use invoice_reimbursement::services::scheduler::{
     Clock, ManualClock, Scheduler, SyncRunner, SyncStartBarrier,
 };
@@ -190,6 +190,57 @@ struct FailNextLiveCredentialStore {
     fail_next_live_set: AtomicBool,
 }
 
+#[derive(Default)]
+struct PermanentTempDeleteFailureStore {
+    secrets: RwLock<HashMap<String, String>>,
+    failed_temp_key: RwLock<Option<String>>,
+}
+
+impl PermanentTempDeleteFailureStore {
+    fn fail_delete_for(&self, key: String) {
+        *self.failed_temp_key.write().unwrap() = Some(key);
+    }
+}
+
+impl CredentialStore for PermanentTempDeleteFailureStore {
+    fn get(&self, account_id: &str) -> Result<Option<String>, AppError> {
+        Ok(self.secrets.read().unwrap().get(account_id).cloned())
+    }
+
+    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
+        self.secrets
+            .write()
+            .unwrap()
+            .insert(account_id.to_owned(), secret.to_owned());
+        Ok(())
+    }
+
+    fn delete(&self, account_id: &str) -> Result<(), AppError> {
+        if self.failed_temp_key.read().unwrap().as_deref() == Some(account_id) {
+            return Err(AppError::External {
+                service: "keyring".to_owned(),
+                retryable: false,
+                message: "cleanup failed for cleanup-secret-must-not-leak\n\0".to_owned(),
+            });
+        }
+        self.secrets.write().unwrap().remove(account_id);
+        Ok(())
+    }
+}
+
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CaptureWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl FailNextLiveCredentialStore {
     fn fail_next_live_set(&self) {
         self.fail_next_live_set.store(true, Ordering::SeqCst);
@@ -221,18 +272,6 @@ impl CredentialStore for FailNextLiveCredentialStore {
     fn delete(&self, account_id: &str) -> Result<(), AppError> {
         self.secrets.write().unwrap().remove(account_id);
         Ok(())
-    }
-}
-
-struct DropSignal {
-    dropped: Arc<AtomicBool>,
-    signal: Arc<tokio::sync::Notify>,
-}
-
-impl Drop for DropSignal {
-    fn drop(&mut self) {
-        self.dropped.store(true, Ordering::SeqCst);
-        self.signal.notify_one();
     }
 }
 
@@ -1052,7 +1091,7 @@ async fn cancelled_new_account_save_finishes_after_keyring_succeeds() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     credentials.release_set();
-    state.account_sagas().wait_all().await.unwrap();
+    state.begin_account_saga_shutdown().wait().await.unwrap();
     let account_id =
         sqlx::query_scalar::<_, String>("SELECT id FROM mailbox_accounts WHERE email = ?")
             .bind("cancel-new@example.com")
@@ -1073,6 +1112,87 @@ async fn cancelled_new_account_save_finishes_after_keyring_succeeds() {
             .unwrap(),
         0
     );
+}
+
+#[tokio::test]
+async fn cancelled_shutdown_wait_keeps_blocking_temp_save_owned_until_cleanup() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(BlockingCredentialStore::default());
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let settings = state.settings_service();
+    let stable = settings
+        .save_account(save_input(
+            None,
+            "shutdown-stable@example.com",
+            "stable-secret",
+        ))
+        .await
+        .unwrap();
+    let temp_set_started = credentials.block_next_set();
+    let saving_service = settings.clone();
+    let caller = tokio::spawn(async move {
+        saving_service
+            .save_account(save_input(
+                None,
+                "shutdown-blocked@example.com",
+                "shutdown-secret",
+            ))
+            .await
+    });
+    temp_set_started.await.unwrap();
+    let (operation_id, account_id, phase) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT operation_id, account_id, phase FROM pending_account_saves",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let operation_id = Uuid::parse_str(&operation_id).unwrap();
+    let account_id = Uuid::parse_str(&account_id).unwrap();
+    let shutdown = state.begin_account_saga_shutdown();
+
+    let timed_out =
+        tokio::time::timeout(std::time::Duration::from_millis(50), shutdown.wait()).await;
+    let reconcile_while_closing = state.reconcile_account_saves().await;
+    let rejected_save = settings
+        .save_account(save_input(
+            None,
+            "shutdown-rejected@example.com",
+            "rejected-secret",
+        ))
+        .await;
+    let runner = Arc::new(RecordingRunner::default());
+    let scheduler = state.scheduler(runner.clone());
+    let tick_while_closing = scheduler.tick(Utc::now()).await;
+    let manual_while_closing = scheduler.sync_now(stable.id).await;
+
+    assert!(timed_out.is_err());
+    assert!(matches!(
+        reconcile_while_closing,
+        Err(AppError::Conflict { .. })
+    ));
+    assert!(matches!(rejected_save, Err(AppError::Conflict { .. })));
+    assert!(tick_while_closing.is_ok());
+    assert!(matches!(
+        manual_while_closing,
+        Err(AppError::Conflict { .. })
+    ));
+    assert!(runner.account_ids.lock().unwrap().is_empty());
+    assert_eq!(phase, "prepared");
+    assert_eq!(
+        credentials.get(&pending_save_key(operation_id)).unwrap(),
+        None
+    );
+
+    credentials.release_set();
+    let saved = caller.await.unwrap().unwrap();
+    shutdown.wait().await.unwrap();
+
+    assert_eq!(saved.id, account_id);
+    assert_eq!(
+        credentials.get(&account_id.to_string()).unwrap().as_deref(),
+        Some("shutdown-secret")
+    );
+    assert_pending_save_cleaned(&pool, credentials.as_ref(), operation_id).await;
 }
 
 #[tokio::test]
@@ -1103,7 +1223,11 @@ async fn cancelled_new_account_temp_failure_remains_owned_and_reconciles() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     credentials.release_set();
-    let error = state.account_sagas().wait_all().await.unwrap_err();
+    let error = state
+        .begin_account_saga_shutdown()
+        .wait()
+        .await
+        .unwrap_err();
 
     assert_eq!(metadata_during_keyring, 0);
     assert!(!error.to_string().contains("new-secret"));
@@ -1114,7 +1238,10 @@ async fn cancelled_new_account_temp_failure_remains_owned_and_reconciles() {
             .unwrap(),
         "prepared"
     );
-    state.reconcile_account_saves().await.unwrap();
+    drop(service);
+    drop(state);
+    let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    restarted.reconcile_account_saves().await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
             .fetch_one(&pool)
@@ -1171,8 +1298,15 @@ async fn cancelled_account_edit_keeps_guard_and_live_state_until_temp_failure_re
         })
         .await;
     credentials.release_set();
-    let error = state.account_sagas().wait_all().await.unwrap_err();
-    state.reconcile_account_saves().await.unwrap();
+    let error = state
+        .begin_account_saga_shutdown()
+        .wait()
+        .await
+        .unwrap_err();
+    drop(service);
+    drop(state);
+    let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    restarted.reconcile_account_saves().await.unwrap();
 
     assert_eq!(staged_account, original_account);
     assert_eq!(staged_retry, original_retry);
@@ -2135,6 +2269,181 @@ async fn scheduler_only_runs_enabled_due_accounts() {
 }
 
 #[tokio::test]
+async fn locked_account_save_does_not_block_other_account_scheduler_or_save() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(BlockingCredentialStore::default());
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let settings = state.settings_service();
+    let locked = settings
+        .save_account(save_input(None, "a-locked@example.com", "locked-secret"))
+        .await
+        .unwrap();
+    let free = settings
+        .save_account(save_input(None, "b-free@example.com", "free-secret"))
+        .await
+        .unwrap();
+    let temp_set_started = credentials.block_next_set();
+    let saving_service = settings.clone();
+    let locked_save = tokio::spawn(async move {
+        saving_service
+            .save_account(save_input(
+                Some(locked.id),
+                "a-locked-updated@example.com",
+                "locked-new-secret",
+            ))
+            .await
+    });
+    temp_set_started.await.unwrap();
+    let runner = Arc::new(RecordingRunner::default());
+    let scheduler = state.scheduler(runner.clone());
+
+    let tick_result = scheduler.tick(Utc::now()).await;
+    let saved_free = settings
+        .save_account(save_input(
+            Some(free.id),
+            "b-free-updated@example.com",
+            "free-new-secret",
+        ))
+        .await;
+
+    credentials.release_set();
+    locked_save.await.unwrap().unwrap();
+    assert!(tick_result.is_ok());
+    assert_eq!(*runner.account_ids.lock().unwrap(), vec![free.id]);
+    assert_eq!(saved_free.unwrap().email, "b-free-updated@example.com");
+}
+
+#[tokio::test]
+async fn staged_missing_temp_for_one_account_does_not_block_other_scheduled_sync() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let blocked = insert_account(&accounts, "a-staged-missing@example.com", true).await;
+    let free = insert_account(&accounts, "b-staged-free@example.com", true).await;
+    let operation_id = Uuid::new_v4();
+    insert_pending_save(
+        &pool,
+        operation_id,
+        blocked,
+        "credential_staged",
+        true,
+        "a-staged-updated@example.com",
+    )
+    .await;
+    let state = mailbox_state(
+        pool,
+        Arc::new(PassingGateway),
+        Arc::new(MemoryCredentialStore::default()),
+    );
+    let runner = Arc::new(RecordingRunner::default());
+    let scheduler = state.scheduler(runner.clone());
+
+    scheduler.tick(Utc::now()).await.unwrap();
+    let manual = scheduler.sync_now(blocked).await;
+
+    assert_eq!(*runner.account_ids.lock().unwrap(), vec![free]);
+    assert!(matches!(manual, Err(AppError::Conflict { .. })));
+}
+
+#[tokio::test]
+async fn committed_cleanup_failure_allows_sync_and_other_account_save() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let committed = insert_account(&accounts, "a-committed-cleanup@example.com", true).await;
+    let free = insert_account(&accounts, "b-committed-free@example.com", true).await;
+    let operation_id = Uuid::new_v4();
+    insert_pending_save(
+        &pool,
+        operation_id,
+        committed,
+        "committed",
+        true,
+        "a-committed-cleanup@example.com",
+    )
+    .await;
+    let credentials = Arc::new(PermanentTempDeleteFailureStore::default());
+    let temp_key = pending_save_key(operation_id);
+    credentials.set(&temp_key, "cleanup-secret").unwrap();
+    credentials
+        .set(&committed.to_string(), "committed-secret")
+        .unwrap();
+    credentials.set(&free.to_string(), "free-secret").unwrap();
+    credentials.fail_delete_for(temp_key);
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let runner = Arc::new(RecordingRunner::default());
+    let scheduler = state.scheduler(runner.clone());
+
+    scheduler.tick(Utc::now()).await.unwrap();
+    let saved_free = state
+        .settings_service()
+        .save_account(save_input(
+            Some(free),
+            "b-committed-free-updated@example.com",
+            "free-new-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(*runner.account_ids.lock().unwrap(), vec![committed, free]);
+    assert_eq!(saved_free.email, "b-committed-free-updated@example.com");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT phase FROM pending_account_saves WHERE account_id = ?",
+        )
+        .bind(committed.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "committed"
+    );
+}
+
+#[test]
+fn best_effort_reconciliation_log_identifies_account_without_secret() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer_output = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || CaptureWriter(writer_output.clone()))
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    let account_id = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let pool = db::connect("sqlite::memory:").await.unwrap();
+            let accounts = MailboxAccountRepository::new(pool.clone());
+            let account_id = insert_account(&accounts, "cleanup-log@example.com", true).await;
+            let operation_id = Uuid::new_v4();
+            insert_pending_save(
+                &pool,
+                operation_id,
+                account_id,
+                "committed",
+                true,
+                "cleanup-log@example.com",
+            )
+            .await;
+            let credentials = Arc::new(PermanentTempDeleteFailureStore::default());
+            let temp_key = pending_save_key(operation_id);
+            credentials
+                .set(&temp_key, "cleanup-secret-must-not-leak")
+                .unwrap();
+            credentials.fail_delete_for(temp_key);
+            let state = mailbox_state(pool, Arc::new(PassingGateway), credentials);
+
+            state.reconcile_account_saves().await.unwrap();
+            account_id
+        });
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+    assert!(logs.contains(&account_id.to_string()));
+    assert!(!logs.contains("cleanup-secret-must-not-leak"));
+    assert!(!logs.chars().any(|character| character == '\0'));
+}
+
+#[tokio::test]
 async fn prepared_marker_without_temp_is_rolled_back_after_restart() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let credentials = Arc::new(MemoryCredentialStore::default());
@@ -2401,7 +2710,7 @@ async fn pending_existing_account_cannot_run_manual_or_scheduled_sync() {
     let scheduled = scheduler.tick(Utc::now()).await;
 
     assert!(manual.is_err());
-    assert!(scheduled.is_err());
+    assert!(scheduled.is_ok());
     assert!(runner.account_ids.lock().unwrap().is_empty());
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -2413,85 +2722,6 @@ async fn pending_existing_account_cannot_run_manual_or_scheduled_sync() {
         .unwrap(),
         1
     );
-}
-
-#[tokio::test]
-async fn account_saga_registry_owns_child_after_receiver_is_dropped() {
-    let registry = AccountSagaRegistry::default();
-    let release = Arc::new(tokio::sync::Notify::new());
-    let completed = Arc::new(AtomicBool::new(false));
-    let child_release = release.clone();
-    let child_completed = completed.clone();
-    let receiver = registry.spawn(async move {
-        child_release.notified().await;
-        child_completed.store(true, Ordering::SeqCst);
-        Ok::<_, AppError>(())
-    });
-    drop(receiver);
-
-    release.notify_one();
-    registry.wait_all().await.unwrap();
-
-    assert!(completed.load(Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn account_saga_registry_shutdown_waits_and_preserves_child_error() {
-    let registry = AccountSagaRegistry::default();
-    let release = Arc::new(tokio::sync::Notify::new());
-    let child_release = release.clone();
-    let receiver = registry.spawn(async move {
-        child_release.notified().await;
-        Err::<(), _>(AppError::Internal {
-            message: "durable account save failed".to_owned(),
-        })
-    });
-    drop(receiver);
-    let waiting_registry = registry.clone();
-    let wait = tokio::spawn(async move { waiting_registry.wait_all().await });
-    tokio::task::yield_now().await;
-    assert!(!wait.is_finished());
-
-    release.notify_one();
-    let error = wait.await.unwrap().unwrap_err();
-
-    assert!(error.to_string().contains("durable account save failed"));
-}
-
-#[tokio::test]
-async fn aborting_account_saga_shutdown_aborts_blocked_child_without_detach() {
-    let registry = AccountSagaRegistry::default();
-    let started = Arc::new(tokio::sync::Notify::new());
-    let cleanup = Arc::new(tokio::sync::Notify::new());
-    let dropped = Arc::new(AtomicBool::new(false));
-    let dropped_signal = Arc::new(tokio::sync::Notify::new());
-    let child_started = started.clone();
-    let child_cleanup = cleanup.clone();
-    let child_dropped = dropped.clone();
-    let child_dropped_signal = dropped_signal.clone();
-    let receiver = registry.spawn(async move {
-        let _drop_signal = DropSignal {
-            dropped: child_dropped,
-            signal: child_dropped_signal,
-        };
-        child_started.notify_one();
-        child_cleanup.notified().await;
-        Ok::<_, AppError>(())
-    });
-    drop(receiver);
-    started.notified().await;
-    let waiting_registry = registry.clone();
-    let wait = tokio::spawn(async move { waiting_registry.wait_all().await });
-    tokio::task::yield_now().await;
-
-    wait.abort();
-    assert!(wait.await.unwrap_err().is_cancelled());
-    let aborted =
-        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_signal.notified()).await;
-    cleanup.notify_one();
-
-    assert!(aborted.is_ok());
-    assert!(dropped.load(Ordering::SeqCst));
 }
 
 async fn insert_account(accounts: &MailboxAccountRepository, email: &str, enabled: bool) -> Uuid {

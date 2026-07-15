@@ -16,10 +16,27 @@ use crate::infra::credentials::{
 };
 use crate::services::operations::AccountOperationCoordinator;
 
-pub use registry::AccountSagaRegistry;
+use registry::AccountSagaRegistry;
+pub use registry::AccountSagaShutdown;
 use repository::{PendingAccountSave, PendingAccountSaveRepository, PendingSavePhase};
 
 const PENDING_KEY_PREFIX: &str = "pending-save:";
+
+#[derive(Debug, Default)]
+pub(crate) struct AccountSaveReconciliationReport {
+    failed_accounts: Vec<Uuid>,
+    skipped_accounts: Vec<Uuid>,
+}
+
+impl AccountSaveReconciliationReport {
+    pub(crate) fn failure_count(&self) -> usize {
+        self.failed_accounts.len()
+    }
+
+    pub(crate) fn skipped_count(&self) -> usize {
+        self.skipped_accounts.len()
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AccountSaveCoordinator {
@@ -33,12 +50,11 @@ impl AccountSaveCoordinator {
         pool: SqlitePool,
         credentials: Arc<dyn CredentialStore>,
         operations: AccountOperationCoordinator,
-        registry: AccountSagaRegistry,
     ) -> Self {
         Self {
             worker: AccountSaveWorker::new(pool, credentials),
             operations,
-            registry,
+            registry: AccountSagaRegistry::default(),
         }
     }
 
@@ -57,17 +73,36 @@ impl AccountSaveCoordinator {
         })
     }
 
-    pub(crate) async fn reconcile_all(&self) -> Result<(), AppError> {
+    pub(crate) async fn reconcile_all(&self) -> Result<AccountSaveReconciliationReport, AppError> {
+        self.registry.ensure_open()?;
+        let mut report = AccountSaveReconciliationReport::default();
         for pending in self.worker.pending.list().await? {
-            let _guard = self.operations.try_lock(pending.account_id)?;
+            self.registry.ensure_open()?;
+            let _guard = match self.operations.try_lock(pending.account_id) {
+                Ok(guard) => guard,
+                Err(AppError::Conflict { .. }) => {
+                    report.skipped_accounts.push(pending.account_id);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(current) = self.worker.pending.get(pending.operation_id).await? {
-                self.worker.reconcile(current).await?;
+                let diagnostic = current.clone();
+                if self.worker.reconcile(current).await.is_err() {
+                    log_reconciliation_failure(&diagnostic);
+                    report.failed_accounts.push(diagnostic.account_id);
+                }
             }
         }
-        Ok(())
+        Ok(report)
     }
 
-    pub(crate) async fn reconcile_account(&self, account_id: Uuid) -> Result<(), AppError> {
+    pub(crate) async fn reconcile_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<AccountSaveReconciliationReport, AppError> {
+        self.registry.ensure_open()?;
+        let mut report = AccountSaveReconciliationReport::default();
         if self
             .worker
             .pending
@@ -75,22 +110,36 @@ impl AccountSaveCoordinator {
             .await?
             .is_none()
         {
-            return Ok(());
+            return Ok(report);
         }
-        let _guard = self.operations.try_lock(account_id)?;
+        let _guard = match self.operations.try_lock(account_id) {
+            Ok(guard) => guard,
+            Err(AppError::Conflict { .. }) => {
+                report.skipped_accounts.push(account_id);
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(pending) = self.worker.pending.get_for_account(account_id).await? {
-            self.worker.reconcile(pending).await?;
+            let diagnostic = pending.clone();
+            if self.worker.reconcile(pending).await.is_err() {
+                log_reconciliation_failure(&diagnostic);
+                report.failed_accounts.push(account_id);
+            }
         }
-        Ok(())
+        Ok(report)
     }
 
-    pub(crate) async fn ensure_no_pending(&self, account_id: Uuid) -> Result<(), AppError> {
+    pub(crate) async fn ensure_no_blocking_pending(
+        &self,
+        account_id: Uuid,
+    ) -> Result<(), AppError> {
+        self.registry.ensure_open()?;
         if self
             .worker
             .pending
-            .get_for_account(account_id)
+            .has_blocking_for_account(account_id)
             .await?
-            .is_some()
         {
             return Err(AppError::Conflict {
                 message: "mailbox account save recovery is still pending".to_owned(),
@@ -99,8 +148,23 @@ impl AccountSaveCoordinator {
         Ok(())
     }
 
-    pub(crate) fn registry(&self) -> &AccountSagaRegistry {
-        &self.registry
+    pub(crate) async fn has_blocking_pending(&self, account_id: Uuid) -> Result<bool, AppError> {
+        self.worker
+            .pending
+            .has_blocking_for_account(account_id)
+            .await
+    }
+
+    pub(crate) fn ensure_open(&self) -> Result<(), AppError> {
+        self.registry.ensure_open()
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.registry.is_closing()
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> AccountSagaShutdown {
+        self.registry.begin_shutdown()
     }
 }
 
@@ -246,6 +310,15 @@ impl AccountSaveWorker {
 
 fn pending_save_key(operation_id: Uuid) -> String {
     format!("{PENDING_KEY_PREFIX}{operation_id}")
+}
+
+fn log_reconciliation_failure(pending: &PendingAccountSave) {
+    tracing::warn!(
+        account_id = %pending.account_id,
+        operation_id = %pending.operation_id,
+        phase = pending.phase.as_str(),
+        "mailbox account save reconciliation failed"
+    );
 }
 
 fn database_error(error: sqlx::Error) -> AppError {

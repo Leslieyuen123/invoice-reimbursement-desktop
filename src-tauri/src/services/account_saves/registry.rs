@@ -1,15 +1,20 @@
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::domain::error::AppError;
 
 #[derive(Clone)]
-pub struct AccountSagaRegistry {
+pub(super) struct AccountSagaRegistry {
     inner: Arc<AccountSagaRegistryInner>,
+}
+
+#[derive(Clone)]
+pub struct AccountSagaShutdown {
+    registry: AccountSagaRegistry,
 }
 
 impl Default for AccountSagaRegistry {
@@ -23,17 +28,19 @@ impl Default for AccountSagaRegistry {
 #[derive(Default)]
 struct AccountSagaRegistryInner {
     state: StdMutex<AccountSagaRegistryState>,
+    changed: Notify,
 }
 
 #[derive(Default)]
 struct AccountSagaRegistryState {
     closed: bool,
-    tasks: Vec<JoinHandle<Result<(), AppError>>>,
+    next_task_id: u64,
+    tasks: HashMap<u64, JoinHandle<()>>,
     first_error: Option<AppError>,
 }
 
 impl AccountSagaRegistry {
-    pub fn spawn<T, F>(&self, future: F) -> oneshot::Receiver<Result<T, AppError>>
+    pub(super) fn spawn<T, F>(&self, future: F) -> oneshot::Receiver<Result<T, AppError>>
     where
         T: Send + 'static,
         F: Future<Output = Result<T, AppError>> + Send + 'static,
@@ -44,126 +51,90 @@ impl AccountSagaRegistry {
             let _ = sender.send(Err(registry_closed_error()));
             return receiver;
         }
+        let task_id = state.next_task_id;
+        state.next_task_id = state.next_task_id.wrapping_add(1);
+        let inner = self.inner.clone();
         let task = tokio::spawn(async move {
-            let result = future.await;
+            let result = match tokio::spawn(future).await {
+                Ok(result) => result,
+                Err(_) => Err(child_task_error()),
+            };
             let observed = result.as_ref().map(|_| ()).map_err(Clone::clone);
             if sender.send(result).is_err() && observed.is_err() {
                 tracing::warn!("mailbox account save failed after its caller stopped waiting");
             }
-            observed
+            let completed_handle = {
+                let mut state = inner.state.lock().expect("account saga lock poisoned");
+                if let Err(error) = observed
+                    && state.first_error.is_none()
+                {
+                    state.first_error = Some(error);
+                }
+                state.tasks.remove(&task_id)
+            };
+            drop(completed_handle);
+            inner.changed.notify_waiters();
         });
-        state.tasks.push(task);
+        state.tasks.insert(task_id, task);
         receiver
     }
 
-    pub async fn wait_all(&self) -> Result<(), AppError> {
-        let (tasks, previous_error) = {
-            let mut state = self.inner.state.lock().expect("account saga lock poisoned");
-            state.closed = true;
-            (std::mem::take(&mut state.tasks), state.first_error.clone())
-        };
-        let result = await_tasks(tasks, previous_error).await;
-        if let Err(error) = &result {
-            let mut state = self.inner.state.lock().expect("account saga lock poisoned");
-            if state.first_error.is_none() {
-                state.first_error = Some(error.clone());
-            }
-        }
-        result
-    }
-
-    pub fn abort_all(&self) {
-        let tasks = {
-            let mut state = self.inner.state.lock().expect("account saga lock poisoned");
-            state.closed = true;
-            std::mem::take(&mut state.tasks)
-        };
-        for task in tasks {
-            task.abort();
+    pub(super) fn ensure_open(&self) -> Result<(), AppError> {
+        if self.is_closing() {
+            Err(registry_closed_error())
+        } else {
+            Ok(())
         }
     }
-}
 
-impl Drop for AccountSagaRegistryInner {
-    fn drop(&mut self) {
-        let tasks = self
+    pub(super) fn is_closing(&self) -> bool {
+        self.inner
             .state
-            .get_mut()
+            .lock()
+            .expect("account saga lock poisoned")
+            .closed
+    }
+
+    pub(super) fn begin_shutdown(&self) -> AccountSagaShutdown {
+        self.inner
+            .state
+            .lock()
+            .expect("account saga lock poisoned")
+            .closed = true;
+        self.inner.changed.notify_waiters();
+        AccountSagaShutdown {
+            registry: self.clone(),
+        }
+    }
+
+    async fn wait_for_completion(&self) -> Result<(), AppError> {
+        loop {
+            let changed = self.inner.changed.notified();
+            let completed = {
+                let state = self.inner.state.lock().expect("account saga lock poisoned");
+                state.tasks.is_empty().then(|| state.first_error.clone())
+            };
+            if let Some(first_error) = completed {
+                return first_error.map_or(Ok(()), Err);
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
             .expect("account saga lock poisoned")
             .tasks
-            .drain(..)
-            .collect::<Vec<_>>();
-        for task in tasks {
-            task.abort();
-        }
+            .len()
     }
 }
 
-async fn await_tasks(
-    tasks: Vec<JoinHandle<Result<(), AppError>>>,
-    mut first_error: Option<AppError>,
-) -> Result<(), AppError> {
-    let mut tasks = AbortOnDropTaskSet::new(tasks);
-    while let Some(task) = tasks.pop_front() {
-        match AbortOnDropJoinHandle::new(task).join().await {
-            Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
-            Ok(_) => {}
-            Err(_) if first_error.is_none() => first_error = Some(child_task_error()),
-            Err(_) => {}
-        }
-    }
-    first_error.map_or(Ok(()), Err)
-}
-
-struct AbortOnDropJoinHandle<T> {
-    task: Option<JoinHandle<T>>,
-}
-
-impl<T> AbortOnDropJoinHandle<T> {
-    fn new(task: JoinHandle<T>) -> Self {
-        Self { task: Some(task) }
-    }
-
-    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
-        let result = self
-            .task
-            .as_mut()
-            .expect("owned task must be present")
-            .await;
-        self.task.take();
-        result
-    }
-}
-
-impl<T> Drop for AbortOnDropJoinHandle<T> {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
-struct AbortOnDropTaskSet<T> {
-    tasks: VecDeque<JoinHandle<T>>,
-}
-
-impl<T> AbortOnDropTaskSet<T> {
-    fn new(tasks: Vec<JoinHandle<T>>) -> Self {
-        Self {
-            tasks: tasks.into(),
-        }
-    }
-
-    fn pop_front(&mut self) -> Option<JoinHandle<T>> {
-        self.tasks.pop_front()
-    }
-}
-
-impl<T> Drop for AbortOnDropTaskSet<T> {
-    fn drop(&mut self) {
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
+impl AccountSagaShutdown {
+    pub async fn wait(&self) -> Result<(), AppError> {
+        self.registry.wait_for_completion().await
     }
 }
 
@@ -246,7 +217,7 @@ mod tests {
                         secret.to_owned(),
                     ));
                     drop(receiver);
-                    registry.wait_all().await.unwrap_err()
+                    registry.begin_shutdown().wait().await.unwrap_err()
                 })
         });
         let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
@@ -255,5 +226,35 @@ mod tests {
         assert!(!error.to_string().chars().any(char::is_control));
         assert!(logs.contains("mailbox account save failed after its caller stopped waiting"));
         assert!(!logs.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn completed_tasks_are_reaped_while_first_error_is_retained_for_shutdown() {
+        let registry = AccountSagaRegistry::default();
+        let receiver = registry.spawn(async {
+            Err::<(), _>(AppError::Internal {
+                message: "completed account saga failure".to_owned(),
+            })
+        });
+
+        assert!(receiver.await.unwrap().is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while registry.active_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let shutdown = registry.begin_shutdown();
+
+        assert_eq!(registry.active_count(), 0);
+        assert!(
+            shutdown
+                .wait()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("completed account saga failure")
+        );
     }
 }

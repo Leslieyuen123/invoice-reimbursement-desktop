@@ -13,7 +13,7 @@ pub(super) enum PendingSavePhase {
 }
 
 impl PendingSavePhase {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Prepared => "prepared",
             Self::CredentialStaged => "credential_staged",
@@ -151,6 +151,21 @@ impl PendingAccountSaveRepository {
         .await
         .map_err(database_error)?;
         row.map(PendingAccountSave::try_from).transpose()
+    }
+
+    pub(super) async fn has_blocking_for_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_account_saves \
+             WHERE account_id = ? AND phase IN ('prepared', 'credential_staged')",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(count != 0)
     }
 
     pub(super) async fn set_phase(

@@ -197,7 +197,17 @@ impl Scheduler {
         registry: &TaskRegistry,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Vec<oneshot::Receiver<Result<(), AppError>>>, AppError> {
-        self.account_saves.reconcile_all().await?;
+        if self.account_saves.is_closing() {
+            return Ok(Vec::new());
+        }
+        let reconciliation = self.account_saves.reconcile_all().await?;
+        if reconciliation.failure_count() != 0 || reconciliation.skipped_count() != 0 {
+            tracing::debug!(
+                failed_accounts = reconciliation.failure_count(),
+                skipped_accounts = reconciliation.skipped_count(),
+                "background mailbox reconciliation completed with pending work"
+            );
+        }
         if !load_preferences(&self.pool).await?.background_sync_enabled {
             return Ok(Vec::new());
         }
@@ -205,6 +215,9 @@ impl Scheduler {
         for account in self.accounts.list().await? {
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
                 break;
+            }
+            if self.account_saves.has_blocking_pending(account.id).await? {
+                continue;
             }
             let retry = self.accounts.get_retry_state(account.id).await?;
             let due = match retry {
@@ -240,6 +253,10 @@ impl Scheduler {
         started: Option<oneshot::Sender<()>>,
     ) -> Result<(), SyncExecutionError> {
         self.account_saves
+            .ensure_open()
+            .map_err(SyncExecutionError::Infrastructure)?;
+        let _ = self
+            .account_saves
             .reconcile_account(account_id)
             .await
             .map_err(SyncExecutionError::Infrastructure)?;
@@ -252,7 +269,7 @@ impl Scheduler {
             .try_lock(account_id)
             .map_err(SyncExecutionError::Infrastructure)?;
         self.account_saves
-            .ensure_no_pending(account_id)
+            .ensure_no_blocking_pending(account_id)
             .await
             .map_err(SyncExecutionError::Infrastructure)?;
         if let Some(started) = started {
@@ -607,7 +624,7 @@ mod tests {
 
     use crate::db::accounts::{MailboxProvider, NewMailboxAccount};
     use crate::infra::credentials::MemoryCredentialStore;
-    use crate::services::account_saves::{AccountSagaRegistry, AccountSaveCoordinator};
+    use crate::services::account_saves::AccountSaveCoordinator;
 
     use super::*;
 
@@ -690,7 +707,6 @@ mod tests {
                         pool.clone(),
                         Arc::new(MemoryCredentialStore::default()),
                         operations.clone(),
-                        AccountSagaRegistry::default(),
                     );
                     let handle = Scheduler::with_operations_and_gate(
                         pool,
