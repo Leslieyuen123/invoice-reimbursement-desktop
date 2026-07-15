@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqliteConnection, SqlitePool, Type};
+use sqlx::{FromRow, Sqlite, SqliteConnection, SqlitePool, Transaction, Type};
 use uuid::Uuid;
 
 use crate::domain::error::AppError;
@@ -52,6 +52,13 @@ pub struct SyncCursor {
 pub struct SyncRun {
     pub id: Uuid,
     pub account_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRetryState {
+    pub failures: u32,
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub suspended: bool,
 }
 
 #[derive(Clone)]
@@ -212,20 +219,144 @@ impl MailboxAccountRepository {
         Ok(())
     }
 
-    pub async fn set_last_error(&self, id: Uuid, message: Option<&str>) -> Result<(), AppError> {
-        let message = message.map(sanitize_error_message);
-        let result =
-            sqlx::query("UPDATE mailbox_accounts SET last_error = ?, updated_at = ? WHERE id = ?")
-                .bind(message)
-                .bind(Utc::now().to_rfc3339())
-                .bind(id.to_string())
-                .execute(&self.pool)
-                .await
-                .map_err(|error| map_database_error("failed to update mailbox error", error))?;
-        if result.rows_affected() != 1 {
-            return Err(account_not_found(id));
+    pub async fn get_retry_state(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<SyncRetryState>, AppError> {
+        let row = sqlx::query_as::<_, DbSyncRetryStateRow>(
+            "SELECT failures, next_retry_at, suspended FROM sync_retry_states \
+             WHERE account_id = ?",
+        )
+        .bind(account_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_database_error("failed to get mailbox retry state", error))?;
+        row.map(SyncRetryState::try_from).transpose()
+    }
+
+    pub async fn record_retryable_failure(
+        &self,
+        account_id: Uuid,
+        failed_at: DateTime<Utc>,
+        message: &str,
+    ) -> Result<SyncRetryState, AppError> {
+        let next_one = (failed_at + chrono::Duration::minutes(1)).to_rfc3339();
+        let next_five = (failed_at + chrono::Duration::minutes(5)).to_rfc3339();
+        let next_fifteen = (failed_at + chrono::Duration::minutes(15)).to_rfc3339();
+        let updated_at = failed_at.to_rfc3339();
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin mailbox retry update", error))?;
+        let result = async {
+            sqlx::query(
+                "INSERT INTO sync_retry_states (\
+                    account_id, failures, next_retry_at, suspended, updated_at\
+                 ) VALUES (?, 1, ?, 0, ?) \
+                 ON CONFLICT(account_id) DO UPDATE SET \
+                    failures = CASE \
+                        WHEN sync_retry_states.failures < 2147483647 \
+                        THEN sync_retry_states.failures + 1 \
+                        ELSE sync_retry_states.failures \
+                    END, \
+                    next_retry_at = CASE sync_retry_states.failures \
+                        WHEN 0 THEN ? WHEN 1 THEN ? ELSE ? END, \
+                    suspended = 0, updated_at = excluded.updated_at",
+            )
+            .bind(account_id.to_string())
+            .bind(&next_one)
+            .bind(&updated_at)
+            .bind(&next_one)
+            .bind(&next_five)
+            .bind(&next_fifteen)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to save mailbox retry state", error))?;
+            update_last_error_in_transaction(
+                &mut transaction,
+                account_id,
+                Some(message),
+                &updated_at,
+            )
+            .await?;
+            let row = sqlx::query_as::<_, DbSyncRetryStateRow>(
+                "SELECT failures, next_retry_at, suspended FROM sync_retry_states \
+                 WHERE account_id = ?",
+            )
+            .bind(account_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to read mailbox retry state", error))?;
+            SyncRetryState::try_from(row)
         }
-        Ok(())
+        .await;
+        finish_retry_transaction(transaction, result).await
+    }
+
+    pub async fn suspend_retry(
+        &self,
+        account_id: Uuid,
+        failed_at: DateTime<Utc>,
+        message: &str,
+    ) -> Result<SyncRetryState, AppError> {
+        let updated_at = failed_at.to_rfc3339();
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| {
+                map_database_error("failed to begin mailbox suspension update", error)
+            })?;
+        let result = async {
+            sqlx::query(
+                "INSERT INTO sync_retry_states (\
+                    account_id, failures, next_retry_at, suspended, updated_at\
+                 ) VALUES (?, 0, NULL, 1, ?) \
+                 ON CONFLICT(account_id) DO UPDATE SET failures = 0, \
+                    next_retry_at = NULL, suspended = 1, updated_at = excluded.updated_at",
+            )
+            .bind(account_id.to_string())
+            .bind(&updated_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to suspend mailbox retry", error))?;
+            update_last_error_in_transaction(
+                &mut transaction,
+                account_id,
+                Some(message),
+                &updated_at,
+            )
+            .await?;
+            Ok(SyncRetryState {
+                failures: 0,
+                next_retry_at: None,
+                suspended: true,
+            })
+        }
+        .await;
+        finish_retry_transaction(transaction, result).await
+    }
+
+    pub async fn clear_retry_state(&self, account_id: Uuid) -> Result<(), AppError> {
+        let updated_at = Utc::now().to_rfc3339();
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin mailbox retry cleanup", error))?;
+        let result = async {
+            sqlx::query("DELETE FROM sync_retry_states WHERE account_id = ?")
+                .bind(account_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    map_database_error("failed to clear mailbox retry state", error)
+                })?;
+            update_last_error_in_transaction(&mut transaction, account_id, None, &updated_at).await
+        }
+        .await;
+        finish_retry_transaction(transaction, result).await
     }
 
     pub async fn get_cursor(
@@ -449,6 +580,47 @@ impl MailboxAccountRepository {
     }
 }
 
+async fn update_last_error_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    account_id: Uuid,
+    message: Option<&str>,
+    updated_at: &str,
+) -> Result<(), AppError> {
+    let message = message.map(sanitize_error_message);
+    let result =
+        sqlx::query("UPDATE mailbox_accounts SET last_error = ?, updated_at = ? WHERE id = ?")
+            .bind(message)
+            .bind(updated_at)
+            .bind(account_id.to_string())
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| map_database_error("failed to update mailbox error", error))?;
+    if result.rows_affected() != 1 {
+        return Err(account_not_found(account_id));
+    }
+    Ok(())
+}
+
+async fn finish_retry_transaction<T>(
+    transaction: Transaction<'_, Sqlite>,
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
+    match result {
+        Ok(value) => {
+            transaction.commit().await.map_err(|error| {
+                map_database_error("failed to commit mailbox retry update", error)
+            })?;
+            Ok(value)
+        }
+        Err(error) => {
+            transaction.rollback().await.map_err(|rollback| {
+                map_database_error("failed to roll back mailbox retry update", rollback)
+            })?;
+            Err(error)
+        }
+    }
+}
+
 fn sanitize_error_message(message: &str) -> String {
     message
         .chars()
@@ -478,6 +650,26 @@ struct DbMailboxAccountRow {
     last_error: Option<String>,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(FromRow)]
+struct DbSyncRetryStateRow {
+    failures: i64,
+    next_retry_at: Option<String>,
+    suspended: i64,
+}
+
+impl TryFrom<DbSyncRetryStateRow> for SyncRetryState {
+    type Error = AppError;
+
+    fn try_from(row: DbSyncRetryStateRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            failures: u32::try_from(row.failures)
+                .map_err(|error| internal_error("invalid retry failure count", error))?,
+            next_retry_at: parse_optional_datetime(row.next_retry_at, "next_retry_at")?,
+            suspended: parse_enabled(row.suspended)?,
+        })
+    }
 }
 
 impl TryFrom<DbMailboxAccountRow> for MailboxAccount {

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 use crate::db::accounts::{
@@ -32,7 +33,7 @@ pub struct TestAccountInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Preferences {
     pub background_sync_enabled: bool,
     pub export_directory: String,
@@ -44,7 +45,7 @@ impl Default for Preferences {
         Self {
             background_sync_enabled: true,
             export_directory: "exports".to_owned(),
-            batch_directory_pattern: "{start_date}_{end_date}".to_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
         }
     }
 }
@@ -56,12 +57,28 @@ pub struct PreferencesInput {
     pub batch_directory_pattern: String,
 }
 
+#[derive(Clone, Default)]
+pub struct BackgroundSyncGate {
+    lock: Arc<RwLock<()>>,
+}
+
+impl BackgroundSyncGate {
+    pub(crate) async fn read(&self) -> RwLockReadGuard<'_, ()> {
+        self.lock.read().await
+    }
+
+    async fn write(&self) -> RwLockWriteGuard<'_, ()> {
+        self.lock.write().await
+    }
+}
+
 #[derive(Clone)]
 pub struct SettingsService {
     pool: SqlitePool,
     gateway: Arc<dyn ImapGateway>,
     credentials: Arc<dyn CredentialStore>,
     accounts: MailboxAccountRepository,
+    background_gate: BackgroundSyncGate,
 }
 
 impl SettingsService {
@@ -70,11 +87,21 @@ impl SettingsService {
         gateway: Arc<dyn ImapGateway>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Self {
+        Self::with_background_gate(pool, gateway, credentials, BackgroundSyncGate::default())
+    }
+
+    pub fn with_background_gate(
+        pool: SqlitePool,
+        gateway: Arc<dyn ImapGateway>,
+        credentials: Arc<dyn CredentialStore>,
+        background_gate: BackgroundSyncGate,
+    ) -> Self {
         Self {
             accounts: MailboxAccountRepository::new(pool.clone()),
             pool,
             gateway,
             credentials,
+            background_gate,
         }
     }
 
@@ -167,6 +194,7 @@ impl SettingsService {
         let value_json = serde_json::to_string(&preferences).map_err(|_| AppError::Internal {
             message: "failed to serialize preferences".to_owned(),
         })?;
+        let _gate = self.background_gate.write().await;
         sqlx::query(
             "INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?) \
              ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, \
@@ -206,26 +234,10 @@ fn validate_preferences(preferences: &Preferences) -> Result<(), AppError> {
             "export directory must not be blank or contain NUL",
         ));
     }
-    let pattern = &preferences.batch_directory_pattern;
-    if pattern.is_empty()
-        || pattern.contains("..")
-        || pattern.contains('/')
-        || pattern.contains('\\')
-        || !pattern.contains("{start_date}")
-        || !pattern.contains("{end_date}")
-    {
+    if preferences.batch_directory_pattern != "{batchName}-{timestamp}" {
         return Err(AppError::validation(
             "batch_directory_pattern",
-            "batch directory pattern must contain {start_date} and {end_date} without path separators",
-        ));
-    }
-    let without_known_tokens = pattern
-        .replace("{start_date}", "")
-        .replace("{end_date}", "");
-    if without_known_tokens.contains('{') || without_known_tokens.contains('}') {
-        return Err(AppError::validation(
-            "batch_directory_pattern",
-            "batch directory pattern contains an unsupported placeholder",
+            "batch directory pattern must be {batchName}-{timestamp}",
         ));
     }
     Ok(())

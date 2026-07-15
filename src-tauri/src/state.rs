@@ -6,7 +6,7 @@ use crate::infra::credentials::CredentialStore;
 use crate::infra::files::AppPaths;
 use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
 use crate::services::scheduler::{Scheduler, SchedulerCoordinator, SyncRunner};
-use crate::services::settings::SettingsService;
+use crate::services::settings::{BackgroundSyncGate, SettingsService};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -15,6 +15,7 @@ pub struct AppState {
     credentials: Arc<dyn CredentialStore>,
     gateway: Arc<dyn ImapGateway>,
     scheduler_coordinator: SchedulerCoordinator,
+    background_sync_gate: BackgroundSyncGate,
 }
 
 impl AppState {
@@ -39,6 +40,7 @@ impl AppState {
             credentials,
             gateway,
             scheduler_coordinator: SchedulerCoordinator::default(),
+            background_sync_gate: BackgroundSyncGate::default(),
         }
     }
 
@@ -55,18 +57,20 @@ impl AppState {
     }
 
     pub fn settings_service(&self) -> SettingsService {
-        SettingsService::new(
+        SettingsService::with_background_gate(
             self.pool.clone(),
             self.gateway.clone(),
             self.credentials.clone(),
+            self.background_sync_gate.clone(),
         )
     }
 
     pub fn scheduler(&self, runner: Arc<dyn SyncRunner>) -> Scheduler {
-        Scheduler::with_coordinator(
+        Scheduler::with_coordinator_and_gate(
             self.pool.clone(),
             runner,
             self.scheduler_coordinator.clone(),
+            self.background_sync_gate.clone(),
         )
     }
 }

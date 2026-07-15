@@ -12,9 +12,11 @@ use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
 use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta};
-use invoice_reimbursement::services::scheduler::{Scheduler, SyncRunner};
+use invoice_reimbursement::services::scheduler::{
+    ManualClock, Scheduler, SyncRunner, SyncStartBarrier,
+};
 use invoice_reimbursement::services::settings::{
-    Preferences, PreferencesInput, SaveAccountInput, SettingsService,
+    BackgroundSyncGate, Preferences, PreferencesInput, SaveAccountInput, SettingsService,
 };
 use invoice_reimbursement::state::AppState;
 use uuid::Uuid;
@@ -150,11 +152,42 @@ struct BlockingRunner {
     release: tokio::sync::Notify,
 }
 
+struct BlockingFailureRunner {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl SyncRunner for BlockingFailureRunner {
+    async fn run(&self, _account_id: Uuid) -> Result<(), AppError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Err(AppError::External {
+            service: "imap".to_owned(),
+            retryable: true,
+            message: "network unavailable".to_owned(),
+        })
+    }
+}
+
 struct FirstAccountBlockingRunner {
     first_account_id: Uuid,
     account_ids: Mutex<Vec<Uuid>>,
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+struct ControlledStartBarrier {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl SyncStartBarrier for ControlledStartBarrier {
+    async fn before_start(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
 }
 
 #[async_trait]
@@ -362,11 +395,13 @@ async fn preferences_have_stable_defaults_and_roundtrip_as_json() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let service = settings_service(pool.clone());
 
-    assert_eq!(service.preferences().await.unwrap(), Preferences::default());
+    let defaults = Preferences::default();
+    assert_eq!(defaults.batch_directory_pattern, "{batchName}-{timestamp}");
+    assert_eq!(service.preferences().await.unwrap(), defaults);
     let expected = Preferences {
         background_sync_enabled: false,
         export_directory: "/tmp/invoice-exports".to_owned(),
-        batch_directory_pattern: "{start_date}_{end_date}".to_owned(),
+        batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
     };
     let saved = service
         .save_preferences(PreferencesInput {
@@ -388,6 +423,14 @@ async fn preferences_have_stable_defaults_and_roundtrip_as_json() {
     .fetch_one(&pool)
     .await
     .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+        serde_json::json!({
+            "backgroundSyncEnabled": false,
+            "exportDirectory": "/tmp/invoice-exports",
+            "batchDirectoryPattern": "{batchName}-{timestamp}",
+        })
+    );
     assert_eq!(serde_json::from_str::<Preferences>(&raw).unwrap(), expected);
 }
 
@@ -399,7 +442,7 @@ async fn invalid_preferences_are_rejected_without_overwriting_saved_values() {
         .save_preferences(PreferencesInput {
             background_sync_enabled: true,
             export_directory: "/tmp/exports".to_owned(),
-            batch_directory_pattern: "{start_date}-{end_date}".to_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
         })
         .await
         .unwrap();
@@ -408,7 +451,7 @@ async fn invalid_preferences_are_rejected_without_overwriting_saved_values() {
         .save_preferences(PreferencesInput {
             background_sync_enabled: false,
             export_directory: "  ".to_owned(),
-            batch_directory_pattern: "{start_date}-{end_date}".to_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
         })
         .await
         .unwrap_err();
@@ -431,6 +474,31 @@ async fn invalid_preferences_are_rejected_without_overwriting_saved_values() {
 }
 
 #[tokio::test]
+async fn persisted_legacy_batch_pattern_is_reported_as_invalid() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)")
+        .bind("preferences")
+        .bind(
+            serde_json::json!({
+                "backgroundSyncEnabled": true,
+                "exportDirectory": "exports",
+                "batchDirectoryPattern": "{start_date}_{end_date}",
+            })
+            .to_string(),
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = settings_service(pool).preferences().await.unwrap_err();
+
+    assert!(
+        matches!(error, AppError::Validation { ref field, .. } if field == "batch_directory_pattern")
+    );
+}
+
+#[tokio::test]
 async fn background_sync_disabled_prevents_new_scheduled_runs() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let accounts = MailboxAccountRepository::new(pool.clone());
@@ -439,7 +507,7 @@ async fn background_sync_disabled_prevents_new_scheduled_runs() {
         .save_preferences(PreferencesInput {
             background_sync_enabled: false,
             export_directory: "exports".to_owned(),
-            batch_directory_pattern: "{start_date}_{end_date}".to_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
         })
         .await
         .unwrap();
@@ -453,6 +521,8 @@ async fn background_sync_disabled_prevents_new_scheduled_runs() {
 
 #[tokio::test]
 async fn disabling_background_sync_during_tick_allows_current_run_but_starts_no_next_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path()).unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let accounts = MailboxAccountRepository::new(pool.clone());
     let first = insert_account(&accounts, "a-blocking@example.com", true).await;
@@ -463,23 +533,84 @@ async fn disabling_background_sync_during_tick_allows_current_run_but_starts_no_
         started: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
-    let scheduler = Scheduler::new(pool.clone(), runner.clone());
+    let state = AppState::with_gateway(
+        pool,
+        paths,
+        Arc::new(MemoryCredentialStore::default()),
+        Arc::new(PassingGateway),
+    );
+    let scheduler = state.scheduler(runner.clone());
     let running_scheduler = scheduler.clone();
     let tick = tokio::spawn(async move { running_scheduler.tick(Utc::now()).await });
     runner.started.notified().await;
 
-    settings_service(pool)
-        .save_preferences(PreferencesInput {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.settings_service().save_preferences(PreferencesInput {
             background_sync_enabled: false,
             export_directory: "exports".to_owned(),
-            batch_directory_pattern: "{start_date}_{end_date}".to_owned(),
-        })
-        .await
-        .unwrap();
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     runner.release.notify_one();
     tick.await.unwrap().unwrap();
 
     assert_eq!(*runner.account_ids.lock().unwrap(), vec![first]);
+}
+
+#[tokio::test]
+async fn disabling_background_sync_linearizes_before_runner_start() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "start-race@example.com", true).await;
+    let gate = BackgroundSyncGate::default();
+    let settings = SettingsService::with_background_gate(
+        pool.clone(),
+        Arc::new(PassingGateway),
+        Arc::new(MemoryCredentialStore::default()),
+        gate.clone(),
+    );
+    let runner = Arc::new(RecordingRunner::default());
+    let boundary = Arc::new(ControlledStartBarrier {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let scan_time = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+    let scheduler = Scheduler::with_runtime(
+        pool,
+        runner.clone(),
+        Arc::new(ManualClock::new(scan_time)),
+        gate,
+        boundary.clone(),
+    );
+    let running = scheduler.clone();
+    let tick = tokio::spawn(async move { running.tick(scan_time).await });
+    boundary.reached.notified().await;
+
+    let (attempting, attempted) = tokio::sync::oneshot::channel();
+    let disable = tokio::spawn(async move {
+        let _ = attempting.send(());
+        settings
+            .save_preferences(PreferencesInput {
+                background_sync_enabled: false,
+                export_directory: "exports".to_owned(),
+                batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            })
+            .await
+    });
+    attempted.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(!disable.is_finished());
+    boundary.release.notify_one();
+    disable.await.unwrap().unwrap();
+    tick.await.unwrap().unwrap();
+
+    assert_eq!(*runner.account_ids.lock().unwrap(), vec![account_id]);
+    scheduler.tick(scan_time + Duration::days(1)).await.unwrap();
+    assert_eq!(*runner.account_ids.lock().unwrap(), vec![account_id]);
 }
 
 #[tokio::test]
@@ -497,10 +628,10 @@ async fn concurrent_sync_for_same_account_returns_conflict_without_waiting() {
     });
     let scheduler = Scheduler::new(pool, runner.clone());
     let first_scheduler = scheduler.clone();
-    let first = tokio::spawn(async move { first_scheduler.sync_now(account_id, Utc::now()).await });
+    let first = tokio::spawn(async move { first_scheduler.sync_now(account_id).await });
     runner.started.notified().await;
 
-    let second = scheduler.sync_now(account_id, Utc::now()).await;
+    let second = scheduler.sync_now(account_id).await;
 
     assert!(matches!(second, Err(AppError::Conflict { .. })));
     assert!(!first.is_finished());
@@ -528,23 +659,32 @@ async fn retryable_failures_back_off_for_one_five_then_fifteen_minutes() {
         Err(retryable()),
         Err(retryable()),
     ]));
-    let scheduler = Scheduler::new(pool, runner.clone());
     let start = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+    let clock = Arc::new(ManualClock::new(start));
+    let scheduler = Scheduler::with_clock(pool, runner.clone(), clock.clone());
 
     scheduler.tick(start).await.unwrap();
+    clock.set(start + Duration::seconds(59));
     scheduler.tick(start + Duration::seconds(59)).await.unwrap();
+    clock.set(start + Duration::minutes(1));
     scheduler.tick(start + Duration::minutes(1)).await.unwrap();
+    clock.set(start + Duration::minutes(5) + Duration::seconds(59));
     scheduler
         .tick(start + Duration::minutes(5) + Duration::seconds(59))
         .await
         .unwrap();
+    clock.set(start + Duration::minutes(6));
     scheduler.tick(start + Duration::minutes(6)).await.unwrap();
+    clock.set(start + Duration::minutes(20) + Duration::seconds(59));
     scheduler
         .tick(start + Duration::minutes(20) + Duration::seconds(59))
         .await
         .unwrap();
+    clock.set(start + Duration::minutes(21));
     scheduler.tick(start + Duration::minutes(21)).await.unwrap();
+    clock.set(start + Duration::minutes(35));
     scheduler.tick(start + Duration::minutes(35)).await.unwrap();
+    clock.set(start + Duration::minutes(36));
     scheduler.tick(start + Duration::minutes(36)).await.unwrap();
 
     assert_eq!(runner.calls.load(Ordering::SeqCst), 5);
@@ -579,6 +719,162 @@ async fn authentication_failure_is_not_retried_and_preserves_last_error() {
 }
 
 #[tokio::test]
+async fn authentication_suspension_survives_scheduler_reconstruction() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "auth-restart@example.com", true).await;
+    let first_runner = Arc::new(SequenceRunner::new(vec![Err(AppError::External {
+        service: "imap".to_owned(),
+        retryable: false,
+        message: "authentication failed".to_owned(),
+    })]));
+    let start = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+    Scheduler::with_clock(
+        pool.clone(),
+        first_runner,
+        Arc::new(ManualClock::new(start)),
+    )
+    .tick(start)
+    .await
+    .unwrap();
+
+    let second_runner = Arc::new(RecordingRunner::default());
+    Scheduler::new(pool.clone(), second_runner.clone())
+        .tick(start + Duration::days(1))
+        .await
+        .unwrap();
+
+    assert!(second_runner.account_ids.lock().unwrap().is_empty());
+    let suspended = sqlx::query_scalar::<_, i64>(
+        "SELECT suspended FROM sync_retry_states WHERE account_id = ?",
+    )
+    .bind(account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(suspended, 1);
+}
+
+#[tokio::test]
+async fn retryable_backoff_survives_scheduler_reconstruction() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "retry-restart@example.com", true).await;
+    let first_runner = Arc::new(SequenceRunner::new(vec![Err(AppError::External {
+        service: "imap".to_owned(),
+        retryable: true,
+        message: "network unavailable".to_owned(),
+    })]));
+    let start = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+    Scheduler::with_clock(
+        pool.clone(),
+        first_runner,
+        Arc::new(ManualClock::new(start)),
+    )
+    .tick(start)
+    .await
+    .unwrap();
+
+    let second_runner = Arc::new(RecordingRunner::default());
+    let reconstructed = Scheduler::new(pool, second_runner.clone());
+    reconstructed
+        .tick(start + Duration::seconds(59))
+        .await
+        .unwrap();
+    assert!(second_runner.account_ids.lock().unwrap().is_empty());
+    reconstructed
+        .tick(start + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(*second_runner.account_ids.lock().unwrap(), vec![account_id]);
+}
+
+#[tokio::test]
+async fn retry_due_time_overrides_normal_sync_interval() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "retry-interval@example.com", true).await;
+    let start = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+    sqlx::query("UPDATE mailbox_accounts SET last_synced_at = ? WHERE id = ?")
+        .bind(start.to_rfc3339())
+        .bind(account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let runner = Arc::new(SequenceRunner::new(vec![
+        Err(AppError::External {
+            service: "imap".to_owned(),
+            retryable: true,
+            message: "network unavailable".to_owned(),
+        }),
+        Ok(()),
+    ]));
+    let scheduler = Scheduler::with_clock(pool, runner.clone(), Arc::new(ManualClock::new(start)));
+    scheduler.sync_now(account_id).await.unwrap_err();
+
+    scheduler.tick(start + Duration::minutes(1)).await.unwrap();
+
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn retry_backoff_starts_when_the_failed_run_finishes() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "failure-time@example.com", true).await;
+    let start = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+    let clock = Arc::new(ManualClock::new(start));
+    let runner = Arc::new(BlockingFailureRunner {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let scheduler = Scheduler::with_clock(pool, runner.clone(), clock.clone());
+    let running = scheduler.clone();
+    let tick = tokio::spawn(async move { running.tick(start).await });
+    runner.started.notified().await;
+
+    clock.set(start + Duration::minutes(10));
+    runner.release.notify_one();
+    tick.await.unwrap().unwrap();
+
+    let retry = scheduler.retry_state(account_id).await.unwrap().unwrap();
+    assert_eq!(retry.next_retry_at, Some(start + Duration::minutes(11)));
+}
+
+#[tokio::test]
+async fn deleting_account_cascades_persisted_retry_state() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "retry-delete@example.com", true).await;
+    let runner = Arc::new(SequenceRunner::new(vec![Err(AppError::External {
+        service: "imap".to_owned(),
+        retryable: true,
+        message: "network unavailable".to_owned(),
+    })]));
+    Scheduler::new(pool.clone(), runner)
+        .tick(Utc::now())
+        .await
+        .unwrap();
+    let before =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_retry_states WHERE account_id = ?")
+            .bind(account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, 1);
+
+    accounts.delete(account_id).await.unwrap();
+
+    let after =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_retry_states WHERE account_id = ?")
+            .bind(account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, 0);
+}
+
+#[tokio::test]
 async fn successful_manual_sync_clears_retry_state_and_last_error() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let accounts = MailboxAccountRepository::new(pool.clone());
@@ -591,18 +887,15 @@ async fn successful_manual_sync_clears_retry_state_and_last_error() {
         }),
         Ok(()),
     ]));
-    let scheduler = Scheduler::new(pool, runner);
     let start = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+    let scheduler = Scheduler::with_clock(pool, runner, Arc::new(ManualClock::new(start)));
     scheduler.tick(start).await.unwrap();
-    assert!(scheduler.retry_state(account_id).is_some());
+    assert!(scheduler.retry_state(account_id).await.unwrap().is_some());
     assert!(accounts.get(account_id).await.unwrap().last_error.is_some());
 
-    scheduler
-        .sync_now(account_id, start + Duration::seconds(10))
-        .await
-        .unwrap();
+    scheduler.sync_now(account_id).await.unwrap();
 
-    assert_eq!(scheduler.retry_state(account_id), None);
+    assert_eq!(scheduler.retry_state(account_id).await.unwrap(), None);
     assert_eq!(accounts.get(account_id).await.unwrap().last_error, None);
 }
 
@@ -680,12 +973,12 @@ async fn schedulers_from_same_app_state_share_the_account_guard() {
     });
     let scheduled = state.scheduler(runner.clone());
     let manual = state.scheduler(runner.clone());
-    let first = tokio::spawn(async move { scheduled.sync_now(account_id, Utc::now()).await });
+    let first = tokio::spawn(async move { scheduled.sync_now(account_id).await });
     runner.started.notified().await;
 
     let second = tokio::time::timeout(
         std::time::Duration::from_millis(50),
-        manual.sync_now(account_id, Utc::now()),
+        manual.sync_now(account_id),
     )
     .await;
     runner.release.notify_waiters();
