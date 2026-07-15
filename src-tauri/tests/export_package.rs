@@ -11,8 +11,8 @@ use invoice_reimbursement::domain::model::{
     RecognitionStatus, SourceType,
 };
 use invoice_reimbursement::infra::files::AppPaths;
-use invoice_reimbursement::services::export::ExportService;
-use lopdf::{Document, Object, dictionary};
+use invoice_reimbursement::services::export::{ExportCoordinator, ExportService};
+use lopdf::{Document, Object, Stream, dictionary};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -69,7 +69,7 @@ impl TestApp {
 
         Self {
             _directory: directory,
-            exports: ExportService::new(pool.clone(), paths.clone()),
+            exports: ExportService::new(pool.clone(), paths.clone(), ExportCoordinator::default()),
             pool,
             paths,
             batch_id: batch.id,
@@ -103,8 +103,9 @@ impl TestApp {
                 format!("invoice-{sequence}.pdf")
             };
             item.amount_cents = Some(amount_cents);
-            fs::write(&item.original_path, format!("original-{sequence}"))
-                .expect("original fixture should write");
+            let original_bytes = format!("original-{sequence}");
+            item.sha256 = sha256_hex(original_bytes.as_bytes());
+            fs::write(&item.original_path, original_bytes).expect("original fixture should write");
             fs::write(
                 item.normalized_pdf_path.as_deref().unwrap(),
                 inherited_media_box_pdf(100.0 * f64::from(sequence), 150.0 * f64::from(sequence)),
@@ -116,7 +117,7 @@ impl TestApp {
 
         Self {
             _directory: directory,
-            exports: ExportService::new(pool.clone(), paths.clone()),
+            exports: ExportService::new(pool.clone(), paths.clone(), ExportCoordinator::default()),
             pool,
             paths,
             batch_id: batch.id,
@@ -221,6 +222,18 @@ async fn merged_pdf_preserves_inherited_page_dimensions() {
         .collect::<Vec<_>>();
 
     assert_eq!(dimensions, vec![(100.0, 150.0), (200.0, 300.0)]);
+    for page_id in document.get_pages().into_values() {
+        let page = document.get_object(page_id).unwrap().as_dict().unwrap();
+        let resources = page.get(b"Resources").unwrap().as_dict().unwrap();
+        assert!(resources.get(b"ProcSet").is_ok());
+        let contents_id = page.get(b"Contents").unwrap().as_reference().unwrap();
+        let contents = document
+            .get_object(contents_id)
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert_eq!(contents.content, b"q Q");
+    }
 }
 
 #[tokio::test]
@@ -261,8 +274,9 @@ async fn pdf_and_rows_sort_by_invoice_date_created_at_then_item_id() {
         item.invoice_date = Some(NaiveDate::from_ymd_opt(date.0, date.1, date.2).unwrap());
         item.created_at = Utc.with_ymd_and_hms(2026, 7, 13, hour, 0, 0).unwrap();
         item.updated_at = item.created_at;
-        fs::write(&item.original_path, format!("original-{id_number}"))
-            .expect("original should write");
+        let original_bytes = format!("original-{id_number}");
+        item.sha256 = sha256_hex(original_bytes.as_bytes());
+        fs::write(&item.original_path, original_bytes).expect("original should write");
         fs::write(
             item.normalized_pdf_path.as_deref().unwrap(),
             inherited_media_box_pdf(dimension, dimension + 50.0),
@@ -357,6 +371,13 @@ async fn cancellation_during_publication_claim_removes_staging_and_keeps_batch_d
         .await
         .expect("writer blocker should rollback");
 
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fs::read_dir(&app.paths.staging).unwrap().next().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled blocking generation should release its staging directory");
     assert_eq!(fs::read_dir(&app.paths.exports).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&app.paths.staging).unwrap().count(), 0);
     let batch = BatchRepository::new(app.pool)
@@ -519,8 +540,13 @@ async fn artifacts_contain_exact_workbook_zip_and_manifest_data() {
     assert_eq!(manifest["appVersion"], env!("CARGO_PKG_VERSION"));
     assert!(manifest["exportedAt"].as_str().is_some());
     assert_eq!(manifest["items"].as_array().unwrap().len(), 2);
-    for item in manifest["items"].as_array().unwrap() {
-        assert_eq!(item["sha256"], "fixture-sha256");
+    for (item, original_bytes) in manifest["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([b"original-1".as_slice(), b"original-2".as_slice()])
+    {
+        assert_eq!(item["sha256"], sha256_hex(original_bytes));
         let file_name = item["fileName"].as_str().unwrap();
         assert!(file_name.contains(item["itemId"].as_str().unwrap().get(..8).unwrap()));
     }
@@ -618,6 +644,29 @@ async fn missing_original_and_normalized_pdf_are_rejected_before_staging() {
         .unwrap_err();
     assert!(matches!(error, AppError::Validation { field, .. } if field == "normalizedPdf"));
     assert_storage_empty(&missing_normalized.paths);
+}
+
+#[tokio::test]
+async fn original_changed_after_import_is_rejected_without_residue() {
+    let app = TestApp::with_exportable_batch().await;
+    let original_path =
+        sqlx::query_scalar::<_, String>("SELECT original_path FROM items WHERE id = ?")
+            .bind(app.item_ids[0].to_string())
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    fs::write(original_path, b"corrupted after import").unwrap();
+
+    let error = app.exports.export(app.batch_id).await.unwrap_err();
+
+    assert!(matches!(error, AppError::Validation { field, .. } if field == "original"));
+    assert_storage_empty(&app.paths);
+    let batch = BatchRepository::new(app.pool)
+        .get(app.batch_id)
+        .await
+        .unwrap();
+    assert_eq!(batch.status, BatchStatus::Draft);
+    assert_eq!(batch.last_exported_at, None);
 }
 
 #[tokio::test]
@@ -804,9 +853,11 @@ fn sample_item(paths: &AppPaths, batch_id: Uuid, status: ItemStatus) -> NewItemR
 fn inherited_media_box_pdf(width: f64, height: f64) -> Vec<u8> {
     let mut document = Document::with_version("1.5");
     let pages_id = document.new_object_id();
+    let contents_id = document.add_object(Stream::new(dictionary! {}, b"q Q".to_vec()));
     let page_id = document.add_object(dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
+        "Contents" => contents_id,
     });
     document.objects.insert(
         pages_id,
@@ -815,6 +866,9 @@ fn inherited_media_box_pdf(width: f64, height: f64) -> Vec<u8> {
             "Kids" => vec![Object::Reference(page_id)],
             "Count" => 1,
             "MediaBox" => vec![0.into(), 0.into(), width.into(), height.into()],
+            "Resources" => dictionary! {
+                "ProcSet" => vec![Object::Name(b"PDF".to_vec())],
+            },
         }),
     );
     let catalog_id = document.add_object(dictionary! {

@@ -8,6 +8,7 @@ use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
 use crate::services::account_saves::{
     AccountSagaShutdown, AccountSaveCoordinator, AccountSaveReconciliationReport,
 };
+use crate::services::export::{ExportCoordinator, ExportService};
 use crate::services::operations::AccountOperationCoordinator;
 use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
 use crate::services::settings::{BackgroundSyncGate, SettingsService};
@@ -20,6 +21,7 @@ pub struct AppState {
     gateway: Arc<dyn ImapGateway>,
     account_operations: AccountOperationCoordinator,
     account_saves: AccountSaveCoordinator,
+    export_coordinator: ExportCoordinator,
     background_sync_gate: BackgroundSyncGate,
 }
 
@@ -52,6 +54,7 @@ impl AppState {
             gateway,
             account_operations,
             account_saves,
+            export_coordinator: ExportCoordinator::default(),
             background_sync_gate: BackgroundSyncGate::default(),
         }
     }
@@ -76,6 +79,14 @@ impl AppState {
             self.background_sync_gate.clone(),
             self.account_operations.clone(),
             self.account_saves.clone(),
+        )
+    }
+
+    pub fn export_service(&self) -> ExportService {
+        ExportService::new(
+            self.pool.clone(),
+            self.paths.clone(),
+            self.export_coordinator.clone(),
         )
     }
 

@@ -1,17 +1,25 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+#[cfg(test)]
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::db::batches::BatchRepository;
+use crate::db::batches::{BatchExportClaim, BatchRepository};
 use crate::domain::error::AppError;
 use crate::domain::model::{ItemStatus, RecognitionStatus};
-use crate::infra::exporters::{ExportItem, generate_artifacts, publish_directory};
+use crate::infra::exporters::{
+    DEFAULT_EXPORT_LIMITS, ExportItem, ExportLimits, generate_artifacts, publish_directory,
+};
 use crate::infra::files::{AppPaths, sync_directory};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,20 +30,39 @@ pub struct ExportResult {
 }
 
 #[derive(Clone)]
+pub struct ExportCoordinator {
+    active_exports: Arc<DashMap<Uuid, ()>>,
+    generation_slots: Arc<Semaphore>,
+}
+
+impl Default for ExportCoordinator {
+    fn default() -> Self {
+        Self {
+            active_exports: Arc::new(DashMap::new()),
+            generation_slots: Arc::new(Semaphore::new(2)),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ExportService {
     pool: SqlitePool,
     paths: AppPaths,
-    active_exports: Arc<DashMap<Uuid, ()>>,
+    coordinator: ExportCoordinator,
     publisher: Arc<dyn DirectoryPublisher>,
+    committer: Arc<dyn ExportCommitter>,
+    generation_hook: Arc<dyn GenerationHook>,
 }
 
 impl ExportService {
-    pub fn new(pool: SqlitePool, paths: AppPaths) -> Self {
+    pub fn new(pool: SqlitePool, paths: AppPaths, coordinator: ExportCoordinator) -> Self {
         Self {
             pool,
             paths,
-            active_exports: Arc::new(DashMap::new()),
+            coordinator,
             publisher: Arc::new(AtomicDirectoryPublisher),
+            committer: Arc::new(SqliteExportCommitter),
+            generation_hook: Arc::new(NoopGenerationHook),
         }
     }
 
@@ -48,13 +75,65 @@ impl ExportService {
         Self {
             pool,
             paths,
-            active_exports: Arc::new(DashMap::new()),
+            coordinator: ExportCoordinator::default(),
             publisher,
+            committer: Arc::new(SqliteExportCommitter),
+            generation_hook: Arc::new(NoopGenerationHook),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_committer(
+        pool: SqlitePool,
+        paths: AppPaths,
+        committer: Arc<dyn ExportCommitter>,
+    ) -> Self {
+        Self {
+            pool,
+            paths,
+            coordinator: ExportCoordinator::default(),
+            publisher: Arc::new(AtomicDirectoryPublisher),
+            committer,
+            generation_hook: Arc::new(NoopGenerationHook),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_generation_hook(
+        pool: SqlitePool,
+        paths: AppPaths,
+        generation_hook: Arc<dyn GenerationHook>,
+    ) -> Self {
+        Self {
+            pool,
+            paths,
+            coordinator: ExportCoordinator::default(),
+            publisher: Arc::new(AtomicDirectoryPublisher),
+            committer: Arc::new(SqliteExportCommitter),
+            generation_hook,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_coordinator_and_generation_hook(
+        pool: SqlitePool,
+        paths: AppPaths,
+        coordinator: ExportCoordinator,
+        generation_hook: Arc<dyn GenerationHook>,
+    ) -> Self {
+        Self {
+            pool,
+            paths,
+            coordinator,
+            publisher: Arc::new(AtomicDirectoryPublisher),
+            committer: Arc::new(SqliteExportCommitter),
+            generation_hook,
         }
     }
 
     pub async fn export(&self, batch_id: Uuid) -> Result<ExportResult, AppError> {
-        let _active_export = ActiveExport::acquire(self.active_exports.clone(), batch_id)?;
+        let active_export =
+            ActiveExport::acquire(self.coordinator.active_exports.clone(), batch_id)?;
         let batches = BatchRepository::new(self.pool.clone());
         let snapshot = batches.export_snapshot(batch_id).await?;
         let batch = snapshot.batch.clone();
@@ -101,6 +180,9 @@ impl ExportService {
                 message: "报销批次没有票据".to_owned(),
             });
         }
+        if items.len() > DEFAULT_EXPORT_LIMITS.max_items {
+            return Err(AppError::validation("export", "导出票据数量超过限制"));
+        }
 
         let mut items = items;
         items.sort_by_key(|item| {
@@ -112,29 +194,56 @@ impl ExportService {
             )
         });
         let mut total_amount_cents = 0_i64;
-        let export_items = items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                total_amount_cents =
-                    total_amount_cents
-                        .checked_add(item.amount_cents.ok_or_else(|| {
-                            AppError::validation("amountCents", "票据金额不能为空")
-                        })?)
-                        .ok_or_else(|| AppError::Internal {
-                            message: "batch export amount overflow".to_owned(),
-                        })?;
-                prepare_export_item(&self.paths, index + 1, item)
-            })
-            .collect::<Result<Vec<_>, AppError>>()?;
+        for item in &items {
+            total_amount_cents = total_amount_cents
+                .checked_add(
+                    item.amount_cents
+                        .ok_or_else(|| AppError::validation("amountCents", "票据金额不能为空"))?,
+                )
+                .ok_or_else(|| AppError::Internal {
+                    message: "batch export amount overflow".to_owned(),
+                })?;
+        }
 
         let exported_at = Utc::now();
-        let staging = self
+        let staging_path = self
             .paths
             .staging
             .join(format!("export-{}", Uuid::new_v4()));
-        let staging = OwnedExportDirectory::create(staging)?;
-        generate_artifacts(staging.path(), &batch, &export_items, exported_at)?;
+        let generation_slot = self
+            .coordinator
+            .generation_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::Internal {
+                message: "export generation coordinator closed".to_owned(),
+            })?;
+        let generation_paths = self.paths.clone();
+        let generation_batch = batch.clone();
+        let generation_items = items.clone();
+        let generation_active_export = active_export.clone();
+        let generation_hook = self.generation_hook.clone();
+        let staging = tokio::task::spawn_blocking(move || {
+            let _generation_slot = generation_slot;
+            let _generation_active_export = generation_active_export;
+            generation_hook.before_generation()?;
+            let mut export_items =
+                prepare_export_items(&generation_paths, &generation_items, DEFAULT_EXPORT_LIMITS)?;
+            let staging = OwnedExportDirectory::create(staging_path)?;
+            generate_artifacts(
+                staging.path(),
+                &generation_batch,
+                &mut export_items,
+                exported_at,
+                DEFAULT_EXPORT_LIMITS,
+            )?;
+            Ok::<_, AppError>(staging)
+        })
+        .await
+        .map_err(|_| AppError::Internal {
+            message: "export generation task failed".to_owned(),
+        })??;
 
         let sanitized_name = sanitize_filename::sanitize(&batch.name);
         let batch_name = if sanitized_name.trim().is_empty() {
@@ -148,16 +257,58 @@ impl ExportService {
         ));
         let claim = batches.claim_export(&snapshot).await?;
         let published = self.publisher.publish(staging, directory).await?;
-        if let Err(error) = claim.commit(exported_at).await {
-            return Err(published.cleanup_after(error));
-        }
-        let directory = published.commit();
+        let committer = self.committer.clone();
+        let directory = tokio::spawn(async move {
+            let _active_export = active_export;
+            if let Err(error) = committer.commit(claim, exported_at).await {
+                return Err(published.cleanup_after(error));
+            }
+            Ok(published.commit())
+        })
+        .await
+        .map_err(|_| AppError::Internal {
+            message: "export finalizer task failed".to_owned(),
+        })??;
 
         Ok(ExportResult {
             directory,
             item_count: items.len(),
             total_amount_cents,
         })
+    }
+}
+
+trait GenerationHook: Send + Sync {
+    fn before_generation(&self) -> Result<(), AppError>;
+}
+
+struct NoopGenerationHook;
+
+impl GenerationHook for NoopGenerationHook {
+    fn before_generation(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+trait ExportCommitter: Send + Sync {
+    async fn commit(
+        &self,
+        claim: BatchExportClaim,
+        exported_at: DateTime<Utc>,
+    ) -> Result<(), AppError>;
+}
+
+struct SqliteExportCommitter;
+
+#[async_trait::async_trait]
+impl ExportCommitter for SqliteExportCommitter {
+    async fn commit(
+        &self,
+        claim: BatchExportClaim,
+        exported_at: DateTime<Utc>,
+    ) -> Result<(), AppError> {
+        claim.commit(exported_at).await.map(|_| ())
     }
 }
 
@@ -187,7 +338,12 @@ impl DirectoryPublisher for AtomicDirectoryPublisher {
     }
 }
 
+#[derive(Clone)]
 struct ActiveExport {
+    _lease: Arc<ActiveExportLease>,
+}
+
+struct ActiveExportLease {
     active_exports: Arc<DashMap<Uuid, ()>>,
     batch_id: Uuid,
 }
@@ -205,13 +361,15 @@ impl ActiveExport {
             }
         }
         Ok(Self {
-            active_exports,
-            batch_id,
+            _lease: Arc::new(ActiveExportLease {
+                active_exports,
+                batch_id,
+            }),
         })
     }
 }
 
-impl Drop for ActiveExport {
+impl Drop for ActiveExportLease {
     fn drop(&mut self) {
         self.active_exports.remove(&self.batch_id);
     }
@@ -252,11 +410,11 @@ impl OwnedExportDirectory {
         self.owned = false;
         match remove_export_directory(&self.path) {
             Ok(()) => error,
-            Err(()) => AppError::External {
+            Err(cleanup_error) => AppError::External {
                 service: "filesystem_sync".to_owned(),
                 retryable: false,
                 message: format!(
-                    "export failed and package cleanup was incomplete; manual recovery is required: {error}"
+                    "export failed and package cleanup was incomplete; manual recovery is required: original error: {error}; cleanup error: {cleanup_error}"
                 ),
             },
         }
@@ -265,28 +423,88 @@ impl OwnedExportDirectory {
 
 impl Drop for OwnedExportDirectory {
     fn drop(&mut self) {
-        if self.owned {
-            let _ = remove_export_directory(&self.path);
+        if self.owned
+            && let Err(error) = remove_export_directory(&self.path)
+        {
+            tracing::error!(
+                path = %self.path.display(),
+                %error,
+                "export directory cleanup failed; manual recovery may be required"
+            );
         }
     }
 }
 
-fn remove_export_directory(path: &Path) -> Result<(), ()> {
+fn remove_export_directory(path: &Path) -> std::io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(()),
+        Err(error) => return Err(error),
     }
     path.parent()
-        .ok_or(())
-        .and_then(|parent| sync_directory(parent).map_err(|_| ()))
+        .ok_or_else(|| std::io::Error::other("export directory has no parent"))
+        .and_then(sync_directory)
 }
 
-fn prepare_export_item(
+struct PendingExportItem {
+    item: crate::db::items::InvoiceItem,
+    original: OpenedSourceFile,
+    normalized_pdf: OpenedSourceFile,
+    archive_name: String,
+}
+
+struct OpenedSourceFile {
+    file: File,
+    length: u64,
+}
+
+fn prepare_export_items(
+    paths: &AppPaths,
+    items: &[crate::db::items::InvoiceItem],
+    limits: ExportLimits,
+) -> Result<Vec<ExportItem>, AppError> {
+    if items.len() > limits.max_items {
+        return Err(AppError::validation("export", "导出票据数量超过限制"));
+    }
+    let pending = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| open_export_item(paths, index + 1, item))
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let lengths = pending
+        .iter()
+        .flat_map(|item| {
+            [
+                (item.original.length, "original"),
+                (item.normalized_pdf.length, "normalizedPdf"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    validate_source_lengths(
+        &lengths,
+        limits.max_source_file_bytes,
+        limits.max_aggregate_source_bytes,
+    )?;
+
+    pending
+        .into_iter()
+        .map(|pending| {
+            Ok(ExportItem {
+                item: pending.item,
+                original_file: pending.original.file,
+                normalized_pdf_file: pending.normalized_pdf.file,
+                verified_sha256: String::new(),
+                archive_name: pending.archive_name,
+            })
+        })
+        .collect()
+}
+
+fn open_export_item(
     paths: &AppPaths,
     sequence: usize,
     item: &crate::db::items::InvoiceItem,
-) -> Result<ExportItem, AppError> {
+) -> Result<PendingExportItem, AppError> {
     if item.status() != ItemStatus::Ready {
         return Err(AppError::Conflict {
             message: "批次包含尚未就绪的票据".to_owned(),
@@ -305,13 +523,13 @@ fn prepare_export_item(
         return Err(AppError::validation("currency", "仅支持人民币票据"));
     }
 
-    let original_bytes =
-        read_contained_regular_file(Path::new(&item.original_path), &paths.originals, "original")?;
+    let original =
+        open_contained_regular_file(Path::new(&item.original_path), &paths.originals, "original")?;
     let normalized_path = item
         .normalized_pdf_path
         .as_deref()
         .ok_or_else(|| AppError::validation("normalizedPdf", "票据缺少归一化 PDF"))?;
-    let normalized_pdf_bytes = read_contained_regular_file(
+    let normalized_pdf = open_contained_regular_file(
         Path::new(normalized_path),
         &paths.normalized,
         "normalizedPdf",
@@ -329,15 +547,114 @@ fn prepare_export_item(
     };
     let id_prefix = item.id.to_string().chars().take(8).collect::<String>();
 
-    Ok(ExportItem {
+    Ok(PendingExportItem {
         item: item.clone(),
-        original_bytes,
-        normalized_pdf_bytes,
+        original,
+        normalized_pdf,
         archive_name: format!("{sequence}-{id_prefix}-{sanitized_name}"),
     })
 }
 
-fn read_contained_regular_file(path: &Path, root: &Path, field: &str) -> Result<Vec<u8>, AppError> {
+fn validate_source_lengths(
+    lengths: &[(u64, &str)],
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<(), AppError> {
+    let mut total = 0_u64;
+    for (length, field) in lengths {
+        if *length > max_file_bytes {
+            return Err(AppError::validation(*field, "票据文件超过导出大小限制"));
+        }
+        total = total
+            .checked_add(*length)
+            .ok_or_else(|| AppError::validation("export", "导出源文件总量超过限制"))?;
+        if total > max_total_bytes {
+            return Err(AppError::validation("export", "导出源文件总量超过限制"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn open_contained_regular_file(
+    path: &Path,
+    root: &Path,
+    field: &str,
+) -> Result<OpenedSourceFile, AppError> {
+    open_contained_regular_file_with_hook(path, root, field, || {})
+}
+
+#[cfg(unix)]
+fn open_contained_regular_file_with_hook(
+    path: &Path,
+    root: &Path,
+    field: &str,
+    parent_anchored: impl FnOnce(),
+) -> Result<OpenedSourceFile, AppError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| AppError::validation(field, "票据文件不在应用存储目录内"))?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
+    }
+
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut parent = rustix::fs::open(root, directory_flags, Mode::empty())
+        .map(File::from)
+        .map_err(|_| AppError::Internal {
+            message: "failed to open application file storage".to_owned(),
+        })?;
+    if let Some(relative_parent) = relative.parent() {
+        for component in relative_parent.components() {
+            let Component::Normal(component) = component else {
+                return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
+            };
+            parent = rustix::fs::openat(&parent, component, directory_flags, Mode::empty())
+                .map(File::from)
+                .map_err(|_| AppError::validation(field, "票据文件路径无法读取"))?;
+        }
+    }
+
+    parent_anchored();
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| AppError::validation(field, "票据文件路径无法读取"))?;
+    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let file = rustix::fs::openat(&parent, file_name, file_flags, Mode::empty())
+        .map(File::from)
+        .map_err(|_| AppError::validation(field, "票据路径必须是普通文件"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
+    if !metadata.is_file() {
+        return Err(AppError::validation(field, "票据路径必须是普通文件"));
+    }
+    Ok(OpenedSourceFile {
+        file,
+        length: metadata.len(),
+    })
+}
+
+#[cfg(not(unix))]
+fn open_contained_regular_file_with_hook(
+    path: &Path,
+    root: &Path,
+    field: &str,
+    parent_anchored: impl FnOnce(),
+) -> Result<OpenedSourceFile, AppError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|_| AppError::validation(field, "票据文件不存在"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -351,24 +668,68 @@ fn read_contained_regular_file(path: &Path, root: &Path, field: &str) -> Result<
     if !canonical_path.starts_with(&canonical_root) {
         return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
     }
-    fs::read(canonical_path).map_err(|_| AppError::validation(field, "票据文件无法读取"))
+    parent_anchored();
+    let file =
+        File::open(canonical_path).map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
+    if !opened_metadata.is_file() {
+        return Err(AppError::validation(field, "票据路径必须是普通文件"));
+    }
+    Ok(OpenedSourceFile {
+        file,
+        length: opened_metadata.len(),
+    })
+}
+
+#[cfg(test)]
+fn read_contained_regular_file_with_hooks(
+    path: &Path,
+    root: &Path,
+    field: &str,
+    max_bytes: u64,
+    parent_anchored: impl FnOnce(),
+    before_read: impl FnOnce(),
+) -> Result<Vec<u8>, AppError> {
+    let mut opened = open_contained_regular_file_with_hook(path, root, field, parent_anchored)?;
+    if opened.length > max_bytes {
+        return Err(AppError::validation(field, "票据文件超过导出大小限制"));
+    }
+    before_read();
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.length).unwrap_or(0));
+    opened
+        .file
+        .by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(AppError::validation(field, "票据文件超过导出大小限制"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use lopdf::{Document, Object, dictionary};
     use tokio::sync::{Notify, oneshot};
     use uuid::Uuid;
 
-    use super::{DirectoryPublisher, ExportService, OwnedExportDirectory};
+    use super::{
+        DirectoryPublisher, ExportCommitter, ExportCoordinator, ExportService, GenerationHook,
+        OwnedExportDirectory, read_contained_regular_file_with_hooks, sha256_hex,
+    };
     use crate::db;
-    use crate::db::batches::BatchRepository;
+    use crate::db::batches::{BatchExportClaim, BatchRepository};
     use crate::db::items::{ItemRepository, NewItemRecord};
     use crate::domain::error::AppError;
     use crate::domain::model::{
@@ -380,6 +741,91 @@ mod tests {
     struct GatedRealPublisher {
         published: Mutex<Option<oneshot::Sender<PathBuf>>>,
         release: Arc<Notify>,
+    }
+
+    struct GatedRealCommitter {
+        committed: Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<Notify>,
+    }
+
+    struct HeartbeatGenerationHook {
+        requested: Arc<AtomicBool>,
+        heartbeat: Arc<AtomicBool>,
+    }
+
+    struct BlockingGenerationHook {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl GenerationHook for BlockingGenerationHook {
+        fn before_generation(&self) -> Result<(), AppError> {
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .map_err(|_| AppError::Internal {
+                    message: "generation start observer closed".to_owned(),
+                })?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| AppError::Internal {
+                    message: "generation release observer closed".to_owned(),
+                })
+        }
+    }
+
+    struct RecordingGenerationHook {
+        started: Arc<AtomicBool>,
+    }
+
+    impl GenerationHook for RecordingGenerationHook {
+        fn before_generation(&self) -> Result<(), AppError> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl GenerationHook for HeartbeatGenerationHook {
+        fn before_generation(&self) -> Result<(), AppError> {
+            self.requested.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !self.heartbeat.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    return Err(AppError::Internal {
+                        message: "async runtime heartbeat was blocked".to_owned(),
+                    });
+                }
+                std::thread::yield_now();
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ExportCommitter for GatedRealCommitter {
+        async fn commit(
+            &self,
+            claim: BatchExportClaim,
+            exported_at: DateTime<Utc>,
+        ) -> Result<(), AppError> {
+            let result = claim.commit(exported_at).await.map(|_| ());
+            if result.is_ok() {
+                self.committed
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+            }
+            self.release.notified().await;
+            result
+        }
     }
 
     #[async_trait]
@@ -406,13 +852,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn cancellation_after_real_publication_removes_final_and_keeps_batch_draft() {
+    struct ExportFixture {
+        _directory: tempfile::TempDir,
+        paths: AppPaths,
+        pool: sqlx::SqlitePool,
+        batch_id: Uuid,
+    }
+
+    async fn export_fixture(name: &str) -> ExportFixture {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths::create(directory.path().join("storage")).unwrap();
         let pool = db::connect("sqlite::memory:").await.unwrap();
         let batch = BatchRepository::new(pool.clone())
-            .create(NewBatch::try_new("取消测试", "2026-07-01", "2026-07-31", None).unwrap())
+            .create(NewBatch::try_new(name, "2026-07-01", "2026-07-31", None).unwrap())
             .await
             .unwrap();
         let item_id = Uuid::new_v4();
@@ -427,7 +879,7 @@ mod tests {
                 original_name: "invoice.pdf".to_owned(),
                 original_path: original.to_string_lossy().into_owned(),
                 normalized_pdf_path: Some(normalized.to_string_lossy().into_owned()),
-                sha256: "fixture-sha256".to_owned(),
+                sha256: sha256_hex(b"original"),
                 mime_type: "application/pdf".to_owned(),
                 source_type: SourceType::ManualUpload,
                 source_account_id: None,
@@ -458,34 +910,241 @@ mod tests {
             })
             .await
             .unwrap();
+        ExportFixture {
+            _directory: directory,
+            paths,
+            pool,
+            batch_id: batch.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_real_publication_removes_final_and_keeps_batch_draft() {
+        let fixture = export_fixture("取消测试").await;
         let (published_tx, published_rx) = oneshot::channel();
         let release = Arc::new(Notify::new());
         let service = ExportService::with_publisher(
-            pool.clone(),
-            paths.clone(),
+            fixture.pool.clone(),
+            fixture.paths.clone(),
             Arc::new(GatedRealPublisher {
                 published: Mutex::new(Some(published_tx)),
                 release: release.clone(),
             }),
         );
-        let task = tokio::spawn(async move { service.export(batch.id).await });
+        let batch_id = fixture.batch_id;
+        let task = tokio::spawn(async move { service.export(batch_id).await });
 
         let final_directory = tokio::time::timeout(std::time::Duration::from_secs(5), published_rx)
             .await
             .expect("publisher should report final rename")
             .expect("publisher signal should remain open");
         assert!(final_directory.is_dir());
-        assert_eq!(fs::read_dir(&paths.staging).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&fixture.paths.staging).unwrap().count(), 0);
 
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         release.notify_waiters();
 
         assert!(!final_directory.exists());
-        assert_eq!(fs::read_dir(&paths.staging).unwrap().count(), 0);
-        let batch = BatchRepository::new(pool).get(batch.id).await.unwrap();
+        assert_eq!(fs::read_dir(&fixture.paths.staging).unwrap().count(), 0);
+        let batch = BatchRepository::new(fixture.pool)
+            .get(batch_id)
+            .await
+            .unwrap();
         assert_eq!(batch.status, BatchStatus::Draft);
         assert_eq!(batch.last_exported_at, None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_database_commit_keeps_final_and_exported_batch() {
+        let fixture = export_fixture("提交取消测试").await;
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let service = ExportService::with_committer(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            Arc::new(GatedRealCommitter {
+                committed: Mutex::new(Some(committed_tx)),
+                release: release.clone(),
+            }),
+        );
+        let task_service = service.clone();
+        let batch_id = fixture.batch_id;
+        let task = tokio::spawn(async move { task_service.export(batch_id).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), committed_rx)
+            .await
+            .expect("committer should report the durable database commit")
+            .expect("committer signal should remain open");
+        let final_directory = fs::read_dir(&fixture.paths.exports)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(final_directory.is_dir());
+        assert!(service.coordinator.active_exports.contains_key(&batch_id));
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(final_directory.is_dir());
+        assert!(service.coordinator.active_exports.contains_key(&batch_id));
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while service.coordinator.active_exports.contains_key(&batch_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("internal finalizer should release the batch guard");
+
+        assert!(final_directory.is_dir());
+        let persisted = BatchRepository::new(fixture.pool)
+            .get(batch_id)
+            .await
+            .unwrap();
+        assert_eq!(persisted.status, BatchStatus::Exported);
+        assert!(persisted.last_exported_at.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_replaced_by_external_symlink_after_parent_anchor_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("originals");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("invoice.pdf");
+        fs::write(&source, b"trusted invoice").unwrap();
+        let external = directory.path().join("external-secret.pdf");
+        fs::write(&external, b"external secret").unwrap();
+        let (anchored_tx, anchored_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader_source = source.clone();
+        let reader_root = root.clone();
+        let reader = std::thread::spawn(move || {
+            read_contained_regular_file_with_hooks(
+                &reader_source,
+                &reader_root,
+                "original",
+                u64::MAX,
+                || {
+                    anchored_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+                || {},
+            )
+        });
+
+        anchored_rx.recv().unwrap();
+        fs::remove_file(&source).unwrap();
+        symlink(&external, &source).unwrap();
+        release_tx.send(()).unwrap();
+
+        let error = reader.join().unwrap().unwrap_err();
+        assert!(matches!(error, AppError::Validation { field, .. } if field == "original"));
+    }
+
+    #[test]
+    fn oversized_source_is_rejected_before_read_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("originals");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("invoice.pdf");
+        let file = fs::File::create(&source).unwrap();
+        file.set_len(1_024).unwrap();
+        drop(file);
+        let read_started = AtomicBool::new(false);
+
+        let result = read_contained_regular_file_with_hooks(
+            &source,
+            &root,
+            "original",
+            16,
+            || {},
+            || read_started.store(true, Ordering::SeqCst),
+        );
+
+        assert!(matches!(result, Err(AppError::Validation { field, .. }) if field == "original"));
+        assert!(!read_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn aggregate_source_budget_is_enforced_during_preflight() {
+        let error =
+            super::validate_source_lengths(&[(8, "original"), (9, "normalizedPdf")], 10, 16)
+                .unwrap_err();
+
+        assert!(matches!(error, AppError::Validation { field, .. } if field == "export"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_generation_does_not_stop_the_async_runtime_heartbeat() {
+        let fixture = export_fixture("异步心跳测试").await;
+        let heartbeat = Arc::new(AtomicBool::new(false));
+        let requested = Arc::new(AtomicBool::new(false));
+        let service = ExportService::with_generation_hook(
+            fixture.pool,
+            fixture.paths,
+            Arc::new(HeartbeatGenerationHook {
+                requested: requested.clone(),
+                heartbeat: heartbeat.clone(),
+            }),
+        );
+        let heartbeat_task = tokio::spawn(async move {
+            while !requested.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            tokio::task::yield_now().await;
+            heartbeat.store(true, Ordering::SeqCst);
+        });
+
+        let result = service.export(fixture.batch_id).await;
+
+        heartbeat_task.await.unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_coordinator_rejects_second_service_before_generation() {
+        let fixture = export_fixture("共享协调测试").await;
+        let coordinator = ExportCoordinator::default();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = ExportService::with_coordinator_and_generation_hook(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            coordinator.clone(),
+            Arc::new(BlockingGenerationHook {
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second = ExportService::with_coordinator_and_generation_hook(
+            fixture.pool,
+            fixture.paths,
+            coordinator,
+            Arc::new(RecordingGenerationHook {
+                started: second_started.clone(),
+            }),
+        );
+        let batch_id = fixture.batch_id;
+        let first_task = tokio::spawn(async move { first.export(batch_id).await });
+        started_rx.await.unwrap();
+
+        let second_result = second.export(batch_id).await;
+
+        assert!(matches!(
+            second_result,
+            Err(AppError::Conflict { message }) if message.contains("正在导出")
+        ));
+        assert!(!second_started.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        first_task.await.unwrap().unwrap();
     }
 
     fn one_page_pdf() -> Vec<u8> {
