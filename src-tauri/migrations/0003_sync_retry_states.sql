@@ -1,6 +1,6 @@
 CREATE TABLE sync_retry_states (
     account_id TEXT PRIMARY KEY NOT NULL,
-    failures INTEGER NOT NULL CHECK (failures BETWEEN 0 AND 2147483647),
+    failures INTEGER NOT NULL CHECK (failures >= 0),
     next_retry_at TEXT,
     suspended INTEGER NOT NULL CHECK (suspended IN (0, 1)),
     updated_at TEXT NOT NULL,

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-use crate::domain::error::AppError;
+use crate::domain::error::{AppError, sanitize_app_error};
 
 pub trait CredentialStore: Send + Sync {
     fn get(&self, account_id: &str) -> Result<Option<String>, AppError>;
@@ -14,9 +14,10 @@ pub async fn get_credential(
     store: Arc<dyn CredentialStore>,
     account_id: String,
 ) -> Result<Option<String>, AppError> {
-    tokio::task::spawn_blocking(move || store.get(&account_id))
+    let result = tokio::task::spawn_blocking(move || store.get(&account_id))
         .await
-        .map_err(|_| credential_task_error("read"))?
+        .map_err(|_| credential_task_error("read"))?;
+    result.map_err(|error| sanitize_app_error(error, &[]))
 }
 
 pub async fn set_credential(
@@ -24,18 +25,21 @@ pub async fn set_credential(
     account_id: String,
     secret: String,
 ) -> Result<(), AppError> {
-    tokio::task::spawn_blocking(move || store.set(&account_id, &secret))
+    let error_secret = secret.clone();
+    let result = tokio::task::spawn_blocking(move || store.set(&account_id, &secret))
         .await
-        .map_err(|_| credential_task_error("write"))?
+        .map_err(|_| credential_task_error("write"))?;
+    result.map_err(|error| sanitize_app_error(error, &[&error_secret]))
 }
 
 pub async fn delete_credential(
     store: Arc<dyn CredentialStore>,
     account_id: String,
 ) -> Result<(), AppError> {
-    tokio::task::spawn_blocking(move || store.delete(&account_id))
+    let result = tokio::task::spawn_blocking(move || store.delete(&account_id))
         .await
-        .map_err(|_| credential_task_error("delete"))?
+        .map_err(|_| credential_task_error("delete"))?;
+    result.map_err(|error| sanitize_app_error(error, &[]))
 }
 
 const KEYRING_SERVICE: &str = "com.invoice-desk.credentials";

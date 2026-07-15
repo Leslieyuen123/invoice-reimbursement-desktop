@@ -29,6 +29,62 @@ impl AppError {
     }
 }
 
+pub(crate) fn sanitize_message(message: &str, secrets: &[&str]) -> String {
+    let mut secrets = secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_unstable_by(|left, right| right.len().cmp(&left.len()));
+    let redacted = secrets
+        .into_iter()
+        .fold(message.to_owned(), |message, secret| {
+            message.replace(secret, "[redacted]")
+        });
+    redacted
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+pub(crate) fn sanitize_app_error(error: AppError, secrets: &[&str]) -> AppError {
+    let sanitize = |message: String| sanitize_message(&message, secrets);
+    match error {
+        AppError::Validation { field, message } => AppError::Validation {
+            field,
+            message: sanitize(message),
+        },
+        AppError::NotFound { entity, message } => AppError::NotFound {
+            entity,
+            message: sanitize(message),
+        },
+        AppError::Conflict { message } => AppError::Conflict {
+            message: sanitize(message),
+        },
+        AppError::External {
+            service,
+            retryable,
+            message,
+        } => AppError::External {
+            service,
+            retryable,
+            message: sanitize(message),
+        },
+        AppError::Internal { message } => AppError::Internal {
+            message: sanitize(message),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

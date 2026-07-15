@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
@@ -87,47 +88,6 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(pool: SqlitePool, runner: Arc<dyn SyncRunner>) -> Self {
-        Self::with_operations_and_gate(
-            pool,
-            runner,
-            AccountOperationCoordinator::default(),
-            BackgroundSyncGate::default(),
-        )
-    }
-
-    pub fn with_clock(
-        pool: SqlitePool,
-        runner: Arc<dyn SyncRunner>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self::build(
-            pool,
-            runner,
-            AccountOperationCoordinator::default(),
-            clock,
-            BackgroundSyncGate::default(),
-            Arc::new(ImmediateStart),
-        )
-    }
-
-    pub fn with_runtime(
-        pool: SqlitePool,
-        runner: Arc<dyn SyncRunner>,
-        clock: Arc<dyn Clock>,
-        background_gate: BackgroundSyncGate,
-        start_barrier: Arc<dyn SyncStartBarrier>,
-    ) -> Self {
-        Self::build(
-            pool,
-            runner,
-            AccountOperationCoordinator::default(),
-            clock,
-            background_gate,
-            start_barrier,
-        )
-    }
-
     pub(crate) fn with_operations_and_gate(
         pool: SqlitePool,
         runner: Arc<dyn SyncRunner>,
@@ -141,6 +101,41 @@ impl Scheduler {
             Arc::new(UtcClock),
             background_gate,
             Arc::new(ImmediateStart),
+        )
+    }
+
+    pub(crate) fn with_operations_clock_and_gate(
+        pool: SqlitePool,
+        runner: Arc<dyn SyncRunner>,
+        operations: AccountOperationCoordinator,
+        clock: Arc<dyn Clock>,
+        background_gate: BackgroundSyncGate,
+    ) -> Self {
+        Self::build(
+            pool,
+            runner,
+            operations,
+            clock,
+            background_gate,
+            Arc::new(ImmediateStart),
+        )
+    }
+
+    pub(crate) fn with_operations_runtime(
+        pool: SqlitePool,
+        runner: Arc<dyn SyncRunner>,
+        operations: AccountOperationCoordinator,
+        clock: Arc<dyn Clock>,
+        background_gate: BackgroundSyncGate,
+        start_barrier: Arc<dyn SyncStartBarrier>,
+    ) -> Self {
+        Self::build(
+            pool,
+            runner,
+            operations,
+            clock,
+            background_gate,
+            start_barrier,
         )
     }
 
@@ -418,9 +413,12 @@ impl SchedulerHandle {
             let _ = cancel.send(());
         }
         if let Some(task) = self.task.take() {
-            task.await.map_err(|_| AppError::Internal {
-                message: "background mailbox scheduler task failed".to_owned(),
-            })?;
+            AbortOnDropJoinHandle::new(task)
+                .join()
+                .await
+                .map_err(|_| AppError::Internal {
+                    message: "background mailbox scheduler task failed".to_owned(),
+                })?;
         }
         self.registry.wait_all().await
     }
@@ -448,6 +446,7 @@ struct TaskRegistry {
 struct TaskRegistryState {
     closed: bool,
     tasks: Vec<JoinHandle<()>>,
+    child_failed: bool,
 }
 
 impl TaskRegistry {
@@ -474,16 +473,29 @@ impl TaskRegistry {
             }
             finished
         };
-        await_tasks(finished).await
+        let result = await_tasks(finished).await;
+        if result.is_err() {
+            self.state
+                .lock()
+                .expect("scheduler task lock poisoned")
+                .child_failed = true;
+        }
+        result
     }
 
     async fn wait_all(&self) -> Result<(), AppError> {
-        let tasks = {
+        let (tasks, previous_failure) = {
             let mut state = self.state.lock().expect("scheduler task lock poisoned");
             state.closed = true;
-            std::mem::take(&mut state.tasks)
+            let previous_failure = std::mem::take(&mut state.child_failed);
+            (std::mem::take(&mut state.tasks), previous_failure)
         };
-        await_tasks(tasks).await
+        let result = await_tasks(tasks).await;
+        if previous_failure || result.is_err() {
+            Err(child_task_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn abort_all(&self) {
@@ -499,12 +511,75 @@ impl TaskRegistry {
 }
 
 async fn await_tasks(tasks: Vec<JoinHandle<()>>) -> Result<(), AppError> {
-    for task in tasks {
-        task.await.map_err(|_| AppError::Internal {
-            message: "background mailbox scheduler child task failed".to_owned(),
-        })?;
+    let mut tasks = AbortOnDropTaskSet::new(tasks);
+    let mut first_error = None;
+    while let Some(task) = tasks.pop_front() {
+        if AbortOnDropJoinHandle::new(task).join().await.is_err() && first_error.is_none() {
+            first_error = Some(child_task_error());
+        }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn child_task_error() -> AppError {
+    AppError::Internal {
+        message: "background mailbox scheduler child task failed".to_owned(),
+    }
+}
+
+struct AbortOnDropJoinHandle {
+    task: Option<JoinHandle<()>>,
+}
+
+impl AbortOnDropJoinHandle {
+    fn new(task: JoinHandle<()>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("owned task must be present")
+            .await;
+        self.task.take();
+        result
+    }
+}
+
+impl Drop for AbortOnDropJoinHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+struct AbortOnDropTaskSet {
+    tasks: VecDeque<JoinHandle<()>>,
+}
+
+impl AbortOnDropTaskSet {
+    fn new(tasks: Vec<JoinHandle<()>>) -> Self {
+        Self {
+            tasks: tasks.into(),
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<JoinHandle<()>> {
+        self.tasks.pop_front()
+    }
+}
+
+impl Drop for AbortOnDropTaskSet {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +607,18 @@ mod tests {
     }
 
     struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    struct DropNotifier {
+        dropped: Arc<AtomicBool>,
+        signal: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for DropNotifier {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            self.signal.notify_one();
+        }
+    }
 
     impl Write for CaptureWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -577,7 +664,13 @@ mod tests {
                     let runner = Arc::new(ImmediateInfrastructureRunner {
                         completed: tokio::sync::Notify::new(),
                     });
-                    let handle = Scheduler::new(pool, runner.clone()).start();
+                    let handle = Scheduler::with_operations_and_gate(
+                        pool,
+                        runner.clone(),
+                        AccountOperationCoordinator::default(),
+                        BackgroundSyncGate::default(),
+                    )
+                    .start();
                     runner.completed.notified().await;
                     handle.stop().await.unwrap();
                 });
@@ -614,5 +707,91 @@ mod tests {
 
         assert!(late_completion.is_err());
         assert!(!completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reaped_child_failure_is_retained_for_final_wait() {
+        let registry = TaskRegistry::default();
+        registry.push(tokio::spawn(async {
+            panic!("injected reaped child panic");
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if registry
+                    .state
+                    .lock()
+                    .expect("scheduler task lock poisoned")
+                    .tasks
+                    .iter()
+                    .all(JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(registry.reap_finished().await.is_err());
+        assert!(registry.wait_all().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn aborting_stop_future_aborts_child_already_taken_for_waiting() {
+        let registry = TaskRegistry::default();
+        let child_started = Arc::new(tokio::sync::Notify::new());
+        let child_dropped = Arc::new(AtomicBool::new(false));
+        let child_dropped_signal = Arc::new(tokio::sync::Notify::new());
+        let cleanup = Arc::new(tokio::sync::Notify::new());
+        let started = child_started.clone();
+        let dropped = child_dropped.clone();
+        let dropped_signal = child_dropped_signal.clone();
+        let child_cleanup = cleanup.clone();
+        let child = tokio::spawn(async move {
+            let _notifier = DropNotifier {
+                dropped,
+                signal: dropped_signal,
+            };
+            started.notify_one();
+            child_cleanup.notified().await;
+        });
+        child_started.notified().await;
+        registry.push(child);
+        let handle = SchedulerHandle {
+            cancel: None,
+            task: Some(tokio::spawn(async {})),
+            cancellation_flag: Arc::new(AtomicBool::new(false)),
+            registry: registry.clone(),
+        };
+
+        let stop = tokio::spawn(async move { handle.stop().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if registry
+                    .state
+                    .lock()
+                    .expect("scheduler task lock poisoned")
+                    .tasks
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.abort();
+        assert!(stop.await.unwrap_err().is_cancelled());
+        let aborted = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            child_dropped_signal.notified(),
+        )
+        .await;
+        cleanup.notify_one();
+
+        assert!(aborted.is_ok());
+        assert!(child_dropped.load(Ordering::SeqCst));
     }
 }

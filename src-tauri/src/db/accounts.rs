@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Sqlite, SqliteConnection, SqlitePool, Transaction, Type};
 use uuid::Uuid;
 
-use crate::domain::error::AppError;
+use crate::domain::error::{AppError, sanitize_message};
 
 const ACCOUNT_COLUMNS: &str = "id, provider, email, imap_host, imap_port, enabled, \
     sync_interval_minutes, last_synced_at, last_error, created_at, updated_at";
@@ -59,6 +59,11 @@ pub struct SyncRetryState {
     pub failures: u32,
     pub next_retry_at: Option<DateTime<Utc>>,
     pub suspended: bool,
+}
+
+pub(crate) struct MailboxAccountSnapshot {
+    account: MailboxAccount,
+    retry: Option<DbSyncRetryStateSnapshotRow>,
 }
 
 #[derive(Clone)]
@@ -167,6 +172,97 @@ impl MailboxAccountRepository {
             .await
             .map_err(|error| map_database_error("failed to read saved mailbox account", error))?;
         MailboxAccount::try_from(row)
+    }
+
+    pub(crate) async fn snapshot_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        account_id: Uuid,
+    ) -> Result<MailboxAccountSnapshot, AppError> {
+        let query = format!("SELECT {ACCOUNT_COLUMNS} FROM mailbox_accounts WHERE id = ?");
+        let account = sqlx::query_as::<_, DbMailboxAccountRow>(&query)
+            .bind(account_id.to_string())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to snapshot mailbox account", error))?
+            .ok_or_else(|| account_not_found(account_id))
+            .and_then(MailboxAccount::try_from)?;
+        let retry = sqlx::query_as::<_, DbSyncRetryStateSnapshotRow>(
+            "SELECT failures, next_retry_at, suspended, updated_at \
+             FROM sync_retry_states WHERE account_id = ?",
+        )
+        .bind(account_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_database_error("failed to snapshot mailbox retry state", error))?;
+        Ok(MailboxAccountSnapshot { account, retry })
+    }
+
+    pub(crate) async fn restore_snapshot_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        snapshot: MailboxAccountSnapshot,
+    ) -> Result<(), AppError> {
+        let account = snapshot.account;
+        let result = sqlx::query(
+            "UPDATE mailbox_accounts SET provider = ?, email = ?, imap_host = ?, \
+                imap_port = ?, enabled = ?, sync_interval_minutes = ?, last_synced_at = ?, \
+                last_error = ?, created_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(provider_str(account.provider))
+        .bind(account.email)
+        .bind(account.imap_host)
+        .bind(i64::from(account.imap_port))
+        .bind(account.enabled)
+        .bind(account.sync_interval_minutes)
+        .bind(account.last_synced_at.map(|value| value.to_rfc3339()))
+        .bind(account.last_error)
+        .bind(account.created_at.to_rfc3339())
+        .bind(account.updated_at.to_rfc3339())
+        .bind(account.id.to_string())
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_database_error("failed to restore mailbox account", error))?;
+        if result.rows_affected() != 1 {
+            return Err(account_not_found(account.id));
+        }
+        sqlx::query("DELETE FROM sync_retry_states WHERE account_id = ?")
+            .bind(account.id.to_string())
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to restore mailbox retry state", error))?;
+        if let Some(retry) = snapshot.retry {
+            sqlx::query(
+                "INSERT INTO sync_retry_states (\
+                    account_id, failures, next_retry_at, suspended, updated_at\
+                 ) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(account.id.to_string())
+            .bind(retry.failures)
+            .bind(retry.next_retry_at)
+            .bind(retry.suspended)
+            .bind(retry.updated_at)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to restore mailbox retry state", error))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn delete_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        account_id: Uuid,
+    ) -> Result<(), AppError> {
+        let result = sqlx::query("DELETE FROM mailbox_accounts WHERE id = ?")
+            .bind(account_id.to_string())
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to delete mailbox account", error))?;
+        if result.rows_affected() != 1 {
+            return Err(account_not_found(account_id));
+        }
+        Ok(())
     }
 
     pub async fn get(&self, id: Uuid) -> Result<MailboxAccount, AppError> {
@@ -651,19 +747,7 @@ async fn finish_retry_transaction<T>(
 }
 
 fn sanitize_error_message(message: &str) -> String {
-    message
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(512)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+    sanitize_message(message, &[])
 }
 
 #[derive(FromRow)]
@@ -686,6 +770,14 @@ struct DbSyncRetryStateRow {
     failures: i64,
     next_retry_at: Option<String>,
     suspended: i64,
+}
+
+#[derive(FromRow)]
+struct DbSyncRetryStateSnapshotRow {
+    failures: i64,
+    next_retry_at: Option<String>,
+    suspended: i64,
+    updated_at: String,
 }
 
 impl TryFrom<DbSyncRetryStateRow> for SyncRetryState {

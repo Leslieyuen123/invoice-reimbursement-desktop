@@ -12,6 +12,7 @@ use invoice_reimbursement::domain::model::{
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteQueryResult};
 use sqlx::{Row, SqlitePool};
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
@@ -78,6 +79,90 @@ async fn retry_state_failures_reject_values_above_i32_max() {
     .unwrap_err();
 
     assert!(matches!(error, sqlx::Error::Database(_)));
+}
+
+#[tokio::test]
+async fn migrations_upgrade_original_retry_schema_and_preserve_state() {
+    const ORIGINAL_0003: &str = r#"CREATE TABLE sync_retry_states (
+    account_id TEXT PRIMARY KEY NOT NULL,
+    failures INTEGER NOT NULL CHECK (failures >= 0),
+    next_retry_at TEXT,
+    suspended INTEGER NOT NULL CHECK (suspended IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (account_id) REFERENCES mailbox_accounts(id) ON DELETE CASCADE,
+    CHECK (
+        (suspended = 1 AND next_retry_at IS NULL) OR
+        (suspended = 0 AND next_retry_at IS NOT NULL)
+    )
+);
+"#;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let current = sqlx::migrate!("./migrations");
+    assert_eq!(
+        ORIGINAL_0003.as_bytes(),
+        current.iter().nth(2).unwrap().sql.as_bytes()
+    );
+    let mut legacy_migrations = current.iter().take(2).cloned().collect::<Vec<_>>();
+    legacy_migrations.push(sqlx::migrate::Migration::new(
+        3,
+        Cow::Borrowed("sync retry states"),
+        sqlx::migrate::MigrationType::Simple,
+        Cow::Borrowed(ORIGINAL_0003),
+        false,
+    ));
+    let legacy = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(legacy_migrations),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    legacy.run(&pool).await.unwrap();
+    let active_id = Uuid::new_v4();
+    let suspended_id = Uuid::new_v4();
+    insert_mailbox_account(&pool, active_id).await;
+    insert_mailbox_account(&pool, suspended_id).await;
+    sqlx::query(
+        "INSERT INTO sync_retry_states \
+         (account_id, failures, next_retry_at, suspended, updated_at) VALUES \
+         (?, 7, '2026-07-15T10:01:00Z', 0, '2026-07-15T10:00:00Z'), \
+         (?, 0, NULL, 1, '2026-07-15T11:00:00Z')",
+    )
+    .bind(active_id.to_string())
+    .bind(suspended_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    current.run(&pool).await.unwrap();
+
+    let active = sqlx::query_as::<_, (i64, Option<String>, i64, String)>(
+        "SELECT failures, next_retry_at, suspended, updated_at \
+         FROM sync_retry_states WHERE account_id = ?",
+    )
+    .bind(active_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let suspended = sqlx::query_as::<_, (i64, Option<String>, i64, String)>(
+        "SELECT failures, next_retry_at, suspended, updated_at \
+         FROM sync_retry_states WHERE account_id = ?",
+    )
+    .bind(suspended_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        active,
+        (
+            7,
+            Some("2026-07-15T10:01:00Z".to_owned()),
+            0,
+            "2026-07-15T10:00:00Z".to_owned()
+        )
+    );
+    assert_eq!(suspended, (0, None, 1, "2026-07-15T11:00:00Z".to_owned()));
 }
 
 #[tokio::test]

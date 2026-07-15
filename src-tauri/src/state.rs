@@ -6,7 +6,7 @@ use crate::infra::credentials::CredentialStore;
 use crate::infra::files::AppPaths;
 use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
 use crate::services::operations::AccountOperationCoordinator;
-use crate::services::scheduler::{Scheduler, SyncRunner};
+use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
 use crate::services::settings::{BackgroundSyncGate, SettingsService};
 
 #[derive(Clone)]
@@ -73,6 +73,36 @@ impl AppState {
             runner,
             self.account_operations.clone(),
             self.background_sync_gate.clone(),
+        )
+    }
+
+    pub fn scheduler_with_clock(
+        &self,
+        runner: Arc<dyn SyncRunner>,
+        clock: Arc<dyn Clock>,
+    ) -> Scheduler {
+        Scheduler::with_operations_clock_and_gate(
+            self.pool.clone(),
+            runner,
+            self.account_operations.clone(),
+            clock,
+            self.background_sync_gate.clone(),
+        )
+    }
+
+    pub fn scheduler_with_runtime(
+        &self,
+        runner: Arc<dyn SyncRunner>,
+        clock: Arc<dyn Clock>,
+        start_barrier: Arc<dyn SyncStartBarrier>,
+    ) -> Scheduler {
+        Scheduler::with_operations_runtime(
+            self.pool.clone(),
+            runner,
+            self.account_operations.clone(),
+            clock,
+            self.background_sync_gate.clone(),
+            start_barrier,
         )
     }
 }

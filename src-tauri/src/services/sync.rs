@@ -7,7 +7,7 @@ use mail_parser::{MessageParser, MimeHeaders};
 use uuid::Uuid;
 
 use crate::db::accounts::{MailboxAccountRepository, SyncCursor};
-use crate::domain::error::AppError;
+use crate::domain::error::{AppError, sanitize_message};
 use crate::domain::model::{ConfirmationStatus, RecognitionStatus};
 use crate::infra::credentials::{CredentialStore, get_credential};
 use crate::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta, RawMessage};
@@ -429,24 +429,7 @@ fn is_supported_file_name(file_name: &str) -> bool {
 }
 
 fn sanitize_error(message: &str, secret: &str) -> String {
-    let redacted = if secret.is_empty() {
-        message.to_owned()
-    } else {
-        message.replace(secret, "[redacted]")
-    };
-    redacted
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(512)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+    sanitize_message(message, &[secret])
 }
 
 fn is_document_recognition_failure(error: &AppError) -> bool {
