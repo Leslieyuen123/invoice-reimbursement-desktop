@@ -2,7 +2,9 @@ use std::fs;
 use std::fs::File;
 #[cfg(test)]
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -18,9 +20,12 @@ use crate::db::batches::{BatchExportClaim, BatchRepository};
 use crate::domain::error::AppError;
 use crate::domain::model::{ItemStatus, RecognitionStatus};
 use crate::infra::exporters::{
-    DEFAULT_EXPORT_LIMITS, ExportItem, ExportLimits, generate_artifacts, publish_directory,
+    DEFAULT_EXPORT_LIMITS, ExportItem, ExportLimits, generate_artifacts, prepare_merged_pdf,
+    publish_directory,
 };
 use crate::infra::files::{AppPaths, sync_directory};
+
+const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportResult {
@@ -230,6 +235,7 @@ impl ExportService {
             generation_hook.before_generation()?;
             let mut export_items =
                 prepare_export_items(&generation_paths, &generation_items, DEFAULT_EXPORT_LIMITS)?;
+            let merged_pdf = prepare_merged_pdf(&mut export_items, DEFAULT_EXPORT_LIMITS)?;
             let staging = OwnedExportDirectory::create(staging_path)?;
             generate_artifacts(
                 staging.path(),
@@ -237,6 +243,7 @@ impl ExportService {
                 &mut export_items,
                 exported_at,
                 DEFAULT_EXPORT_LIMITS,
+                merged_pdf,
             )?;
             Ok::<_, AppError>(staging)
         })
@@ -245,23 +252,23 @@ impl ExportService {
             message: "export generation task failed".to_owned(),
         })??;
 
-        let sanitized_name = sanitize_filename::sanitize(&batch.name);
-        let batch_name = if sanitized_name.trim().is_empty() {
-            "batch"
-        } else {
-            sanitized_name.as_str()
-        };
-        let directory = self.paths.exports.join(format!(
-            "{batch_name}-{}",
-            exported_at.format("%Y%m%d-%H%M%S")
-        ));
+        let directory = self
+            .paths
+            .exports
+            .join(export_directory_name(&batch.name, &exported_at));
         let claim = batches.claim_export(&snapshot).await?;
         let published = self.publisher.publish(staging, directory).await?;
         let committer = self.committer.clone();
         let directory = tokio::spawn(async move {
             let _active_export = active_export;
             if let Err(error) = committer.commit(claim, exported_at).await {
-                return Err(published.cleanup_after(error));
+                let finalization_error = published.cleanup_after(error);
+                tracing::error!(
+                    %batch_id,
+                    error = %finalization_error,
+                    "export finalization failed"
+                );
+                return Err(finalization_error);
             }
             Ok(published.commit())
         })
@@ -276,6 +283,22 @@ impl ExportService {
             total_amount_cents,
         })
     }
+}
+
+fn export_directory_name(batch_name: &str, exported_at: &DateTime<Utc>) -> String {
+    let sanitized = sanitize_filename::sanitize(batch_name);
+    let sanitized = if sanitized.trim().is_empty() {
+        "batch"
+    } else {
+        sanitized.as_str()
+    };
+    let suffix = format!("-{}", exported_at.format("%Y%m%d-%H%M%S"));
+    let batch_budget = MAX_FILENAME_COMPONENT_BYTES.saturating_sub(suffix.len());
+    let mut end = sanitized.len().min(batch_budget);
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &sanitized[..end])
 }
 
 trait GenerationHook: Send + Sync {
@@ -650,37 +673,17 @@ fn open_contained_regular_file_with_hook(
 
 #[cfg(not(unix))]
 fn open_contained_regular_file_with_hook(
-    path: &Path,
-    root: &Path,
+    _path: &Path,
+    _root: &Path,
     field: &str,
-    parent_anchored: impl FnOnce(),
+    _parent_anchored: impl FnOnce(),
 ) -> Result<OpenedSourceFile, AppError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| AppError::validation(field, "票据文件不存在"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AppError::validation(field, "票据路径必须是普通文件"));
-    }
-    let canonical_root = fs::canonicalize(root).map_err(|_| AppError::Internal {
-        message: "failed to resolve application file storage".to_owned(),
-    })?;
-    let canonical_path =
-        fs::canonicalize(path).map_err(|_| AppError::validation(field, "票据文件不存在"))?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
-    }
-    parent_anchored();
-    let file =
-        File::open(canonical_path).map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
-    if !opened_metadata.is_file() {
-        return Err(AppError::validation(field, "票据路径必须是普通文件"));
-    }
-    Ok(OpenedSourceFile {
-        file,
-        length: opened_metadata.len(),
-    })
+    Err(unsupported_export_source_platform(field))
+}
+
+#[cfg(not(unix))]
+fn unsupported_export_source_platform(field: &str) -> AppError {
+    AppError::validation(field, "当前平台不支持安全导出源文件读取")
 }
 
 #[cfg(test)]
@@ -713,6 +716,7 @@ fn read_contained_regular_file_with_hooks(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -746,6 +750,24 @@ mod tests {
     struct GatedRealCommitter {
         committed: Mutex<Option<oneshot::Sender<()>>>,
         release: Arc<Notify>,
+    }
+
+    struct GatedFailingCommitter {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<Notify>,
+    }
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     struct HeartbeatGenerationHook {
@@ -825,6 +847,27 @@ mod tests {
             }
             self.release.notified().await;
             result
+        }
+    }
+
+    #[async_trait]
+    impl ExportCommitter for GatedFailingCommitter {
+        async fn commit(
+            &self,
+            _claim: BatchExportClaim,
+            _exported_at: DateTime<Utc>,
+        ) -> Result<(), AppError> {
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            self.release.notified().await;
+            Err(AppError::Internal {
+                message: "injected detached commit failure".to_owned(),
+            })
         }
     }
 
@@ -1008,6 +1051,60 @@ mod tests {
         assert!(persisted.last_exported_at.is_some());
     }
 
+    #[test]
+    fn detached_finalizer_logs_commit_failure_after_caller_cancellation() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CaptureWriter(writer_output.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let fixture = export_fixture("游离终结失败测试").await;
+                    let (started_tx, started_rx) = oneshot::channel();
+                    let release = Arc::new(Notify::new());
+                    let service = ExportService::with_committer(
+                        fixture.pool,
+                        fixture.paths.clone(),
+                        Arc::new(GatedFailingCommitter {
+                            started: Mutex::new(Some(started_tx)),
+                            release: release.clone(),
+                        }),
+                    );
+                    let task_service = service.clone();
+                    let batch_id = fixture.batch_id;
+                    let task = tokio::spawn(async move { task_service.export(batch_id).await });
+
+                    tokio::time::timeout(Duration::from_secs(5), started_rx)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                    release.notify_waiters();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while service.coordinator.active_exports.contains_key(&batch_id) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(fs::read_dir(&fixture.paths.exports).unwrap().count(), 0);
+                });
+        });
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("export finalization failed"));
+        assert!(logs.contains("injected detached commit failure"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_replaced_by_external_symlink_after_parent_anchor_is_rejected() {
@@ -1049,6 +1146,21 @@ mod tests {
     }
 
     #[test]
+    fn non_unix_export_source_open_fails_closed_by_construction() {
+        let source = include_str!("export.rs");
+        let start = source
+            .find("#[cfg(not(unix))]\nfn open_contained_regular_file_with_hook")
+            .unwrap();
+        let remainder = &source[start..];
+        let end = remainder.find("\n#[cfg(test)]").unwrap();
+        let implementation = &remainder[..end];
+
+        assert!(!implementation.contains("canonicalize"));
+        assert!(!implementation.contains("File::open"));
+        assert!(implementation.contains("unsupported_export_source_platform(field)"));
+    }
+
+    #[test]
     fn oversized_source_is_rejected_before_read_allocation() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("originals");
@@ -1079,6 +1191,17 @@ mod tests {
                 .unwrap_err();
 
         assert!(matches!(error, AppError::Validation { field, .. } if field == "export"));
+    }
+
+    #[test]
+    fn batch_directory_name_reserves_suffix_at_utf8_boundary() {
+        let exported_at = Utc.with_ymd_and_hms(2026, 7, 15, 12, 34, 56).unwrap();
+
+        let component = super::export_directory_name(&"报".repeat(100), &exported_at);
+
+        assert!(component.len() <= 255);
+        assert!(component.ends_with("-20260715-123456"));
+        assert!(component.starts_with('报'));
     }
 
     #[tokio::test(flavor = "current_thread")]

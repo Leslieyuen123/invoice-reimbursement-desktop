@@ -1,7 +1,9 @@
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 
 use chrono::{NaiveDate, TimeZone, Utc};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use invoice_reimbursement::db;
 use invoice_reimbursement::db::batches::BatchRepository;
 use invoice_reimbursement::db::items::{ItemRepository, NewItemRecord};
@@ -224,7 +226,12 @@ async fn merged_pdf_preserves_inherited_page_dimensions() {
     assert_eq!(dimensions, vec![(100.0, 150.0), (200.0, 300.0)]);
     for page_id in document.get_pages().into_values() {
         let page = document.get_object(page_id).unwrap().as_dict().unwrap();
-        let resources = page.get(b"Resources").unwrap().as_dict().unwrap();
+        let resources_id = page.get(b"Resources").unwrap().as_reference().unwrap();
+        let resources = document
+            .get_object(resources_id)
+            .unwrap()
+            .as_dict()
+            .unwrap();
         assert!(resources.get(b"ProcSet").is_ok());
         let contents_id = page.get(b"Contents").unwrap().as_reference().unwrap();
         let contents = document
@@ -233,6 +240,42 @@ async fn merged_pdf_preserves_inherited_page_dimensions() {
             .as_stream()
             .unwrap();
         assert_eq!(contents.content, b"q Q");
+    }
+}
+
+#[tokio::test]
+async fn merged_pdf_renumbers_colliding_indirect_font_and_xobject_resources() {
+    let app = TestApp::with_exportable_batch().await;
+    let result = app.exports.export(app.batch_id).await.unwrap();
+    let document = Document::load(result.directory.join("merged.pdf")).unwrap();
+
+    for (page_id, marker) in document.get_pages().into_values().zip([100, 200]) {
+        let page = document.get_object(page_id).unwrap().as_dict().unwrap();
+        let resources_id = page.get(b"Resources").unwrap().as_reference().unwrap();
+        let resources = document
+            .get_object(resources_id)
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        let fonts = resources.get(b"Font").unwrap().as_dict().unwrap();
+        let font_id = fonts.get(b"F1").unwrap().as_reference().unwrap();
+        let font = document.get_object(font_id).unwrap().as_dict().unwrap();
+        assert_eq!(
+            font.get(b"BaseFont").unwrap().as_name().unwrap(),
+            format!("FixtureFont{marker}").as_bytes()
+        );
+
+        let xobjects = resources.get(b"XObject").unwrap().as_dict().unwrap();
+        let xobject_id = xobjects.get(b"XO1").unwrap().as_reference().unwrap();
+        let xobject = document
+            .get_object(xobject_id)
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert_eq!(
+            xobject.content,
+            format!("fixture-xobject-{marker}").as_bytes()
+        );
     }
 }
 
@@ -702,6 +745,50 @@ async fn malformed_and_encrypted_pdfs_fail_with_no_staging_residue() {
     assert_storage_empty(&encrypted.paths);
 }
 
+#[tokio::test]
+async fn escaped_object_stream_is_rejected_before_staging() {
+    let app = TestApp::with_exportable_batch().await;
+    let normalized = normalized_path(&app.pool, app.item_ids[0]).await;
+    fs::write(normalized, classic_pdf_with_escaped_object_stream()).unwrap();
+
+    let error = app.exports.export(app.batch_id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation { field, message }
+            if field == "normalizedPdf" && message.contains("压缩对象")
+    ));
+    assert_storage_empty(&app.paths);
+    let batch = BatchRepository::new(app.pool)
+        .get(app.batch_id)
+        .await
+        .unwrap();
+    assert_eq!(batch.status, BatchStatus::Draft);
+    assert_eq!(batch.last_exported_at, None);
+}
+
+#[tokio::test]
+async fn highly_compressed_stream_is_bounded_before_staging() {
+    let app = TestApp::with_exportable_batch().await;
+    let normalized = normalized_path(&app.pool, app.item_ids[0]).await;
+    fs::write(normalized, high_ratio_flate_pdf(100 * 1024 * 1024 + 1)).unwrap();
+
+    let error = app.exports.export(app.batch_id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation { field, message }
+            if field == "normalizedPdf" && message.contains("解码数据")
+    ));
+    assert_storage_empty(&app.paths);
+    let batch = BatchRepository::new(app.pool)
+        .get(app.batch_id)
+        .await
+        .unwrap();
+    assert_eq!(batch.status, BatchStatus::Draft);
+    assert_eq!(batch.last_exported_at, None);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_and_out_of_root_originals_are_rejected_without_path_disclosure() {
@@ -853,6 +940,29 @@ fn sample_item(paths: &AppPaths, batch_id: Uuid, status: ItemStatus) -> NewItemR
 fn inherited_media_box_pdf(width: f64, height: f64) -> Vec<u8> {
     let mut document = Document::with_version("1.5");
     let pages_id = document.new_object_id();
+    let marker = width.round() as i64;
+    let font_id = document.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => Object::Name(format!("FixtureFont{marker}").into_bytes()),
+    });
+    let xobject_id = document.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+        },
+        format!("fixture-xobject-{marker}").into_bytes(),
+    ));
+    let resources_id = document.add_object(dictionary! {
+        "ProcSet" => vec![Object::Name(b"PDF".to_vec())],
+        "Font" => dictionary! {
+            "F1" => font_id,
+        },
+        "XObject" => dictionary! {
+            "XO1" => xobject_id,
+        },
+    });
     let contents_id = document.add_object(Stream::new(dictionary! {}, b"q Q".to_vec()));
     let page_id = document.add_object(dictionary! {
         "Type" => "Page",
@@ -866,9 +976,76 @@ fn inherited_media_box_pdf(width: f64, height: f64) -> Vec<u8> {
             "Kids" => vec![Object::Reference(page_id)],
             "Count" => 1,
             "MediaBox" => vec![0.into(), 0.into(), width.into(), height.into()],
-            "Resources" => dictionary! {
-                "ProcSet" => vec![Object::Name(b"PDF".to_vec())],
-            },
+            "Resources" => resources_id,
+        }),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn classic_pdf_with_escaped_object_stream() -> Vec<u8> {
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
+        b"<< /Type /Obj#53tm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
+        bytes.extend_from_slice(object);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        &mut bytes,
+        "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    )
+    .unwrap();
+    bytes
+}
+
+fn high_ratio_flate_pdf(decoded_size: usize) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    let zeros = [0_u8; 64 * 1024];
+    let mut remaining = decoded_size;
+    while remaining != 0 {
+        let chunk = remaining.min(zeros.len());
+        encoder.write_all(&zeros[..chunk]).unwrap();
+        remaining -= chunk;
+    }
+    let compressed = encoder.finish().unwrap();
+
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    let contents_id = document.add_object(Stream::new(
+        dictionary! { "Filter" => "FlateDecode" },
+        compressed,
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 100.into(), 150.into()],
+        "Contents" => contents_id,
+    });
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
         }),
     );
     let catalog_id = document.add_object(dictionary! {

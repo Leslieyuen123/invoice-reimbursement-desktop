@@ -4,7 +4,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use lopdf::{Document, Object, ObjectId, dictionary};
+use flate2::read::ZlibDecoder;
+use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use rust_xlsxwriter::{Format, Workbook};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -16,6 +17,7 @@ use crate::db::items::InvoiceItem;
 use crate::domain::error::AppError;
 use crate::domain::model::{Category, SourceType};
 use crate::infra::files::sync_directory;
+use crate::infra::pdf_preflight::validate_pdf_structure;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExportLimits {
@@ -119,6 +121,11 @@ pub(crate) struct ExportItem {
     pub archive_name: String,
 }
 
+pub(crate) struct PreparedMergedPdf {
+    bytes: Vec<u8>,
+    normalized_source_bytes: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Manifest<'a> {
@@ -143,19 +150,21 @@ pub(crate) fn generate_artifacts(
     items: &mut [ExportItem],
     exported_at: DateTime<Utc>,
     limits: ExportLimits,
+    merged_pdf: PreparedMergedPdf,
 ) -> Result<(), AppError> {
-    let mut source_usage = SourceReadUsage::default();
-    let originals_hash = write_originals_zip(directory, items, limits, &mut source_usage)?;
-
-    let merged_pdf = merge_pdfs(items, limits, &mut source_usage)?;
-    let merged_pdf_hash = sha256_hex(&merged_pdf);
-    write_artifact(directory, MERGED_PDF, &merged_pdf)?;
-    drop(merged_pdf);
+    let mut source_usage = SourceReadUsage {
+        bytes: merged_pdf.normalized_source_bytes,
+    };
+    let merged_pdf_hash = sha256_hex(&merged_pdf.bytes);
+    write_artifact(directory, MERGED_PDF, &merged_pdf.bytes)?;
+    drop(merged_pdf.bytes);
 
     let workbook = create_workbook(batch, items, limits)?;
     let workbook_hash = sha256_hex(&workbook);
     write_artifact(directory, REIMBURSEMENT_XLSX, &workbook)?;
     drop(workbook);
+
+    let originals_hash = write_originals_zip(directory, items, limits, &mut source_usage)?;
 
     let artifacts = BTreeMap::from([
         (MERGED_PDF, merged_pdf_hash),
@@ -299,14 +308,14 @@ fn sync_publication_parents(staging: &Path, destination: &Path) -> std::io::Resu
     sync_directory(staging_parent).and_then(|()| sync_directory(destination_parent))
 }
 
-fn merge_pdfs(
+pub(crate) fn prepare_merged_pdf(
     items: &mut [ExportItem],
     limits: ExportLimits,
-    source_usage: &mut SourceReadUsage,
-) -> Result<Vec<u8>, AppError> {
+) -> Result<PreparedMergedPdf, AppError> {
     let mut output = Document::with_version("1.5");
     let mut pages = Vec::<ObjectId>::new();
     let mut usage = PdfResourceUsage::default();
+    let mut source_usage = SourceReadUsage::default();
     let pdf_limits = PdfResourceLimits {
         max_pages_per_item: limits.max_pdf_pages_per_item,
         max_pages_total: limits.max_pdf_pages_total,
@@ -318,12 +327,19 @@ fn merge_pdfs(
 
     for item in items {
         let read_limit = limits.max_source_file_bytes.saturating_add(1);
+        item.normalized_pdf_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| validation_error("normalizedPdf", "归一化 PDF 无法读取"))?;
         let mut reader = Read::by_ref(&mut item.normalized_pdf_file).take(read_limit);
-        let document = Document::load_from(&mut reader);
-        let bytes_read = read_limit.saturating_sub(reader.limit());
-        source_usage.record(bytes_read, limits, "normalizedPdf")?;
-        let mut document =
-            document.map_err(|_| validation_error("normalizedPdf", "归一化 PDF 无法读取"))?;
+        let mut raw_pdf = Vec::new();
+        reader
+            .read_to_end(&mut raw_pdf)
+            .map_err(|_| validation_error("normalizedPdf", "归一化 PDF 无法读取"))?;
+        source_usage.record(raw_pdf.len() as u64, limits, "normalizedPdf")?;
+        validate_pdf_structure(&raw_pdf)?;
+        let mut document = Document::load_mem(&raw_pdf)
+            .map_err(|_| validation_error("normalizedPdf", "归一化 PDF 无法读取"))?;
+        drop(raw_pdf);
         if document.is_encrypted() || document.encryption_state.is_some() {
             return Err(validation_error("normalizedPdf", "归一化 PDF 不得加密"));
         }
@@ -372,7 +388,10 @@ fn merge_pdfs(
         .save_to(&mut bytes)
         .map_err(|_| internal_error("failed to write merged PDF"))?;
     Document::load_mem(&bytes).map_err(|_| internal_error("failed to validate merged PDF"))?;
-    Ok(bytes)
+    Ok(PreparedMergedPdf {
+        bytes,
+        normalized_source_bytes: source_usage.bytes,
+    })
 }
 
 fn validate_pdf_resources(
@@ -418,25 +437,17 @@ fn validate_pdf_resources(
         let Object::Stream(stream) = object else {
             continue;
         };
-        let decoded_len = if stream.dict.get(b"Filter").is_err() {
-            stream.content.len()
-        } else {
-            let supported = stream.filters().is_ok_and(|filters| {
-                filters.iter().all(|filter| {
-                    matches!(*filter, b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode")
-                })
-            });
-            if supported {
-                stream
-                    .decompressed_content()
-                    .map_err(|_| validation_error("normalizedPdf", "PDF 数据流无法解码"))?
-                    .len()
-            } else {
-                stream.content.len()
-            }
-        };
+        let item_remaining = limits
+            .max_decoded_stream_bytes_per_item
+            .saturating_sub(decoded_stream_bytes);
+        let package_remaining = remaining_decoded_stream_budget(
+            limits.max_decoded_stream_bytes_total,
+            usage.decoded_stream_bytes,
+            decoded_stream_bytes,
+        )?;
+        let decoded_len = bounded_stream_size(stream, item_remaining.min(package_remaining))?;
         decoded_stream_bytes = decoded_stream_bytes
-            .checked_add(decoded_len as u64)
+            .checked_add(decoded_len)
             .ok_or_else(|| validation_error("normalizedPdf", "PDF 数据流超过导出限制"))?;
         if decoded_stream_bytes > limits.max_decoded_stream_bytes_per_item {
             return Err(validation_error(
@@ -460,6 +471,77 @@ fn validate_pdf_resources(
     usage.objects = total_objects;
     usage.decoded_stream_bytes = total_decoded_stream_bytes;
     Ok(())
+}
+
+fn remaining_decoded_stream_budget(
+    limit: u64,
+    committed: u64,
+    current: u64,
+) -> Result<u64, AppError> {
+    let used = committed
+        .checked_add(current)
+        .ok_or_else(|| validation_error("normalizedPdf", "PDF 数据流超过导出限制"))?;
+    Ok(limit.saturating_sub(used))
+}
+
+fn bounded_stream_size(stream: &Stream, limit: u64) -> Result<u64, AppError> {
+    let filters = match stream.filters() {
+        Ok(filters) => filters,
+        Err(_) if stream.dict.get(b"Filter").is_err() => {
+            return bounded_opaque_size(stream.content.len(), limit);
+        }
+        Err(_) => return Err(unsupported_stream_filter()),
+    };
+    if filters.len() != 1 {
+        return Err(unsupported_stream_filter());
+    }
+    match filters[0] {
+        b"FlateDecode" | b"Fl" => bounded_flate_size(&stream.content, limit),
+        // These codecs remain opaque in lopdf's load/renumber/save path. The exporter never calls
+        // lopdf's content decoders for them, so their stored bytes are the allocation bound.
+        b"DCTDecode" | b"DCT" | b"JPXDecode" | b"CCITTFaxDecode" | b"CCF" | b"JBIG2Decode"
+        | b"Crypt" => bounded_opaque_size(stream.content.len(), limit),
+        // lopdf's LZW and ASCII85 helpers allocate complete output buffers. Fail closed until a
+        // bounded streaming implementation is available for these filters.
+        _ => Err(unsupported_stream_filter()),
+    }
+}
+
+fn bounded_flate_size(content: &[u8], limit: u64) -> Result<u64, AppError> {
+    let decoder = ZlibDecoder::new(content);
+    let mut bounded = decoder.take(limit.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = bounded
+            .read(&mut buffer)
+            .map_err(|_| validation_error("normalizedPdf", "PDF 数据流无法解码"))?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(read as u64);
+        if total > limit {
+            return Err(validation_error(
+                "normalizedPdf",
+                "单张票据 PDF 解码数据超过导出限制",
+            ));
+        }
+    }
+}
+
+fn bounded_opaque_size(size: usize, limit: u64) -> Result<u64, AppError> {
+    let size = size as u64;
+    if size > limit {
+        return Err(validation_error(
+            "normalizedPdf",
+            "单张票据 PDF 解码数据超过导出限制",
+        ));
+    }
+    Ok(size)
+}
+
+fn unsupported_stream_filter() -> AppError {
+    validation_error("normalizedPdf", "PDF 数据流过滤器不受安全导出支持")
 }
 
 fn flatten_page_attributes(document: &mut Document) -> Result<(), AppError> {
@@ -828,8 +910,8 @@ mod tests {
     #[cfg(unix)]
     use super::publish_directory_with_sync;
     use super::{
-        PdfResourceLimits, PdfResourceUsage, exact_xlsx_amount, validate_pdf_resources,
-        validate_xlsx_text,
+        PdfResourceLimits, PdfResourceUsage, exact_xlsx_amount, remaining_decoded_stream_budget,
+        validate_pdf_resources, validate_xlsx_text,
     };
 
     #[test]
@@ -876,6 +958,15 @@ mod tests {
         limits.max_decoded_stream_bytes_per_item = 16;
 
         let error = validate_pdf_resources(&document, &mut usage, limits).unwrap_err();
+
+        assert!(
+            matches!(error, crate::domain::error::AppError::Validation { field, .. } if field == "normalizedPdf")
+        );
+    }
+
+    #[test]
+    fn pdf_decoded_stream_budget_overflow_is_rejected() {
+        let error = remaining_decoded_stream_budget(u64::MAX, u64::MAX, 1).unwrap_err();
 
         assert!(
             matches!(error, crate::domain::error::AppError::Validation { field, .. } if field == "normalizedPdf")

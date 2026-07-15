@@ -2774,6 +2774,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "flate2",
  "image",
  "imap",
  "infer",
