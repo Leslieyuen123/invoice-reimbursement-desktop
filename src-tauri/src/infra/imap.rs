@@ -441,7 +441,11 @@ fn imap_error(message: &str) -> AppError {
 }
 
 fn authentication_error(message: &str) -> AppError {
-    permanent_imap_error(message)
+    AppError::External {
+        service: "imap_authentication".to_owned(),
+        retryable: false,
+        message: message.to_owned(),
+    }
 }
 
 fn configuration_error(message: &str) -> AppError {
@@ -470,7 +474,7 @@ mod tests {
     use crate::db::accounts::{MailboxProvider, SyncCursor};
     use crate::domain::error::AppError;
 
-    fn assert_retryable(error: AppError, expected: bool) {
+    fn assert_external(error: AppError, expected_service: &str, expected_retryable: bool) {
         assert!(
             matches!(
                 error,
@@ -478,7 +482,7 @@ mod tests {
                     ref service,
                     retryable,
                     ..
-                } if service == "imap" && retryable == expected
+                } if service == expected_service && retryable == expected_retryable
             ),
             "unexpected IMAP error: {error:?}"
         );
@@ -493,7 +497,7 @@ mod tests {
             Ok(_) => panic!("blank secret must be rejected before connecting"),
             Err(error) => error,
         };
-        assert_retryable(blank_secret, false);
+        assert_external(blank_secret, "imap_authentication", false);
 
         let mut insecure = config;
         insecure.tls = false;
@@ -501,11 +505,15 @@ mod tests {
             Ok(_) => panic!("unencrypted configuration must be rejected before connecting"),
             Err(error) => error,
         };
-        assert_retryable(insecure_config, false);
+        assert_external(insecure_config, "imap", false);
 
-        assert_retryable(authentication_error("IMAP authentication failed"), false);
-        assert_retryable(imap_error("IMAP transport failed"), true);
-        assert_retryable(limit_error("IMAP resource limit"), false);
+        assert_external(
+            authentication_error("IMAP authentication failed"),
+            "imap_authentication",
+            false,
+        );
+        assert_external(imap_error("IMAP transport failed"), "imap", true);
+        assert_external(limit_error("IMAP resource limit"), "imap", false);
     }
 
     #[test]

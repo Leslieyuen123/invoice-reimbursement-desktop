@@ -10,6 +10,34 @@ pub trait CredentialStore: Send + Sync {
     fn delete(&self, account_id: &str) -> Result<(), AppError>;
 }
 
+pub async fn get_credential(
+    store: Arc<dyn CredentialStore>,
+    account_id: String,
+) -> Result<Option<String>, AppError> {
+    tokio::task::spawn_blocking(move || store.get(&account_id))
+        .await
+        .map_err(|_| credential_task_error("read"))?
+}
+
+pub async fn set_credential(
+    store: Arc<dyn CredentialStore>,
+    account_id: String,
+    secret: String,
+) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || store.set(&account_id, &secret))
+        .await
+        .map_err(|_| credential_task_error("write"))?
+}
+
+pub async fn delete_credential(
+    store: Arc<dyn CredentialStore>,
+    account_id: String,
+) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || store.delete(&account_id))
+        .await
+        .map_err(|_| credential_task_error("delete"))?
+}
+
 const KEYRING_SERVICE: &str = "com.invoice-desk.credentials";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -124,5 +152,11 @@ fn keyring_error(message: &str) -> AppError {
 fn lock_error() -> AppError {
     AppError::Internal {
         message: "credential storage lock is unavailable".to_owned(),
+    }
+}
+
+fn credential_task_error(operation: &str) -> AppError {
+    AppError::Internal {
+        message: format!("credential {operation} task failed"),
     }
 }

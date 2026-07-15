@@ -735,7 +735,7 @@ async fn authentication_failure_is_sanitized_and_does_not_advance_the_cursor() {
             messages: vec![],
         }),
         Err(AppError::External {
-            service: "imap".to_owned(),
+            service: "imap_authentication".to_owned(),
             retryable: false,
             message: format!("login rejected credential {secret}\nserver detail"),
         }),
@@ -822,7 +822,7 @@ async fn missing_mailbox_credential_is_not_retryable_and_does_not_fetch() {
             ref service,
             retryable: false,
             ..
-        } if service == "imap"
+        } if service == "mailbox_credential"
     ));
     assert!(gateway.cursors().is_empty());
     assert_eq!(

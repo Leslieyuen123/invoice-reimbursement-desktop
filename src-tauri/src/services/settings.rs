@@ -10,8 +10,11 @@ use crate::db::accounts::{
     MailboxAccount, MailboxAccountRepository, MailboxProvider, NewMailboxAccount,
 };
 use crate::domain::error::AppError;
-use crate::infra::credentials::CredentialStore;
+use crate::infra::credentials::{
+    CredentialStore, delete_credential, get_credential, set_credential,
+};
 use crate::infra::imap::{ImapAccountConfig, ImapGateway};
+use crate::services::operations::AccountOperationCoordinator;
 
 pub struct SaveAccountInput {
     pub id: Option<Uuid>,
@@ -25,6 +28,7 @@ pub struct SaveAccountInput {
 }
 
 pub struct TestAccountInput {
+    pub id: Option<Uuid>,
     pub provider: MailboxProvider,
     pub email: String,
     pub secret: String,
@@ -79,6 +83,7 @@ pub struct SettingsService {
     credentials: Arc<dyn CredentialStore>,
     accounts: MailboxAccountRepository,
     background_gate: BackgroundSyncGate,
+    operations: AccountOperationCoordinator,
 }
 
 impl SettingsService {
@@ -96,87 +101,118 @@ impl SettingsService {
         credentials: Arc<dyn CredentialStore>,
         background_gate: BackgroundSyncGate,
     ) -> Self {
+        Self::with_runtime(
+            pool,
+            gateway,
+            credentials,
+            background_gate,
+            AccountOperationCoordinator::default(),
+        )
+    }
+
+    pub(crate) fn with_runtime(
+        pool: SqlitePool,
+        gateway: Arc<dyn ImapGateway>,
+        credentials: Arc<dyn CredentialStore>,
+        background_gate: BackgroundSyncGate,
+        operations: AccountOperationCoordinator,
+    ) -> Self {
         Self {
             accounts: MailboxAccountRepository::new(pool.clone()),
             pool,
             gateway,
             credentials,
             background_gate,
+            operations,
         }
     }
 
     pub async fn save_account(&self, input: SaveAccountInput) -> Result<MailboxAccount, AppError> {
+        let _operation_guard = input
+            .id
+            .map(|id| self.operations.try_lock(id))
+            .transpose()?;
         let config = account_config(
             input.provider,
             &input.email,
             input.imap_host.as_deref(),
             input.imap_port,
         )?;
-        if let Err(error) = self.gateway.test_connection(&config, &input.secret).await {
-            return Err(sanitize_error(error, &input.secret));
+        let resolved_secret = self.resolve_secret(input.id, input.secret).await?;
+        if let Err(error) = self
+            .gateway
+            .test_connection(&config, &resolved_secret.value)
+            .await
+        {
+            return Err(sanitize_error(error, &resolved_secret.value));
         }
 
-        let previous_secret = input
-            .id
-            .map(|id| self.credentials.get(&id.to_string()))
-            .transpose()?
-            .flatten();
-
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let account = self
-            .accounts
-            .save_metadata(
-                &mut transaction,
-                input.id,
-                NewMailboxAccount {
-                    provider: input.provider,
-                    email: input.email,
-                    imap_host: config.host,
-                    imap_port: i64::from(config.port),
-                    enabled: input.enabled,
-                    sync_interval_minutes: input.sync_interval_minutes,
-                },
+        let previous_secret = match input.id {
+            Some(_) if !resolved_secret.replace => Some(resolved_secret.value.clone()),
+            Some(id) => get_credential(self.credentials.clone(), id.to_string()).await?,
+            None => None,
+        };
+        let is_update = input.id.is_some();
+        let account_id = input.id.unwrap_or_else(Uuid::new_v4);
+        if resolved_secret.replace {
+            set_credential(
+                self.credentials.clone(),
+                account_id.to_string(),
+                resolved_secret.value.clone(),
             )
-            .await?;
-        if let Err(error) = self.credentials.set(&account.id.to_string(), &input.secret) {
-            transaction.rollback().await.map_err(database_error)?;
-            return Err(sanitize_error(error, &input.secret));
+            .await
+            .map_err(|error| sanitize_error(error, &resolved_secret.value))?;
         }
-        if let Err(error) = transaction.commit().await {
-            let restored = match previous_secret {
-                Some(previous_secret) => self
-                    .credentials
-                    .set(&account.id.to_string(), &previous_secret),
-                None => self.credentials.delete(&account.id.to_string()),
-            };
-            if restored.is_err() {
+        let metadata = NewMailboxAccount {
+            provider: input.provider,
+            email: input.email,
+            imap_host: config.host,
+            imap_port: i64::from(config.port),
+            enabled: input.enabled,
+            sync_interval_minutes: input.sync_interval_minutes,
+        };
+        let database_result = self
+            .persist_account_metadata(account_id, is_update, metadata)
+            .await;
+        if let Err(database_error) = database_result {
+            if resolved_secret.replace
+                && let Err(recovery_error) =
+                    restore_credential(self.credentials.clone(), account_id, previous_secret).await
+            {
                 return Err(AppError::Internal {
-                    message: "failed to restore credential after database commit failure"
-                        .to_owned(),
+                    message: format!(
+                        "failed to save mailbox account {account_id}: database stage failed ({database_error}); credential recovery failed ({recovery_error})"
+                    ),
                 });
             }
-            return Err(database_error(error));
+            return Err(database_error);
         }
-        Ok(account)
+        database_result
     }
 
     pub async fn test_account(&self, input: TestAccountInput) -> Result<(), AppError> {
+        let _operation_guard = input
+            .id
+            .map(|id| self.operations.try_lock(id))
+            .transpose()?;
         let config = account_config(
             input.provider,
             &input.email,
             input.imap_host.as_deref(),
             input.imap_port,
         )?;
+        let resolved_secret = self.resolve_secret(input.id, input.secret).await?;
         self.gateway
-            .test_connection(&config, &input.secret)
+            .test_connection(&config, &resolved_secret.value)
             .await
-            .map_err(|error| sanitize_error(error, &input.secret))
+            .map_err(|error| sanitize_error(error, &resolved_secret.value))
     }
 
     pub async fn delete_account(&self, id: Uuid) -> Result<(), AppError> {
+        let _operation_guard = self.operations.try_lock(id)?;
         self.accounts.get(id).await?;
         self.accounts.set_enabled(id, false).await?;
-        self.credentials.delete(&id.to_string())?;
+        delete_credential(self.credentials.clone(), id.to_string()).await?;
         self.accounts.delete(id).await
     }
 
@@ -206,6 +242,90 @@ impl SettingsService {
         .await
         .map_err(database_error)?;
         Ok(preferences)
+    }
+
+    async fn resolve_secret(
+        &self,
+        id: Option<Uuid>,
+        secret: String,
+    ) -> Result<ResolvedSecret, AppError> {
+        if !secret.trim().is_empty() {
+            return Ok(ResolvedSecret {
+                value: secret,
+                replace: true,
+            });
+        }
+        let Some(id) = id else {
+            return Err(AppError::validation(
+                "secret",
+                "credential secret must not be blank for a new account",
+            ));
+        };
+        let value = get_credential(self.credentials.clone(), id.to_string())
+            .await?
+            .ok_or_else(missing_credential_error)?;
+        Ok(ResolvedSecret {
+            value,
+            replace: false,
+        })
+    }
+
+    async fn persist_account_metadata(
+        &self,
+        account_id: Uuid,
+        is_update: bool,
+        metadata: NewMailboxAccount,
+    ) -> Result<MailboxAccount, AppError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let result = async {
+            let account = self
+                .accounts
+                .save_metadata(&mut transaction, account_id, is_update, metadata)
+                .await?;
+            let account = self
+                .accounts
+                .clear_retry_state_in_transaction(&mut transaction, account.id)
+                .await?;
+            Ok::<_, AppError>(account)
+        }
+        .await;
+        match result {
+            Ok(account) => {
+                transaction.commit().await.map_err(database_error)?;
+                Ok(account)
+            }
+            Err(error) => {
+                transaction.rollback().await.map_err(database_error)?;
+                Err(error)
+            }
+        }
+    }
+}
+
+struct ResolvedSecret {
+    value: String,
+    replace: bool,
+}
+
+async fn restore_credential(
+    credentials: Arc<dyn CredentialStore>,
+    account_id: Uuid,
+    previous_secret: Option<String>,
+) -> Result<(), AppError> {
+    match previous_secret {
+        Some(secret) => {
+            let result = set_credential(credentials, account_id.to_string(), secret.clone()).await;
+            result.map_err(|error| sanitize_error(error, &secret))
+        }
+        None => delete_credential(credentials, account_id.to_string()).await,
+    }
+}
+
+fn missing_credential_error() -> AppError {
+    AppError::External {
+        service: "mailbox_credential".to_owned(),
+        retryable: false,
+        message: "mailbox credential is unavailable".to_owned(),
     }
 }
 
@@ -338,7 +458,5 @@ fn sanitize_error(error: AppError, secret: &str) -> AppError {
 }
 
 fn database_error(error: sqlx::Error) -> AppError {
-    AppError::Internal {
-        message: format!("failed to save mailbox settings: {error}"),
-    }
+    crate::db::accounts::map_database_error("failed to save mailbox settings", error)
 }

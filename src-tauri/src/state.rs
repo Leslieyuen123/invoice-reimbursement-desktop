@@ -5,7 +5,8 @@ use sqlx::SqlitePool;
 use crate::infra::credentials::CredentialStore;
 use crate::infra::files::AppPaths;
 use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
-use crate::services::scheduler::{Scheduler, SchedulerCoordinator, SyncRunner};
+use crate::services::operations::AccountOperationCoordinator;
+use crate::services::scheduler::{Scheduler, SyncRunner};
 use crate::services::settings::{BackgroundSyncGate, SettingsService};
 
 #[derive(Clone)]
@@ -14,7 +15,7 @@ pub struct AppState {
     paths: AppPaths,
     credentials: Arc<dyn CredentialStore>,
     gateway: Arc<dyn ImapGateway>,
-    scheduler_coordinator: SchedulerCoordinator,
+    account_operations: AccountOperationCoordinator,
     background_sync_gate: BackgroundSyncGate,
 }
 
@@ -39,7 +40,7 @@ impl AppState {
             paths,
             credentials,
             gateway,
-            scheduler_coordinator: SchedulerCoordinator::default(),
+            account_operations: AccountOperationCoordinator::default(),
             background_sync_gate: BackgroundSyncGate::default(),
         }
     }
@@ -57,19 +58,20 @@ impl AppState {
     }
 
     pub fn settings_service(&self) -> SettingsService {
-        SettingsService::with_background_gate(
+        SettingsService::with_runtime(
             self.pool.clone(),
             self.gateway.clone(),
             self.credentials.clone(),
             self.background_sync_gate.clone(),
+            self.account_operations.clone(),
         )
     }
 
     pub fn scheduler(&self, runner: Arc<dyn SyncRunner>) -> Scheduler {
-        Scheduler::with_coordinator_and_gate(
+        Scheduler::with_operations_and_gate(
             self.pool.clone(),
             runner,
-            self.scheduler_coordinator.clone(),
+            self.account_operations.clone(),
             self.background_sync_gate.clone(),
         )
     }

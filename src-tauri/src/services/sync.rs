@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::db::accounts::{MailboxAccountRepository, SyncCursor};
 use crate::domain::error::AppError;
 use crate::domain::model::{ConfirmationStatus, RecognitionStatus};
-use crate::infra::credentials::CredentialStore;
+use crate::infra::credentials::{CredentialStore, get_credential};
 use crate::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta, RawMessage};
 use crate::services::import::{EmailImportSource, ImportOutcome, ImportService};
 use crate::services::recognition::RecognitionService;
@@ -62,7 +62,7 @@ impl SyncService {
                 return Err(sanitized_external_error(&error, sanitized));
             }
         };
-        let secret = match self.credentials.get(&account_id.to_string()) {
+        let secret = match get_credential(self.credentials.clone(), account_id.to_string()).await {
             Ok(Some(secret)) => secret,
             Ok(None) => {
                 let error = authentication_error("mailbox credential is unavailable");
@@ -481,7 +481,7 @@ fn external_error(message: &str) -> AppError {
 
 fn authentication_error(message: &str) -> AppError {
     AppError::External {
-        service: "imap".to_owned(),
+        service: "mailbox_credential".to_owned(),
         retryable: false,
         message: message.to_owned(),
     }

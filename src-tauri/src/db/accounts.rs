@@ -101,12 +101,11 @@ impl MailboxAccountRepository {
     pub async fn save_metadata(
         &self,
         connection: &mut SqliteConnection,
-        id: Option<Uuid>,
+        id: Uuid,
+        is_update: bool,
         account: NewMailboxAccount,
     ) -> Result<MailboxAccount, AppError> {
         validate_account(&account)?;
-        let is_update = id.is_some();
-        let id = id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now().to_rfc3339();
         if id.is_nil() {
             return Err(AppError::validation("id", "account ID must not be nil"));
@@ -357,6 +356,36 @@ impl MailboxAccountRepository {
         }
         .await;
         finish_retry_transaction(transaction, result).await
+    }
+
+    pub async fn clear_retry_state_in_transaction(
+        &self,
+        connection: &mut SqliteConnection,
+        account_id: Uuid,
+    ) -> Result<MailboxAccount, AppError> {
+        sqlx::query("DELETE FROM sync_retry_states WHERE account_id = ?")
+            .bind(account_id.to_string())
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to clear mailbox retry state", error))?;
+        let result = sqlx::query(
+            "UPDATE mailbox_accounts SET last_error = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(account_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_database_error("failed to clear mailbox error", error))?;
+        if result.rows_affected() != 1 {
+            return Err(account_not_found(account_id));
+        }
+        let query = format!("SELECT {ACCOUNT_COLUMNS} FROM mailbox_accounts WHERE id = ?");
+        let row = sqlx::query_as::<_, DbMailboxAccountRow>(&query)
+            .bind(account_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to read saved mailbox account", error))?;
+        MailboxAccount::try_from(row)
     }
 
     pub async fn get_cursor(
@@ -778,7 +807,7 @@ fn map_insert_error(error: sqlx::Error) -> AppError {
     map_database_error("failed to insert mailbox account", error)
 }
 
-fn map_database_error(context: &str, error: sqlx::Error) -> AppError {
+pub(crate) fn map_database_error(context: &str, error: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(database_error) = &error
         && database_error
             .code()

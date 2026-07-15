@@ -59,6 +59,28 @@ async fn connect_enables_foreign_key_enforcement() {
 }
 
 #[tokio::test]
+async fn retry_state_failures_reject_values_above_i32_max() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let account_id = Uuid::new_v4();
+    insert_mailbox_account(&pool, account_id).await;
+
+    let error = sqlx::query(
+        "INSERT INTO sync_retry_states (\
+            account_id, failures, next_retry_at, suspended, updated_at\
+         ) VALUES (?, ?, ?, 0, ?)",
+    )
+    .bind(account_id.to_string())
+    .bind(2_147_483_648_i64)
+    .bind("2026-07-15T12:01:00Z")
+    .bind(Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, sqlx::Error::Database(_)));
+}
+
+#[tokio::test]
 async fn mailbox_sync_repository_maps_real_sqlite_busy_errors_as_retryable() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

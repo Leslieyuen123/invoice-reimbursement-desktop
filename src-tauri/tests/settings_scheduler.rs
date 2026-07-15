@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use async_trait::async_trait;
 use chrono::{Duration, TimeZone, Utc};
@@ -17,6 +17,7 @@ use invoice_reimbursement::services::scheduler::{
 };
 use invoice_reimbursement::services::settings::{
     BackgroundSyncGate, Preferences, PreferencesInput, SaveAccountInput, SettingsService,
+    TestAccountInput,
 };
 use invoice_reimbursement::state::AppState;
 use uuid::Uuid;
@@ -45,6 +46,32 @@ impl ImapGateway for PassingGateway {
 }
 
 struct FailingConnectionGateway;
+
+#[derive(Default)]
+struct CapturingGateway {
+    tested_secrets: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl ImapGateway for CapturingGateway {
+    async fn test_connection(
+        &self,
+        _config: &ImapAccountConfig,
+        secret: &str,
+    ) -> Result<(), AppError> {
+        self.tested_secrets.lock().unwrap().push(secret.to_owned());
+        Ok(())
+    }
+
+    async fn fetch_since(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+        _cursor: Option<SyncCursor>,
+    ) -> Result<MailboxDelta, AppError> {
+        unreachable!("settings tests do not fetch mail")
+    }
+}
 
 #[async_trait]
 impl ImapGateway for FailingConnectionGateway {
@@ -75,6 +102,7 @@ struct ControlledCredentialStore {
     secrets: RwLock<HashMap<String, String>>,
     fail_set: AtomicBool,
     fail_delete: AtomicBool,
+    set_calls: AtomicUsize,
 }
 
 impl ControlledCredentialStore {
@@ -93,6 +121,7 @@ impl CredentialStore for ControlledCredentialStore {
     }
 
     fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
+        self.set_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_set.load(Ordering::SeqCst) {
             return Err(AppError::External {
                 service: "keyring".to_owned(),
@@ -115,6 +144,91 @@ impl CredentialStore for ControlledCredentialStore {
                 message: "credential delete failed".to_owned(),
             });
         }
+        self.secrets.write().unwrap().remove(account_id);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecoveryFailureCredentialStore {
+    secrets: RwLock<HashMap<String, String>>,
+    set_calls: AtomicUsize,
+}
+
+impl CredentialStore for RecoveryFailureCredentialStore {
+    fn get(&self, account_id: &str) -> Result<Option<String>, AppError> {
+        Ok(self.secrets.read().unwrap().get(account_id).cloned())
+    }
+
+    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
+        let call = self.set_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 3 {
+            return Err(AppError::External {
+                service: "keyring".to_owned(),
+                retryable: false,
+                message: format!("failed to restore credential {secret}"),
+            });
+        }
+        self.secrets
+            .write()
+            .unwrap()
+            .insert(account_id.to_owned(), secret.to_owned());
+        Ok(())
+    }
+
+    fn delete(&self, account_id: &str) -> Result<(), AppError> {
+        self.secrets.write().unwrap().remove(account_id);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct BlockingCredentialStore {
+    secrets: RwLock<HashMap<String, String>>,
+    block_next_set: AtomicBool,
+    set_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    released: Mutex<bool>,
+    release_signal: Condvar,
+}
+
+impl BlockingCredentialStore {
+    fn block_next_set(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (started, receiver) = tokio::sync::oneshot::channel();
+        *self.set_started.lock().unwrap() = Some(started);
+        *self.released.lock().unwrap() = false;
+        self.block_next_set.store(true, Ordering::SeqCst);
+        receiver
+    }
+
+    fn release_set(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release_signal.notify_all();
+    }
+}
+
+impl CredentialStore for BlockingCredentialStore {
+    fn get(&self, account_id: &str) -> Result<Option<String>, AppError> {
+        Ok(self.secrets.read().unwrap().get(account_id).cloned())
+    }
+
+    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
+        if self.block_next_set.swap(false, Ordering::SeqCst) {
+            if let Some(started) = self.set_started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.release_signal.wait(released).unwrap();
+            }
+        }
+        self.secrets
+            .write()
+            .unwrap()
+            .insert(account_id.to_owned(), secret.to_owned());
+        Ok(())
+    }
+
+    fn delete(&self, account_id: &str) -> Result<(), AppError> {
         self.secrets.write().unwrap().remove(account_id);
         Ok(())
     }
@@ -155,6 +269,44 @@ struct BlockingRunner {
 struct BlockingFailureRunner {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+struct SlowFirstRunner {
+    slow_account_id: Uuid,
+    slow_started: tokio::sync::Notify,
+    fast_started: tokio::sync::Notify,
+    release_slow: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl SyncRunner for SlowFirstRunner {
+    async fn run(&self, account_id: Uuid) -> Result<(), AppError> {
+        if account_id == self.slow_account_id {
+            self.slow_started.notify_one();
+            self.release_slow.notified().await;
+        } else {
+            self.fast_started.notify_one();
+        }
+        Ok(())
+    }
+}
+
+struct CompletionBlockingRunner {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    completed: AtomicBool,
+    completed_signal: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl SyncRunner for CompletionBlockingRunner {
+    async fn run(&self, _account_id: Uuid) -> Result<(), AppError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        self.completed.store(true, Ordering::SeqCst);
+        self.completed_signal.notify_one();
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -346,6 +498,329 @@ async fn credential_set_failure_preserves_edited_account_and_old_secret() {
 }
 
 #[tokio::test]
+async fn credential_recovery_failure_does_not_expose_either_secret() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(RecoveryFailureCredentialStore::default());
+    let service = SettingsService::new(pool.clone(), Arc::new(PassingGateway), credentials);
+    let account = service
+        .save_account(save_input(None, "recovery@example.com", "old-secret"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_account_update BEFORE UPDATE ON mailbox_accounts \
+         BEGIN SELECT RAISE(ABORT, 'account update failed'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = service
+        .save_account(save_input(
+            Some(account.id),
+            "changed@example.com",
+            "new-secret",
+        ))
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert!(matches!(error, AppError::Internal { .. }));
+    assert!(!message.contains("old-secret"));
+    assert!(!message.contains("new-secret"));
+}
+
+#[tokio::test]
+async fn blank_secret_edit_reuses_old_credential_without_rewriting_keyring() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(ControlledCredentialStore::default());
+    let gateway = Arc::new(CapturingGateway::default());
+    let service = SettingsService::new(pool.clone(), gateway.clone(), credentials.clone());
+    let original = service
+        .save_account(save_input(None, "blank-edit@example.com", "old-secret"))
+        .await
+        .unwrap();
+    let mut edit = save_input(Some(original.id), "edited@example.com", "   ");
+    edit.enabled = false;
+
+    let edited = service.save_account(edit).await.unwrap();
+
+    assert_eq!(edited.email, "edited@example.com");
+    assert!(!edited.enabled);
+    assert_eq!(
+        credentials.get(&original.id.to_string()).unwrap(),
+        Some("old-secret".to_owned())
+    );
+    assert_eq!(credentials.set_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *gateway.tested_secrets.lock().unwrap(),
+        vec!["old-secret".to_owned(), "old-secret".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn blank_secret_connection_test_reuses_existing_credential() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let gateway = Arc::new(CapturingGateway::default());
+    let service = SettingsService::new(pool, gateway.clone(), credentials);
+    let account = service
+        .save_account(save_input(None, "blank-test@example.com", "old-secret"))
+        .await
+        .unwrap();
+
+    service
+        .test_account(TestAccountInput {
+            id: Some(account.id),
+            provider: MailboxProvider::Gmail,
+            email: account.email,
+            secret: "".to_owned(),
+            imap_host: None,
+            imap_port: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        gateway.tested_secrets.lock().unwrap().last().unwrap(),
+        "old-secret"
+    );
+}
+
+#[tokio::test]
+async fn blank_secret_edit_reports_missing_stored_credential() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "missing-secret@example.com", true).await;
+    let service = settings_service(pool);
+
+    let error = service
+        .save_account(save_input(
+            Some(account_id),
+            "missing-secret@example.com",
+            "",
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::External {
+            ref service,
+            retryable: false,
+            ..
+        } if service == "mailbox_credential"
+    ));
+}
+
+#[tokio::test]
+async fn blank_secret_is_rejected_for_new_account_without_persistence() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let service = settings_service(pool.clone());
+
+    let error = service
+        .save_account(save_input(None, "blank-new@example.com", "   "))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, AppError::Validation { ref field, .. } if field == "secret"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mailbox_accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn credential_replacement_clears_persisted_auth_suspension() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let service = SettingsService::new(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let account = service
+        .save_account(save_input(None, "suspended@example.com", "old-secret"))
+        .await
+        .unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    accounts
+        .suspend_retry(account.id, Utc::now(), "authentication failed")
+        .await
+        .unwrap();
+    assert!(
+        accounts
+            .get_retry_state(account.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let saved = service
+        .save_account(save_input(
+            Some(account.id),
+            "recovered@example.com",
+            "new-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(saved.last_error, None);
+    let recovered = accounts.get(account.id).await.unwrap();
+    assert_eq!(saved, recovered);
+    assert_eq!(recovered.email, "recovered@example.com");
+    assert_eq!(recovered.last_error, None);
+    assert_eq!(accounts.get_retry_state(account.id).await.unwrap(), None);
+    assert_eq!(
+        credentials.get(&account.id.to_string()).unwrap(),
+        Some("new-secret".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn editing_account_conflicts_with_running_sync_without_changing_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path()).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let state = AppState::with_gateway(
+        pool.clone(),
+        paths,
+        credentials.clone(),
+        Arc::new(PassingGateway),
+    );
+    let account = state
+        .settings_service()
+        .save_account(save_input(None, "race-save@example.com", "old-secret"))
+        .await
+        .unwrap();
+    let runner = Arc::new(BlockingRunner {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let scheduler = state.scheduler(runner.clone());
+    let running = scheduler.clone();
+    let sync = tokio::spawn(async move { running.sync_now(account.id).await });
+    runner.started.notified().await;
+
+    let error = state
+        .settings_service()
+        .save_account(save_input(
+            Some(account.id),
+            "changed@example.com",
+            "new-secret",
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, AppError::Conflict { .. }));
+    assert_eq!(
+        MailboxAccountRepository::new(pool)
+            .get(account.id)
+            .await
+            .unwrap()
+            .email,
+        "race-save@example.com"
+    );
+    assert_eq!(
+        credentials.get(&account.id.to_string()).unwrap(),
+        Some("old-secret".to_owned())
+    );
+    runner.release.notify_one();
+    sync.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn deleting_account_conflicts_with_running_sync_without_disabling_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path()).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let state = AppState::with_gateway(
+        pool.clone(),
+        paths,
+        credentials.clone(),
+        Arc::new(PassingGateway),
+    );
+    let account = state
+        .settings_service()
+        .save_account(save_input(None, "race-delete@example.com", "old-secret"))
+        .await
+        .unwrap();
+    let runner = Arc::new(BlockingRunner {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let scheduler = state.scheduler(runner.clone());
+    let running = scheduler.clone();
+    let sync = tokio::spawn(async move { running.sync_now(account.id).await });
+    runner.started.notified().await;
+
+    let error = state
+        .settings_service()
+        .delete_account(account.id)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, AppError::Conflict { .. }));
+    assert!(
+        MailboxAccountRepository::new(pool)
+            .get(account.id)
+            .await
+            .unwrap()
+            .enabled
+    );
+    assert_eq!(
+        credentials.get(&account.id.to_string()).unwrap(),
+        Some("old-secret".to_owned())
+    );
+    runner.release.notify_one();
+    sync.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn blocking_credential_write_does_not_hold_sqlite_writer_transaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        directory
+            .path()
+            .join("credential-blocking.sqlite3")
+            .display()
+    );
+    let pool = db::connect(&database_url).await.unwrap();
+    let credentials = Arc::new(BlockingCredentialStore::default());
+    let service = SettingsService::new(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let account = service
+        .save_account(save_input(None, "blocking@example.com", "old-secret"))
+        .await
+        .unwrap();
+    let set_started = credentials.block_next_set();
+    let saving = tokio::spawn(async move {
+        service
+            .save_account(save_input(
+                Some(account.id),
+                "blocking-updated@example.com",
+                "new-secret",
+            ))
+            .await
+    });
+    set_started.await.unwrap();
+
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)")
+            .bind("credential_probe")
+            .bind("true")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool),
+    )
+    .await;
+
+    credentials.release_set();
+    saving.await.unwrap().unwrap();
+    assert!(matches!(probe, Ok(Ok(_))));
+}
+
+#[tokio::test]
 async fn credential_delete_failure_leaves_account_disabled_and_recoverable() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let credentials = Arc::new(ControlledCredentialStore::default());
@@ -432,6 +907,68 @@ async fn preferences_have_stable_defaults_and_roundtrip_as_json() {
         })
     );
     assert_eq!(serde_json::from_str::<Preferences>(&raw).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn saving_preferences_maps_sqlite_busy_as_retryable_database_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("settings-busy.sqlite3").display()
+    );
+    let options = database_url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete)
+        .busy_timeout(std::time::Duration::ZERO);
+    let setup_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&setup_pool)
+        .await
+        .unwrap();
+    setup_pool.close().await;
+
+    let lock_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let service_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let mut lock = lock_pool.acquire().await.unwrap();
+    sqlx::query("BEGIN EXCLUSIVE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let service = settings_service(service_pool);
+
+    let error = service
+        .save_preferences(PreferencesInput {
+            background_sync_enabled: false,
+            export_directory: "/tmp/invoice-exports".to_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::External {
+            ref service,
+            retryable: true,
+            ..
+        } if service == "database"
+    ));
+    sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
 }
 
 #[tokio::test]
@@ -649,7 +1186,7 @@ async fn retryable_failures_back_off_for_one_five_then_fifteen_minutes() {
     )
     .await;
     let retryable = || AppError::External {
-        service: "imap".to_owned(),
+        service: "imap_authentication".to_owned(),
         retryable: true,
         message: "network unavailable".to_owned(),
     };
@@ -696,7 +1233,7 @@ async fn authentication_failure_is_not_retried_and_preserves_last_error() {
     let accounts = MailboxAccountRepository::new(pool.clone());
     let account_id = insert_account(&accounts, "auth@example.com", true).await;
     let runner = Arc::new(SequenceRunner::new(vec![Err(AppError::External {
-        service: "imap".to_owned(),
+        service: "imap_authentication".to_owned(),
         retryable: false,
         message: "authentication failed".to_owned(),
     })]));
@@ -719,12 +1256,79 @@ async fn authentication_failure_is_not_retried_and_preserves_last_error() {
 }
 
 #[tokio::test]
+async fn retry_policy_persistence_failure_is_returned_by_tick() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    insert_account(
+        &MailboxAccountRepository::new(pool.clone()),
+        "policy-failure@example.com",
+        true,
+    )
+    .await;
+    sqlx::query(
+        "CREATE TRIGGER fail_retry_policy BEFORE INSERT ON sync_retry_states \
+         BEGIN SELECT RAISE(ABORT, 'retry policy write failed'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let runner = Arc::new(SequenceRunner::new(vec![Err(AppError::External {
+        service: "imap".to_owned(),
+        retryable: true,
+        message: "network unavailable".to_owned(),
+    })]));
+    let scheduler = Scheduler::new(pool, runner);
+
+    let error = scheduler.tick(Utc::now()).await.unwrap_err();
+
+    assert!(
+        matches!(error, AppError::Internal { .. })
+            || matches!(
+                error,
+                AppError::External {
+                    ref service,
+                    retryable: true,
+                    ..
+                } if service == "database"
+            )
+    );
+}
+
+#[tokio::test]
+async fn non_authentication_configuration_failure_is_observable_not_suspended() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let account_id = insert_account(
+        &MailboxAccountRepository::new(pool.clone()),
+        "config-failure@example.com",
+        true,
+    )
+    .await;
+    let runner = Arc::new(SequenceRunner::new(vec![Err(AppError::External {
+        service: "imap".to_owned(),
+        retryable: false,
+        message: "IMAP configuration failed".to_owned(),
+    })]));
+    let scheduler = Scheduler::new(pool, runner);
+
+    let error = scheduler.tick(Utc::now()).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::External {
+            ref service,
+            retryable: false,
+            ..
+        } if service == "imap"
+    ));
+    assert_eq!(scheduler.retry_state(account_id).await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn authentication_suspension_survives_scheduler_reconstruction() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let accounts = MailboxAccountRepository::new(pool.clone());
     let account_id = insert_account(&accounts, "auth-restart@example.com", true).await;
     let first_runner = Arc::new(SequenceRunner::new(vec![Err(AppError::External {
-        service: "imap".to_owned(),
+        service: "imap_authentication".to_owned(),
         retryable: false,
         message: "authentication failed".to_owned(),
     })]));
@@ -925,6 +1529,115 @@ async fn scheduler_loop_can_be_stopped_after_its_initial_tick() {
     handle.stop().await.unwrap();
 
     assert_eq!(runner.account_ids.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn slow_first_account_does_not_block_starting_second_due_account() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let slow = insert_account(&accounts, "a-slow@example.com", true).await;
+    insert_account(&accounts, "z-fast@example.com", true).await;
+    let runner = Arc::new(SlowFirstRunner {
+        slow_account_id: slow,
+        slow_started: tokio::sync::Notify::new(),
+        fast_started: tokio::sync::Notify::new(),
+        release_slow: tokio::sync::Notify::new(),
+    });
+    let scheduler = Scheduler::new(pool, runner.clone());
+    let running = scheduler.clone();
+    let tick = tokio::spawn(async move { running.tick(Utc::now()).await });
+    runner.slow_started.notified().await;
+
+    let fast_started = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        runner.fast_started.notified(),
+    )
+    .await;
+    runner.release_slow.notify_one();
+    tick.await.unwrap().unwrap();
+
+    assert!(fast_started.is_ok());
+}
+
+#[tokio::test]
+async fn dropping_active_scheduler_handle_does_not_detach_child_task() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    insert_account(
+        &MailboxAccountRepository::new(pool.clone()),
+        "drop-active@example.com",
+        true,
+    )
+    .await;
+    let runner = Arc::new(CompletionBlockingRunner {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        completed: AtomicBool::new(false),
+        completed_signal: tokio::sync::Notify::new(),
+    });
+    let handle = Scheduler::new(pool, runner.clone()).start();
+    runner.started.notified().await;
+
+    drop(handle);
+    runner.release.notify_one();
+    let detached_completion = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        runner.completed_signal.notified(),
+    )
+    .await;
+
+    assert!(detached_completion.is_err());
+    assert!(!runner.completed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn stopping_scheduler_waits_for_in_flight_child_task() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    insert_account(
+        &MailboxAccountRepository::new(pool.clone()),
+        "stop-active@example.com",
+        true,
+    )
+    .await;
+    let runner = Arc::new(CompletionBlockingRunner {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        completed: AtomicBool::new(false),
+        completed_signal: tokio::sync::Notify::new(),
+    });
+    let handle = Scheduler::new(pool, runner.clone()).start();
+    runner.started.notified().await;
+
+    let stop = tokio::spawn(async move { handle.stop().await });
+    tokio::task::yield_now().await;
+    assert!(!stop.is_finished());
+
+    runner.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(1), stop)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert!(runner.completed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn ready_cancellation_prevents_overdue_scheduler_start() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    insert_account(
+        &MailboxAccountRepository::new(pool.clone()),
+        "cancel-overdue@example.com",
+        true,
+    )
+    .await;
+    let runner = Arc::new(RecordingRunner::default());
+    let scheduler = Scheduler::new(pool, runner.clone());
+
+    for _ in 0..64 {
+        scheduler.start().stop().await.unwrap();
+    }
+
+    assert!(runner.account_ids.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
