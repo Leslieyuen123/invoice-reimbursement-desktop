@@ -789,6 +789,43 @@ async fn highly_compressed_stream_is_bounded_before_staging() {
     assert_eq!(batch.last_exported_at, None);
 }
 
+#[tokio::test]
+async fn opaque_dct_stream_exports_without_in_process_decode() {
+    let app = TestApp::with_exportable_batch().await;
+    let normalized = normalized_path(&app.pool, app.item_ids[0]).await;
+    fs::write(
+        normalized,
+        pdf_with_filtered_stream("DCTDecode", b"opaque-jpeg-payload"),
+    )
+    .unwrap();
+
+    let result = app.exports.export(app.batch_id).await.unwrap();
+
+    assert!(result.directory.join("merged.pdf").is_file());
+}
+
+#[tokio::test]
+async fn allocative_stream_filters_are_rejected_before_staging() {
+    for filter in ["LZWDecode", "ASCII85Decode"] {
+        let app = TestApp::with_exportable_batch().await;
+        let normalized = normalized_path(&app.pool, app.item_ids[0]).await;
+        fs::write(
+            normalized,
+            pdf_with_filtered_stream(filter, b"encoded-payload"),
+        )
+        .unwrap();
+
+        let error = app.exports.export(app.batch_id).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Validation { field, message }
+                if field == "normalizedPdf" && message.contains("过滤器")
+        ));
+        assert_storage_empty(&app.paths);
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_and_out_of_root_originals_are_rejected_without_path_disclosure() {
@@ -1039,6 +1076,36 @@ fn high_ratio_flate_pdf(decoded_size: usize) -> Vec<u8> {
         "Parent" => pages_id,
         "MediaBox" => vec![0.into(), 0.into(), 100.into(), 150.into()],
         "Contents" => contents_id,
+    });
+    document.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn pdf_with_filtered_stream(filter: &str, content: &[u8]) -> Vec<u8> {
+    let mut document = Document::with_version("1.5");
+    let pages_id = document.new_object_id();
+    document.add_object(Stream::new(
+        dictionary! { "Filter" => Object::Name(filter.as_bytes().to_vec()) },
+        content.to_vec(),
+    ));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 100.into(), 150.into()],
     });
     document.objects.insert(
         pages_id,
