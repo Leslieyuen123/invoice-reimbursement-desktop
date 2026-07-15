@@ -324,7 +324,7 @@ async fn timestamp_collision_never_overwrites_an_existing_directory() {
 }
 
 #[tokio::test]
-async fn cancellation_after_publication_removes_package_and_keeps_batch_draft() {
+async fn cancellation_during_publication_claim_removes_staging_and_keeps_batch_draft() {
     let app = TestApp::with_exportable_batch().await;
     let blocker = app
         .pool
@@ -335,11 +335,10 @@ async fn cancellation_after_publication_removes_package_and_keeps_batch_draft() 
     let batch_id = app.batch_id;
     let task = tokio::spawn(async move { exports.export(batch_id).await });
 
-    let published = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let generated = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let staged = fs::read_dir(&app.paths.staging).unwrap().next().is_some();
-            let published = fs::read_dir(&app.paths.exports).unwrap().next().is_some();
-            if staged || published {
+            if staged {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -347,9 +346,10 @@ async fn cancellation_after_publication_removes_package_and_keeps_batch_draft() 
     })
     .await;
     assert!(
-        published.is_ok(),
+        generated.is_ok(),
         "package generation should finish before cancellation"
     );
+    assert_eq!(fs::read_dir(&app.paths.exports).unwrap().count(), 0);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     blocker
@@ -531,6 +531,31 @@ async fn artifacts_contain_exact_workbook_zip_and_manifest_data() {
         );
     }
     assert!(manifest["artifacts"].get("manifest.json").is_none());
+}
+
+#[tokio::test]
+async fn xlsx_rejects_cents_that_cannot_round_trip_through_numeric_cell() {
+    let app = TestApp::with_exportable_batch().await;
+    sqlx::query("UPDATE items SET amount_cents = ? WHERE id = ?")
+        .bind(9_007_199_254_740_990_i64)
+        .bind(app.item_ids[0].to_string())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let error = app.exports.export(app.batch_id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation { field, .. } if field == "amountCents"
+    ));
+    assert_storage_empty(&app.paths);
+    let batch = BatchRepository::new(app.pool)
+        .get(app.batch_id)
+        .await
+        .unwrap();
+    assert_eq!(batch.status, BatchStatus::Draft);
+    assert_eq!(batch.last_exported_at, None);
 }
 
 #[tokio::test]

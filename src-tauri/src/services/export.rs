@@ -26,6 +26,7 @@ pub struct ExportService {
     pool: SqlitePool,
     paths: AppPaths,
     active_exports: Arc<DashMap<Uuid, ()>>,
+    publisher: Arc<dyn DirectoryPublisher>,
 }
 
 impl ExportService {
@@ -34,6 +35,21 @@ impl ExportService {
             pool,
             paths,
             active_exports: Arc::new(DashMap::new()),
+            publisher: Arc::new(AtomicDirectoryPublisher),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_publisher(
+        pool: SqlitePool,
+        paths: AppPaths,
+        publisher: Arc<dyn DirectoryPublisher>,
+    ) -> Self {
+        Self {
+            pool,
+            paths,
+            active_exports: Arc::new(DashMap::new()),
+            publisher,
         }
     }
 
@@ -131,7 +147,7 @@ impl ExportService {
             exported_at.format("%Y%m%d-%H%M%S")
         ));
         let claim = batches.claim_export(&snapshot).await?;
-        let published = staging.publish(directory)?;
+        let published = self.publisher.publish(staging, directory).await?;
         if let Err(error) = claim.commit(exported_at).await {
             return Err(published.cleanup_after(error));
         }
@@ -142,6 +158,32 @@ impl ExportService {
             item_count: items.len(),
             total_amount_cents,
         })
+    }
+}
+
+#[async_trait::async_trait]
+trait DirectoryPublisher: Send + Sync {
+    async fn publish(
+        &self,
+        staging: OwnedExportDirectory,
+        destination: PathBuf,
+    ) -> Result<OwnedExportDirectory, AppError>;
+}
+
+struct AtomicDirectoryPublisher;
+
+#[async_trait::async_trait]
+impl DirectoryPublisher for AtomicDirectoryPublisher {
+    async fn publish(
+        &self,
+        staging: OwnedExportDirectory,
+        destination: PathBuf,
+    ) -> Result<OwnedExportDirectory, AppError> {
+        tokio::task::spawn_blocking(move || staging.publish(destination))
+            .await
+            .map_err(|_| AppError::Internal {
+                message: "atomic export publisher task failed".to_owned(),
+            })?
     }
 }
 
@@ -310,4 +352,165 @@ fn read_contained_regular_file(path: &Path, root: &Path, field: &str) -> Result<
         return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
     }
     fs::read(canonical_path).map_err(|_| AppError::validation(field, "票据文件无法读取"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use lopdf::{Document, Object, dictionary};
+    use tokio::sync::{Notify, oneshot};
+    use uuid::Uuid;
+
+    use super::{DirectoryPublisher, ExportService, OwnedExportDirectory};
+    use crate::db;
+    use crate::db::batches::BatchRepository;
+    use crate::db::items::{ItemRepository, NewItemRecord};
+    use crate::domain::error::AppError;
+    use crate::domain::model::{
+        BatchStatus, Category, ConfirmationStatus, DedupeStatus, NewBatch, RecognitionStatus,
+        SourceType,
+    };
+    use crate::infra::files::AppPaths;
+
+    struct GatedRealPublisher {
+        published: Mutex<Option<oneshot::Sender<PathBuf>>>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl DirectoryPublisher for GatedRealPublisher {
+        async fn publish(
+            &self,
+            staging: OwnedExportDirectory,
+            destination: PathBuf,
+        ) -> Result<OwnedExportDirectory, AppError> {
+            let published = tokio::task::spawn_blocking(move || staging.publish(destination))
+                .await
+                .map_err(|_| AppError::Internal {
+                    message: "test publisher task failed".to_owned(),
+                })??;
+            self.published
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(published.path().to_path_buf())
+                .unwrap();
+            self.release.notified().await;
+            Ok(published)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_real_publication_removes_final_and_keeps_batch_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let batch = BatchRepository::new(pool.clone())
+            .create(NewBatch::try_new("取消测试", "2026-07-01", "2026-07-31", None).unwrap())
+            .await
+            .unwrap();
+        let item_id = Uuid::new_v4();
+        let original = paths.originals.join(format!("{item_id}.pdf"));
+        let normalized = paths.normalized.join(format!("{item_id}.pdf"));
+        fs::write(&original, b"original").unwrap();
+        fs::write(&normalized, one_page_pdf()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 2, 0, 0).unwrap();
+        ItemRepository::new(pool.clone())
+            .insert(&NewItemRecord {
+                id: item_id,
+                original_name: "invoice.pdf".to_owned(),
+                original_path: original.to_string_lossy().into_owned(),
+                normalized_pdf_path: Some(normalized.to_string_lossy().into_owned()),
+                sha256: "fixture-sha256".to_owned(),
+                mime_type: "application/pdf".to_owned(),
+                source_type: SourceType::ManualUpload,
+                source_account_id: None,
+                source_mailbox: None,
+                source_uid_validity: None,
+                source_uid: None,
+                source_message_id: None,
+                source_part_id: None,
+                fetched_at: now,
+                invoice_date: Some(NaiveDate::from_ymd_opt(2026, 7, 12).unwrap()),
+                suggested_period: Some("2026-07".to_owned()),
+                batch_id: Some(batch.id),
+                suggested_category: Some(Category::Transport),
+                final_category: Some(Category::Transport),
+                amount_cents: Some(12_345),
+                currency: "CNY".to_owned(),
+                city: None,
+                company: None,
+                recognition_status: RecognitionStatus::Succeeded,
+                confirmation_status: ConfirmationStatus::Confirmed,
+                dedupe_status: DedupeStatus::Unique,
+                duplicate_of_id: None,
+                note: None,
+                event_tag: None,
+                project_tag: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let (published_tx, published_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let service = ExportService::with_publisher(
+            pool.clone(),
+            paths.clone(),
+            Arc::new(GatedRealPublisher {
+                published: Mutex::new(Some(published_tx)),
+                release: release.clone(),
+            }),
+        );
+        let task = tokio::spawn(async move { service.export(batch.id).await });
+
+        let final_directory = tokio::time::timeout(std::time::Duration::from_secs(5), published_rx)
+            .await
+            .expect("publisher should report final rename")
+            .expect("publisher signal should remain open");
+        assert!(final_directory.is_dir());
+        assert_eq!(fs::read_dir(&paths.staging).unwrap().count(), 0);
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        release.notify_waiters();
+
+        assert!(!final_directory.exists());
+        assert_eq!(fs::read_dir(&paths.staging).unwrap().count(), 0);
+        let batch = BatchRepository::new(pool).get(batch.id).await.unwrap();
+        assert_eq!(batch.status, BatchStatus::Draft);
+        assert_eq!(batch.last_exported_at, None);
+    }
+
+    fn one_page_pdf() -> Vec<u8> {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 150.into()],
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
+    }
 }

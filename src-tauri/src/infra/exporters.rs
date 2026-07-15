@@ -311,8 +311,6 @@ fn create_workbook(batch: &Batch, items: &[ExportItem]) -> Result<Vec<u8>, AppEr
         "事项标签",
         "项目标签",
     ];
-    const MAX_EXACT_F64_INTEGER: i64 = 9_007_199_254_740_991;
-
     let mut workbook = Workbook::new();
     let currency = Format::new().set_num_format("¥#,##0.00");
     let worksheet = workbook.add_worksheet();
@@ -329,9 +327,7 @@ fn create_workbook(batch: &Batch, items: &[ExportItem]) -> Result<Vec<u8>, AppEr
         let amount_cents = item
             .amount_cents
             .ok_or_else(|| validation_error("amountCents", "票据金额不能为空"))?;
-        if amount_cents > MAX_EXACT_F64_INTEGER {
-            return Err(validation_error("amountCents", "票据金额无法精确导出"));
-        }
+        let amount = exact_xlsx_amount(amount_cents)?;
         write_string(
             worksheet,
             row,
@@ -347,7 +343,7 @@ fn create_workbook(batch: &Batch, items: &[ExportItem]) -> Result<Vec<u8>, AppEr
             item.final_category.map(category_label).map(str::to_owned),
         )?;
         worksheet
-            .write_number_with_format(row, 4, amount_cents as f64 / 100.0, &currency)
+            .write_number_with_format(row, 4, amount, &currency)
             .map_err(|_| internal_error("failed to write reimbursement amount"))?;
         write_string(worksheet, row, 5, item.city.clone())?;
         write_string(worksheet, row, 6, item.company.clone())?;
@@ -365,6 +361,21 @@ fn create_workbook(batch: &Batch, items: &[ExportItem]) -> Result<Vec<u8>, AppEr
     workbook
         .save_to_buffer()
         .map_err(|_| internal_error("failed to create reimbursement workbook"))
+}
+
+fn exact_xlsx_amount(cents: i64) -> Result<f64, AppError> {
+    let value = cents as f64 / 100.0;
+    let recovered = (value * 100.0).round();
+    const I64_MAX_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if !value.is_finite()
+        || !recovered.is_finite()
+        || recovered < i64::MIN as f64
+        || recovered >= I64_MAX_EXCLUSIVE
+        || recovered as i64 != cents
+    {
+        return Err(validation_error("amountCents", "票据金额无法精确导出"));
+    }
+    Ok(value)
 }
 
 fn write_string(
@@ -454,13 +465,51 @@ fn internal_error(message: &str) -> AppError {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::io;
 
+    use super::exact_xlsx_amount;
+    #[cfg(unix)]
     use super::publish_directory_with_sync;
 
+    #[test]
+    fn xlsx_amount_round_trips_regular_cent_values() {
+        for cents in [0_i64, 1, 99, 100, 12_345, 4_485_000_001] {
+            let value = exact_xlsx_amount(cents).unwrap();
+            assert_eq!((value * 100.0).round() as i64, cents);
+        }
+    }
+
+    #[test]
+    fn xlsx_amount_rejects_collapsed_values_near_f64_integer_limit() {
+        for cents in [
+            9_007_199_254_740_984_i64,
+            9_007_199_254_740_986,
+            9_007_199_254_740_988,
+            9_007_199_254_740_989,
+            9_007_199_254_740_991,
+        ] {
+            assert!(exact_xlsx_amount(cents).is_ok(), "should preserve {cents}");
+        }
+        for cents in [
+            9_007_199_254_740_985_i64,
+            9_007_199_254_740_987,
+            9_007_199_254_740_990,
+            i64::MAX,
+        ] {
+            assert!(exact_xlsx_amount(cents).is_err(), "must reject {cents}");
+        }
+
+        let collapsed_low = 9_007_199_254_740_990_i64 as f64 / 100.0;
+        let adjacent_high = 9_007_199_254_740_991_i64 as f64 / 100.0;
+        assert_eq!(collapsed_low, adjacent_high);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn publication_sync_failure_rolls_directory_back_to_staging() {
         let directory = tempfile::tempdir().unwrap();
