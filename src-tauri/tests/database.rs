@@ -34,6 +34,7 @@ async fn connect_runs_migrations_and_creates_application_tables() {
         "batches",
         "items",
         "mailbox_accounts",
+        "pending_account_saves",
         "settings",
         "sync_cursors",
         "sync_runs",
@@ -43,6 +44,57 @@ async fn connect_runs_migrations_and_creates_application_tables() {
             "missing table {table}; found {tables:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn migrations_upgrade_database_through_0004_with_pending_account_saves() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let current = sqlx::migrate!("./migrations");
+    let through_0004 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(current.iter().take(4).cloned().collect()),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0004.run(&pool).await.unwrap();
+    let existing_account_id = Uuid::new_v4();
+    insert_mailbox_account(&pool, existing_account_id).await;
+
+    current.run(&pool).await.unwrap();
+
+    let pending_account_columns = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM pragma_table_info('pending_account_saves') ORDER BY cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending_account_columns,
+        vec![
+            "operation_id",
+            "account_id",
+            "phase",
+            "is_update",
+            "provider",
+            "email",
+            "imap_host",
+            "imap_port",
+            "enabled",
+            "sync_interval_minutes",
+            "created_at",
+            "updated_at",
+        ]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mailbox_accounts WHERE id = ?")
+            .bind(existing_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]

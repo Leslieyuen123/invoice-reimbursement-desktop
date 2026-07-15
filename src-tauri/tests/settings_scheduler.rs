@@ -12,6 +12,7 @@ use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
 use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta};
+use invoice_reimbursement::services::account_saves::AccountSagaRegistry;
 use invoice_reimbursement::services::scheduler::{
     Clock, ManualClock, Scheduler, SyncRunner, SyncStartBarrier,
 };
@@ -149,42 +150,6 @@ impl CredentialStore for ControlledCredentialStore {
 }
 
 #[derive(Default)]
-struct RecoveryFailureCredentialStore {
-    secrets: RwLock<HashMap<String, String>>,
-    set_calls: AtomicUsize,
-}
-
-impl CredentialStore for RecoveryFailureCredentialStore {
-    fn get(&self, account_id: &str) -> Result<Option<String>, AppError> {
-        Ok(self.secrets.read().unwrap().get(account_id).cloned())
-    }
-
-    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
-        let call = self.set_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if matches!(call, 2 | 3) {
-            return Err(AppError::External {
-                service: "keyring".to_owned(),
-                retryable: false,
-                message: format!(
-                    "failed credential stage old-secret\nnew-secret\0{secret}{}",
-                    "x".repeat(700)
-                ),
-            });
-        }
-        self.secrets
-            .write()
-            .unwrap()
-            .insert(account_id.to_owned(), secret.to_owned());
-        Ok(())
-    }
-
-    fn delete(&self, account_id: &str) -> Result<(), AppError> {
-        self.secrets.write().unwrap().remove(account_id);
-        Ok(())
-    }
-}
-
-#[derive(Default)]
 struct NewAccountRecoveryFailureCredentialStore;
 
 impl CredentialStore for NewAccountRecoveryFailureCredentialStore {
@@ -217,6 +182,58 @@ struct BlockingCredentialStore {
     set_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     released: Mutex<bool>,
     release_signal: Condvar,
+}
+
+#[derive(Default)]
+struct FailNextLiveCredentialStore {
+    secrets: RwLock<HashMap<String, String>>,
+    fail_next_live_set: AtomicBool,
+}
+
+impl FailNextLiveCredentialStore {
+    fn fail_next_live_set(&self) {
+        self.fail_next_live_set.store(true, Ordering::SeqCst);
+    }
+}
+
+impl CredentialStore for FailNextLiveCredentialStore {
+    fn get(&self, account_id: &str) -> Result<Option<String>, AppError> {
+        Ok(self.secrets.read().unwrap().get(account_id).cloned())
+    }
+
+    fn set(&self, account_id: &str, secret: &str) -> Result<(), AppError> {
+        if !account_id.starts_with("pending-save:")
+            && self.fail_next_live_set.swap(false, Ordering::SeqCst)
+        {
+            return Err(AppError::External {
+                service: "keyring".to_owned(),
+                retryable: false,
+                message: format!("failed to publish live credential {secret}\n\0"),
+            });
+        }
+        self.secrets
+            .write()
+            .unwrap()
+            .insert(account_id.to_owned(), secret.to_owned());
+        Ok(())
+    }
+
+    fn delete(&self, account_id: &str) -> Result<(), AppError> {
+        self.secrets.write().unwrap().remove(account_id);
+        Ok(())
+    }
+}
+
+struct DropSignal {
+    dropped: Arc<AtomicBool>,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+        self.signal.notify_one();
+    }
 }
 
 impl BlockingCredentialStore {
@@ -568,15 +585,67 @@ async fn credential_set_failure_preserves_edited_account_and_old_secret() {
 }
 
 #[tokio::test]
-async fn credential_recovery_failure_does_not_expose_either_secret() {
+async fn duplicate_email_edit_is_rejected_before_any_credential_is_staged() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
-    let credentials = Arc::new(RecoveryFailureCredentialStore::default());
+    let credentials = Arc::new(ControlledCredentialStore::default());
+    let service =
+        settings_service_with(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let first = service
+        .save_account(save_input(None, "first@example.com", "first-secret"))
+        .await
+        .unwrap();
+    service
+        .save_account(save_input(None, "second@example.com", "second-secret"))
+        .await
+        .unwrap();
+    let writes_before_conflict = credentials.set_calls.load(Ordering::SeqCst);
+
+    let error = service
+        .save_account(save_input(
+            Some(first.id),
+            "second@example.com",
+            "replacement-secret",
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, AppError::Conflict { .. }));
+    assert_eq!(
+        MailboxAccountRepository::new(pool.clone())
+            .get(first.id)
+            .await
+            .unwrap()
+            .email,
+        "first@example.com"
+    );
+    assert_eq!(
+        credentials.get(&first.id.to_string()).unwrap().as_deref(),
+        Some("first-secret")
+    );
+    assert_eq!(
+        credentials.set_calls.load(Ordering::SeqCst),
+        writes_before_conflict
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn final_credential_failure_does_not_expose_either_secret() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(FailNextLiveCredentialStore::default());
     let service =
         settings_service_with(pool.clone(), Arc::new(PassingGateway), credentials.clone());
     let account = service
         .save_account(save_input(None, "recovery@example.com", "old-secret"))
         .await
         .unwrap();
+    credentials.fail_next_live_set();
 
     let error = service
         .save_account(save_input(
@@ -588,15 +657,20 @@ async fn credential_recovery_failure_does_not_expose_either_secret() {
         .unwrap_err();
     let message = error.to_string();
 
-    assert!(matches!(error, AppError::Internal { .. }));
+    assert!(matches!(error, AppError::External { .. }));
     assert!(!message.contains("old-secret"));
     assert!(!message.contains("new-secret"));
     assert!(!message.chars().any(char::is_control));
     assert!(message.chars().count() <= 512);
-    assert!(message.contains("credential recovery"));
-    assert!(message.contains("metadata recovery"));
     assert_eq!(
-        MailboxAccountRepository::new(pool)
+        sqlx::query_scalar::<_, String>("SELECT phase FROM pending_account_saves")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "credential_staged"
+    );
+    assert_eq!(
+        MailboxAccountRepository::new(pool.clone())
             .get(account.id)
             .await
             .unwrap()
@@ -610,13 +684,11 @@ async fn credential_recovery_failure_does_not_expose_either_secret() {
 }
 
 #[tokio::test]
-async fn new_account_compensation_failure_is_bounded_and_redacts_attempted_secret() {
+async fn temp_credential_failure_is_bounded_redacted_and_reconciles_marker_only() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
-    let service = settings_service_with(
-        pool.clone(),
-        Arc::new(PassingGateway),
-        Arc::new(NewAccountRecoveryFailureCredentialStore),
-    );
+    let credentials = Arc::new(NewAccountRecoveryFailureCredentialStore);
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials);
+    let service = state.settings_service();
 
     let error = service
         .save_account(save_input(
@@ -628,14 +700,29 @@ async fn new_account_compensation_failure_is_bounded_and_redacts_attempted_secre
         .unwrap_err();
     let message = error.to_string();
 
-    assert!(matches!(error, AppError::Internal { .. }));
+    assert!(matches!(error, AppError::External { .. }));
     assert!(!message.contains("new-secret"));
     assert!(!message.chars().any(char::is_control));
     assert!(message.chars().count() <= 512);
-    assert!(message.contains("credential recovery"));
-    assert!(message.contains("metadata recovery"));
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mailbox_accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    state.reconcile_account_saves().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
             .fetch_one(&pool)
             .await
             .unwrap(),
@@ -644,7 +731,7 @@ async fn new_account_compensation_failure_is_bounded_and_redacts_attempted_secre
 }
 
 #[tokio::test]
-async fn blank_secret_edit_reuses_old_credential_without_rewriting_keyring() {
+async fn blank_secret_edit_stages_and_republishes_old_credential() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let credentials = Arc::new(ControlledCredentialStore::default());
     let gateway = Arc::new(CapturingGateway::default());
@@ -664,7 +751,7 @@ async fn blank_secret_edit_reuses_old_credential_without_rewriting_keyring() {
         credentials.get(&original.id.to_string()).unwrap(),
         Some("old-secret".to_owned())
     );
-    assert_eq!(credentials.set_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(credentials.set_calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         *gateway.tested_secrets.lock().unwrap(),
         vec!["old-secret".to_owned(), "old-secret".to_owned()]
@@ -940,8 +1027,8 @@ async fn blocking_credential_write_does_not_hold_sqlite_writer_transaction() {
 async fn cancelled_new_account_save_finishes_after_keyring_succeeds() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let credentials = Arc::new(BlockingCredentialStore::default());
-    let service =
-        settings_service_with(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let service = state.settings_service();
     let set_started = credentials.block_next_set();
     let saving_service = service.clone();
     let caller = tokio::spawn(async move {
@@ -957,37 +1044,43 @@ async fn cancelled_new_account_save_finishes_after_keyring_succeeds() {
             .fetch_one(&pool)
             .await
             .unwrap();
+    let marker_during_keyring =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     credentials.release_set();
-    let finished = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let account_id =
-                sqlx::query_scalar::<_, String>("SELECT id FROM mailbox_accounts WHERE email = ?")
-                    .bind("cancel-new@example.com")
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap();
-            if account_id.as_ref().is_some_and(|account_id| {
-                credentials.get(account_id).unwrap().as_deref() == Some("new-secret")
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
+    state.account_sagas().wait_all().await.unwrap();
+    let account_id =
+        sqlx::query_scalar::<_, String>("SELECT id FROM mailbox_accounts WHERE email = ?")
+            .bind("cancel-new@example.com")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
-    assert_eq!(metadata_during_keyring, 1);
-    assert!(finished.is_ok());
+    assert_eq!(metadata_during_keyring, 0);
+    assert_eq!(marker_during_keyring, 1);
+    assert_eq!(
+        credentials.get(&account_id).unwrap().as_deref(),
+        Some("new-secret")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
-async fn cancelled_new_account_save_compensates_after_keyring_failure() {
+async fn cancelled_new_account_temp_failure_remains_owned_and_reconciles() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let credentials = Arc::new(BlockingCredentialStore::default());
-    let service =
-        settings_service_with(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let service = state.settings_service();
     let set_started = credentials.block_next_set_with_failure();
     let saving_service = service.clone();
     let caller = tokio::spawn(async move {
@@ -1010,34 +1103,34 @@ async fn cancelled_new_account_save_compensates_after_keyring_failure() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     credentials.release_set();
-    let compensated = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let count = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM mailbox_accounts WHERE email = ?",
-            )
-            .bind("cancel-new-failure@example.com")
+    let error = state.account_sagas().wait_all().await.unwrap_err();
+
+    assert_eq!(metadata_during_keyring, 0);
+    assert!(!error.to_string().contains("new-secret"));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT phase FROM pending_account_saves")
             .fetch_one(&pool)
             .await
-            .unwrap();
-            if count == 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-
-    assert_eq!(metadata_during_keyring, 1);
-    assert!(compensated.is_ok());
+            .unwrap(),
+        "prepared"
+    );
+    state.reconcile_account_saves().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_account_saves")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
     assert!(credentials.secrets.read().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn cancelled_account_edit_keeps_guard_and_restores_full_state_on_keyring_failure() {
+async fn cancelled_account_edit_keeps_guard_and_live_state_until_temp_failure_reconciles() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let credentials = Arc::new(BlockingCredentialStore::default());
-    let service =
-        settings_service_with(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let service = state.settings_service();
     let account = service
         .save_account(save_input(None, "cancel-edit@example.com", "old-secret"))
         .await
@@ -1078,23 +1171,18 @@ async fn cancelled_account_edit_keeps_guard_and_restores_full_state_on_keyring_f
         })
         .await;
     credentials.release_set();
-    let compensated = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if accounts.get(account.id).await.unwrap() == original_account
-                && accounts.get_retry_state(account.id).await.unwrap() == original_retry
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
+    let error = state.account_sagas().wait_all().await.unwrap_err();
+    state.reconcile_account_saves().await.unwrap();
 
-    assert_eq!(staged_account.email, "cancel-edit-updated@example.com");
-    assert_eq!(staged_account.last_error, None);
-    assert_eq!(staged_retry, None);
+    assert_eq!(staged_account, original_account);
+    assert_eq!(staged_retry, original_retry);
     assert!(matches!(conflict, Err(AppError::Conflict { .. })));
-    assert!(compensated.is_ok());
+    assert!(!error.to_string().contains("new-secret"));
+    assert_eq!(accounts.get(account.id).await.unwrap(), original_account);
+    assert_eq!(
+        accounts.get_retry_state(account.id).await.unwrap(),
+        original_retry
+    );
     assert_eq!(
         credentials.get(&account.id.to_string()).unwrap(),
         Some("old-secret".to_owned())
@@ -2046,6 +2134,366 @@ async fn scheduler_only_runs_enabled_due_accounts() {
     assert!(!runner.account_ids.lock().unwrap().contains(&disabled));
 }
 
+#[tokio::test]
+async fn prepared_marker_without_temp_is_rolled_back_after_restart() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "before-marker@example.com", true).await;
+    credentials
+        .set(&account_id.to_string(), "old-secret")
+        .unwrap();
+    let operation_id = Uuid::new_v4();
+    insert_pending_save(
+        &pool,
+        operation_id,
+        account_id,
+        "prepared",
+        true,
+        "after-marker@example.com",
+    )
+    .await;
+    drop(mailbox_state(
+        pool.clone(),
+        Arc::new(PassingGateway),
+        credentials.clone(),
+    ));
+
+    let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    restarted.reconcile_account_saves().await.unwrap();
+
+    assert_eq!(
+        accounts.get(account_id).await.unwrap().email,
+        "before-marker@example.com"
+    );
+    assert_eq!(
+        credentials.get(&account_id.to_string()).unwrap().as_deref(),
+        Some("old-secret")
+    );
+    assert_pending_save_cleaned(&pool, credentials.as_ref(), operation_id).await;
+}
+
+#[tokio::test]
+async fn prepared_new_account_with_temp_rolls_forward_after_restart() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let account_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    insert_pending_save(
+        &pool,
+        operation_id,
+        account_id,
+        "prepared",
+        false,
+        "prepared-temp@example.com",
+    )
+    .await;
+    credentials
+        .set(&pending_save_key(operation_id), "new-secret")
+        .unwrap();
+    drop(mailbox_state(
+        pool.clone(),
+        Arc::new(PassingGateway),
+        credentials.clone(),
+    ));
+
+    let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    restarted.reconcile_account_saves().await.unwrap();
+
+    assert_eq!(
+        MailboxAccountRepository::new(pool.clone())
+            .get(account_id)
+            .await
+            .unwrap()
+            .email,
+        "prepared-temp@example.com"
+    );
+    assert_eq!(
+        credentials.get(&account_id.to_string()).unwrap().as_deref(),
+        Some("new-secret")
+    );
+    assert_pending_save_cleaned(&pool, credentials.as_ref(), operation_id).await;
+}
+
+#[tokio::test]
+async fn staged_edit_with_live_credential_switched_rolls_forward_after_restart() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "before-switch@example.com", true).await;
+    let operation_id = Uuid::new_v4();
+    insert_pending_save(
+        &pool,
+        operation_id,
+        account_id,
+        "credential_staged",
+        true,
+        "after-switch@example.com",
+    )
+    .await;
+    credentials
+        .set(&pending_save_key(operation_id), "new-secret")
+        .unwrap();
+    credentials
+        .set(&account_id.to_string(), "new-secret")
+        .unwrap();
+    drop(mailbox_state(
+        pool.clone(),
+        Arc::new(PassingGateway),
+        credentials.clone(),
+    ));
+
+    let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    restarted.reconcile_account_saves().await.unwrap();
+
+    assert_eq!(
+        accounts.get(account_id).await.unwrap().email,
+        "after-switch@example.com"
+    );
+    assert_eq!(
+        credentials.get(&account_id.to_string()).unwrap().as_deref(),
+        Some("new-secret")
+    );
+    assert_pending_save_cleaned(&pool, credentials.as_ref(), operation_id).await;
+}
+
+#[tokio::test]
+async fn committed_marker_only_cleans_temp_and_marker_after_restart() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "committed@example.com", true).await;
+    let operation_id = Uuid::new_v4();
+    insert_pending_save(
+        &pool,
+        operation_id,
+        account_id,
+        "committed",
+        true,
+        "committed@example.com",
+    )
+    .await;
+    credentials
+        .set(&pending_save_key(operation_id), "final-secret")
+        .unwrap();
+    credentials
+        .set(&account_id.to_string(), "final-secret")
+        .unwrap();
+    drop(mailbox_state(
+        pool.clone(),
+        Arc::new(PassingGateway),
+        credentials.clone(),
+    ));
+
+    let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    restarted.reconcile_account_saves().await.unwrap();
+
+    assert_eq!(
+        accounts.get(account_id).await.unwrap().email,
+        "committed@example.com"
+    );
+    assert_eq!(
+        credentials.get(&account_id.to_string()).unwrap().as_deref(),
+        Some("final-secret")
+    );
+    assert_pending_save_cleaned(&pool, credentials.as_ref(), operation_id).await;
+}
+
+#[tokio::test]
+async fn final_credential_failure_preserves_durable_state_and_restart_forwards() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(FailNextLiveCredentialStore::default());
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    credentials.fail_next_live_set();
+
+    let error = state
+        .settings_service()
+        .save_account(save_input(
+            None,
+            "resume-final-set@example.com",
+            "durable-secret",
+        ))
+        .await
+        .unwrap_err();
+    let (operation_id, account_id, phase) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT operation_id, account_id, phase FROM pending_account_saves",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let operation_id = Uuid::parse_str(&operation_id).unwrap();
+    let account_id = Uuid::parse_str(&account_id).unwrap();
+    let persisted_marker = sqlx::query_scalar::<_, String>(
+        "SELECT operation_id || account_id || phase || email || imap_host \
+         FROM pending_account_saves WHERE operation_id = ?",
+    )
+    .bind(operation_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(phase, "credential_staged");
+    assert!(!error.to_string().contains("durable-secret"));
+    assert!(!error.to_string().chars().any(char::is_control));
+    assert!(!persisted_marker.contains("durable-secret"));
+    assert_eq!(
+        credentials
+            .get(&pending_save_key(operation_id))
+            .unwrap()
+            .as_deref(),
+        Some("durable-secret")
+    );
+    assert!(
+        MailboxAccountRepository::new(pool.clone())
+            .get(account_id)
+            .await
+            .is_err()
+    );
+    drop(state);
+
+    let restarted = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    restarted.reconcile_account_saves().await.unwrap();
+
+    assert_eq!(
+        MailboxAccountRepository::new(pool.clone())
+            .get(account_id)
+            .await
+            .unwrap()
+            .email,
+        "resume-final-set@example.com"
+    );
+    assert_eq!(
+        credentials.get(&account_id.to_string()).unwrap().as_deref(),
+        Some("durable-secret")
+    );
+    assert_pending_save_cleaned(&pool, credentials.as_ref(), operation_id).await;
+}
+
+#[tokio::test]
+async fn pending_existing_account_cannot_run_manual_or_scheduled_sync() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let credentials = Arc::new(FailNextLiveCredentialStore::default());
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account_id = insert_account(&accounts, "pending-sync@example.com", true).await;
+    credentials
+        .set(&account_id.to_string(), "old-secret")
+        .unwrap();
+    let operation_id = Uuid::new_v4();
+    insert_pending_save(
+        &pool,
+        operation_id,
+        account_id,
+        "credential_staged",
+        true,
+        "pending-sync-updated@example.com",
+    )
+    .await;
+    credentials
+        .set(&pending_save_key(operation_id), "new-secret")
+        .unwrap();
+    let state = mailbox_state(pool.clone(), Arc::new(PassingGateway), credentials.clone());
+    let runner = Arc::new(RecordingRunner::default());
+    let scheduler = state.scheduler(runner.clone());
+
+    credentials.fail_next_live_set();
+    let manual = scheduler.sync_now(account_id).await;
+    credentials.fail_next_live_set();
+    let scheduled = scheduler.tick(Utc::now()).await;
+
+    assert!(manual.is_err());
+    assert!(scheduled.is_err());
+    assert!(runner.account_ids.lock().unwrap().is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_account_saves WHERE account_id = ?",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn account_saga_registry_owns_child_after_receiver_is_dropped() {
+    let registry = AccountSagaRegistry::default();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(AtomicBool::new(false));
+    let child_release = release.clone();
+    let child_completed = completed.clone();
+    let receiver = registry.spawn(async move {
+        child_release.notified().await;
+        child_completed.store(true, Ordering::SeqCst);
+        Ok::<_, AppError>(())
+    });
+    drop(receiver);
+
+    release.notify_one();
+    registry.wait_all().await.unwrap();
+
+    assert!(completed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn account_saga_registry_shutdown_waits_and_preserves_child_error() {
+    let registry = AccountSagaRegistry::default();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let child_release = release.clone();
+    let receiver = registry.spawn(async move {
+        child_release.notified().await;
+        Err::<(), _>(AppError::Internal {
+            message: "durable account save failed".to_owned(),
+        })
+    });
+    drop(receiver);
+    let waiting_registry = registry.clone();
+    let wait = tokio::spawn(async move { waiting_registry.wait_all().await });
+    tokio::task::yield_now().await;
+    assert!(!wait.is_finished());
+
+    release.notify_one();
+    let error = wait.await.unwrap().unwrap_err();
+
+    assert!(error.to_string().contains("durable account save failed"));
+}
+
+#[tokio::test]
+async fn aborting_account_saga_shutdown_aborts_blocked_child_without_detach() {
+    let registry = AccountSagaRegistry::default();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cleanup = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let dropped_signal = Arc::new(tokio::sync::Notify::new());
+    let child_started = started.clone();
+    let child_cleanup = cleanup.clone();
+    let child_dropped = dropped.clone();
+    let child_dropped_signal = dropped_signal.clone();
+    let receiver = registry.spawn(async move {
+        let _drop_signal = DropSignal {
+            dropped: child_dropped,
+            signal: child_dropped_signal,
+        };
+        child_started.notify_one();
+        child_cleanup.notified().await;
+        Ok::<_, AppError>(())
+    });
+    drop(receiver);
+    started.notified().await;
+    let waiting_registry = registry.clone();
+    let wait = tokio::spawn(async move { waiting_registry.wait_all().await });
+    tokio::task::yield_now().await;
+
+    wait.abort();
+    assert!(wait.await.unwrap_err().is_cancelled());
+    let aborted =
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_signal.notified()).await;
+    cleanup.notify_one();
+
+    assert!(aborted.is_ok());
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
 async fn insert_account(accounts: &MailboxAccountRepository, email: &str, enabled: bool) -> Uuid {
     accounts
         .insert(NewMailboxAccount {
@@ -2120,4 +2568,56 @@ fn mailbox_state(
     let directory = tempfile::tempdir().unwrap();
     let paths = AppPaths::create(directory.path()).unwrap();
     AppState::with_gateway(pool, paths, credentials, gateway)
+}
+
+async fn insert_pending_save(
+    pool: &sqlx::SqlitePool,
+    operation_id: Uuid,
+    account_id: Uuid,
+    phase: &str,
+    is_update: bool,
+    email: &str,
+) {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO pending_account_saves (\
+            operation_id, account_id, phase, is_update, provider, email, imap_host, imap_port, \
+            enabled, sync_interval_minutes, created_at, updated_at\
+         ) VALUES (?, ?, ?, ?, 'gmail', ?, 'imap.gmail.com', 993, 1, 15, ?, ?)",
+    )
+    .bind(operation_id.to_string())
+    .bind(account_id.to_string())
+    .bind(phase)
+    .bind(is_update)
+    .bind(email)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn pending_save_key(operation_id: Uuid) -> String {
+    format!("pending-save:{operation_id}")
+}
+
+async fn assert_pending_save_cleaned(
+    pool: &sqlx::SqlitePool,
+    credentials: &dyn CredentialStore,
+    operation_id: Uuid,
+) {
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_account_saves WHERE operation_id = ?",
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        credentials.get(&pending_save_key(operation_id)).unwrap(),
+        None
+    );
 }

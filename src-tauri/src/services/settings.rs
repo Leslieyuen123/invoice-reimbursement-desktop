@@ -7,14 +7,12 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 use crate::db::accounts::{
-    MailboxAccount, MailboxAccountRepository, MailboxAccountSnapshot, MailboxProvider,
-    NewMailboxAccount,
+    MailboxAccount, MailboxAccountRepository, MailboxProvider, NewMailboxAccount,
 };
-use crate::domain::error::{AppError, sanitize_app_error, sanitize_message};
-use crate::infra::credentials::{
-    CredentialStore, delete_credential, get_credential, set_credential,
-};
+use crate::domain::error::{AppError, sanitize_app_error};
+use crate::infra::credentials::{CredentialStore, delete_credential, get_credential};
 use crate::infra::imap::{ImapAccountConfig, ImapGateway};
+use crate::services::account_saves::AccountSaveCoordinator;
 use crate::services::operations::AccountOperationCoordinator;
 
 pub struct SaveAccountInput {
@@ -85,6 +83,7 @@ pub struct SettingsService {
     accounts: MailboxAccountRepository,
     background_gate: BackgroundSyncGate,
     operations: AccountOperationCoordinator,
+    account_saves: AccountSaveCoordinator,
 }
 
 impl SettingsService {
@@ -94,6 +93,7 @@ impl SettingsService {
         credentials: Arc<dyn CredentialStore>,
         background_gate: BackgroundSyncGate,
         operations: AccountOperationCoordinator,
+        account_saves: AccountSaveCoordinator,
     ) -> Self {
         Self {
             accounts: MailboxAccountRepository::new(pool.clone()),
@@ -102,10 +102,12 @@ impl SettingsService {
             credentials,
             background_gate,
             operations,
+            account_saves,
         }
     }
 
     pub async fn save_account(&self, input: SaveAccountInput) -> Result<MailboxAccount, AppError> {
+        self.account_saves.reconcile_all().await?;
         let is_update = input.id.is_some();
         let account_id = input.id.unwrap_or_else(Uuid::new_v4);
         let operation_guard = self.operations.try_lock(account_id)?;
@@ -115,20 +117,11 @@ impl SettingsService {
             input.imap_host.as_deref(),
             input.imap_port,
         )?;
-        let resolved_secret = self.resolve_secret(input.id, input.secret).await?;
-        if let Err(error) = self
-            .gateway
-            .test_connection(&config, &resolved_secret.value)
-            .await
-        {
-            return Err(sanitize_error(error, &resolved_secret.value));
+        let secret = self.resolve_secret(input.id, input.secret).await?;
+        if let Err(error) = self.gateway.test_connection(&config, &secret).await {
+            return Err(sanitize_error(error, &secret));
         }
 
-        let previous_secret = match input.id {
-            Some(_) if !resolved_secret.replace => Some(resolved_secret.value.clone()),
-            Some(id) => get_credential(self.credentials.clone(), id.to_string()).await?,
-            None => None,
-        };
         let metadata = NewMailboxAccount {
             provider: input.provider,
             email: input.email,
@@ -137,45 +130,44 @@ impl SettingsService {
             enabled: input.enabled,
             sync_interval_minutes: input.sync_interval_minutes,
         };
-        let service = self.clone();
-        tokio::spawn(async move {
-            let _operation_guard = operation_guard;
-            service
-                .run_account_save_saga(
-                    account_id,
-                    is_update,
-                    metadata,
-                    resolved_secret,
-                    previous_secret,
-                )
-                .await
-        })
-        .await
-        .map_err(|_| AppError::Internal {
-            message: "mailbox account save task failed".to_owned(),
-        })?
+        self.account_saves
+            .start_save(operation_guard, account_id, is_update, metadata, secret)
+            .await
+            .map_err(|_| AppError::Internal {
+                message: "mailbox account save result was lost".to_owned(),
+            })?
     }
 
     pub async fn test_account(&self, input: TestAccountInput) -> Result<(), AppError> {
+        if let Some(id) = input.id {
+            self.account_saves.reconcile_account(id).await?;
+        } else {
+            self.account_saves.reconcile_all().await?;
+        }
         let _operation_guard = input
             .id
             .map(|id| self.operations.try_lock(id))
             .transpose()?;
+        if let Some(id) = input.id {
+            self.account_saves.ensure_no_pending(id).await?;
+        }
         let config = account_config(
             input.provider,
             &input.email,
             input.imap_host.as_deref(),
             input.imap_port,
         )?;
-        let resolved_secret = self.resolve_secret(input.id, input.secret).await?;
+        let secret = self.resolve_secret(input.id, input.secret).await?;
         self.gateway
-            .test_connection(&config, &resolved_secret.value)
+            .test_connection(&config, &secret)
             .await
-            .map_err(|error| sanitize_error(error, &resolved_secret.value))
+            .map_err(|error| sanitize_error(error, &secret))
     }
 
     pub async fn delete_account(&self, id: Uuid) -> Result<(), AppError> {
+        self.account_saves.reconcile_account(id).await?;
         let _operation_guard = self.operations.try_lock(id)?;
+        self.account_saves.ensure_no_pending(id).await?;
         self.accounts.get(id).await?;
         self.accounts.set_enabled(id, false).await?;
         delete_credential(self.credentials.clone(), id.to_string()).await?;
@@ -210,16 +202,9 @@ impl SettingsService {
         Ok(preferences)
     }
 
-    async fn resolve_secret(
-        &self,
-        id: Option<Uuid>,
-        secret: String,
-    ) -> Result<ResolvedSecret, AppError> {
+    async fn resolve_secret(&self, id: Option<Uuid>, secret: String) -> Result<String, AppError> {
         if !secret.trim().is_empty() {
-            return Ok(ResolvedSecret {
-                value: secret,
-                replace: true,
-            });
+            return Ok(secret);
         }
         let Some(id) = id else {
             return Err(AppError::validation(
@@ -227,153 +212,9 @@ impl SettingsService {
                 "credential secret must not be blank for a new account",
             ));
         };
-        let value = get_credential(self.credentials.clone(), id.to_string())
+        get_credential(self.credentials.clone(), id.to_string())
             .await?
-            .ok_or_else(missing_credential_error)?;
-        Ok(ResolvedSecret {
-            value,
-            replace: false,
-        })
-    }
-
-    async fn persist_account_metadata(
-        &self,
-        account_id: Uuid,
-        is_update: bool,
-        metadata: NewMailboxAccount,
-    ) -> Result<StagedAccountSave, AppError> {
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let result = async {
-            let previous = if is_update {
-                Some(
-                    self.accounts
-                        .snapshot_in_transaction(&mut transaction, account_id)
-                        .await?,
-                )
-            } else {
-                None
-            };
-            let account = self
-                .accounts
-                .save_metadata(&mut transaction, account_id, is_update, metadata)
-                .await?;
-            let account = self
-                .accounts
-                .clear_retry_state_in_transaction(&mut transaction, account.id)
-                .await?;
-            Ok::<_, AppError>(StagedAccountSave { account, previous })
-        }
-        .await;
-        match result {
-            Ok(staged) => {
-                transaction.commit().await.map_err(database_error)?;
-                Ok(staged)
-            }
-            Err(error) => {
-                transaction.rollback().await.map_err(database_error)?;
-                Err(error)
-            }
-        }
-    }
-
-    async fn run_account_save_saga(
-        &self,
-        account_id: Uuid,
-        is_update: bool,
-        metadata: NewMailboxAccount,
-        resolved_secret: ResolvedSecret,
-        previous_secret: Option<String>,
-    ) -> Result<MailboxAccount, AppError> {
-        let staged = self
-            .persist_account_metadata(account_id, is_update, metadata)
-            .await?;
-        if !resolved_secret.replace {
-            return Ok(staged.account);
-        }
-        let credential_result = set_credential(
-            self.credentials.clone(),
-            account_id.to_string(),
-            resolved_secret.value.clone(),
-        )
-        .await;
-        let Err(credential_error) = credential_result else {
-            return Ok(staged.account);
-        };
-        let previous_secret_value = previous_secret.as_deref().unwrap_or_default();
-        let secrets = [resolved_secret.value.as_str(), previous_secret_value];
-        let credential_recovery = restore_credential(
-            self.credentials.clone(),
-            account_id,
-            previous_secret.clone(),
-        )
-        .await;
-        let metadata_recovery = self
-            .restore_account_metadata(account_id, staged.previous)
-            .await;
-        let credential_error = sanitize_app_error(credential_error, &secrets);
-        match (credential_recovery, metadata_recovery) {
-            (Ok(()), Ok(())) => Err(credential_error),
-            (credential_recovery, metadata_recovery) => Err(AppError::Internal {
-                message: sanitize_message(
-                    &format!(
-                        "failed to save mailbox account {account_id}; credential stage failed ({}); \
-                         credential recovery: {}; metadata recovery: {}",
-                        bounded_error_detail(&credential_error, &secrets),
-                        recovery_status(credential_recovery, &secrets),
-                        recovery_status(metadata_recovery, &secrets),
-                    ),
-                    &secrets,
-                ),
-            }),
-        }
-    }
-
-    async fn restore_account_metadata(
-        &self,
-        account_id: Uuid,
-        previous: Option<MailboxAccountSnapshot>,
-    ) -> Result<(), AppError> {
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let result = match previous {
-            Some(previous) => {
-                self.accounts
-                    .restore_snapshot_in_transaction(&mut transaction, previous)
-                    .await
-            }
-            None => {
-                self.accounts
-                    .delete_in_transaction(&mut transaction, account_id)
-                    .await
-            }
-        };
-        match result {
-            Ok(()) => transaction.commit().await.map_err(database_error),
-            Err(error) => {
-                transaction.rollback().await.map_err(database_error)?;
-                Err(error)
-            }
-        }
-    }
-}
-
-struct StagedAccountSave {
-    account: MailboxAccount,
-    previous: Option<MailboxAccountSnapshot>,
-}
-
-struct ResolvedSecret {
-    value: String,
-    replace: bool,
-}
-
-async fn restore_credential(
-    credentials: Arc<dyn CredentialStore>,
-    account_id: Uuid,
-    previous_secret: Option<String>,
-) -> Result<(), AppError> {
-    match previous_secret {
-        Some(secret) => set_credential(credentials, account_id.to_string(), secret).await,
-        None => delete_credential(credentials, account_id.to_string()).await,
+            .ok_or_else(missing_credential_error)
     }
 }
 
@@ -383,20 +224,6 @@ fn missing_credential_error() -> AppError {
         retryable: false,
         message: "mailbox credential is unavailable".to_owned(),
     }
-}
-
-fn recovery_status(result: Result<(), AppError>, secrets: &[&str]) -> String {
-    match result {
-        Ok(()) => "completed".to_owned(),
-        Err(error) => bounded_error_detail(&error, secrets),
-    }
-}
-
-fn bounded_error_detail(error: &AppError, secrets: &[&str]) -> String {
-    sanitize_message(&error.to_string(), secrets)
-        .chars()
-        .take(96)
-        .collect()
 }
 
 pub(crate) async fn load_preferences(pool: &SqlitePool) -> Result<Preferences, AppError> {

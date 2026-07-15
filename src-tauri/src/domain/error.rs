@@ -1,7 +1,7 @@
 use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Debug, Error, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, Serialize, PartialEq, Eq)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum AppError {
     #[error("{message}")]

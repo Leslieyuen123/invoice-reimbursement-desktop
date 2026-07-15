@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::db::accounts::MailboxAccountRepository;
 pub use crate::db::accounts::SyncRetryState as RetryState;
 use crate::domain::error::AppError;
+use crate::services::account_saves::AccountSaveCoordinator;
 use crate::services::operations::AccountOperationCoordinator;
 use crate::services::settings::{BackgroundSyncGate, load_preferences};
 use crate::services::sync::SyncService;
@@ -82,6 +83,7 @@ pub struct Scheduler {
     accounts: MailboxAccountRepository,
     runner: Arc<dyn SyncRunner>,
     operations: AccountOperationCoordinator,
+    account_saves: AccountSaveCoordinator,
     clock: Arc<dyn Clock>,
     background_gate: BackgroundSyncGate,
     start_barrier: Arc<dyn SyncStartBarrier>,
@@ -92,12 +94,14 @@ impl Scheduler {
         pool: SqlitePool,
         runner: Arc<dyn SyncRunner>,
         operations: AccountOperationCoordinator,
+        account_saves: AccountSaveCoordinator,
         background_gate: BackgroundSyncGate,
     ) -> Self {
         Self::build(
             pool,
             runner,
             operations,
+            account_saves,
             Arc::new(UtcClock),
             background_gate,
             Arc::new(ImmediateStart),
@@ -108,6 +112,7 @@ impl Scheduler {
         pool: SqlitePool,
         runner: Arc<dyn SyncRunner>,
         operations: AccountOperationCoordinator,
+        account_saves: AccountSaveCoordinator,
         clock: Arc<dyn Clock>,
         background_gate: BackgroundSyncGate,
     ) -> Self {
@@ -115,6 +120,7 @@ impl Scheduler {
             pool,
             runner,
             operations,
+            account_saves,
             clock,
             background_gate,
             Arc::new(ImmediateStart),
@@ -125,6 +131,7 @@ impl Scheduler {
         pool: SqlitePool,
         runner: Arc<dyn SyncRunner>,
         operations: AccountOperationCoordinator,
+        account_saves: AccountSaveCoordinator,
         clock: Arc<dyn Clock>,
         background_gate: BackgroundSyncGate,
         start_barrier: Arc<dyn SyncStartBarrier>,
@@ -133,6 +140,7 @@ impl Scheduler {
             pool,
             runner,
             operations,
+            account_saves,
             clock,
             background_gate,
             start_barrier,
@@ -143,6 +151,7 @@ impl Scheduler {
         pool: SqlitePool,
         runner: Arc<dyn SyncRunner>,
         operations: AccountOperationCoordinator,
+        account_saves: AccountSaveCoordinator,
         clock: Arc<dyn Clock>,
         background_gate: BackgroundSyncGate,
         start_barrier: Arc<dyn SyncStartBarrier>,
@@ -152,6 +161,7 @@ impl Scheduler {
             pool,
             runner,
             operations,
+            account_saves,
             clock,
             background_gate,
             start_barrier,
@@ -187,6 +197,7 @@ impl Scheduler {
         registry: &TaskRegistry,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Vec<oneshot::Receiver<Result<(), AppError>>>, AppError> {
+        self.account_saves.reconcile_all().await?;
         if !load_preferences(&self.pool).await?.background_sync_enabled {
             return Ok(Vec::new());
         }
@@ -228,6 +239,10 @@ impl Scheduler {
         account_id: Uuid,
         started: Option<oneshot::Sender<()>>,
     ) -> Result<(), SyncExecutionError> {
+        self.account_saves
+            .reconcile_account(account_id)
+            .await
+            .map_err(SyncExecutionError::Infrastructure)?;
         self.accounts
             .get(account_id)
             .await
@@ -235,6 +250,10 @@ impl Scheduler {
         let _guard = self
             .operations
             .try_lock(account_id)
+            .map_err(SyncExecutionError::Infrastructure)?;
+        self.account_saves
+            .ensure_no_pending(account_id)
+            .await
             .map_err(SyncExecutionError::Infrastructure)?;
         if let Some(started) = started {
             let _ = started.send(());
@@ -587,6 +606,8 @@ mod tests {
     use std::io::Write;
 
     use crate::db::accounts::{MailboxProvider, NewMailboxAccount};
+    use crate::infra::credentials::MemoryCredentialStore;
+    use crate::services::account_saves::{AccountSagaRegistry, AccountSaveCoordinator};
 
     use super::*;
 
@@ -664,10 +685,18 @@ mod tests {
                     let runner = Arc::new(ImmediateInfrastructureRunner {
                         completed: tokio::sync::Notify::new(),
                     });
+                    let operations = AccountOperationCoordinator::default();
+                    let account_saves = AccountSaveCoordinator::new(
+                        pool.clone(),
+                        Arc::new(MemoryCredentialStore::default()),
+                        operations.clone(),
+                        AccountSagaRegistry::default(),
+                    );
                     let handle = Scheduler::with_operations_and_gate(
                         pool,
                         runner.clone(),
-                        AccountOperationCoordinator::default(),
+                        operations,
+                        account_saves,
                         BackgroundSyncGate::default(),
                     )
                     .start();
