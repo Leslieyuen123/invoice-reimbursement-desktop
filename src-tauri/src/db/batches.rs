@@ -2,6 +2,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{FromRow, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use uuid::Uuid;
 
+use crate::db::items::{InvoiceItem, ItemRepository};
 use crate::domain::error::AppError;
 use crate::domain::model::{BatchStatus, NewBatch};
 
@@ -39,6 +40,17 @@ pub struct BatchSummary {
 #[derive(Clone)]
 pub struct BatchRepository {
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchExportSnapshot {
+    pub batch: Batch,
+    pub items: Vec<InvoiceItem>,
+}
+
+pub(crate) struct BatchExportClaim {
+    transaction: Transaction<'static, Sqlite>,
+    batch_id: Uuid,
 }
 
 impl BatchRepository {
@@ -230,6 +242,97 @@ impl BatchRepository {
         }
 
         Ok(())
+    }
+
+    pub(crate) async fn export_snapshot(&self, id: Uuid) -> Result<BatchExportSnapshot, AppError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| stable_internal_error("failed to begin batch export snapshot"))?;
+        let result = Self::export_snapshot_with_connection(&mut transaction, id).await;
+        match result {
+            Ok(snapshot) => transaction
+                .commit()
+                .await
+                .map(|()| snapshot)
+                .map_err(|_| stable_internal_error("failed to finish batch export snapshot")),
+            Err(error) => match transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(_) => Err(stable_internal_error(
+                    "batch export snapshot failed and rollback also failed",
+                )),
+            },
+        }
+    }
+
+    pub(crate) async fn claim_export(
+        &self,
+        expected: &BatchExportSnapshot,
+    ) -> Result<BatchExportClaim, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| stable_internal_error("failed to claim batch export"))?;
+        let current =
+            Self::export_snapshot_with_connection(&mut transaction, expected.batch.id).await;
+        match current {
+            Ok(current) if current == *expected => Ok(BatchExportClaim {
+                transaction,
+                batch_id: expected.batch.id,
+            }),
+            Ok(_) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|_| stable_internal_error("stale batch export rollback failed"))?;
+                Err(AppError::Conflict {
+                    message: "报销批次内容已更改，请重新导出".to_owned(),
+                })
+            }
+            Err(error) => match transaction.rollback().await {
+                Ok(()) => Err(error),
+                Err(_) => Err(stable_internal_error(
+                    "batch export claim failed and rollback also failed",
+                )),
+            },
+        }
+    }
+
+    async fn export_snapshot_with_connection(
+        connection: &mut SqliteConnection,
+        id: Uuid,
+    ) -> Result<BatchExportSnapshot, AppError> {
+        Ok(BatchExportSnapshot {
+            batch: Self::get_with_connection(connection, id).await?,
+            items: ItemRepository::list_by_batch_with_connection(connection, id).await?,
+        })
+    }
+}
+
+impl BatchExportClaim {
+    pub(crate) async fn commit(mut self, exported_at: DateTime<Utc>) -> Result<Batch, AppError> {
+        let result = async {
+            let rows = sqlx::query(
+                "UPDATE batches SET status = 'exported', last_exported_at = ?, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(exported_at.to_rfc3339())
+            .bind(exported_at.to_rfc3339())
+            .bind(self.batch_id.to_string())
+            .execute(&mut *self.transaction)
+            .await
+            .map_err(|_| stable_internal_error("failed to mark batch exported"))?
+            .rows_affected();
+            if rows == 0 {
+                return Err(batch_not_found(self.batch_id));
+            }
+            BatchRepository::get_with_connection(&mut self.transaction, self.batch_id).await
+        }
+        .await;
+
+        finish_batch_transaction(self.transaction, result).await
     }
 }
 
