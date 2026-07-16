@@ -1238,6 +1238,7 @@ a {
   background: #d8d8d6;
 }
 
+.preview-loading,
 .preview-error {
   display: flex;
   height: 100%;
@@ -1249,6 +1250,10 @@ a {
   padding: 24px;
   color: var(--text-tertiary);
   text-align: center;
+}
+
+.preview-loading {
+  color: var(--text-tertiary);
 }
 
 .preview-error > svg {

@@ -1,14 +1,13 @@
 import {
   act,
   cleanup,
-  fireEvent,
   render,
   screen,
   waitFor,
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -23,6 +22,7 @@ import {
 import type { InvoiceItemDto } from "../../types";
 
 const openDialogMock = vi.mocked(open);
+const fetchMock = vi.fn<typeof fetch>();
 
 function pendingInvoiceFixture(
   overrides: Partial<InvoiceItemDto> = {},
@@ -81,7 +81,17 @@ describe("InboxPage", () => {
     cleanup();
     resetMockApi();
     openDialogMock.mockReset();
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(
+      new Response(new Uint8Array(), {
+        status: 200,
+        headers: { "Content-Type": "application/pdf" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
   });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it("filters pending items and saves a manual correction", async () => {
     const user = userEvent.setup();
@@ -259,8 +269,14 @@ describe("InboxPage", () => {
     expect(commandCalls("review_item")).toHaveLength(0);
   });
 
-  it("shows complete editable details and an accessible preview failure", async () => {
+  it("shows complete editable details and detects a failed preview response", async () => {
     const user = userEvent.setup();
+    fetchMock.mockResolvedValueOnce(
+      new Response("Preview unavailable", {
+        status: 404,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      }),
+    );
     mockCommand("get_dashboard", new Promise(() => undefined));
     mockCommand("list_items", {
       items: [pendingInvoiceFixture()],
@@ -286,10 +302,14 @@ describe("InboxPage", () => {
     expect(within(drawer).getByLabelText("项目标签")).toBeInTheDocument();
     expect(within(drawer).getByText("未分配批次")).toBeInTheDocument();
 
-    fireEvent.error(within(drawer).getByTitle("票据预览"));
-    expect(within(drawer).getByRole("alert")).toHaveTextContent(
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(await within(drawer).findByRole("alert")).toHaveTextContent(
       "无法显示票据预览",
     );
+    expect(within(drawer).queryByTitle("票据预览")).not.toBeInTheDocument();
+
+    await user.click(within(drawer).getByRole("button", { name: "重新加载" }));
+    expect(await within(drawer).findByTitle("票据预览")).toBeInTheDocument();
   });
 
   it("closes the review dialog with Escape and restores focus", async () => {
@@ -315,6 +335,38 @@ describe("InboxPage", () => {
 
     expect(screen.queryByRole("dialog", { name: "票据详情" })).not.toBeInTheDocument();
     expect(opener).toHaveFocus();
+  });
+
+  it("restores focus to the latest opener after replacing the drawer", async () => {
+    const user = userEvent.setup();
+    const secondItem = pendingInvoiceFixture({
+      id: "invoice-hotel",
+      originalName: "酒店住宿发票.pdf",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture(), secondItem],
+      nextCursor: null,
+    });
+
+    renderAppAt("/inbox");
+    const firstOpener = await screen.findByRole("button", {
+      name: "出租车电子发票.pdf",
+    });
+    const secondOpener = screen.getByRole("button", { name: "酒店住宿发票.pdf" });
+    await user.click(firstOpener);
+    await user.click(secondOpener);
+
+    const dialog = screen.getByRole("dialog", { name: "票据详情" });
+    expect(dialog).toHaveTextContent("酒店住宿发票.pdf");
+    expect(
+      within(dialog).getByRole("button", { name: "关闭票据详情" }),
+    ).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog", { name: "票据详情" })).not.toBeInTheDocument();
+    expect(secondOpener).toHaveFocus();
   });
 
   it("does not reopen a closed drawer when a save response arrives", async () => {
@@ -349,6 +401,120 @@ describe("InboxPage", () => {
     });
 
     expect(screen.queryByRole("dialog", { name: "票据详情" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a reopened drawer isolated from an older save response", async () => {
+    const user = userEvent.setup();
+    let resolveSave: ((item: InvoiceItemDto) => void) | undefined;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+    mockCommand(
+      "review_item",
+      new Promise<InvoiceItemDto>((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+
+    renderAppAt("/inbox");
+    await user.click(
+      await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
+    await user.click(screen.getByRole("button", { name: "出租车电子发票.pdf" }));
+
+    await act(async () => {
+      resolveSave?.(
+        pendingInvoiceFixture({
+          originalName: "旧保存响应.pdf",
+          status: "ready",
+          confirmationStatus: "confirmed",
+        }),
+      );
+    });
+
+    expect(screen.getByRole("button", { name: "旧保存响应.pdf" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
+      "出租车电子发票.pdf",
+    );
+  });
+
+  it("keeps a reopened drawer isolated from an older recognition response", async () => {
+    const user = userEvent.setup();
+    let resolveRetry: ((item: InvoiceItemDto) => void) | undefined;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+    mockCommand(
+      "retry_recognition",
+      new Promise<InvoiceItemDto>((resolve) => {
+        resolveRetry = resolve;
+      }),
+    );
+
+    renderAppAt("/inbox");
+    await user.click(
+      await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
+    );
+    await user.click(screen.getByRole("button", { name: "重新识别" }));
+    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
+    await user.click(screen.getByRole("button", { name: "出租车电子发票.pdf" }));
+
+    await act(async () => {
+      resolveRetry?.(
+        pendingInvoiceFixture({
+          originalName: "旧识别响应.pdf",
+          status: "pending_recognition",
+          recognitionStatus: "pending",
+        }),
+      );
+    });
+
+    expect(screen.getByRole("button", { name: "旧识别响应.pdf" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
+      "出租车电子发票.pdf",
+    );
+  });
+
+  it("keeps a reopened drawer open when an older deletion response arrives", async () => {
+    const user = userEvent.setup();
+    let resolveDeletion: ((item: null) => void) | undefined;
+    const duplicate = pendingInvoiceFixture({
+      status: "suspected_duplicate",
+      dedupeStatus: "suspected_duplicate",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [duplicate], nextCursor: null });
+    mockCommand(
+      "resolve_duplicate",
+      new Promise<null>((resolve) => {
+        resolveDeletion = resolve;
+      }),
+    );
+
+    renderAppAt("/inbox?status=suspected_duplicate");
+    await user.click(
+      await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
+    );
+    await user.click(screen.getByRole("button", { name: "删除重复" }));
+    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
+    await user.click(screen.getByRole("button", { name: "出租车电子发票.pdf" }));
+
+    await act(async () => {
+      resolveDeletion?.(null);
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "出租车电子发票.pdf" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
+      "出租车电子发票.pdf",
+    );
   });
 
   it("does not close a newer drawer when an older deletion response arrives", async () => {

@@ -1,14 +1,45 @@
 import { FileWarning, RefreshCw } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 interface ItemPreviewProps {
   originalName: string;
   previewUrl: string;
+  loadAvailability?: PreviewAvailabilityLoader;
 }
 
 type PreviewVariant = "original" | "normalized";
+type PreviewState = "loading" | "ready" | "failed";
+
+export type PreviewAvailabilityLoader = (
+  source: string,
+  signal: AbortSignal,
+) => Promise<void>;
+
+function isPreviewContentType(contentType: string | null) {
+  const mediaType = contentType?.split(";", 1)[0].trim().toLowerCase();
+  return mediaType === "application/pdf" || mediaType?.startsWith("image/");
+}
+
+export const loadPreviewAvailability: PreviewAvailabilityLoader = async (
+  source,
+  signal,
+) => {
+  if (source.startsWith("data:")) return;
+
+  const response = await fetch(source, {
+    method: "GET",
+    cache: "no-store",
+    headers: { Range: "bytes=0-0" },
+    signal,
+  });
+  const available =
+    response.ok && isPreviewContentType(response.headers.get("Content-Type"));
+  await response.body?.cancel();
+  if (!available) throw new Error("Preview unavailable");
+};
 
 function withVariant(previewUrl: string, variant: PreviewVariant) {
+  if (previewUrl.startsWith("data:")) return previewUrl;
   try {
     const url = new URL(previewUrl);
     url.searchParams.set("variant", variant);
@@ -18,30 +49,42 @@ function withVariant(previewUrl: string, variant: PreviewVariant) {
   }
 }
 
-export function ItemPreview({ originalName, previewUrl }: ItemPreviewProps) {
+export function ItemPreview({
+  originalName,
+  previewUrl,
+  loadAvailability = loadPreviewAvailability,
+}: ItemPreviewProps) {
   const hasNormalized = previewUrl.includes("variant=normalized");
   const [variant, setVariant] = useState<PreviewVariant>(
     hasNormalized ? "normalized" : "original",
   );
-  const [failed, setFailed] = useState(false);
+  const [state, setState] = useState<PreviewState>("loading");
   const [revision, setRevision] = useState(0);
-  const frameRef = useRef<HTMLIFrameElement>(null);
   const source = useMemo(
     () => withVariant(previewUrl, variant),
     [previewUrl, variant],
   );
 
   useEffect(() => {
-    const frame = frameRef.current;
-    if (!frame) return;
-    const handleError = () => setFailed(true);
-    frame.addEventListener("error", handleError);
-    return () => frame.removeEventListener("error", handleError);
-  }, [revision, source]);
+    const controller = new AbortController();
+    let current = true;
+    setState("loading");
+    void loadAvailability(source, controller.signal).then(
+      () => {
+        if (current && !controller.signal.aborted) setState("ready");
+      },
+      () => {
+        if (current && !controller.signal.aborted) setState("failed");
+      },
+    );
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [loadAvailability, revision, source]);
 
   function chooseVariant(nextVariant: PreviewVariant) {
     setVariant(nextVariant);
-    setFailed(false);
   }
 
   return (
@@ -73,7 +116,7 @@ export function ItemPreview({ originalName, previewUrl }: ItemPreviewProps) {
         )}
       </header>
       <div className="item-preview-surface">
-        {failed ? (
+        {state === "failed" ? (
           <div className="preview-error" role="alert">
             <FileWarning size={24} strokeWidth={1.6} aria-hidden="true" />
             <strong>无法显示票据预览</strong>
@@ -82,7 +125,6 @@ export function ItemPreview({ originalName, previewUrl }: ItemPreviewProps) {
               className="button button-secondary"
               type="button"
               onClick={() => {
-                setFailed(false);
                 setRevision((current) => current + 1);
               }}
             >
@@ -90,12 +132,20 @@ export function ItemPreview({ originalName, previewUrl }: ItemPreviewProps) {
               重新加载
             </button>
           </div>
+        ) : state === "loading" ? (
+          <div
+            className="preview-loading"
+            role="status"
+            aria-label="正在检查票据预览"
+          >
+            正在加载预览
+          </div>
         ) : (
           <iframe
-            ref={frameRef}
             key={`${source}-${revision}`}
             title="票据预览"
             src={source}
+            onError={() => setState("failed")}
           />
         )}
       </div>

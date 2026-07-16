@@ -5,7 +5,7 @@ interface InboxTableProps {
   selectedItemId: string | null;
   state: "loading" | "ready" | "error";
   errorMessage?: string;
-  onSelect: (item: InvoiceItemDto) => void;
+  onSelect: (item: InvoiceItemDto, opener: HTMLButtonElement) => void;
   onRetry: () => void;
 }
 
@@ -94,7 +94,10 @@ export function InboxTable({
             className={selectedItemId === item.id ? "is-selected" : undefined}
           >
             <td>
-              <button type="button" onClick={() => onSelect(item)}>
+              <button
+                type="button"
+                onClick={(event) => onSelect(item, event.currentTarget)}
+              >
                 {item.originalName}
               </button>
             </td>

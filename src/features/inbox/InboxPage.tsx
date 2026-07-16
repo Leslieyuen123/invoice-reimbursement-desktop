@@ -1,6 +1,6 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { Check, RotateCcw, Search, TriangleAlert } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { FileDropZone } from "../../components/FileDropZone";
@@ -50,9 +50,16 @@ function statusFromSearch(value: string | null): ItemStatus | undefined {
   return itemStatuses.find((status) => status === value);
 }
 
+interface DrawerSelection {
+  item: InvoiceItemDto;
+  opener: HTMLButtonElement;
+  sessionId: number;
+}
+
 export function InboxPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [selectedItem, setSelectedItem] = useState<InvoiceItemDto | null>(null);
+  const [selection, setSelection] = useState<DrawerSelection | null>(null);
+  const nextSessionId = useRef(0);
   const [suggestedPeriod, setSuggestedPeriod] = useState("");
   const [category, setCategory] = useState<Category | "">("");
   const [sourceType, setSourceType] = useState<SourceType | "">("");
@@ -117,23 +124,38 @@ export function InboxPage() {
     });
   }, [deletedItemIds, filter, importedItems, queriedItems, updatedItems]);
 
-  function updateItem(item: InvoiceItemDto) {
+  function updateItem(item: InvoiceItemDto, sessionId: number) {
     setUpdatedItems((current) => [
       ...current.filter((candidate) => candidate.id !== item.id),
       item,
     ]);
-    setSelectedItem((current) => (current?.id === item.id ? item : current));
+    setSelection((current) =>
+      current?.sessionId === sessionId ? { ...current, item } : current,
+    );
   }
 
-  function deleteItem(itemId: string) {
+  function deleteItem(itemId: string, sessionId: number) {
     setDeletedItemIds((current) =>
       current.includes(itemId) ? current : [...current, itemId],
     );
-    setSelectedItem((current) => (current?.id === itemId ? null : current));
+    setSelection((current) =>
+      current?.sessionId === sessionId ? null : current,
+    );
+  }
+
+  function openItem(item: InvoiceItemDto, opener: HTMLButtonElement) {
+    nextSessionId.current += 1;
+    setSelection({ item, opener, sessionId: nextSessionId.current });
+  }
+
+  function closeDrawer(sessionId: number, opener: HTMLButtonElement) {
+    if (selection?.sessionId !== sessionId) return;
+    setSelection(null);
+    opener.focus();
   }
 
   useEffect(() => {
-    setSelectedItem(null);
+    setSelection(null);
   }, [filter]);
 
   function chooseStatus(nextStatus?: ItemStatus) {
@@ -297,7 +319,7 @@ export function InboxPage() {
       <div className="inbox-table-region">
         <InboxTable
           items={items}
-          selectedItemId={selectedItem?.id ?? null}
+          selectedItemId={selection?.item.id ?? null}
           state={
             itemsQuery.isPending
               ? "loading"
@@ -306,7 +328,7 @@ export function InboxPage() {
                 : "ready"
           }
           errorMessage={errorMessage(itemsQuery.error)}
-          onSelect={setSelectedItem}
+          onSelect={openItem}
           onRetry={() => void itemsQuery.refetch()}
         />
       </div>
@@ -320,13 +342,13 @@ export function InboxPage() {
           {itemsQuery.isFetchingNextPage ? "加载中" : "加载更多"}
         </button>
       ) : null}
-      {selectedItem ? (
+      {selection ? (
         <ItemDrawer
-          key={selectedItem.id}
-          item={selectedItem}
-          onClose={() => setSelectedItem(null)}
-          onDeleted={deleteItem}
-          onSaved={updateItem}
+          key={`${selection.item.id}:${selection.sessionId}`}
+          item={selection.item}
+          onClose={() => closeDrawer(selection.sessionId, selection.opener)}
+          onDeleted={(itemId) => deleteItem(itemId, selection.sessionId)}
+          onSaved={(item) => updateItem(item, selection.sessionId)}
         />
       ) : null}
     </div>
