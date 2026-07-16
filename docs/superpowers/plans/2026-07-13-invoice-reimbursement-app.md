@@ -1582,17 +1582,29 @@ Expected: FAIL。
 
 ```ts
 import { invoke } from "@tauri-apps/api/core";
-import type { DashboardDto, ItemFilter, InvoiceItemDto } from "../types";
+import type {
+  BatchSummaryDto,
+  DashboardDto,
+  ItemFilter,
+  InvoiceItemDto,
+  ManualImportOutcomeDto,
+  PageDto,
+  PageRequestDto,
+} from "../types";
 
 export const api = {
   getDashboard: () => invoke<DashboardDto>("get_dashboard"),
-  listItems: (filter: ItemFilter) => invoke<InvoiceItemDto[]>("list_items", { filter }),
-  importManualFiles: (paths: string[]) => invoke<InvoiceItemDto[]>("import_manual_files", { paths }),
+  listItems: (filter: ItemFilter, page?: PageRequestDto) =>
+    invoke<PageDto<InvoiceItemDto>>("list_items", { filter, page }),
+  listBatches: (page?: PageRequestDto) =>
+    invoke<PageDto<BatchSummaryDto>>("list_batches", { page }),
+  importManualFiles: (paths: string[]) =>
+    invoke<ManualImportOutcomeDto[]>("import_manual_files", { paths }),
   syncAccountNow: (accountId: string) => invoke("sync_account_now", { accountId }),
 };
 ```
 
-为 Task 13 的每个 command 都提供一个命名一致的方法，不允许页面直接 import `invoke`。
+为 Task 13 的每个 command 都提供一个命名一致的方法，不允许页面直接 import `invoke`。`PageRequestDto` 精确为 `{ cursor?: { sortValue: string; id: string }; pageSize?: number }`，默认 50、最大 200；`PageDto<T>` 为 `{ items: T[]; nextCursor: CursorDto | null }`。`ManualImportOutcomeDto` 使用 `status` 区分 `{ status: "imported"; path; item }` 与 `{ status: "failed"; path; error }`，顺序与输入路径一致。
 
 - [ ] **Step 3: 实现安静、密集的桌面工作台壳**
 
@@ -1628,7 +1640,10 @@ git commit -m "feat: add desktop shell and operations dashboard"
 ```tsx
 it("filters pending items and saves a manual correction", async () => {
   const user = userEvent.setup();
-  mockCommand("list_items", [pendingInvoiceFixture()]);
+  mockCommand("list_items", {
+    items: [pendingInvoiceFixture()],
+    nextCursor: null,
+  });
   renderAppAt("/inbox?status=pending_confirmation");
   await user.click(await screen.findByText("出租车电子发票.pdf"));
   await user.click(screen.getByRole("radio", { name: "交通" }));
@@ -1645,11 +1660,11 @@ Expected: FAIL。
 
 - [ ] **Step 2: 实现稳定表格和状态筛选**
 
-表格列：原件、开票日期、建议月份、分类、金额、来源、状态、批次；状态 tabs 精确对应五个 ItemStatus，另有“全部”。行高固定，加载、空态、错误、重试不改变表头布局。支持按建议月份、分类、来源和文本过滤。
+表格列：原件、开票日期、建议月份、分类、金额、来源、状态、批次；状态 tabs 精确对应五个 ItemStatus，另有“全部”。行高固定，加载、空态、错误、重试不改变表头布局。支持按建议月份、分类、来源和文本过滤。首次加载 50 条，只在 `nextCursor` 存在时请求下一页；筛选变化必须清空旧 cursor 和已累加行，不得回退到无界全量加载。
 
 - [ ] **Step 3: 实现文件选择/拖放和导入反馈**
 
-使用 Tauri dialog 选择多文件，并支持把系统拖入的路径传给 `import_manual_files`。逐文件显示导入结果；重复项跳转“疑似重复”，失败项保留错误信息和重试入口。
+使用 Tauri dialog 选择多文件，并支持把系统拖入的路径传给 `import_manual_files`。按返回的 `ManualImportOutcomeDto[]` 逐文件显示结果；`imported` 结果进入列表，重复项跳转“疑似重复”，`failed` 结果保留结构化错误和单文件重试入口。不得因一个失败丢失其他成功结果。
 
 - [ ] **Step 4: 实现票据详情抽屉**
 
@@ -1701,7 +1716,7 @@ Expected: FAIL。
 
 - [ ] **Step 2: 实现批次创建和列表**
 
-创建对话框首选“按月”模式，年月默认当前月；切换“自定义范围”显示名称和起止日期。列表按 updatedAt 降序，展示范围、状态、数量、总金额、未确认数、最后导出时间。
+创建对话框首选“按月”模式，年月默认当前月；切换“自定义范围”显示名称和起止日期。列表按 updatedAt 和 id 稳定降序，展示范围、状态、数量、总金额、未确认数、最后导出时间。使用 `PageDto<BatchSummaryDto>` 和 `nextCursor` 加载后续批次，不允许一次请求全部历史批次。
 
 - [ ] **Step 3: 实现批次详情和归属操作**
 
