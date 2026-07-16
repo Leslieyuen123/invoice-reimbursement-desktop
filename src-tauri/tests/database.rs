@@ -36,6 +36,7 @@ async fn connect_runs_migrations_and_creates_application_tables() {
         "mailbox_accounts",
         "pending_account_save_cleanups",
         "pending_account_saves",
+        "pending_exports",
         "settings",
         "sync_cursors",
         "sync_runs",
@@ -45,6 +46,33 @@ async fn connect_runs_migrations_and_creates_application_tables() {
             "missing table {table}; found {tables:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn pending_export_journal_has_recovery_identity_paths_and_state() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let columns = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM pragma_table_info('pending_exports') ORDER BY cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        columns,
+        vec![
+            "operation_id",
+            "batch_id",
+            "staging_component",
+            "final_component",
+            "exported_at",
+            "state",
+            "interrupted",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1191,7 +1219,7 @@ async fn item_repository_filters_all_derived_statuses_with_dedupe_precedence() {
 
     for (expected_suffix, _, _, _, status) in cases {
         let items = repository
-            .list(ItemFilter {
+            .list_bounded_for_tests(ItemFilter {
                 status: Some(status),
                 ..ItemFilter::default()
             })
@@ -1263,7 +1291,7 @@ async fn item_repository_combines_typed_filters_text_search_and_deterministic_or
         .expect("older noise should insert");
 
     let all = repository
-        .list(ItemFilter::default())
+        .list_bounded_for_tests(ItemFilter::default())
         .await
         .expect("unfiltered list should succeed");
     assert_eq!(
@@ -1273,7 +1301,7 @@ async fn item_repository_combines_typed_filters_text_search_and_deterministic_or
 
     for query in ["quarterly", "ACME", "shenzhen", "board meeting"] {
         let matches = repository
-            .list(ItemFilter {
+            .list_bounded_for_tests(ItemFilter {
                 query: Some(query.to_owned()),
                 ..ItemFilter::default()
             })
@@ -1302,7 +1330,7 @@ async fn item_repository_combines_typed_filters_text_search_and_deterministic_or
         },
     ] {
         let matches = repository
-            .list(filter)
+            .list_bounded_for_tests(filter)
             .await
             .expect("typed filter should succeed");
         assert_eq!(matches.len(), 1);
@@ -1310,7 +1338,7 @@ async fn item_repository_combines_typed_filters_text_search_and_deterministic_or
     }
 
     let category_override = repository
-        .list(ItemFilter {
+        .list_bounded_for_tests(ItemFilter {
             category: Some(Category::Transport),
             ..ItemFilter::default()
         })
@@ -1530,7 +1558,10 @@ async fn batch_repository_creates_gets_and_lists_normalized_batches() {
         .get(created.id)
         .await
         .expect("batch should be retrievable");
-    let summaries = repository.list().await.expect("batches should list");
+    let summaries = repository
+        .list_bounded_for_tests()
+        .await
+        .expect("batches should list");
 
     assert_eq!(created, fetched);
     assert_eq!(created.name, "July expenses");
@@ -1591,7 +1622,10 @@ async fn batch_repository_list_aggregates_only_assigned_items() {
         .await
         .expect("other batch item should insert");
 
-    let summaries = batches.list().await.expect("batches should list");
+    let summaries = batches
+        .list_bounded_for_tests()
+        .await
+        .expect("batches should list");
     let target_summary = summaries
         .iter()
         .find(|summary| summary.id == target.id)
@@ -1649,7 +1683,7 @@ async fn batch_repository_list_reports_stable_rust_amount_overflow() {
         .expect("overflow fixture should assign directly");
 
     let error = batches
-        .list()
+        .list_bounded_for_tests()
         .await
         .expect_err("one overflowing batch should fail the full list");
 
@@ -1691,7 +1725,10 @@ async fn batch_repository_list_orders_by_updated_at_then_id_descending() {
             .expect("batch timestamp should update");
     }
 
-    let summaries = repository.list().await.expect("batches should list");
+    let summaries = repository
+        .list_bounded_for_tests()
+        .await
+        .expect("batches should list");
     let mut tied_ids = [same_time_a.id, same_time_b.id];
     tied_ids.sort_unstable_by(|left, right| right.cmp(left));
 

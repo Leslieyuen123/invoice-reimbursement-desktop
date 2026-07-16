@@ -227,7 +227,14 @@ async fn incremental_sync_imports_each_mail_part_once() {
 
     assert_eq!(first.imported_count, 2);
     assert_eq!(second.imported_count, 0);
-    assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 2);
+    assert_eq!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         Some(SyncCursor {
@@ -346,7 +353,14 @@ async fn refetched_existing_pending_part_resumes_recognition_without_reimporting
     let preserved = items.get_by_id(confirmed.id).await.unwrap();
     assert_eq!(preserved.recognition_status, RecognitionStatus::Pending);
     assert_eq!(preserved.confirmation_status, ConfirmationStatus::Confirmed);
-    assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 2);
+    assert_eq!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         Some(SyncCursor {
@@ -435,7 +449,10 @@ async fn first_sync_recovers_a_legacy_epoch_zero_pending_part() {
     let result = service.run(account.id).await.unwrap();
 
     assert_eq!(result.imported_count, 0);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].id, legacy.id);
     assert_eq!(stored[0].source_uid_validity, Some(0));
@@ -491,7 +508,10 @@ async fn cid_image_without_content_disposition_is_imported() {
     );
 
     let result = service.run(account.id).await.unwrap();
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
 
     assert_eq!(result.imported_count, 1);
     assert_eq!(stored.len(), 1);
@@ -547,7 +567,10 @@ async fn https_download_link_becomes_a_local_pending_placeholder_without_network
         .unwrap();
 
     assert_eq!(result.imported_count, 1);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 1);
     let link = &stored[0];
     assert_eq!(link.mime_type, "text/uri-list");
@@ -622,7 +645,10 @@ async fn html_links_only_import_download_candidates_from_the_message_body() {
     let result = service.run(account.id).await.unwrap();
 
     assert_eq!(result.imported_count, 3);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 3);
     let mut urls = stored
         .iter()
@@ -687,7 +713,10 @@ async fn excessive_download_candidates_are_truncated_and_cursor_advances() {
     let result = service.run(account.id).await.unwrap();
 
     assert_eq!(result.imported_count, 32);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 32);
     assert!(stored.iter().any(|item| {
         item.note.as_deref() == Some("https://example.com/invoices/invoice-00.pdf")
@@ -891,11 +920,25 @@ async fn infrastructure_failure_after_import_keeps_the_item_but_not_the_cursor()
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         None
     );
-    assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 1);
+    assert_eq!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     let rerun = service.run(account.id).await.unwrap();
     assert_eq!(rerun.imported_count, 0);
-    assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 1);
+    assert_eq!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         Some(SyncCursor {
@@ -1089,7 +1132,10 @@ async fn damaged_document_is_marked_failed_while_later_parts_continue_with_prove
     let result = service.run(account.id).await.unwrap();
 
     assert_eq!(result.imported_count, 2);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 2);
     let failed = stored
         .iter()
@@ -1173,7 +1219,10 @@ async fn empty_email_attachment_is_retained_as_failed_while_later_mail_continues
     let result = service.run(account.id).await.unwrap();
 
     assert_eq!(result.imported_count, 2);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 2);
     let empty = stored
         .iter()
@@ -1266,7 +1315,10 @@ async fn oversized_message_creates_a_rejection_item_and_later_mail_continues_onc
 
     assert_eq!(first.imported_count, 2);
     assert_eq!(second.imported_count, 0);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 2);
     let rejected = stored
         .iter()
@@ -1348,7 +1400,14 @@ async fn uidvalidity_change_rescans_without_duplicating_a_mail_part() {
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 0);
 
-    assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 1);
+    assert_eq!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         Some(SyncCursor {
@@ -1422,7 +1481,10 @@ async fn uidvalidity_change_reuses_the_same_message_part_at_a_new_uid() {
 
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 0);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].source_uid_validity, Some(10));
 }
@@ -1481,7 +1543,10 @@ async fn uidvalidity_change_keeps_reused_uid_when_message_content_changes() {
 
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 2);
     let mut identities = stored
         .iter()
@@ -1545,7 +1610,10 @@ async fn same_uidvalidity_same_content_at_a_new_uid_is_a_suspected_duplicate() {
 
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
     assert_eq!(service.run(account.id).await.unwrap().imported_count, 1);
-    let stored = items.list(ItemFilter::default()).await.unwrap();
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stored.len(), 2);
     let duplicate = stored
         .iter()
@@ -1612,7 +1680,14 @@ async fn concurrent_syncs_import_one_database_row_and_one_original() {
 
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
-    assert_eq!(items.list(ItemFilter::default()).await.unwrap().len(), 1);
+    assert_eq!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(count_files(&paths.originals), 1);
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
@@ -1708,7 +1783,13 @@ async fn stale_concurrent_completion_cannot_overwrite_a_newer_cursor_epoch() {
             last_uid: 7,
         })
     );
-    assert!(items.list(ItemFilter::default()).await.unwrap().is_empty());
+    assert!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let mut statuses = sqlx::query_scalar::<_, String>(
         "SELECT status FROM sync_runs WHERE account_id = ? ORDER BY status",
     )
@@ -1880,7 +1961,13 @@ async fn inconsistent_gateway_mailbox_is_rejected_before_import_or_cursor_update
     let error = service.run(account.id).await.unwrap_err();
 
     assert!(error.to_string().contains("mailbox"));
-    assert!(items.list(ItemFilter::default()).await.unwrap().is_empty());
+    assert!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         None

@@ -3,14 +3,13 @@ use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transact
 use uuid::Uuid;
 
 use crate::db::items::{InvoiceItem, ItemRepository};
-use crate::domain::amount::{
-    amount_total_out_of_range, checked_add_amount_cents, validate_amount_cents,
-};
+use crate::domain::amount::{amount_total_out_of_range, validate_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{BatchStatus, NewBatch};
 
 const BATCH_COLUMNS: &str =
     "id, name, start_date, end_date, status, note, created_at, updated_at, last_exported_at";
+const MAX_PAGE_SIZE: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
@@ -171,89 +170,11 @@ impl BatchRepository {
         Batch::try_from(row)
     }
 
-    pub async fn list(&self) -> Result<Vec<BatchSummary>, AppError> {
-        let rows = sqlx::query_as::<_, DbBatchListRow>(
-            "SELECT \
-                b.id, b.name, b.start_date, b.end_date, b.status, b.note, \
-                b.created_at, b.updated_at, b.last_exported_at, \
-                i.id AS item_id, i.amount_cents AS item_amount_cents, \
-                i.confirmation_status AS item_confirmation_status \
-             FROM batches b \
-             LEFT JOIN items i ON i.batch_id = b.id \
-             ORDER BY b.updated_at DESC, b.id DESC, i.id ASC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| internal_error("failed to list batches", error))?;
-
-        let mut summaries = Vec::<BatchSummary>::new();
-        for row in rows {
-            let DbBatchListRow {
-                id,
-                name,
-                start_date,
-                end_date,
-                status,
-                note,
-                created_at,
-                updated_at,
-                last_exported_at,
-                item_id,
-                item_amount_cents,
-                item_confirmation_status,
-            } = row;
-            let batch = Batch::try_from(DbBatchRow {
-                id,
-                name,
-                start_date,
-                end_date,
-                status,
-                note,
-                created_at,
-                updated_at,
-                last_exported_at,
-            })?;
-            if summaries
-                .last()
-                .is_none_or(|summary| summary.id != batch.id)
-            {
-                summaries.push(BatchSummary {
-                    id: batch.id,
-                    name: batch.name,
-                    start_date: batch.start_date,
-                    end_date: batch.end_date,
-                    status: batch.status,
-                    note: batch.note,
-                    created_at: batch.created_at,
-                    updated_at: batch.updated_at,
-                    last_exported_at: batch.last_exported_at,
-                    item_count: 0,
-                    total_amount_cents: 0,
-                    unconfirmed_count: 0,
-                });
-            }
-            if item_id.is_some() {
-                let summary = summaries
-                    .last_mut()
-                    .ok_or_else(|| stable_internal_error("failed to build batch summary"))?;
-                summary.item_count = summary
-                    .item_count
-                    .checked_add(1)
-                    .ok_or_else(|| stable_internal_error("batch summary item count overflow"))?;
-                summary.total_amount_cents = checked_add_amount_cents(
-                    summary.total_amount_cents,
-                    item_amount_cents.unwrap_or(0),
-                    "totalAmountCents",
-                )?;
-                if item_confirmation_status.as_deref() != Some("confirmed") {
-                    summary.unconfirmed_count = summary
-                        .unconfirmed_count
-                        .checked_add(1)
-                        .ok_or_else(|| stable_internal_error("batch unconfirmed count overflow"))?;
-                }
-            }
-        }
-        Ok(summaries)
+    #[doc(hidden)]
+    pub async fn list_bounded_for_tests(&self) -> Result<Vec<BatchSummary>, AppError> {
+        self.list_page(None, MAX_PAGE_SIZE)
+            .await
+            .map(|page| page.batches)
     }
 
     pub async fn list_page(
@@ -261,25 +182,21 @@ impl BatchRepository {
         cursor: Option<BatchPageCursor>,
         page_size: usize,
     ) -> Result<BatchPage, AppError> {
+        validate_page_size(page_size)?;
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT b.id, b.name, b.start_date, b.end_date, b.status, b.note,
-                    b.created_at, b.updated_at, b.last_exported_at,
-                    COUNT(i.id) AS item_count,
-                    COALESCE(SUM(i.amount_cents), 0) AS total_amount_cents,
-                    COALESCE(SUM(CASE
-                        WHEN i.id IS NOT NULL AND i.confirmation_status != 'confirmed'
-                        THEN 1 ELSE 0 END), 0) AS unconfirmed_count
-             FROM batches b
-             LEFT JOIN items i ON i.batch_id = b.id",
+            "WITH candidate_batches AS MATERIALIZED (
+                 SELECT id, name, start_date, end_date, status, note, created_at, updated_at,
+                        last_exported_at
+                 FROM batches",
         );
         if let Some(cursor) = cursor {
             let updated_at = cursor.updated_at.to_rfc3339();
             query
-                .push(" WHERE (b.updated_at < ")
+                .push(" WHERE (updated_at < ")
                 .push_bind(updated_at.clone())
-                .push(" OR (b.updated_at = ")
+                .push(" OR (updated_at = ")
                 .push_bind(updated_at)
-                .push(" AND b.id < ")
+                .push(" AND id < ")
                 .push_bind(cursor.id.to_string())
                 .push("))");
         }
@@ -287,26 +204,38 @@ impl BatchRepository {
             message: "batch page size overflow".to_owned(),
         })?;
         query
-            .push(
-                " GROUP BY b.id, b.name, b.start_date, b.end_date, b.status, b.note,
-                           b.created_at, b.updated_at, b.last_exported_at
-                  ORDER BY b.updated_at DESC, b.id DESC LIMIT ",
-            )
+            .push(" ORDER BY updated_at DESC, id DESC LIMIT ")
             .push_bind(
                 i64::try_from(fetch_limit)
                     .map_err(|_| AppError::validation("pageSize", "page size is too large"))?,
+            )
+            .push(
+                ")
+                 SELECT b.id, b.name, b.start_date, b.end_date, b.status, b.note,
+                    b.created_at, b.updated_at, b.last_exported_at,
+                    COUNT(i.id) AS item_count,
+                    COALESCE(SUM(i.amount_cents), 0) AS total_amount_cents,
+                    COALESCE(SUM(CASE
+                        WHEN i.id IS NOT NULL AND i.confirmation_status != 'confirmed'
+                        THEN 1 ELSE 0 END), 0) AS unconfirmed_count
+             FROM candidate_batches b
+             LEFT JOIN items i ON i.batch_id = b.id
+             GROUP BY b.id, b.name, b.start_date, b.end_date, b.status, b.note,
+                           b.created_at, b.updated_at, b.last_exported_at
+             ORDER BY b.updated_at DESC, b.id DESC",
             );
         let rows = query
             .build_query_as::<DbBatchSummaryRow>()
             .fetch_all(&self.pool)
             .await
             .map_err(map_batch_summary_query_error)?;
-        let mut batches = rows
+        let has_next = rows.len() > page_size;
+        let mut rows = rows;
+        rows.truncate(page_size);
+        let batches = rows
             .into_iter()
             .map(BatchSummary::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let has_next = batches.len() > page_size;
-        batches.truncate(page_size);
         let next_cursor = has_next.then(|| {
             let last = batches
                 .last()
@@ -320,6 +249,34 @@ impl BatchRepository {
             batches,
             next_cursor,
         })
+    }
+
+    pub async fn recent_for_dashboard(&self) -> Result<Vec<BatchSummary>, AppError> {
+        let rows = sqlx::query_as::<_, DbBatchSummaryRow>(
+            "WITH candidate_batches AS MATERIALIZED (
+                 SELECT id, name, start_date, end_date, status, note, created_at, updated_at,
+                        last_exported_at
+                 FROM batches
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT 5
+             )
+             SELECT b.id, b.name, b.start_date, b.end_date, b.status, b.note,
+                    b.created_at, b.updated_at, b.last_exported_at,
+                    COUNT(i.id) AS item_count,
+                    COALESCE(SUM(i.amount_cents), 0) AS total_amount_cents,
+                    COALESCE(SUM(CASE
+                        WHEN i.id IS NOT NULL AND i.confirmation_status != 'confirmed'
+                        THEN 1 ELSE 0 END), 0) AS unconfirmed_count
+             FROM candidate_batches b
+             LEFT JOIN items i ON i.batch_id = b.id
+             GROUP BY b.id, b.name, b.start_date, b.end_date, b.status, b.note,
+                      b.created_at, b.updated_at, b.last_exported_at
+             ORDER BY b.updated_at DESC, b.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_batch_summary_query_error)?;
+        rows.into_iter().map(BatchSummary::try_from).collect()
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
@@ -403,9 +360,37 @@ impl BatchRepository {
     }
 }
 
+fn validate_page_size(page_size: usize) -> Result<(), AppError> {
+    if page_size == 0 || page_size > MAX_PAGE_SIZE {
+        return Err(AppError::validation(
+            "pageSize",
+            format!("page size must be between 1 and {MAX_PAGE_SIZE}"),
+        ));
+    }
+    Ok(())
+}
+
 impl BatchExportClaim {
-    pub(crate) async fn commit(mut self, exported_at: DateTime<Utc>) -> Result<Batch, AppError> {
+    pub(crate) async fn commit(
+        mut self,
+        operation_id: Uuid,
+        exported_at: DateTime<Utc>,
+    ) -> Result<Batch, AppError> {
         let result = async {
+            let journal_rows = sqlx::query(
+                "UPDATE pending_exports
+                 SET state = 'published', last_error = NULL, updated_at = ?
+                 WHERE operation_id = ?",
+            )
+            .bind(exported_at.to_rfc3339())
+            .bind(operation_id.to_string())
+            .execute(&mut *self.transaction)
+            .await
+            .map_err(|_| stable_internal_error("failed to advance export recovery journal"))?
+            .rows_affected();
+            if journal_rows == 0 {
+                return Err(stable_internal_error("export recovery journal was missing"));
+            }
             let rows = sqlx::query(
                 "UPDATE batches SET status = 'exported', last_exported_at = ?, updated_at = ? \
                  WHERE id = ?",
@@ -458,22 +443,6 @@ struct DbBatchRow {
     created_at: String,
     updated_at: String,
     last_exported_at: Option<String>,
-}
-
-#[derive(FromRow)]
-struct DbBatchListRow {
-    id: String,
-    name: String,
-    start_date: String,
-    end_date: String,
-    status: String,
-    note: Option<String>,
-    created_at: String,
-    updated_at: String,
-    last_exported_at: Option<String>,
-    item_id: Option<String>,
-    item_amount_cents: Option<i64>,
-    item_confirmation_status: Option<String>,
 }
 
 #[derive(FromRow)]

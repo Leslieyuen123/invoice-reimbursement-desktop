@@ -15,6 +15,7 @@ const ITEM_COLUMNS: &str = "id, original_name, original_path, normalized_pdf_pat
     suggested_category, final_category, amount_cents, currency, city, company, \
     recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, event_tag, \
     project_tag, created_at, updated_at";
+const MAX_PAGE_SIZE: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceItem {
@@ -354,83 +355,14 @@ impl ItemRepository {
         row.map(InvoiceItem::try_from).transpose()
     }
 
-    pub async fn list(&self, filter: ItemFilter) -> Result<Vec<InvoiceItem>, AppError> {
-        let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
-        query.push(ITEM_COLUMNS).push(" FROM items WHERE 1 = 1");
-
-        if let Some(status) = filter.status {
-            match status {
-                ItemStatus::SuspectedDuplicate => {
-                    query.push(" AND dedupe_status = 'suspected_duplicate'");
-                }
-                ItemStatus::RecognitionFailed => {
-                    query.push(
-                        " AND dedupe_status != 'suspected_duplicate' \
-                         AND recognition_status = 'failed'",
-                    );
-                }
-                ItemStatus::PendingRecognition => {
-                    query.push(
-                        " AND dedupe_status != 'suspected_duplicate' \
-                         AND recognition_status = 'pending'",
-                    );
-                }
-                ItemStatus::PendingConfirmation => {
-                    query.push(
-                        " AND dedupe_status != 'suspected_duplicate' \
-                         AND recognition_status = 'succeeded' \
-                         AND confirmation_status = 'pending'",
-                    );
-                }
-                ItemStatus::Ready => {
-                    query.push(
-                        " AND dedupe_status != 'suspected_duplicate' \
-                         AND recognition_status = 'succeeded' \
-                         AND confirmation_status = 'confirmed'",
-                    );
-                }
-            }
-        }
-        if let Some(period) = filter.suggested_period {
-            query.push(" AND suggested_period = ").push_bind(period);
-        }
-        if let Some(category) = filter.category {
-            query
-                .push(" AND COALESCE(final_category, suggested_category) = ")
-                .push_bind(category_str(category));
-        }
-        if let Some(source_type) = filter.source_type {
-            query
-                .push(" AND source_type = ")
-                .push_bind(source_type_str(source_type));
-        }
-        if let Some(batch_id) = filter.batch_id {
-            query
-                .push(" AND batch_id = ")
-                .push_bind(batch_id.to_string());
-        }
-        if let Some(search) = filter.query {
-            let pattern = format!("%{search}%");
-            query
-                .push(" AND (LOWER(original_name) LIKE LOWER(")
-                .push_bind(pattern.clone())
-                .push(") OR LOWER(company) LIKE LOWER(")
-                .push_bind(pattern.clone())
-                .push(") OR LOWER(city) LIKE LOWER(")
-                .push_bind(pattern.clone())
-                .push(") OR LOWER(note) LIKE LOWER(")
-                .push_bind(pattern)
-                .push("))");
-        }
-
-        query.push(" ORDER BY created_at DESC, id DESC");
-        let rows = query
-            .build_query_as::<DbItemRow>()
-            .fetch_all(&self.pool)
+    #[doc(hidden)]
+    pub async fn list_bounded_for_tests(
+        &self,
+        filter: ItemFilter,
+    ) -> Result<Vec<InvoiceItem>, AppError> {
+        self.list_page(filter, None, MAX_PAGE_SIZE)
             .await
-            .map_err(|error| internal_error("failed to list items", error))?;
-
-        rows.into_iter().map(InvoiceItem::try_from).collect()
+            .map(|page| page.items)
     }
 
     pub async fn list_page(
@@ -439,6 +371,7 @@ impl ItemRepository {
         cursor: Option<ItemPageCursor>,
         page_size: usize,
     ) -> Result<ItemPage, AppError> {
+        validate_page_size(page_size)?;
         let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
         query.push(ITEM_COLUMNS).push(" FROM items WHERE 1 = 1");
         push_item_filters(&mut query, filter);
@@ -467,12 +400,13 @@ impl ItemRepository {
             .fetch_all(&self.pool)
             .await
             .map_err(|error| internal_error("failed to list item page", error))?;
-        let mut items = rows
+        let has_next = rows.len() > page_size;
+        let mut rows = rows;
+        rows.truncate(page_size);
+        let items = rows
             .into_iter()
             .map(InvoiceItem::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let has_next = items.len() > page_size;
-        items.truncate(page_size);
         let next_cursor = has_next.then(|| {
             let last = items.last().expect("nonempty page must have a cursor row");
             ItemPageCursor {
@@ -869,6 +803,16 @@ impl ItemRepository {
             },
         }
     }
+}
+
+fn validate_page_size(page_size: usize) -> Result<(), AppError> {
+    if page_size == 0 || page_size > MAX_PAGE_SIZE {
+        return Err(AppError::validation(
+            "pageSize",
+            format!("page size must be between 1 and {MAX_PAGE_SIZE}"),
+        ));
+    }
+    Ok(())
 }
 
 fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {

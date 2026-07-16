@@ -82,6 +82,53 @@ async fn graceful_shutdown_reports_a_completed_tracked_operation_error() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_does_not_repeat_completed_business_errors() {
+    let app = TestState::new().await;
+    let validation = app
+        .state
+        .run_tracked_operation(async { Err::<(), _>(AppError::validation("name", "invalid")) })
+        .await;
+    assert!(matches!(validation, Err(AppError::Validation { .. })));
+    let conflict = app
+        .state
+        .run_tracked_operation(async {
+            Err::<(), _>(AppError::Conflict {
+                message: "already handled by caller".to_owned(),
+            })
+        })
+        .await;
+    assert!(matches!(conflict, Err(AppError::Conflict { .. })));
+
+    let report = app
+        .state
+        .begin_application_shutdown(None)
+        .wait(Duration::from_secs(1))
+        .await;
+
+    assert!(!report.timed_out);
+    assert!(report.errors.is_empty(), "{:#?}", report.errors);
+}
+
+#[tokio::test]
+async fn beginning_application_shutdown_closes_the_export_gate() {
+    let app = TestState::new().await;
+    let shutdown = app.state.begin_application_shutdown(None);
+
+    let error = app
+        .state
+        .export_service()
+        .export(Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Conflict { ref message } if message.contains("shutting down"))
+    );
+
+    let report = shutdown.wait(Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+}
+
+#[tokio::test]
 async fn shutdown_timeout_aborts_pending_operations_and_marks_running_syncs_interrupted() {
     let app = TestState::new().await;
     let account_id = Uuid::new_v4();

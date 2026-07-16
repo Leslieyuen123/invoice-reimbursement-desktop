@@ -55,10 +55,6 @@ impl BatchService {
         Self { pool }
     }
 
-    pub async fn list(&self) -> Result<Vec<BatchSummary>, AppError> {
-        BatchRepository::new(self.pool.clone()).list().await
-    }
-
     pub async fn list_page(
         &self,
         cursor: Option<BatchPageCursor>,
@@ -66,6 +62,12 @@ impl BatchService {
     ) -> Result<BatchPage, AppError> {
         BatchRepository::new(self.pool.clone())
             .list_page(cursor, page_size)
+            .await
+    }
+
+    pub async fn recent_for_dashboard(&self) -> Result<Vec<BatchSummary>, AppError> {
+        BatchRepository::new(self.pool.clone())
+            .recent_for_dashboard()
             .await
     }
 

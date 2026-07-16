@@ -10,6 +10,8 @@ use tokio::time::Instant;
 
 use crate::domain::error::AppError;
 use crate::services::account_saves::AccountSagaShutdown;
+use crate::services::export::ExportShutdown;
+use crate::services::export_recovery::mark_pending_exports_interrupted;
 use crate::services::scheduler::SchedulerHandle;
 
 const INTERRUPTED_MESSAGE: &str = "application_shutdown_interrupted";
@@ -42,12 +44,14 @@ pub struct ShutdownReport {
     pub timed_out: bool,
     pub errors: Vec<String>,
     pub interrupted_sync_runs: u64,
+    pub interrupted_exports: u64,
 }
 
 pub struct ApplicationShutdown {
     scheduler: Option<SchedulerHandle>,
     operations: RuntimeOperationShutdown,
     account_saves: AccountSagaShutdown,
+    exports: ExportShutdown,
     pool: SqlitePool,
 }
 
@@ -84,11 +88,17 @@ impl RuntimeOperationCoordinator {
         let inner = self.inner.clone();
         let task = tokio::spawn(async move {
             let result = future.await;
-            let observed = result.as_ref().map(|_| ()).map_err(Clone::clone);
+            let lifecycle_error = result
+                .as_ref()
+                .err()
+                .filter(|error| {
+                    matches!(error, AppError::External { .. } | AppError::Internal { .. })
+                })
+                .cloned();
             let _ = sender.send(result);
             {
                 let mut state = inner.state.lock().expect("runtime operation lock poisoned");
-                if let Err(error) = observed
+                if let Some(error) = lifecycle_error
                     && state.first_error.is_none()
                 {
                     state.first_error = Some(error);
@@ -160,12 +170,14 @@ impl ApplicationShutdown {
         scheduler: Option<SchedulerHandle>,
         operations: RuntimeOperationShutdown,
         account_saves: AccountSagaShutdown,
+        exports: ExportShutdown,
         pool: SqlitePool,
     ) -> Self {
         Self {
             scheduler,
             operations,
             account_saves,
+            exports,
             pool,
         }
     }
@@ -186,16 +198,18 @@ impl ApplicationShutdown {
             tokio::join!(
                 scheduler_wait,
                 self.operations.wait(),
-                self.account_saves.wait()
+                self.account_saves.wait(),
+                self.exports.wait()
             )
         })
         .await;
 
         match graceful {
-            Ok((scheduler_result, operation_result, saga_result)) => {
+            Ok((scheduler_result, operation_result, saga_result, export_result)) => {
                 collect_error(&mut report, "scheduler", scheduler_result);
                 collect_error(&mut report, "runtime operation", operation_result);
                 collect_error(&mut report, "account save", saga_result);
+                collect_error(&mut report, "export", export_result);
             }
             Err(_) => {
                 report.timed_out = true;
@@ -212,6 +226,16 @@ impl ApplicationShutdown {
                     match mark_running_syncs_interrupted(&self.pool).await {
                         Ok(count) => report.interrupted_sync_runs = count,
                         Err(error) => collect_error(&mut report, "sync interruption", Err(error)),
+                    }
+                    match mark_pending_exports_interrupted(&self.pool).await {
+                        Ok(count) => report.interrupted_exports = count,
+                        Err(error) => collect_error(&mut report, "export interruption", Err(error)),
+                    }
+                    let pending_export_jobs = self.exports.pending_count();
+                    if pending_export_jobs != 0 {
+                        report.errors.push(format!(
+                            "{pending_export_jobs} export internal job(s) remain tracked for durable recovery"
+                        ));
                     }
                 };
                 if tokio::time::timeout_at(deadline, cleanup).await.is_err() {

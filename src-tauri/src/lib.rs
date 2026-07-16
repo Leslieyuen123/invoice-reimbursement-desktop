@@ -71,6 +71,7 @@ fn initialize_state<R: Runtime>(
         extractor,
     );
     tauri::async_runtime::block_on(state.reconcile_account_saves())?;
+    tauri::async_runtime::block_on(state.reconcile_exports())?;
     Ok(state)
 }
 
@@ -104,6 +105,7 @@ fn shutdown_runtime<R: Runtime>(app: &tauri::AppHandle<R>) {
     if report.timed_out {
         tracing::error!(
             interrupted_sync_runs = report.interrupted_sync_runs,
+            interrupted_exports = report.interrupted_exports,
             "application shutdown exceeded the graceful deadline"
         );
     }

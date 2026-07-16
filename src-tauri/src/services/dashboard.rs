@@ -55,9 +55,8 @@ impl DashboardService {
             message: "failed to load dashboard counts".to_owned(),
         })?;
         let recent_batches = BatchService::new(self.pool.clone())
-            .list_page(None, 5)
-            .await?
-            .batches;
+            .recent_for_dashboard()
+            .await?;
 
         Ok(DashboardSnapshot {
             mailbox_accounts: MailboxAccountRepository::new(self.pool.clone())

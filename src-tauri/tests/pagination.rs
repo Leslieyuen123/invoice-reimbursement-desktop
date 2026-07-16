@@ -2,11 +2,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
-use invoice_reimbursement::commands::{PageRequestDto, batches, dashboard, items};
+use invoice_reimbursement::commands::{CursorDto, PageRequestDto, batches, dashboard, items};
 use invoice_reimbursement::db;
+use invoice_reimbursement::db::batches::BatchRepository;
+use invoice_reimbursement::db::items::{ItemFilter, ItemRepository};
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::credentials::MemoryCredentialStore;
 use invoice_reimbursement::infra::files::AppPaths;
+use invoice_reimbursement::services::batches::BatchService;
 use invoice_reimbursement::state::AppState;
 use uuid::Uuid;
 
@@ -130,6 +133,156 @@ async fn item_pages_are_bounded_and_seek_without_duplicates_or_omissions() {
 }
 
 #[tokio::test]
+async fn page_boundaries_are_validated_below_the_command_layer() {
+    let fixture = Fixture::new().await;
+    let items = ItemRepository::new(fixture.state.pool().clone());
+    let batches = BatchRepository::new(fixture.state.pool().clone());
+
+    for page_size in [0, 201] {
+        let item_error = items
+            .list_page(ItemFilter::default(), None, page_size)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(item_error, AppError::Validation { ref field, .. } if field == "pageSize")
+        );
+
+        let item_service_error = fixture
+            .state
+            .item_service()
+            .list_page(ItemFilter::default(), None, page_size)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(item_service_error, AppError::Validation { ref field, .. } if field == "pageSize")
+        );
+
+        let batch_error = batches.list_page(None, page_size).await.unwrap_err();
+        assert!(
+            matches!(batch_error, AppError::Validation { ref field, .. } if field == "pageSize")
+        );
+
+        let batch_service_error = BatchService::new(fixture.state.pool().clone())
+            .list_page(None, page_size)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(batch_service_error, AppError::Validation { ref field, .. } if field == "pageSize")
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_cursors_are_rejected_and_valid_nonexistent_cursors_are_seek_anchors() {
+    let fixture = Fixture::new().await;
+    let invalid_item = items::list_page(
+        &fixture.state,
+        Default::default(),
+        Some(PageRequestDto {
+            cursor: Some(CursorDto {
+                sort_value: "not-a-date".to_owned(),
+                id: Uuid::new_v4().to_string(),
+            }),
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(invalid_item, AppError::Validation { ref field, .. } if field == "cursor"));
+
+    let invalid_batch = batches::list_page(
+        &fixture.state,
+        Some(PageRequestDto {
+            cursor: Some(CursorDto {
+                sort_value: "9999-12-31T23:59:59Z".to_owned(),
+                id: "not-a-uuid".to_owned(),
+            }),
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(invalid_batch, AppError::Validation { ref field, .. } if field == "cursor"));
+
+    let nonexistent = CursorDto {
+        sort_value: "9999-12-31T23:59:59Z".to_owned(),
+        id: Uuid::new_v4().to_string(),
+    };
+    let item_page = items::list_page(
+        &fixture.state,
+        Default::default(),
+        Some(PageRequestDto {
+            cursor: Some(nonexistent.clone()),
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(item_page.items.len(), 5);
+    let batch_page = batches::list_page(
+        &fixture.state,
+        Some(PageRequestDto {
+            cursor: Some(nonexistent),
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(batch_page.items.len(), 5);
+}
+
+#[tokio::test]
+async fn corrupt_item_in_the_extra_row_does_not_break_the_current_page() {
+    let fixture = Fixture::new().await;
+    let corrupt_id = &fixture.expected_item_ids[5];
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(fixture.state.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE items SET source_type = 'corrupt_source' WHERE id = ?")
+        .bind(corrupt_id)
+        .execute(fixture.state.pool())
+        .await
+        .unwrap();
+
+    assert!(
+        ItemRepository::new(fixture.state.pool().clone())
+            .get_by_id(Uuid::parse_str(corrupt_id).unwrap())
+            .await
+            .is_err()
+    );
+    let page = items::list_page(
+        &fixture.state,
+        Default::default(),
+        Some(PageRequestDto {
+            cursor: None,
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        fixture.expected_item_ids[..5]
+    );
+    assert!(page.next_cursor.is_some());
+    let containing_page = items::list_page(
+        &fixture.state,
+        Default::default(),
+        Some(PageRequestDto {
+            cursor: page.next_cursor,
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .expect_err("a page that actually includes the corrupt item must still fail");
+    assert!(matches!(containing_page, AppError::Internal { .. }));
+}
+
+#[tokio::test]
 async fn batch_pages_use_bounded_sql_aggregation_and_dashboard_limits_to_five() {
     let fixture = Fixture::new().await;
     let default_page = batches::list_page(&fixture.state, None).await.unwrap();
@@ -169,45 +322,52 @@ async fn batch_pages_use_bounded_sql_aggregation_and_dashboard_limits_to_five() 
 }
 
 #[tokio::test]
-async fn dashboard_does_not_decode_items_from_the_sixth_batch() {
+async fn corrupt_batch_in_the_extra_row_does_not_break_page_or_dashboard() {
     let fixture = Fixture::new().await;
     let sixth_batch_id = &fixture.expected_batch_ids[5];
-    let corrupt_item_id = Uuid::new_v4();
-    let timestamp = Utc::now().to_rfc3339();
     sqlx::query("PRAGMA ignore_check_constraints = ON")
         .execute(fixture.state.pool())
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO items (
-            id, original_name, original_path, sha256, mime_type, source_type,
-            fetched_at, batch_id, amount_cents, currency, recognition_status,
-            confirmation_status, dedupe_status, created_at, updated_at
-         ) VALUES (?, 'corrupt.pdf', ?, ?, 'application/pdf', 'corrupt_source', ?, ?, 1,
-                   'CNY', 'succeeded', 'confirmed', 'unique', ?, ?)",
+    sqlx::query("UPDATE batches SET status = 'corrupt_status' WHERE id = ?")
+        .bind(sixth_batch_id)
+        .execute(fixture.state.pool())
+        .await
+        .unwrap();
+
+    let direct_error = BatchRepository::new(fixture.state.pool().clone())
+        .get(Uuid::parse_str(sixth_batch_id).unwrap())
+        .await
+        .expect_err("the corrupt batch must fail when selected directly");
+    assert!(matches!(direct_error, AppError::Internal { .. }));
+
+    let page = batches::list_page(
+        &fixture.state,
+        Some(PageRequestDto {
+            cursor: None,
+            page_size: Some(5),
+        }),
     )
-    .bind(corrupt_item_id.to_string())
-    .bind(
-        fixture
-            .state
-            .paths()
-            .originals
-            .join("corrupt.pdf")
-            .to_string_lossy(),
-    )
-    .bind(format!("corrupt-{corrupt_item_id}"))
-    .bind(&timestamp)
-    .bind(sixth_batch_id)
-    .bind(&timestamp)
-    .bind(&timestamp)
-    .execute(fixture.state.pool())
     .await
     .unwrap();
-
-    let detail_error = batches::get(&fixture.state, Uuid::parse_str(sixth_batch_id).unwrap())
-        .await
-        .expect_err("the sixth batch fixture must fail item decoding when opened directly");
-    assert!(matches!(detail_error, AppError::Internal { .. }));
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|batch| batch.id.as_str())
+            .collect::<Vec<_>>(),
+        fixture.expected_batch_ids[..5]
+    );
+    assert!(page.next_cursor.is_some());
+    let containing_page = batches::list_page(
+        &fixture.state,
+        Some(PageRequestDto {
+            cursor: page.next_cursor,
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .expect_err("a page that actually includes the corrupt batch must still fail");
+    assert!(matches!(containing_page, AppError::Internal { .. }));
 
     let dashboard = dashboard::load(&fixture.state).await.unwrap();
     assert_eq!(dashboard.recent_batches.len(), 5);
@@ -219,4 +379,123 @@ async fn dashboard_does_not_decode_items_from_the_sixth_batch() {
             .collect::<Vec<_>>(),
         fixture.expected_batch_ids[..5]
     );
+}
+
+#[tokio::test]
+async fn pagination_queries_use_bounded_candidate_plans_and_composite_indexes() {
+    let fixture = Fixture::new().await;
+    let indexes = sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name",
+    )
+    .fetch_all(fixture.state.pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.0)
+    .collect::<HashSet<_>>();
+    assert!(indexes.contains("idx_items_created_id"));
+    assert!(indexes.contains("idx_batches_updated_id"));
+
+    let item_plan = explain_details(
+        fixture.state.pool(),
+        "EXPLAIN QUERY PLAN
+         SELECT id FROM items
+         WHERE (created_at < ? OR (created_at = ? AND id < ?))
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+        &[
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T23:59:59Z",
+            &Uuid::new_v4().to_string(),
+            "51",
+        ],
+    )
+    .await;
+    assert!(
+        plan_contains(&item_plan, "idx_items_created_id"),
+        "{item_plan:?}"
+    );
+
+    let batch_plan = explain_details(
+        fixture.state.pool(),
+        "EXPLAIN QUERY PLAN
+         WITH candidate_batches AS MATERIALIZED (
+             SELECT id, name, start_date, end_date, status, note, created_at, updated_at,
+                    last_exported_at
+             FROM batches
+             WHERE (updated_at < ? OR (updated_at = ? AND id < ?))
+             ORDER BY updated_at DESC, id DESC LIMIT ?
+         )
+         SELECT b.id, COUNT(i.id)
+         FROM candidate_batches b
+         LEFT JOIN items i ON i.batch_id = b.id
+         GROUP BY b.id
+         ORDER BY b.updated_at DESC, b.id DESC",
+        &[
+            "9999-12-31T23:59:59Z",
+            "9999-12-31T23:59:59Z",
+            &Uuid::new_v4().to_string(),
+            "51",
+        ],
+    )
+    .await;
+    assert!(
+        plan_contains(&batch_plan, "MATERIALIZE candidate_batches"),
+        "{batch_plan:?}"
+    );
+    assert!(
+        plan_contains(&batch_plan, "idx_batches_updated_id"),
+        "{batch_plan:?}"
+    );
+    assert!(
+        plan_contains(&batch_plan, "idx_items_batch"),
+        "{batch_plan:?}"
+    );
+
+    let dashboard_plan = explain_details(
+        fixture.state.pool(),
+        "EXPLAIN QUERY PLAN
+         WITH candidate_batches AS MATERIALIZED (
+             SELECT id, name, start_date, end_date, status, note, created_at, updated_at,
+                    last_exported_at
+             FROM batches
+             ORDER BY updated_at DESC, id DESC LIMIT 5
+         )
+         SELECT b.id, COUNT(i.id)
+         FROM candidate_batches b
+         LEFT JOIN items i ON i.batch_id = b.id
+         GROUP BY b.id
+         ORDER BY b.updated_at DESC, b.id DESC",
+        &[],
+    )
+    .await;
+    assert!(
+        plan_contains(&dashboard_plan, "MATERIALIZE candidate_batches"),
+        "{dashboard_plan:?}"
+    );
+    assert!(
+        plan_contains(&dashboard_plan, "idx_batches_updated_id"),
+        "{dashboard_plan:?}"
+    );
+    assert!(
+        plan_contains(&dashboard_plan, "idx_items_batch"),
+        "{dashboard_plan:?}"
+    );
+}
+
+async fn explain_details(pool: &sqlx::SqlitePool, sql: &str, bindings: &[&str]) -> Vec<String> {
+    let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sql);
+    for binding in bindings {
+        query = query.bind(*binding);
+    }
+    query
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.3)
+        .collect()
+}
+
+fn plan_contains(plan: &[String], needle: &str) -> bool {
+    plan.iter().any(|detail| detail.contains(needle))
 }

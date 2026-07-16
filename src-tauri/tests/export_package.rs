@@ -163,6 +163,13 @@ async fn exports_pdf_xlsx_originals_and_manifest() {
     ] {
         assert!(result.directory.join(name).is_file(), "missing {name}");
     }
+    assert!(
+        !result
+            .directory
+            .join(".invoice-export-recovery.json")
+            .exists(),
+        "successful packages must not expose internal recovery metadata"
+    );
     assert_eq!(result.item_count, 2);
     assert_eq!(result.total_amount_cents, 44_850);
     let batch = BatchRepository::new(app.pool)

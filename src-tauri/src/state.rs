@@ -224,6 +224,12 @@ impl AppState {
         self.account_saves.reconcile_all().await
     }
 
+    pub async fn reconcile_exports(
+        &self,
+    ) -> Result<crate::services::export::ExportRecoveryReport, crate::domain::error::AppError> {
+        self.export_service().reconcile_pending().await
+    }
+
     pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {
         self.account_saves.begin_shutdown()
     }
@@ -247,6 +253,7 @@ impl AppState {
             scheduler,
             self.runtime_operations.begin_shutdown(),
             self.account_saves.begin_shutdown(),
+            self.export_coordinator.begin_shutdown(),
             self.pool.clone(),
         )
     }

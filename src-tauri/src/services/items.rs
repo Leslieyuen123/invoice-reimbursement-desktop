@@ -117,10 +117,6 @@ impl ItemService {
         }
     }
 
-    pub async fn list(&self, filter: ItemFilter) -> Result<Vec<InvoiceItem>, AppError> {
-        self.items.list(filter).await
-    }
-
     pub async fn list_page(
         &self,
         filter: ItemFilter,

@@ -99,11 +99,7 @@ pub async fn list(
     state: &AppState,
     filter: ItemFilterDto,
 ) -> Result<Vec<InvoiceItemDto>, AppError> {
-    let items = state
-        .item_service()
-        .list(ItemFilter::try_from(filter)?)
-        .await?;
-    items.into_iter().map(InvoiceItemDto::try_from).collect()
+    Ok(list_page(state, filter, None).await?.items)
 }
 
 pub async fn list_page(

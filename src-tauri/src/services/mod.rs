@@ -2,6 +2,7 @@ pub mod account_saves;
 pub mod batches;
 pub mod dashboard;
 pub mod export;
+pub(crate) mod export_recovery;
 pub mod import;
 pub mod items;
 pub(crate) mod operations;

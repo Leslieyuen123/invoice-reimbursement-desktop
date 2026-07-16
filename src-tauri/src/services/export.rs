@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -8,7 +10,8 @@ use dashmap::mapref::entry::Entry;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::db::batches::{BatchExportClaim, BatchRepository};
@@ -21,6 +24,10 @@ use crate::infra::exporters::{
 };
 use crate::infra::files::{
     AppPaths, OpenedContainedFile, open_contained_regular_file, sync_directory,
+};
+pub use crate::services::export_recovery::ExportRecoveryReport;
+use crate::services::export_recovery::{
+    ExportJournal, clear_committed_marker, write_generation_marker,
 };
 
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
@@ -36,6 +43,25 @@ pub struct ExportResult {
 pub struct ExportCoordinator {
     active_exports: Arc<DashMap<Uuid, ()>>,
     generation_slots: Arc<Semaphore>,
+    lifecycle: Arc<ExportLifecycleInner>,
+}
+
+#[derive(Default)]
+struct ExportLifecycleInner {
+    state: Mutex<ExportLifecycleState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct ExportLifecycleState {
+    closed: bool,
+    next_id: u64,
+    tasks: HashMap<u64, JoinHandle<()>>,
+    first_error: Option<AppError>,
+}
+
+pub(crate) struct ExportShutdown {
+    coordinator: ExportCoordinator,
 }
 
 impl Default for ExportCoordinator {
@@ -43,7 +69,115 @@ impl Default for ExportCoordinator {
         Self {
             active_exports: Arc::new(DashMap::new()),
             generation_slots: Arc::new(Semaphore::new(2)),
+            lifecycle: Arc::new(ExportLifecycleInner::default()),
         }
+    }
+}
+
+impl ExportCoordinator {
+    fn acquire_export(&self, batch_id: Uuid) -> Result<ActiveExport, AppError> {
+        let state = self
+            .lifecycle
+            .state
+            .lock()
+            .expect("export lifecycle lock poisoned");
+        if state.closed {
+            return Err(AppError::Conflict {
+                message: "application is shutting down".to_owned(),
+            });
+        }
+        ActiveExport::acquire(
+            self.active_exports.clone(),
+            self.lifecycle.clone(),
+            batch_id,
+        )
+    }
+
+    fn spawn_internal<T, F>(&self, future: F) -> oneshot::Receiver<Result<T, AppError>>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, AppError>> + Send + 'static,
+    {
+        let (sender, receiver) = oneshot::channel();
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .expect("export lifecycle lock poisoned");
+        let task_id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        let lifecycle = self.lifecycle.clone();
+        let task = tokio::spawn(async move {
+            let child = tokio::spawn(future);
+            let result = child.await.map_err(|_| AppError::Internal {
+                message: "export internal task was interrupted".to_owned(),
+            });
+            let result = result.and_then(|result| result);
+            let detached_error = match sender.send(result) {
+                Err(Err(error)) => Some(error),
+                Err(Ok(_)) | Ok(()) => None,
+            };
+            {
+                let mut state = lifecycle
+                    .state
+                    .lock()
+                    .expect("export lifecycle lock poisoned");
+                if let Some(error) = detached_error {
+                    tracing::error!(%error, "detached export internal task failed");
+                    if state.first_error.is_none() {
+                        state.first_error = Some(error);
+                    }
+                }
+                state.tasks.remove(&task_id);
+            }
+            lifecycle.changed.notify_waiters();
+        });
+        state.tasks.insert(task_id, task);
+        receiver
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> ExportShutdown {
+        self.lifecycle
+            .state
+            .lock()
+            .expect("export lifecycle lock poisoned")
+            .closed = true;
+        self.lifecycle.changed.notify_waiters();
+        ExportShutdown {
+            coordinator: self.clone(),
+        }
+    }
+}
+
+impl ExportShutdown {
+    pub(crate) async fn wait(&self) -> Result<(), AppError> {
+        loop {
+            let changed = self.coordinator.lifecycle.changed.notified();
+            let completed = {
+                let state = self
+                    .coordinator
+                    .lifecycle
+                    .state
+                    .lock()
+                    .expect("export lifecycle lock poisoned");
+                (state.tasks.is_empty() && self.coordinator.active_exports.is_empty())
+                    .then(|| state.first_error.clone())
+            };
+            if let Some(error) = completed {
+                return error.map_or(Ok(()), Err);
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.coordinator
+            .lifecycle
+            .state
+            .lock()
+            .expect("export lifecycle lock poisoned")
+            .tasks
+            .len()
     }
 }
 
@@ -135,8 +269,7 @@ impl ExportService {
     }
 
     pub async fn export(&self, batch_id: Uuid) -> Result<ExportResult, AppError> {
-        let active_export =
-            ActiveExport::acquire(self.coordinator.active_exports.clone(), batch_id)?;
+        let active_export = self.coordinator.acquire_export(batch_id)?;
         let batches = BatchRepository::new(self.pool.clone());
         let snapshot = batches.export_snapshot(batch_id).await?;
         let batch = snapshot.batch.clone();
@@ -208,10 +341,12 @@ impl ExportService {
         }
 
         let exported_at = Utc::now();
-        let staging_path = self
-            .paths
-            .staging
-            .join(format!("export-{}", Uuid::new_v4()));
+        let operation_id = Uuid::new_v4();
+        let staging_component = format!("export-{operation_id}");
+        let final_component = export_directory_name(&batch.name, &exported_at);
+        let staging_path = self.paths.staging.join(&staging_component);
+        let directory = self.paths.exports.join(&final_component);
+        let journal = ExportJournal::new(self.pool.clone());
         let generation_slot = self
             .coordinator
             .generation_slots
@@ -226,53 +361,115 @@ impl ExportService {
         let generation_items = items.clone();
         let generation_active_export = active_export.clone();
         let generation_hook = self.generation_hook.clone();
-        let staging = tokio::task::spawn_blocking(move || {
-            let _generation_slot = generation_slot;
-            let _generation_active_export = generation_active_export;
-            generation_hook.before_generation()?;
-            let mut export_items =
-                prepare_export_items(&generation_paths, &generation_items, DEFAULT_EXPORT_LIMITS)?;
-            let merged_pdf = prepare_merged_pdf(&mut export_items, DEFAULT_EXPORT_LIMITS)?;
-            let staging = OwnedExportDirectory::create(staging_path)?;
-            generate_artifacts(
-                staging.path(),
-                &generation_batch,
-                &mut export_items,
+        let generation_staging_component = staging_component.clone();
+        let generation_final_component = final_component.clone();
+        let generation = self.coordinator.spawn_internal(async move {
+            tokio::task::spawn_blocking(move || {
+                let _generation_slot = generation_slot;
+                let _generation_active_export = generation_active_export;
+                let staging = OwnedExportDirectory::create(staging_path)?;
+                write_generation_marker(
+                    staging.path(),
+                    operation_id,
+                    batch_id,
+                    &generation_staging_component,
+                    &generation_final_component,
+                    exported_at,
+                )?;
+                generation_hook.before_generation()?;
+                let mut export_items = prepare_export_items(
+                    &generation_paths,
+                    &generation_items,
+                    DEFAULT_EXPORT_LIMITS,
+                )?;
+                let merged_pdf = prepare_merged_pdf(&mut export_items, DEFAULT_EXPORT_LIMITS)?;
+                generate_artifacts(
+                    staging.path(),
+                    &generation_batch,
+                    &mut export_items,
+                    exported_at,
+                    DEFAULT_EXPORT_LIMITS,
+                    merged_pdf,
+                )?;
+                Ok::<_, AppError>(staging)
+            })
+            .await
+            .map_err(|_| AppError::Internal {
+                message: "export generation task failed".to_owned(),
+            })?
+        });
+        let (generation_result, journal_result) = tokio::join!(
+            await_internal(generation, "export generation task was interrupted"),
+            journal.create(
+                operation_id,
+                batch_id,
+                &staging_component,
+                &final_component,
                 exported_at,
-                DEFAULT_EXPORT_LIMITS,
-                merged_pdf,
-            )?;
-            Ok::<_, AppError>(staging)
-        })
-        .await
-        .map_err(|_| AppError::Internal {
-            message: "export generation task failed".to_owned(),
-        })??;
-
-        let directory = self
-            .paths
-            .exports
-            .join(export_directory_name(&batch.name, &exported_at));
-        let claim = batches.claim_export(&snapshot).await?;
-        let published = self.publisher.publish(staging, directory).await?;
-        let committer = self.committer.clone();
-        let directory = tokio::spawn(async move {
-            let _active_export = active_export;
-            if let Err(error) = committer.commit(claim, exported_at).await {
-                let finalization_error = published.cleanup_after(error);
-                tracing::error!(
-                    %batch_id,
-                    error = %finalization_error,
-                    "export finalization failed"
-                );
-                return Err(finalization_error);
+            )
+        );
+        let staging = match (generation_result, journal_result) {
+            (Ok(staging), Ok(())) => staging,
+            (Ok(staging), Err(error)) => {
+                drop(staging);
+                return Err(error);
             }
-            Ok(published.commit())
-        })
-        .await
-        .map_err(|_| AppError::Internal {
-            message: "export finalizer task failed".to_owned(),
-        })??;
+            (Err(error), Ok(())) => {
+                return Err(finish_failed_export(&journal, &self.paths, operation_id, error).await);
+            }
+            (Err(generation_error), Err(journal_error)) => {
+                return Err(AppError::External {
+                    service: "export_recovery".to_owned(),
+                    retryable: false,
+                    message: format!(
+                        "export generation and recovery journal both failed: generation error: \
+                         {generation_error}; journal error: {journal_error}"
+                    ),
+                });
+            }
+        };
+
+        let claim = match batches.claim_export(&snapshot).await {
+            Ok(claim) => claim,
+            Err(error) => {
+                drop(staging);
+                return Err(finish_failed_export(&journal, &self.paths, operation_id, error).await);
+            }
+        };
+        let committer = self.committer.clone();
+        let publisher = self.publisher.clone();
+        let publication_active_export = active_export.clone();
+        let publication = self.coordinator.spawn_internal(async move {
+            let _active_export = publication_active_export;
+            publisher.publish(staging, directory).await
+        });
+        let published = match await_internal(publication, "export publisher task was interrupted")
+            .await
+        {
+            Ok(published) => published,
+            Err(error) => {
+                drop(claim);
+                return Err(finish_failed_export(&journal, &self.paths, operation_id, error).await);
+            }
+        };
+        let finalizer_journal = journal.clone();
+        let finalizer_paths = self.paths.clone();
+        let finalizer = self.coordinator.spawn_internal(async move {
+            let _active_export = active_export;
+            finalize_export(
+                committer,
+                finalizer_journal,
+                finalizer_paths,
+                final_component,
+                operation_id,
+                batch_id,
+                exported_at,
+                published,
+                claim,
+            )
+            .await
+        });
+        let directory = await_internal(finalizer, "export finalizer task was interrupted").await?;
 
         Ok(ExportResult {
             directory,
@@ -280,6 +477,69 @@ impl ExportService {
             total_amount_cents,
         })
     }
+
+    pub async fn reconcile_pending(&self) -> Result<ExportRecoveryReport, AppError> {
+        ExportJournal::new(self.pool.clone())
+            .reconcile(&self.paths)
+            .await
+    }
+}
+
+async fn await_internal<T>(
+    receiver: oneshot::Receiver<Result<T, AppError>>,
+    interrupted_message: &str,
+) -> Result<T, AppError> {
+    receiver.await.map_err(|_| AppError::Internal {
+        message: interrupted_message.to_owned(),
+    })?
+}
+
+async fn finish_failed_export(
+    journal: &ExportJournal,
+    paths: &AppPaths,
+    operation_id: Uuid,
+    error: AppError,
+) -> AppError {
+    match journal.reconcile_operation(paths, operation_id).await {
+        Ok(()) => error,
+        Err(journal_error) => AppError::External {
+            service: "export_recovery".to_owned(),
+            retryable: false,
+            message: format!(
+                "export failed and its recovery journal could not be cleared: original error: \
+                 {error}; journal error: {journal_error}"
+            ),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_export(
+    committer: Arc<dyn ExportCommitter>,
+    journal: ExportJournal,
+    paths: AppPaths,
+    final_component: String,
+    operation_id: Uuid,
+    batch_id: Uuid,
+    exported_at: DateTime<Utc>,
+    published: OwnedExportDirectory,
+    claim: BatchExportClaim,
+) -> Result<PathBuf, AppError> {
+    if let Err(error) = committer.commit(claim, operation_id, exported_at).await {
+        let finalization_error = published.cleanup_after(error);
+        tracing::error!(
+            %batch_id,
+            error = %finalization_error,
+            "export finalization failed"
+        );
+        return Err(finish_failed_export(&journal, &paths, operation_id, finalization_error).await);
+    }
+
+    let directory = published.commit();
+    journal.advance(operation_id, "committed").await?;
+    clear_committed_marker(&paths.exports, &final_component, operation_id)?;
+    journal.finish(operation_id).await?;
+    Ok(directory)
 }
 
 fn export_directory_name(batch_name: &str, exported_at: &DateTime<Utc>) -> String {
@@ -315,6 +575,7 @@ trait ExportCommitter: Send + Sync {
     async fn commit(
         &self,
         claim: BatchExportClaim,
+        operation_id: Uuid,
         exported_at: DateTime<Utc>,
     ) -> Result<(), AppError>;
 }
@@ -326,9 +587,10 @@ impl ExportCommitter for SqliteExportCommitter {
     async fn commit(
         &self,
         claim: BatchExportClaim,
+        operation_id: Uuid,
         exported_at: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        claim.commit(exported_at).await.map(|_| ())
+        claim.commit(operation_id, exported_at).await.map(|_| ())
     }
 }
 
@@ -365,11 +627,16 @@ struct ActiveExport {
 
 struct ActiveExportLease {
     active_exports: Arc<DashMap<Uuid, ()>>,
+    lifecycle: Arc<ExportLifecycleInner>,
     batch_id: Uuid,
 }
 
 impl ActiveExport {
-    fn acquire(active_exports: Arc<DashMap<Uuid, ()>>, batch_id: Uuid) -> Result<Self, AppError> {
+    fn acquire(
+        active_exports: Arc<DashMap<Uuid, ()>>,
+        lifecycle: Arc<ExportLifecycleInner>,
+        batch_id: Uuid,
+    ) -> Result<Self, AppError> {
         match active_exports.entry(batch_id) {
             Entry::Vacant(entry) => {
                 entry.insert(());
@@ -383,6 +650,7 @@ impl ActiveExport {
         Ok(Self {
             _lease: Arc::new(ActiveExportLease {
                 active_exports,
+                lifecycle,
                 batch_id,
             }),
         })
@@ -392,6 +660,7 @@ impl ActiveExport {
 impl Drop for ActiveExportLease {
     fn drop(&mut self) {
         self.active_exports.remove(&self.batch_id);
+        self.lifecycle.changed.notify_waiters();
     }
 }
 
@@ -644,6 +913,11 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    #[cfg(unix)]
+    struct SymlinkReplacingFailingPublisher {
+        external: PathBuf,
+    }
+
     struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
     impl Write for CaptureWriter {
@@ -720,9 +994,10 @@ mod tests {
         async fn commit(
             &self,
             claim: BatchExportClaim,
+            operation_id: Uuid,
             exported_at: DateTime<Utc>,
         ) -> Result<(), AppError> {
-            let result = claim.commit(exported_at).await.map(|_| ());
+            let result = claim.commit(operation_id, exported_at).await.map(|_| ());
             if result.is_ok() {
                 self.committed
                     .lock()
@@ -742,6 +1017,7 @@ mod tests {
         async fn commit(
             &self,
             _claim: BatchExportClaim,
+            _operation_id: Uuid,
             _exported_at: DateTime<Utc>,
         ) -> Result<(), AppError> {
             self.started
@@ -779,6 +1055,26 @@ mod tests {
                 .unwrap();
             self.release.notified().await;
             Ok(published)
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl DirectoryPublisher for SymlinkReplacingFailingPublisher {
+        async fn publish(
+            &self,
+            staging: OwnedExportDirectory,
+            _destination: PathBuf,
+        ) -> Result<OwnedExportDirectory, AppError> {
+            use std::os::unix::fs::symlink;
+
+            let path = staging.path().to_path_buf();
+            std::mem::forget(staging);
+            fs::remove_dir_all(&path).unwrap();
+            symlink(&self.external, path).unwrap();
+            Err(AppError::Internal {
+                message: "injected publisher failure".to_owned(),
+            })
         }
     }
 
@@ -862,7 +1158,8 @@ mod tests {
             }),
         );
         let batch_id = fixture.batch_id;
-        let task = tokio::spawn(async move { service.export(batch_id).await });
+        let task_service = service.clone();
+        let task = tokio::spawn(async move { task_service.export(batch_id).await });
 
         let final_directory = tokio::time::timeout(std::time::Duration::from_secs(5), published_rx)
             .await
@@ -874,6 +1171,13 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while service.coordinator.active_exports.contains_key(&batch_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("internal finalizer should finish rollback before assertions");
 
         assert!(!final_directory.exists());
         assert_eq!(fs::read_dir(&fixture.paths.staging).unwrap().count(), 0);
@@ -1155,6 +1459,357 @@ mod tests {
         assert!(!second_started.load(Ordering::SeqCst));
         release_tx.send(()).unwrap();
         first_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_shutdown_waits_for_the_real_blocking_generation_job() {
+        let fixture = export_fixture("generation shutdown test").await;
+        let coordinator = ExportCoordinator::default();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let service = ExportService::with_coordinator_and_generation_hook(
+            fixture.pool,
+            fixture.paths,
+            coordinator.clone(),
+            Arc::new(BlockingGenerationHook {
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let batch_id = fixture.batch_id;
+        let export = tokio::spawn(async move { service.export(batch_id).await });
+        started_rx.await.unwrap();
+
+        let shutdown = coordinator.begin_shutdown();
+        let mut wait = Box::pin(shutdown.wait());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err(),
+            "shutdown must not finish while spawn_blocking generation can still mutate staging"
+        );
+
+        release_tx.send(()).unwrap();
+        export.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("shutdown should finish after generation and finalization")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_shutdown_waits_for_a_committed_but_blocked_finalizer() {
+        let fixture = export_fixture("committer shutdown test").await;
+        let coordinator = ExportCoordinator::default();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let service = ExportService {
+            pool: fixture.pool,
+            paths: fixture.paths,
+            coordinator: coordinator.clone(),
+            publisher: Arc::new(super::AtomicDirectoryPublisher),
+            committer: Arc::new(GatedRealCommitter {
+                committed: Mutex::new(Some(committed_tx)),
+                release: release.clone(),
+            }),
+            generation_hook: Arc::new(super::NoopGenerationHook),
+        };
+        let batch_id = fixture.batch_id;
+        let export = tokio::spawn(async move { service.export(batch_id).await });
+        committed_rx.await.unwrap();
+
+        let shutdown = coordinator.begin_shutdown();
+        let mut wait = Box::pin(shutdown.wait());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err(),
+            "shutdown must not finish before a post-commit finalizer preserves its package"
+        );
+
+        release.notify_waiters();
+        export.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("shutdown should finish after finalization")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_rolls_back_uncommitted_and_preserves_committed_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let database_url = format!(
+            "sqlite://{}",
+            directory.path().join("recovery.db").display()
+        );
+        let pool = db::connect(&database_url).await.unwrap();
+        let batches = BatchRepository::new(pool.clone());
+        let draft = batches
+            .create(NewBatch::try_new("draft recovery", "2026-07-01", "2026-07-31", None).unwrap())
+            .await
+            .unwrap();
+        let committed = batches
+            .create(
+                NewBatch::try_new("committed recovery", "2026-07-01", "2026-07-31", None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let exported_at = Utc.with_ymd_and_hms(2026, 7, 16, 6, 0, 0).unwrap();
+        sqlx::query("UPDATE batches SET status = 'exported', last_exported_at = ? WHERE id = ?")
+            .bind(exported_at.to_rfc3339())
+            .bind(committed.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let draft_staging = paths.staging.join("export-draft-recovery");
+        let draft_final = paths.exports.join("draft-recovery");
+        let committed_staging = paths.staging.join("export-committed-recovery");
+        let committed_final = paths.exports.join("committed-recovery");
+        for path in [
+            &draft_staging,
+            &draft_final,
+            &committed_staging,
+            &committed_final,
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("marker"), b"durable").unwrap();
+        }
+        let now = Utc::now().to_rfc3339();
+        for (operation_id, batch_id, staging, final_path, operation_exported_at, state) in [
+            (
+                Uuid::new_v4(),
+                draft.id,
+                &draft_staging,
+                &draft_final,
+                Utc.with_ymd_and_hms(2026, 7, 16, 5, 0, 0).unwrap(),
+                "generating",
+            ),
+            (
+                Uuid::new_v4(),
+                committed.id,
+                &committed_staging,
+                &committed_final,
+                exported_at,
+                "published",
+            ),
+        ] {
+            for directory in [staging, final_path] {
+                crate::services::export_recovery::write_generation_marker(
+                    directory,
+                    operation_id,
+                    batch_id,
+                    staging.file_name().unwrap().to_str().unwrap(),
+                    final_path.file_name().unwrap().to_str().unwrap(),
+                    operation_exported_at,
+                )
+                .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO pending_exports (
+                    operation_id, batch_id, staging_component, final_component, exported_at, state,
+                    interrupted, last_error, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, 1, 'application_shutdown_interrupted', ?, ?)",
+            )
+            .bind(operation_id.to_string())
+            .bind(batch_id.to_string())
+            .bind(staging.file_name().unwrap().to_string_lossy())
+            .bind(final_path.file_name().unwrap().to_string_lossy())
+            .bind(operation_exported_at.to_rfc3339())
+            .bind(state)
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let restarted = ExportService::new(pool.clone(), paths, ExportCoordinator::default());
+        let report = restarted.reconcile_pending().await.unwrap();
+
+        assert_eq!(report.rolled_back, 1);
+        assert_eq!(report.preserved, 1);
+        assert!(!draft_staging.exists());
+        assert!(!draft_final.exists());
+        assert!(!committed_staging.exists());
+        assert!(committed_final.join("marker").is_file());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_retains_staging_when_marker_does_not_own_the_journal_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let batch = BatchRepository::new(pool.clone())
+            .create(NewBatch::try_new("marker mismatch", "2026-07-01", "2026-07-31", None).unwrap())
+            .await
+            .unwrap();
+        let journal_operation_id = Uuid::new_v4();
+        let marker_operation_id = Uuid::new_v4();
+        let staging_component = format!("export-{journal_operation_id}");
+        let final_component = "marker-mismatch-final";
+        let exported_at = Utc::now();
+        let staging = paths.staging.join(&staging_component);
+        fs::create_dir(&staging).unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &staging,
+            marker_operation_id,
+            batch.id,
+            &staging_component,
+            final_component,
+            exported_at,
+        )
+        .unwrap();
+        crate::services::export_recovery::ExportJournal::new(pool.clone())
+            .create(
+                journal_operation_id,
+                batch.id,
+                &staging_component,
+                final_component,
+                exported_at,
+            )
+            .await
+            .unwrap();
+
+        let error = ExportService::new(pool.clone(), paths, ExportCoordinator::default())
+            .reconcile_pending()
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mismatched recovery marker"));
+        assert!(staging.is_dir());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pending_exports WHERE operation_id = ?",
+            )
+            .bind(journal_operation_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_removes_generation_staging_when_database_journal_was_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let operation_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let staging_component = format!("export-{operation_id}");
+        let final_component = "orphan-final";
+        let staging = paths.staging.join(&staging_component);
+        fs::create_dir(&staging).unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &staging,
+            operation_id,
+            batch_id,
+            &staging_component,
+            final_component,
+            Utc::now(),
+        )
+        .unwrap();
+        fs::write(staging.join("partial-artifact"), b"partial").unwrap();
+
+        let report = ExportService::new(pool, paths, ExportCoordinator::default())
+            .reconcile_pending()
+            .await
+            .unwrap();
+
+        assert_eq!(report.rolled_back, 1);
+        assert_eq!(report.preserved, 0);
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_marks_a_blocked_generation_for_durable_recovery() {
+        let fixture = export_fixture("timeout marker test").await;
+        let coordinator = ExportCoordinator::default();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let service = ExportService::with_coordinator_and_generation_hook(
+            fixture.pool.clone(),
+            fixture.paths,
+            coordinator.clone(),
+            Arc::new(BlockingGenerationHook {
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let batch_id = fixture.batch_id;
+        let export = tokio::spawn(async move { service.export(batch_id).await });
+        started_rx.await.unwrap();
+
+        let shutdown = coordinator.begin_shutdown();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), shutdown.wait())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::services::export_recovery::mark_pending_exports_interrupted(&fixture.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let marker = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT interrupted, last_error FROM pending_exports WHERE batch_id = ?",
+        )
+        .bind(batch_id.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(marker.0, 1);
+        assert_eq!(
+            marker.1.as_deref(),
+            Some("application_shutdown_interrupted")
+        );
+
+        release_tx.send(()).unwrap();
+        export.await.unwrap().unwrap();
+        shutdown.wait().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_cleanup_never_follows_a_journal_symlink_or_discards_recovery_state() {
+        let fixture = export_fixture("unsafe cleanup test").await;
+        let external = tempfile::tempdir().unwrap();
+        fs::write(external.path().join("keep"), b"external").unwrap();
+        let service = ExportService::with_publisher(
+            fixture.pool.clone(),
+            fixture.paths,
+            Arc::new(SymlinkReplacingFailingPublisher {
+                external: external.path().to_path_buf(),
+            }),
+        );
+
+        let error = service.export(fixture.batch_id).await.unwrap_err();
+
+        assert!(external.path().join("keep").is_file());
+        assert!(
+            !error
+                .to_string()
+                .contains(&external.path().display().to_string())
+        );
+        let journal = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT interrupted, last_error FROM pending_exports WHERE batch_id = ?",
+        )
+        .bind(fixture.batch_id.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("unsafe cleanup must retain a durable recovery record");
+        assert_eq!(journal.0, 1);
+        assert!(journal.1.is_some());
     }
 
     fn one_page_pdf() -> Vec<u8> {
