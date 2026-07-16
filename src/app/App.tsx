@@ -8,6 +8,7 @@ import {
 } from "react-router-dom";
 
 import { DashboardPage } from "../features/dashboard/DashboardPage";
+import { InboxPage } from "../features/inbox/InboxPage";
 import { AppShell } from "./AppShell";
 
 function PlaceholderPage({ title }: { title: string }) {
@@ -39,7 +40,7 @@ export function App() {
         <Routes>
           <Route element={<AppShell />}>
             <Route index element={<DashboardPage />} />
-            <Route path="inbox" element={<PlaceholderPage title="待处理池" />} />
+            <Route path="inbox" element={<InboxPage />} />
             <Route
               path="batches"
               element={<PlaceholderPage title="报销批次" />}
