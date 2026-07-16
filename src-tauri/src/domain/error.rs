@@ -35,7 +35,7 @@ pub(crate) fn sanitize_message(message: &str, secrets: &[&str]) -> String {
         .copied()
         .filter(|secret| !secret.is_empty())
         .collect::<Vec<_>>();
-    secrets.sort_unstable_by(|left, right| right.len().cmp(&left.len()));
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     let redacted = secrets
         .into_iter()
         .fold(message.to_owned(), |message, secret| {

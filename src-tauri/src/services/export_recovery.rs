@@ -963,7 +963,7 @@ fn read_recovery_marker_from_directory(
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
     use rustix::io::Errno;
 
-    let metadata = match statat(&directory, RECOVERY_MARKER, AtFlags::SYMLINK_NOFOLLOW) {
+    let metadata = match statat(directory, RECOVERY_MARKER, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(metadata) => metadata,
         Err(error) if error == Errno::NOENT => return Ok(None),
         Err(_) => return Err(recovery_error("failed to inspect export recovery marker")),
@@ -972,7 +972,7 @@ fn read_recovery_marker_from_directory(
         return Err(recovery_error("export recovery marker is not a safe file"));
     }
     let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-    let mut file = openat(&directory, RECOVERY_MARKER, file_flags, Mode::empty())
+    let mut file = openat(directory, RECOVERY_MARKER, file_flags, Mode::empty())
         .map(File::from)
         .map_err(|_| recovery_error("failed to open export recovery marker"))?;
     let opened_metadata = file

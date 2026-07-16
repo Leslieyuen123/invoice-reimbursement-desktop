@@ -460,17 +460,14 @@ fn recover_directory_anchored(
             )?;
             continue;
         }
-        match file_type {
-            FileType::Directory => {
-                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                let child = rustix::fs::openat(directory, name, flags, Mode::empty())
-                    .map(File::from)
-                    .map_err(|error| {
-                        filesystem_error("failed to anchor recovery subdirectory", error)
-                    })?;
-                recover_directory_anchored(&child, &directory_path.join(name), referenced_paths)?;
-            }
-            _ => {}
+        if file_type == FileType::Directory {
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let child = rustix::fs::openat(directory, name, flags, Mode::empty())
+                .map(File::from)
+                .map_err(|error| {
+                    filesystem_error("failed to anchor recovery subdirectory", error)
+                })?;
+            recover_directory_anchored(&child, &directory_path.join(name), referenced_paths)?;
         }
     }
     Ok(())

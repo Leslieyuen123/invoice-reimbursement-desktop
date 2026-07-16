@@ -2254,7 +2254,7 @@ async fn persisted_domain_enums_round_trip_through_repository_rows() {
         assert!(
             persisted_item_enums
                 .iter()
-                .any(|(suggested, _, ..)| *suggested == expected)
+                .any(|(suggested, ..)| *suggested == expected)
         );
         assert!(
             persisted_item_enums

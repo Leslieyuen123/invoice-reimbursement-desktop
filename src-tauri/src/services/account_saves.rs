@@ -221,15 +221,12 @@ impl AccountSaveWorker {
         self.pending
             .insert(operation_id, account_id, is_update, metadata)
             .await?;
-        if let Err(error) = set_credential(
+        set_credential(
             self.credentials.clone(),
             pending_save_key(operation_id),
             secret,
         )
-        .await
-        {
-            return Err(error);
-        }
+        .await?;
         self.pending
             .set_phase(operation_id, PendingSavePhase::CredentialStaged)
             .await?;

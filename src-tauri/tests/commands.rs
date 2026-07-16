@@ -503,6 +503,12 @@ async fn multi_file_import_reports_each_result_without_stopping_after_an_error()
             if path == valid.to_string_lossy().as_ref()
                 && item.original_name == "valid.pdf"
     ));
+    let wire = serde_json::to_value(&outcomes).unwrap();
+    assert_eq!(wire[0]["status"], "failed");
+    assert_eq!(wire[1]["status"], "imported");
+    assert_eq!(wire[1]["path"], valid.to_string_lossy().as_ref());
+    assert_eq!(wire[1]["item"]["originalName"], "valid.pdf");
+    assert!(wire[1]["item"].is_object());
 }
 
 #[tokio::test]

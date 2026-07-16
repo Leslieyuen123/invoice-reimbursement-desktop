@@ -508,9 +508,9 @@ impl ProcessTree {
     fn attach(child: &Child) -> Result<Self, ()> {
         #[cfg(unix)]
         {
-            return Ok(Self {
+            Ok(Self {
                 process_group: i32::try_from(child.id()).map_err(|_| ())?,
-            });
+            })
         }
         #[cfg(windows)]
         {

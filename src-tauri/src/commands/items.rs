@@ -179,8 +179,14 @@ pub async fn import_manual(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ManualImportOutcomeDto {
-    Imported { path: String, item: InvoiceItemDto },
-    Failed { path: String, error: AppError },
+    Imported {
+        path: String,
+        item: Box<InvoiceItemDto>,
+    },
+    Failed {
+        path: String,
+        error: AppError,
+    },
 }
 
 pub async fn import_manual_outcomes(
@@ -195,7 +201,10 @@ pub async fn import_manual_outcomes(
             .await
             .and_then(InvoiceItemDto::try_from);
         outcomes.push(match result {
-            Ok(item) => ManualImportOutcomeDto::Imported { path, item },
+            Ok(item) => ManualImportOutcomeDto::Imported {
+                path,
+                item: Box::new(item),
+            },
             Err(error) => ManualImportOutcomeDto::Failed { path, error },
         });
     }

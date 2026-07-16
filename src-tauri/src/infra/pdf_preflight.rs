@@ -345,7 +345,7 @@ fn parse_usize_array(lexer: &mut RawLexer<'_>) -> Result<Vec<usize>, AppError> {
 }
 
 fn validate_xref_index(index: &[usize], size: usize) -> Result<usize, AppError> {
-    if index.is_empty() || index.len() % 2 != 0 {
+    if index.is_empty() || !index.len().is_multiple_of(2) {
         return Err(invalid_pdf_structure());
     }
     index.chunks_exact(2).try_fold(0_usize, |total, range| {
