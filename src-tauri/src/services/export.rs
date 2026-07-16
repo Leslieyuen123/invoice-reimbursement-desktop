@@ -577,7 +577,7 @@ async fn finalize_export(
                     outcome_error = %outcome_error,
                     "export commit outcome is indeterminate"
                 );
-                if let Err(record_error) = journal.record_indeterminate(operation_id).await {
+                if let Err(record_error) = journal.record_indeterminate(&paths, &expected).await {
                     tracing::error!(
                         %batch_id,
                         error = %record_error,
@@ -1012,6 +1012,10 @@ mod tests {
 
     struct IndeterminateOutcomeClassifier;
 
+    struct DeleteJournalAfterClassifyingCommit {
+        pool: sqlx::SqlitePool,
+    }
+
     struct MarkerTamperingPublisher;
 
     #[cfg(unix)]
@@ -1161,6 +1165,34 @@ mod tests {
             crate::services::export_recovery::ExportCommitOutcome::Indeterminate(
                 AppError::Internal {
                     message: "injected outcome read failure at /private/export.db".to_owned(),
+                },
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ExportOutcomeClassifier for DeleteJournalAfterClassifyingCommit {
+        async fn classify(
+            &self,
+            expected: &crate::services::export_recovery::PendingExportIdentity,
+        ) -> crate::services::export_recovery::ExportCommitOutcome {
+            let classified =
+                crate::services::export_recovery::ExportJournal::new(self.pool.clone())
+                    .classify_commit_outcome(expected)
+                    .await;
+            assert!(matches!(
+                classified,
+                crate::services::export_recovery::ExportCommitOutcome::ConfirmedCommitted
+            ));
+            let deleted = sqlx::query("DELETE FROM pending_exports WHERE operation_id = ?")
+                .bind(expected.operation_id.to_string())
+                .execute(&self.pool)
+                .await
+                .unwrap();
+            assert_eq!(deleted.rows_affected(), 1);
+            crate::services::export_recovery::ExportCommitOutcome::Indeterminate(
+                AppError::Internal {
+                    message: "injected outcome race at /private/recovery.db".to_owned(),
                 },
             )
         }
@@ -1542,6 +1574,388 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_commit_rebuilds_a_deleted_journal_from_the_final_marker() {
+        let fixture = export_fixture("不可判定提交删索引测试").await;
+        let service = ExportService {
+            pool: fixture.pool.clone(),
+            paths: fixture.paths.clone(),
+            coordinator: ExportCoordinator::default(),
+            publisher: Arc::new(super::AtomicDirectoryPublisher),
+            committer: Arc::new(CommitThenFailCommitter),
+            outcome_classifier: Arc::new(DeleteJournalAfterClassifyingCommit {
+                pool: fixture.pool.clone(),
+            }),
+            generation_hook: Arc::new(super::NoopGenerationHook),
+        };
+
+        let error = service.export(fixture.batch_id).await.unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AppError::External {
+                service,
+                retryable: true,
+                ..
+            } if service == "export_recovery"
+        ));
+        let final_directory = fs::read_dir(&fixture.paths.exports)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            final_directory
+                .join(".invoice-export-recovery.json")
+                .is_file()
+        );
+        let journal = sqlx::query_as::<_, (String, i64, Option<String>)>(
+            "SELECT state, interrupted, last_error FROM pending_exports WHERE batch_id = ?",
+        )
+        .bind(fixture.batch_id.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("the final marker must reconstruct the missing recovery index");
+        assert_eq!(journal.0, "published");
+        assert_eq!(journal.1, 1);
+        assert_eq!(
+            journal.2.as_deref(),
+            Some("export_commit_outcome_indeterminate")
+        );
+        assert!(!journal.2.unwrap().contains("/private/recovery.db"));
+
+        let restarted = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            ExportCoordinator::default(),
+        );
+        let report = restarted.reconcile_pending().await.unwrap();
+
+        assert_eq!(report.preserved, 1);
+        assert!(final_directory.is_dir());
+        assert!(
+            !final_directory
+                .join(".invoice-export-recovery.json")
+                .exists()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_a_missing_journal_from_a_valid_final_marker() {
+        let fixture = export_fixture("final marker启动发现测试").await;
+        let operation_id = Uuid::new_v4();
+        let exported_at = Utc::now();
+        let staging_component = format!("export-{operation_id}");
+        let final_component = "final-marker-discovery";
+        let final_directory = fixture.paths.exports.join(final_component);
+        fs::create_dir(&final_directory).unwrap();
+        fs::write(final_directory.join("artifact"), b"durable").unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &final_directory,
+            operation_id,
+            fixture.batch_id,
+            &staging_component,
+            final_component,
+            exported_at,
+        )
+        .unwrap();
+        sqlx::query(
+            "UPDATE batches SET status = 'exported', last_exported_at = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(exported_at.to_rfc3339())
+        .bind(exported_at.to_rfc3339())
+        .bind(fixture.batch_id.to_string())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        let report = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths,
+            ExportCoordinator::default(),
+        )
+        .reconcile_pending()
+        .await
+        .unwrap();
+
+        assert_eq!(report.preserved, 1);
+        assert!(final_directory.join("artifact").is_file());
+        assert!(
+            !final_directory
+                .join(".invoice-export-recovery.json")
+                .exists()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_fails_closed_on_a_final_marker_for_another_directory() {
+        let fixture = export_fixture("final marker目录错配测试").await;
+        let operation_id = Uuid::new_v4();
+        let exported_at = Utc::now();
+        let staging_component = format!("export-{operation_id}");
+        let final_component = "actual-final-directory";
+        let final_directory = fixture.paths.exports.join(final_component);
+        fs::create_dir(&final_directory).unwrap();
+        fs::write(final_directory.join("artifact"), b"keep").unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &final_directory,
+            operation_id,
+            fixture.batch_id,
+            &staging_component,
+            "different-final-directory",
+            exported_at,
+        )
+        .unwrap();
+
+        let error = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths,
+            ExportCoordinator::default(),
+        )
+        .reconcile_pending()
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("inconsistent"));
+        assert!(final_directory.join("artifact").is_file());
+        assert!(
+            final_directory
+                .join(".invoice-export-recovery.json")
+                .is_file()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_confuse_a_rebuilt_marker_with_a_prior_export() {
+        let fixture = export_fixture("final marker未提交测试").await;
+        let operation_id = Uuid::new_v4();
+        let exported_at = Utc::now();
+        let previous_exported_at = exported_at - chrono::Duration::seconds(1);
+        let staging_component = format!("export-{operation_id}");
+        let final_component = "uncommitted-final-marker";
+        let historical_directory = fixture.paths.exports.join("prior-export");
+        fs::create_dir(&historical_directory).unwrap();
+        fs::write(historical_directory.join("artifact"), b"committed").unwrap();
+        let final_directory = fixture.paths.exports.join(final_component);
+        fs::create_dir(&final_directory).unwrap();
+        fs::write(final_directory.join("artifact"), b"uncommitted").unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &final_directory,
+            operation_id,
+            fixture.batch_id,
+            &staging_component,
+            final_component,
+            exported_at,
+        )
+        .unwrap();
+        sqlx::query(
+            "UPDATE batches SET status = 'exported', last_exported_at = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(previous_exported_at.to_rfc3339())
+        .bind(previous_exported_at.to_rfc3339())
+        .bind(fixture.batch_id.to_string())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        let report = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths,
+            ExportCoordinator::default(),
+        )
+        .reconcile_pending()
+        .await
+        .unwrap();
+
+        assert_eq!(report.rolled_back, 1);
+        assert!(!final_directory.exists());
+        assert!(historical_directory.join("artifact").is_file());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_ignores_an_ordinary_historical_export_without_a_marker() {
+        let fixture = export_fixture("普通历史包测试").await;
+        let historical = fixture.paths.exports.join("historical-export");
+        fs::create_dir(&historical).unwrap();
+        fs::write(historical.join("manifest.json"), b"{}").unwrap();
+
+        let report = ExportService::new(fixture.pool, fixture.paths, ExportCoordinator::default())
+            .reconcile_pending()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report,
+            crate::services::export::ExportRecoveryReport::default()
+        );
+        assert!(historical.join("manifest.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn restart_fails_closed_on_a_malformed_final_marker() {
+        let fixture = export_fixture("畸形final marker测试").await;
+        let final_directory = fixture.paths.exports.join("malformed-final-marker");
+        fs::create_dir(&final_directory).unwrap();
+        fs::write(final_directory.join("artifact"), b"keep").unwrap();
+        fs::write(
+            final_directory.join(".invoice-export-recovery.json"),
+            b"{not-json",
+        )
+        .unwrap();
+
+        let error = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths,
+            ExportCoordinator::default(),
+        )
+        .reconcile_pending()
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("marker is invalid"));
+        assert!(final_directory.join("artifact").is_file());
+        assert!(
+            final_directory
+                .join(".invoice-export-recovery.json")
+                .is_file()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_never_follows_a_final_recovery_marker_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = export_fixture("final marker符号链接测试").await;
+        let external = tempfile::tempdir().unwrap();
+        let external_marker = external.path().join("external-marker");
+        fs::write(&external_marker, b"outside").unwrap();
+        let final_directory = fixture.paths.exports.join("symlink-final-marker");
+        fs::create_dir(&final_directory).unwrap();
+        fs::write(final_directory.join("artifact"), b"keep").unwrap();
+        symlink(
+            &external_marker,
+            final_directory.join(".invoice-export-recovery.json"),
+        )
+        .unwrap();
+
+        let error = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths,
+            ExportCoordinator::default(),
+        )
+        .reconcile_pending()
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not a safe file"));
+        assert_eq!(fs::read(&external_marker).unwrap(), b"outside");
+        assert!(final_directory.join("artifact").is_file());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_rebuild_never_overwrites_a_conflicting_operation_index() {
+        let fixture = export_fixture("marker索引冲突测试").await;
+        let marker_operation_id = Uuid::new_v4();
+        let indexed_operation_id = Uuid::new_v4();
+        let exported_at = Utc::now();
+        let marker_staging_component = format!("export-{marker_operation_id}");
+        let indexed_staging_component = format!("export-{indexed_operation_id}");
+        let final_component = "conflicting-final-component";
+        let final_directory = fixture.paths.exports.join(final_component);
+        fs::create_dir(&final_directory).unwrap();
+        fs::write(final_directory.join("artifact"), b"keep").unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &final_directory,
+            marker_operation_id,
+            fixture.batch_id,
+            &marker_staging_component,
+            final_component,
+            exported_at,
+        )
+        .unwrap();
+        crate::services::export_recovery::ExportJournal::new(fixture.pool.clone())
+            .create(
+                indexed_operation_id,
+                fixture.batch_id,
+                &indexed_staging_component,
+                final_component,
+                exported_at,
+            )
+            .await
+            .unwrap();
+
+        let error = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths,
+            ExportCoordinator::default(),
+        )
+        .reconcile_pending()
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with the durable index")
+        );
+        assert!(final_directory.join("artifact").is_file());
+        let indexed = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT operation_id, staging_component, state FROM pending_exports",
+        )
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(indexed.0, indexed_operation_id.to_string());
+        assert_eq!(indexed.1, indexed_staging_component);
+        assert_eq!(indexed.2, "generating");
     }
 
     #[tokio::test]

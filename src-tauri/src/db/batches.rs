@@ -388,7 +388,7 @@ impl BatchExportClaim {
             .await
             .map_err(|_| stable_internal_error("failed to advance export recovery journal"))?
             .rows_affected();
-            if journal_rows == 0 {
+            if journal_rows != 1 {
                 return Err(stable_internal_error("export recovery journal was missing"));
             }
             let rows = sqlx::query(
@@ -402,7 +402,7 @@ impl BatchExportClaim {
             .await
             .map_err(|_| stable_internal_error("failed to mark batch exported"))?
             .rows_affected();
-            if rows == 0 {
+            if rows != 1 {
                 return Err(batch_not_found(self.batch_id));
             }
             BatchRepository::get_with_connection(&mut self.transaction, self.batch_id).await

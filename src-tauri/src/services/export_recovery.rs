@@ -6,7 +6,7 @@ use std::path::{Component, Path};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::domain::error::AppError;
@@ -15,6 +15,10 @@ use crate::infra::files::{AppPaths, sync_directory};
 const INTERRUPTED_MESSAGE: &str = "application_shutdown_interrupted";
 const RECOVERY_MARKER: &str = ".invoice-export-recovery.json";
 const MAX_MARKER_BYTES: usize = 4 * 1024;
+const MAX_EXPORT_SCAN_ENTRIES: usize = 8 * 1024;
+const MAX_DISCOVERED_MARKERS: usize = 1024;
+const REBUILT_INDEX_MESSAGE: &str = "export_recovery_index_rebuilt";
+const INDETERMINATE_MESSAGE: &str = "export_commit_outcome_indeterminate";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,7 +42,7 @@ pub(crate) struct ExportJournal {
     pool: SqlitePool,
 }
 
-#[derive(FromRow)]
+#[derive(Debug, FromRow)]
 struct PendingExportRow {
     operation_id: String,
     batch_id: String,
@@ -48,7 +52,7 @@ struct PendingExportRow {
     state: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingExportIdentity {
     pub(crate) operation_id: Uuid,
     pub(crate) batch_id: Uuid,
@@ -95,6 +99,14 @@ impl PendingExportIdentity {
             exported_at,
         ))
     }
+
+    fn matches_row(&self, row: &PendingExportRow) -> bool {
+        row.operation_id == self.operation_id.to_string()
+            && row.batch_id == self.batch_id.to_string()
+            && row.staging_component == self.staging_component
+            && row.final_component == self.final_component
+            && row.exported_at == self.exported_at.to_rfc3339()
+    }
 }
 
 #[derive(Debug)]
@@ -133,7 +145,7 @@ impl ExportJournal {
         validate_component(staging_component, Some("export-"))?;
         validate_component(final_component, None)?;
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
+        let rows = sqlx::query(
             "INSERT INTO pending_exports (
                 operation_id, batch_id, staging_component, final_component, exported_at, state,
                 interrupted, last_error, created_at, updated_at
@@ -148,8 +160,9 @@ impl ExportJournal {
         .bind(&now)
         .execute(&self.pool)
         .await
-        .map(|_| ())
-        .map_err(|_| internal_error("failed to persist export recovery journal"))
+        .map_err(|_| internal_error("failed to persist export recovery journal"))?
+        .rows_affected();
+        require_single_journal_row(rows, "failed to persist export recovery journal")
     }
 
     pub(crate) async fn advance(
@@ -172,19 +185,17 @@ impl ExportJournal {
         .await
         .map_err(|_| internal_error("failed to advance export recovery journal"))?
         .rows_affected();
-        if rows == 0 {
-            return Err(internal_error("export recovery journal was missing"));
-        }
-        Ok(())
+        require_single_journal_row(rows, "export recovery journal was missing")
     }
 
     pub(crate) async fn finish(&self, operation_id: Uuid) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM pending_exports WHERE operation_id = ?")
+        let rows = sqlx::query("DELETE FROM pending_exports WHERE operation_id = ?")
             .bind(operation_id.to_string())
             .execute(&self.pool)
             .await
-            .map(|_| ())
-            .map_err(|_| internal_error("failed to clear export recovery journal"))
+            .map_err(|_| internal_error("failed to clear export recovery journal"))?
+            .rows_affected();
+        require_single_journal_row(rows, "export recovery journal was missing during cleanup")
     }
 
     pub(crate) async fn classify_commit_outcome(
@@ -247,7 +258,7 @@ impl ExportJournal {
             && row.last_exported_at.as_deref() == Some(exported_at.as_str());
         match (row.state.as_str(), batch_has_current_export) {
             ("published" | "committed", true) => ExportCommitOutcome::ConfirmedCommitted,
-            ("generating", false) => ExportCommitOutcome::ConfirmedUncommitted,
+            ("generating" | "published", false) => ExportCommitOutcome::ConfirmedUncommitted,
             _ => ExportCommitOutcome::Indeterminate(outcome_error(
                 "export journal and batch outcome disagree",
             )),
@@ -337,18 +348,44 @@ impl ExportJournal {
         self.finish(expected.operation_id).await
     }
 
-    pub(crate) async fn record_indeterminate(&self, operation_id: Uuid) -> Result<(), AppError> {
-        self.record_error_message(
-            &operation_id.to_string(),
-            "export_commit_outcome_indeterminate",
-        )
-        .await
+    pub(crate) async fn record_indeterminate(
+        &self,
+        paths: &AppPaths,
+        expected: &PendingExportIdentity,
+    ) -> Result<(), AppError> {
+        let operation_id = expected.operation_id.to_string();
+        let rows = self
+            .update_error_message(&operation_id, INDETERMINATE_MESSAGE)
+            .await?;
+        if rows == 1 {
+            return Ok(());
+        }
+        if rows != 0 {
+            return Err(internal_error(
+                "export recovery journal update affected an invalid row count",
+            ));
+        }
+
+        let marker = read_final_recovery_marker(&paths.exports, &expected.final_component)?
+            .ok_or_else(|| recovery_error("committed export package has no recovery marker"))?;
+        if marker != *expected {
+            return Err(recovery_error(
+                "committed export package has a mismatched recovery marker",
+            ));
+        }
+        self.rebuild_missing_index(&marker, INDETERMINATE_MESSAGE, true)
+            .await
     }
 
     pub(crate) async fn reconcile(
         &self,
         paths: &AppPaths,
     ) -> Result<ExportRecoveryReport, AppError> {
+        let discovered = discover_final_recovery_markers(&paths.exports)?;
+        for marker in &discovered {
+            self.rebuild_missing_index(marker, REBUILT_INDEX_MESSAGE, false)
+                .await?;
+        }
         let pending = sqlx::query_as::<_, PendingExportRow>(
             "SELECT operation_id, batch_id, staging_component, final_component, exported_at, state
              FROM pending_exports ORDER BY created_at ASC, operation_id ASC",
@@ -363,7 +400,8 @@ impl ExportJournal {
                 Ok(value) => value,
                 Err(_) => {
                     let error = recovery_error("journal contains an invalid operation identity");
-                    self.record_error(&row.operation_id, &error).await?;
+                    self.record_unrecoverable_row_error(&row.operation_id, &error)
+                        .await?;
                     first_error.get_or_insert(error);
                     continue;
                 }
@@ -372,7 +410,7 @@ impl ExportJournal {
                 Ok(RecoveryDisposition::RolledBack) => report.rolled_back += 1,
                 Ok(RecoveryDisposition::Preserved) => report.preserved += 1,
                 Err(error) => {
-                    self.record_error(&row.operation_id, &error).await?;
+                    self.record_error(paths, &row, &error).await?;
                     first_error.get_or_insert(error);
                 }
             }
@@ -446,7 +484,7 @@ impl ExportJournal {
         match self.reconcile_one(paths, operation_id, &row).await {
             Ok(_) => Ok(()),
             Err(error) => {
-                self.record_error(&row.operation_id, &error).await?;
+                self.record_error(paths, &row, &error).await?;
                 Err(error)
             }
         }
@@ -476,16 +514,51 @@ impl ExportJournal {
         }
     }
 
-    async fn record_error(&self, operation_id: &str, error: &AppError) -> Result<(), AppError> {
+    async fn record_error(
+        &self,
+        paths: &AppPaths,
+        row: &PendingExportRow,
+        error: &AppError,
+    ) -> Result<(), AppError> {
         let message = error.to_string().chars().take(512).collect::<String>();
-        self.record_error_message(operation_id, &message).await
+        let rows = self
+            .update_error_message(&row.operation_id, &message)
+            .await?;
+        if rows == 1 {
+            return Ok(());
+        }
+        if rows != 0 {
+            return Err(internal_error(
+                "export recovery journal update affected an invalid row count",
+            ));
+        }
+
+        let expected = PendingExportIdentity::from_row(row)?;
+        let marker = read_final_recovery_marker(&paths.exports, &expected.final_component)?
+            .ok_or_else(|| recovery_error("export recovery journal disappeared"))?;
+        if marker != expected {
+            return Err(recovery_error(
+                "export recovery journal disappeared behind a mismatched marker",
+            ));
+        }
+        self.rebuild_missing_index(&marker, &message, true).await
     }
 
-    async fn record_error_message(
+    async fn record_unrecoverable_row_error(
+        &self,
+        operation_id: &str,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        let message = error.to_string().chars().take(512).collect::<String>();
+        let rows = self.update_error_message(operation_id, &message).await?;
+        require_single_journal_row(rows, "export recovery journal disappeared")
+    }
+
+    async fn update_error_message(
         &self,
         operation_id: &str,
         message: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<u64, AppError> {
         sqlx::query(
             "UPDATE pending_exports SET interrupted = 1, last_error = ?, updated_at = ?
              WHERE operation_id = ?",
@@ -495,8 +568,130 @@ impl ExportJournal {
         .bind(operation_id)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected())
         .map_err(|_| internal_error("failed to record export recovery error"))
+    }
+
+    async fn rebuild_missing_index(
+        &self,
+        expected: &PendingExportIdentity,
+        message: &str,
+        require_published_existing: bool,
+    ) -> Result<(), AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| internal_error("failed to begin export recovery index rebuild"))?;
+        let result = self
+            .rebuild_missing_index_in_transaction(
+                &mut transaction,
+                expected,
+                message,
+                require_published_existing,
+            )
+            .await;
+        finish_index_transaction(transaction, result).await
+    }
+
+    async fn rebuild_missing_index_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        expected: &PendingExportIdentity,
+        message: &str,
+        require_published_existing: bool,
+    ) -> Result<(), AppError> {
+        let conflicts = sqlx::query_as::<_, PendingExportRow>(
+            "SELECT operation_id, batch_id, staging_component, final_component, exported_at, state
+             FROM pending_exports
+             WHERE operation_id = ? OR batch_id = ? OR staging_component = ? OR final_component = ?",
+        )
+        .bind(expected.operation_id.to_string())
+        .bind(expected.batch_id.to_string())
+        .bind(&expected.staging_component)
+        .bind(&expected.final_component)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| internal_error("failed to inspect export recovery index conflicts"))?;
+
+        if let [existing] = conflicts.as_slice() {
+            PendingExportIdentity::from_row(existing)?;
+            if !expected.matches_row(existing)
+                || (require_published_existing && existing.state != "published")
+            {
+                return Err(recovery_error(
+                    "export recovery marker conflicts with the durable index",
+                ));
+            }
+            if require_published_existing {
+                let rows = sqlx::query(
+                    "UPDATE pending_exports
+                     SET interrupted = 1, last_error = ?, updated_at = ?
+                     WHERE operation_id = ? AND state = 'published'",
+                )
+                .bind(message)
+                .bind(Utc::now().to_rfc3339())
+                .bind(expected.operation_id.to_string())
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| internal_error("failed to restore export recovery error"))?
+                .rows_affected();
+                require_single_journal_row(rows, "export recovery index changed during rebuild")?;
+            }
+            return Ok(());
+        }
+        if !conflicts.is_empty() {
+            return Err(recovery_error(
+                "export recovery marker conflicts with the durable index",
+            ));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let rows = sqlx::query(
+            "INSERT INTO pending_exports (
+                operation_id, batch_id, staging_component, final_component, exported_at, state,
+                interrupted, last_error, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'published', 1, ?, ?, ?)",
+        )
+        .bind(expected.operation_id.to_string())
+        .bind(expected.batch_id.to_string())
+        .bind(&expected.staging_component)
+        .bind(&expected.final_component)
+        .bind(expected.exported_at.to_rfc3339())
+        .bind(message)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| internal_error("failed to rebuild export recovery index"))?
+        .rows_affected();
+        require_single_journal_row(rows, "failed to rebuild export recovery index")
+    }
+}
+
+async fn finish_index_transaction(
+    transaction: Transaction<'_, Sqlite>,
+    result: Result<(), AppError>,
+) -> Result<(), AppError> {
+    match result {
+        Ok(()) => transaction
+            .commit()
+            .await
+            .map_err(|_| internal_error("failed to commit export recovery index rebuild")),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(_) => Err(internal_error(
+                "export recovery index rebuild failed and rollback also failed",
+            )),
+        },
+    }
+}
+
+fn require_single_journal_row(rows: u64, message: &'static str) -> Result<(), AppError> {
+    if rows == 1 {
+        Ok(())
+    } else {
+        Err(internal_error(message))
     }
 }
 
@@ -548,30 +743,52 @@ pub(crate) fn clear_committed_marker(
 }
 
 fn validate_marker(marker: &RecoveryMarker, staging_component: &str) -> Result<(), AppError> {
-    Uuid::parse_str(&marker.operation_id)
-        .map_err(|_| recovery_error("export recovery marker has an invalid identity"))?;
-    Uuid::parse_str(&marker.batch_id)
-        .map_err(|_| recovery_error("export recovery marker has an invalid batch identity"))?;
-    DateTime::parse_from_rfc3339(&marker.exported_at)
-        .map_err(|_| recovery_error("export recovery marker has an invalid timestamp"))?;
-    validate_component(&marker.staging_component, Some("export-"))?;
-    validate_component(&marker.final_component, None)?;
-    if marker.state != "generating" || marker.staging_component != staging_component {
+    let identity = marker_identity(marker)?;
+    if identity.staging_component != staging_component {
         return Err(recovery_error("export recovery marker is inconsistent"));
     }
     Ok(())
+}
+
+fn marker_identity(marker: &RecoveryMarker) -> Result<PendingExportIdentity, AppError> {
+    let operation_id = Uuid::parse_str(&marker.operation_id)
+        .map_err(|_| recovery_error("export recovery marker has an invalid identity"))?;
+    let batch_id = Uuid::parse_str(&marker.batch_id)
+        .map_err(|_| recovery_error("export recovery marker has an invalid batch identity"))?;
+    let exported_at = DateTime::parse_from_rfc3339(&marker.exported_at)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| recovery_error("export recovery marker has an invalid timestamp"))?;
+    validate_component(&marker.staging_component, Some("export-"))?;
+    validate_component(&marker.final_component, None)?;
+    if marker.state != "generating" {
+        return Err(recovery_error("export recovery marker is inconsistent"));
+    }
+    Ok(PendingExportIdentity::new(
+        operation_id,
+        batch_id,
+        marker.staging_component.clone(),
+        marker.final_component.clone(),
+        exported_at,
+    ))
+}
+
+fn final_marker_identity(
+    marker: &RecoveryMarker,
+    final_component: &str,
+) -> Result<PendingExportIdentity, AppError> {
+    validate_component(final_component, None)?;
+    let identity = marker_identity(marker)?;
+    if identity.final_component != final_component {
+        return Err(recovery_error("export recovery marker is inconsistent"));
+    }
+    Ok(identity)
 }
 
 fn marker_matches_identity(
     marker: &RecoveryMarker,
     expected: &PendingExportIdentity,
 ) -> Result<bool, AppError> {
-    validate_marker(marker, &expected.staging_component)?;
-    Ok(marker.operation_id == expected.operation_id.to_string()
-        && marker.batch_id == expected.batch_id.to_string()
-        && marker.staging_component == expected.staging_component
-        && marker.final_component == expected.final_component
-        && marker.exported_at == expected.exported_at.to_rfc3339())
+    Ok(marker_identity(marker)? == *expected)
 }
 
 fn owned_recovery_directory_exists(
@@ -624,39 +841,152 @@ fn recovery_directory_exists(_root: &Path, _component: &str) -> Result<bool, App
     ))
 }
 
+fn read_final_recovery_marker(
+    root: &Path,
+    final_component: &str,
+) -> Result<Option<PendingExportIdentity>, AppError> {
+    read_recovery_marker(root, final_component)?
+        .map(|marker| final_marker_identity(&marker, final_component))
+        .transpose()
+}
+
 #[cfg(unix)]
-fn read_recovery_marker(root: &Path, component: &str) -> Result<Option<RecoveryMarker>, AppError> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
+fn discover_final_recovery_markers(root: &Path) -> Result<Vec<PendingExportIdentity>, AppError> {
+    discover_final_recovery_markers_with_budget(
+        root,
+        MAX_EXPORT_SCAN_ENTRIES,
+        MAX_DISCOVERED_MARKERS,
+    )
+}
+
+#[cfg(unix)]
+fn discover_final_recovery_markers_with_budget(
+    root: &Path,
+    max_entries: usize,
+    max_markers: usize,
+) -> Result<Vec<PendingExportIdentity>, AppError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use rustix::fs::{AtFlags, Dir, FileType, statat};
+
+    let root = open_recovery_root(root)?;
+    let entries = Dir::read_from(&root)
+        .map_err(|_| recovery_error("failed to enumerate export recovery storage"))?;
+    let mut scanned = 0_usize;
+    let mut discovered = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|_| recovery_error("failed to enumerate export recovery entry"))?;
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        scanned = scanned
+            .checked_add(1)
+            .ok_or_else(|| recovery_error("export recovery scan exceeded its entry budget"))?;
+        if scanned > max_entries {
+            return Err(recovery_error(
+                "export recovery scan exceeded its entry budget",
+            ));
+        }
+
+        let component = OsStr::from_bytes(name);
+        let metadata = statat(&root, component, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| recovery_error("failed to inspect export recovery entry"))?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+            continue;
+        }
+        let component = component
+            .to_str()
+            .ok_or_else(|| recovery_error("export recovery directory has an invalid name"))?;
+        validate_component(component, None)?;
+        let directory = open_recovery_directory(&root, component)?
+            .ok_or_else(|| recovery_error("export recovery directory changed during discovery"))?;
+        let Some(marker) = read_recovery_marker_from_directory(&directory)? else {
+            continue;
+        };
+        let identity = final_marker_identity(&marker, component)?;
+        discovered.push(identity);
+        if discovered.len() > max_markers {
+            return Err(recovery_error(
+                "export recovery scan exceeded its marker budget",
+            ));
+        }
+    }
+    Ok(discovered)
+}
+
+#[cfg(not(unix))]
+fn discover_final_recovery_markers(_root: &Path) -> Result<Vec<PendingExportIdentity>, AppError> {
+    Err(recovery_error(
+        "safe export recovery is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn open_recovery_root(root: &Path) -> Result<File, AppError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    rustix::fs::open(root, flags, Mode::empty())
+        .map(File::from)
+        .map_err(|_| recovery_error("failed to anchor export recovery storage"))
+}
+
+#[cfg(unix)]
+fn open_recovery_directory(root: &File, component: &str) -> Result<Option<File>, AppError> {
+    use rustix::fs::{Mode, OFlags, openat};
     use rustix::io::Errno;
 
     let component = validate_component(component, None)?;
-    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let root = rustix::fs::open(root, directory_flags, Mode::empty())
-        .map(File::from)
-        .map_err(|_| recovery_error("failed to anchor export recovery storage"))?;
-    let directory = match openat(&root, &component, directory_flags, Mode::empty()) {
-        Ok(directory) => File::from(directory),
-        Err(error) if error == Errno::NOENT => return Ok(None),
-        Err(_) => return Err(recovery_error("export recovery directory is not safe")),
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match openat(root, component, flags, Mode::empty()) {
+        Ok(directory) => Ok(Some(File::from(directory))),
+        Err(error) if error == Errno::NOENT => Ok(None),
+        Err(_) => Err(recovery_error("export recovery directory is not safe")),
+    }
+}
+
+#[cfg(unix)]
+fn read_recovery_marker(root: &Path, component: &str) -> Result<Option<RecoveryMarker>, AppError> {
+    let root = open_recovery_root(root)?;
+    let Some(directory) = open_recovery_directory(&root, component)? else {
+        return Ok(None);
     };
+    read_recovery_marker_from_directory(&directory)
+}
+
+#[cfg(unix)]
+fn read_recovery_marker_from_directory(
+    directory: &File,
+) -> Result<Option<RecoveryMarker>, AppError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
+    use rustix::io::Errno;
+
     let metadata = match statat(&directory, RECOVERY_MARKER, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(metadata) => metadata,
         Err(error) if error == Errno::NOENT => return Ok(None),
         Err(_) => return Err(recovery_error("failed to inspect export recovery marker")),
     };
-    let marker_length = usize::try_from(metadata.st_size)
-        .map_err(|_| recovery_error("export recovery marker has an invalid size"))?;
-    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
-        || marker_length > MAX_MARKER_BYTES
-    {
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
         return Err(recovery_error("export recovery marker is not a safe file"));
     }
     let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
     let mut file = openat(&directory, RECOVERY_MARKER, file_flags, Mode::empty())
         .map(File::from)
         .map_err(|_| recovery_error("failed to open export recovery marker"))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| recovery_error("failed to inspect opened export recovery marker"))?;
+    if !opened_metadata.is_file() || opened_metadata.len() > MAX_MARKER_BYTES as u64 {
+        return Err(recovery_error("export recovery marker is not a safe file"));
+    }
+    let marker_length = usize::try_from(opened_metadata.len())
+        .map_err(|_| recovery_error("export recovery marker has an invalid size"))?;
     let mut bytes = Vec::with_capacity(marker_length);
-    file.read_to_end(&mut bytes)
+    Read::by_ref(&mut file)
+        .take((MAX_MARKER_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|_| recovery_error("failed to read export recovery marker"))?;
     if bytes.len() > MAX_MARKER_BYTES {
         return Err(recovery_error("export recovery marker is too large"));
@@ -876,5 +1206,83 @@ fn outcome_error(message: &str) -> AppError {
 fn internal_error(message: &str) -> AppError {
     AppError::Internal {
         message: message.to_owned(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use super::{
+        ExportJournal, discover_final_recovery_markers_with_budget, write_generation_marker,
+    };
+    use crate::db;
+    use crate::infra::files::AppPaths;
+
+    #[test]
+    fn final_marker_discovery_enforces_its_entry_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        fs::write(paths.exports.join("one"), b"").unwrap();
+        fs::write(paths.exports.join("two"), b"").unwrap();
+
+        let error = discover_final_recovery_markers_with_budget(&paths.exports, 1, 10).unwrap_err();
+
+        assert!(error.to_string().contains("entry budget"));
+    }
+
+    #[test]
+    fn final_marker_discovery_enforces_its_marker_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let batch_id = Uuid::new_v4();
+        for final_component in ["one", "two"] {
+            let operation_id = Uuid::new_v4();
+            let staging_component = format!("export-{operation_id}");
+            let final_directory = paths.exports.join(final_component);
+            fs::create_dir(&final_directory).unwrap();
+            write_generation_marker(
+                &final_directory,
+                operation_id,
+                batch_id,
+                &staging_component,
+                final_component,
+                Utc::now(),
+            )
+            .unwrap();
+        }
+
+        let error = discover_final_recovery_markers_with_budget(&paths.exports, 10, 1).unwrap_err();
+
+        assert!(error.to_string().contains("marker budget"));
+        assert!(paths.exports.join("one").is_dir());
+        assert!(paths.exports.join("two").is_dir());
+    }
+
+    #[tokio::test]
+    async fn advancing_a_missing_index_is_not_reported_as_success() {
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+
+        let error = ExportJournal::new(pool)
+            .advance(Uuid::new_v4(), "published")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("journal was missing"));
+    }
+
+    #[tokio::test]
+    async fn finishing_a_missing_index_is_not_reported_as_success() {
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+
+        let error = ExportJournal::new(pool)
+            .finish(Uuid::new_v4())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("missing during cleanup"));
     }
 }
