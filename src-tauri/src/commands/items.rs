@@ -290,29 +290,34 @@ pub async fn open_preview(
 
 pub async fn preview_response(
     state: &AppState,
-    method: &str,
-    uri: &str,
+    request: &tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
-    if method != "GET" {
+    if request.method() != tauri::http::Method::GET {
         return preview_http_error(tauri::http::StatusCode::METHOD_NOT_ALLOWED);
     }
-    let result = match parse_preview_uri(uri) {
+    let result = match parse_preview_uri(&request.uri().to_string()) {
         Ok((id, variant)) => open_preview(state, id, variant).await,
         Err(error) => Err(error),
     };
     match result {
-        Ok(payload) => tauri::http::Response::builder()
-            .status(tauri::http::StatusCode::OK)
+        Ok(payload) => preview_response_builder(tauri::http::StatusCode::OK)
             .header(tauri::http::header::CONTENT_TYPE, payload.mime_type)
             .header(tauri::http::header::CONTENT_LENGTH, payload.bytes.len())
-            .header(tauri::http::header::CACHE_CONTROL, "no-store")
-            .header("X-Content-Type-Options", "nosniff")
             .header("Content-Disposition", "inline")
             .header("Content-Security-Policy", "default-src 'none'; sandbox")
             .body(payload.bytes)
             .unwrap_or_else(|_| preview_http_error(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)),
         Err(error) => preview_http_error(preview_error_status(&error)),
     }
+}
+
+fn preview_response_builder(status: tauri::http::StatusCode) -> tauri::http::response::Builder {
+    // The protocol is read-only and resolves only database-owned, contained preview files.
+    tauri::http::Response::builder()
+        .status(status)
+        .header(tauri::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(tauri::http::header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
 }
 
 fn preview_error_status(error: &AppError) -> tauri::http::StatusCode {
@@ -330,14 +335,11 @@ fn preview_error_status(error: &AppError) -> tauri::http::StatusCode {
 }
 
 fn preview_http_error(status: tauri::http::StatusCode) -> tauri::http::Response<Vec<u8>> {
-    tauri::http::Response::builder()
-        .status(status)
+    preview_response_builder(status)
         .header(
             tauri::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
         )
-        .header(tauri::http::header::CACHE_CONTROL, "no-store")
-        .header("X-Content-Type-Options", "nosniff")
         .body(b"Preview unavailable".to_vec())
         .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
 }

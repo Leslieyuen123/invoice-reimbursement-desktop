@@ -29,10 +29,8 @@ pub fn run() {
         .invoke_handler(commands::invoke_handler())
         .register_asynchronous_uri_scheme_protocol("invoice-file", |context, request, responder| {
             let state = context.app_handle().state::<AppState>().inner().clone();
-            let method = request.method().as_str().to_owned();
-            let uri = request.uri().to_string();
             tauri::async_runtime::spawn(async move {
-                responder.respond(commands::items::preview_response(&state, &method, &uri).await);
+                responder.respond(commands::items::preview_response(&state, &request).await);
             });
         })
         .setup(|app| {

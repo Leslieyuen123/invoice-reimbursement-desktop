@@ -569,17 +569,80 @@ async fn preview_resolver_allows_only_database_owned_item_variants() {
             .unwrap();
     assert_eq!(normalized_payload.bytes, b"normalized-bytes");
 
-    let response = items::preview_response(
-        &state,
-        "GET",
-        &format!("invoice-file://item/{item_id}?variant=normalized"),
-    )
-    .await;
+    let request = tauri::http::Request::builder()
+        .method(tauri::http::Method::GET)
+        .uri(format!("invoice-file://item/{item_id}?variant=normalized"))
+        .header(tauri::http::header::RANGE, "bytes=0-0")
+        .body(Vec::new())
+        .unwrap();
+    let response = items::preview_response(&state, &request).await;
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["content-type"], "application/pdf");
+    assert_eq!(response.headers()["access-control-allow-origin"], "*");
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(response.headers()["cache-control"], "no-store");
     assert_eq!(response.body(), b"normalized-bytes");
+}
+
+#[tokio::test]
+async fn preview_error_responses_are_cors_readable_without_exposing_paths() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let missing_id = Uuid::new_v4();
+    let responses = [
+        (
+            items::preview_response(
+                &app.state,
+                &preview_request(
+                    tauri::http::Method::GET,
+                    "invoice-file://item/not-a-uuid?variant=original",
+                ),
+            )
+            .await,
+            tauri::http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            items::preview_response(
+                &app.state,
+                &preview_request(
+                    tauri::http::Method::GET,
+                    &format!("invoice-file://item/{missing_id}?variant=original"),
+                ),
+            )
+            .await,
+            tauri::http::StatusCode::NOT_FOUND,
+        ),
+        (
+            items::preview_response(
+                &app.state,
+                &preview_request(
+                    tauri::http::Method::POST,
+                    &format!("invoice-file://item/{missing_id}?variant=original"),
+                ),
+            )
+            .await,
+            tauri::http::StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ];
+
+    for (response, expected_status) in responses {
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.body(), b"Preview unavailable");
+        assert!(!String::from_utf8_lossy(response.body()).contains("storage"));
+    }
+}
+
+fn preview_request(method: tauri::http::Method, uri: &str) -> tauri::http::Request<Vec<u8>> {
+    tauri::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Vec::new())
+        .unwrap()
 }
 
 #[tokio::test]
@@ -661,7 +724,8 @@ fn tauri_security_configuration_is_narrow_and_blocks_remote_scripts() {
     let csp = config["app"]["security"]["csp"].as_str().unwrap();
     assert!(csp.contains("default-src 'self'"));
     assert!(csp.contains("script-src 'self'"));
-    assert!(csp.contains("frame-src 'self' invoice-file:"));
+    assert!(csp.contains("frame-src 'self' data: invoice-file:"));
+    assert!(csp.contains("connect-src 'self' ipc: http://ipc.localhost invoice-file:"));
     assert!(!csp.contains("script-src 'unsafe-inline'"));
     assert!(!csp.contains("https:"));
 
