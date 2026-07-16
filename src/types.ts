@@ -21,6 +21,39 @@ export type ConfirmationStatus = "pending" | "confirmed";
 
 export type DedupeStatus = "unique" | "suspected_duplicate" | "resolved";
 
+export type MailboxProvider = "gmail" | "qq";
+
+export type AmountCents = number;
+
+export const MAX_SAFE_AMOUNT_CENTS = Number.MAX_SAFE_INTEGER;
+
+export interface CursorDto {
+  sortValue: string;
+  id: string;
+}
+
+export interface PageRequestDto {
+  cursor?: CursorDto;
+  pageSize?: number;
+}
+
+export interface PageDto<T> {
+  items: T[];
+  nextCursor: CursorDto | null;
+}
+
+export type AppError =
+  | { code: "validation"; field: string; message: string }
+  | { code: "not_found"; entity: string; message: string }
+  | { code: "conflict"; message: string }
+  | {
+      code: "external";
+      service: string;
+      retryable: boolean;
+      message: string;
+    }
+  | { code: "internal"; message: string };
+
 export interface InvoiceItemDto {
   id: string;
   originalName: string;
@@ -33,7 +66,7 @@ export interface InvoiceItemDto {
   batchId: string | null;
   suggestedCategory: Category | null;
   finalCategory: Category | null;
-  amountCents: number | null;
+  amountCents: AmountCents | null;
   currency: "CNY";
   city: string | null;
   company: string | null;
@@ -55,7 +88,7 @@ export interface BatchDto {
   endDate: string;
   status: BatchStatus;
   itemCount: number;
-  totalAmountCents: number;
+  totalAmountCents: AmountCents;
   unconfirmedCount: number;
   note: string | null;
   createdAt: string;
@@ -65,7 +98,7 @@ export interface BatchDto {
 
 export interface MailboxAccountDto {
   id: string;
-  provider: "gmail" | "qq";
+  provider: MailboxProvider;
   email: string;
   imapHost: string;
   imapPort: number;
@@ -96,5 +129,81 @@ export interface ItemFilter {
 export interface PreferencesDto {
   backgroundSyncEnabled: boolean;
   exportDirectory: string;
-  batchDirectoryPattern: "{batchName}-{timestamp}";
+  batchDirectoryPattern: string;
 }
+
+export interface ReviewItemInputDto {
+  id: string;
+  invoiceDate: string | null;
+  suggestedPeriod: string;
+  finalCategory: Category;
+  amountCents: AmountCents;
+  city: string | null;
+  company: string | null;
+  note: string | null;
+  eventTag: string | null;
+  projectTag: string | null;
+}
+
+export type ManualImportOutcomeDto =
+  | { status: "imported"; path: string; item: InvoiceItemDto }
+  | { status: "failed"; path: string; error: AppError };
+
+export interface CategorySummaryDto {
+  itemCount: number;
+  amountCents: AmountCents;
+}
+
+export interface BatchDetailSummaryDto {
+  itemCount: number;
+  totalAmountCents: AmountCents;
+  transport: CategorySummaryDto;
+  dining: CategorySummaryDto;
+  accommodation: CategorySummaryDto;
+  hospitality: CategorySummaryDto;
+  unconfirmedCount: number;
+}
+
+export interface BatchDetailDto {
+  batch: BatchDto;
+  items: InvoiceItemDto[];
+  summary: BatchDetailSummaryDto;
+  warnings: string[];
+}
+
+export interface NewBatchInputDto {
+  name: string;
+  startDate: string;
+  endDate: string;
+  note: string | null;
+}
+
+export interface ExportResultDto {
+  directory: string;
+  itemCount: number;
+  totalAmountCents: AmountCents;
+}
+
+export interface SaveMailboxAccountInputDto {
+  id: string | null;
+  provider: MailboxProvider;
+  email: string;
+  secret: string;
+  imapHost: string | null;
+  imapPort: number | null;
+  enabled: boolean;
+  syncIntervalMinutes: number;
+}
+
+export interface TestMailboxAccountInputDto {
+  id: string | null;
+  provider: MailboxProvider;
+  email: string;
+  secret: string;
+  imapHost: string | null;
+  imapPort: number | null;
+}
+
+export type PreferencesInputDto = PreferencesDto;
+
+export type BatchSummaryDto = BatchDto;
