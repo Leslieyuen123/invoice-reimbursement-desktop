@@ -188,14 +188,20 @@ impl ExportJournal {
         require_single_journal_row(rows, "export recovery journal was missing")
     }
 
-    pub(crate) async fn finish(&self, operation_id: Uuid) -> Result<(), AppError> {
+    async fn finish_reconciled(&self, operation_id: Uuid) -> Result<(), AppError> {
         let rows = sqlx::query("DELETE FROM pending_exports WHERE operation_id = ?")
             .bind(operation_id.to_string())
             .execute(&self.pool)
             .await
             .map_err(|_| internal_error("failed to clear export recovery journal"))?
             .rows_affected();
-        require_single_journal_row(rows, "export recovery journal was missing during cleanup")
+        if rows <= 1 {
+            Ok(())
+        } else {
+            Err(internal_error(
+                "export recovery journal cleanup affected an invalid row count",
+            ))
+        }
     }
 
     pub(crate) async fn classify_commit_outcome(
@@ -295,7 +301,7 @@ impl ExportJournal {
             )?;
         }
         clear_committed_marker(&paths.exports, &expected.final_component, expected)?;
-        self.finish(expected.operation_id).await
+        self.finish_reconciled(expected.operation_id).await
     }
 
     pub(crate) async fn rollback_uncommitted(
@@ -345,7 +351,7 @@ impl ExportJournal {
                 "final",
             )?;
         }
-        self.finish(expected.operation_id).await
+        self.finish_reconciled(expected.operation_id).await
     }
 
     pub(crate) async fn record_indeterminate(
@@ -1213,13 +1219,16 @@ fn internal_error(message: &str) -> AppError {
 mod tests {
     use std::fs;
 
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
     use super::{
-        ExportJournal, discover_final_recovery_markers_with_budget, write_generation_marker,
+        ExportCommitOutcome, ExportJournal, PendingExportIdentity, RECOVERY_MARKER,
+        discover_final_recovery_markers_with_budget, write_generation_marker,
     };
     use crate::db;
+    use crate::db::batches::BatchRepository;
+    use crate::domain::model::NewBatch;
     use crate::infra::files::AppPaths;
 
     #[test]
@@ -1275,14 +1284,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finishing_a_missing_index_is_not_reported_as_success() {
+    async fn reconciled_finish_treats_an_already_cleared_index_as_success() {
         let pool = db::connect("sqlite::memory:").await.unwrap();
 
-        let error = ExportJournal::new(pool)
-            .finish(Uuid::new_v4())
+        ExportJournal::new(pool)
+            .finish_reconciled(Uuid::new_v4())
             .await
-            .unwrap_err();
+            .unwrap();
+    }
 
-        assert!(error.to_string().contains("missing during cleanup"));
+    #[tokio::test]
+    async fn committed_recovery_converges_after_two_executors_classify_the_same_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let batch = BatchRepository::new(pool.clone())
+            .create(NewBatch::try_new("committed race", "2026-07-01", "2026-07-31", None).unwrap())
+            .await
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let staging_component = format!("export-{operation_id}");
+        let final_component = "committed-race-final";
+        let exported_at = Utc.with_ymd_and_hms(2026, 7, 16, 8, 0, 0).unwrap();
+        let expected = PendingExportIdentity::new(
+            operation_id,
+            batch.id,
+            staging_component.clone(),
+            final_component.to_owned(),
+            exported_at,
+        );
+        let staging = paths.staging.join(&staging_component);
+        let final_directory = paths.exports.join(final_component);
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&final_directory).unwrap();
+        for recovery_directory in [&staging, &final_directory] {
+            write_generation_marker(
+                recovery_directory,
+                operation_id,
+                batch.id,
+                &staging_component,
+                final_component,
+                exported_at,
+            )
+            .unwrap();
+        }
+        fs::write(final_directory.join("keep"), b"committed").unwrap();
+        let first = ExportJournal::new(pool.clone());
+        let second = ExportJournal::new(pool.clone());
+        first
+            .create(
+                operation_id,
+                batch.id,
+                &staging_component,
+                final_component,
+                exported_at,
+            )
+            .await
+            .unwrap();
+        first.advance(operation_id, "published").await.unwrap();
+        sqlx::query("UPDATE batches SET status = 'exported', last_exported_at = ? WHERE id = ?")
+            .bind(exported_at.to_rfc3339())
+            .bind(batch.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            first.classify_commit_outcome(&expected).await,
+            ExportCommitOutcome::ConfirmedCommitted
+        ));
+        assert!(matches!(
+            second.classify_commit_outcome(&expected).await,
+            ExportCommitOutcome::ConfirmedCommitted
+        ));
+        first.preserve_committed(&paths, &expected).await.unwrap();
+        second.preserve_committed(&paths, &expected).await.unwrap();
+
+        assert!(final_directory.join("keep").is_file());
+        assert!(!final_directory.join(RECOVERY_MARKER).exists());
+        assert!(!staging.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pending_exports WHERE operation_id = ?",
+            )
+            .bind(operation_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_recovery_converges_after_two_executors_classify_the_same_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let batch = BatchRepository::new(pool.clone())
+            .create(
+                NewBatch::try_new("uncommitted race", "2026-07-01", "2026-07-31", None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let staging_component = format!("export-{operation_id}");
+        let final_component = "uncommitted-race-final";
+        let exported_at = Utc.with_ymd_and_hms(2026, 7, 16, 9, 0, 0).unwrap();
+        let expected = PendingExportIdentity::new(
+            operation_id,
+            batch.id,
+            staging_component.clone(),
+            final_component.to_owned(),
+            exported_at,
+        );
+        let staging = paths.staging.join(&staging_component);
+        let final_directory = paths.exports.join(final_component);
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&final_directory).unwrap();
+        for recovery_directory in [&staging, &final_directory] {
+            write_generation_marker(
+                recovery_directory,
+                operation_id,
+                batch.id,
+                &staging_component,
+                final_component,
+                exported_at,
+            )
+            .unwrap();
+        }
+        fs::write(staging.join("partial"), b"staging").unwrap();
+        fs::write(final_directory.join("partial"), b"published").unwrap();
+        let first = ExportJournal::new(pool.clone());
+        let second = ExportJournal::new(pool.clone());
+        first
+            .create(
+                operation_id,
+                batch.id,
+                &staging_component,
+                final_component,
+                exported_at,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            first.classify_commit_outcome(&expected).await,
+            ExportCommitOutcome::ConfirmedUncommitted
+        ));
+        assert!(matches!(
+            second.classify_commit_outcome(&expected).await,
+            ExportCommitOutcome::ConfirmedUncommitted
+        ));
+        first.rollback_uncommitted(&paths, &expected).await.unwrap();
+        second
+            .rollback_uncommitted(&paths, &expected)
+            .await
+            .unwrap();
+
+        assert!(!staging.exists());
+        assert!(!final_directory.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pending_exports WHERE operation_id = ?",
+            )
+            .bind(operation_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
     }
 }
