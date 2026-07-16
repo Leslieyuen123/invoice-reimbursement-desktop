@@ -2,6 +2,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use uuid::Uuid;
 
+use crate::domain::amount::{checked_add_amount_cents, validate_optional_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, SourceType,
@@ -105,6 +106,18 @@ pub struct ItemFilter {
     pub source_type: Option<SourceType>,
     pub batch_id: Option<Uuid>,
     pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemPageCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemPage {
+    pub items: Vec<InvoiceItem>,
+    pub next_cursor: Option<ItemPageCursor>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -418,6 +431,56 @@ impl ItemRepository {
             .map_err(|error| internal_error("failed to list items", error))?;
 
         rows.into_iter().map(InvoiceItem::try_from).collect()
+    }
+
+    pub async fn list_page(
+        &self,
+        filter: ItemFilter,
+        cursor: Option<ItemPageCursor>,
+        page_size: usize,
+    ) -> Result<ItemPage, AppError> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
+        query.push(ITEM_COLUMNS).push(" FROM items WHERE 1 = 1");
+        push_item_filters(&mut query, filter);
+        if let Some(cursor) = cursor {
+            let created_at = cursor.created_at.to_rfc3339();
+            query
+                .push(" AND (created_at < ")
+                .push_bind(created_at.clone())
+                .push(" OR (created_at = ")
+                .push_bind(created_at)
+                .push(" AND id < ")
+                .push_bind(cursor.id.to_string())
+                .push("))");
+        }
+        let fetch_limit = page_size.checked_add(1).ok_or_else(|| AppError::Internal {
+            message: "item page size overflow".to_owned(),
+        })?;
+        query
+            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(
+                i64::try_from(fetch_limit)
+                    .map_err(|_| AppError::validation("pageSize", "page size is too large"))?,
+            );
+        let rows = query
+            .build_query_as::<DbItemRow>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to list item page", error))?;
+        let mut items = rows
+            .into_iter()
+            .map(InvoiceItem::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_next = items.len() > page_size;
+        items.truncate(page_size);
+        let next_cursor = has_next.then(|| {
+            let last = items.last().expect("nonempty page must have a cursor row");
+            ItemPageCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }
+        });
+        Ok(ItemPage { items, next_cursor })
     }
 
     pub async fn recommend_unassigned(
@@ -808,6 +871,73 @@ impl ItemRepository {
     }
 }
 
+fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
+    if let Some(status) = filter.status {
+        match status {
+            ItemStatus::SuspectedDuplicate => {
+                query.push(" AND dedupe_status = 'suspected_duplicate'");
+            }
+            ItemStatus::RecognitionFailed => {
+                query.push(
+                    " AND dedupe_status != 'suspected_duplicate' \
+                     AND recognition_status = 'failed'",
+                );
+            }
+            ItemStatus::PendingRecognition => {
+                query.push(
+                    " AND dedupe_status != 'suspected_duplicate' \
+                     AND recognition_status = 'pending'",
+                );
+            }
+            ItemStatus::PendingConfirmation => {
+                query.push(
+                    " AND dedupe_status != 'suspected_duplicate' \
+                     AND recognition_status = 'succeeded' \
+                     AND confirmation_status = 'pending'",
+                );
+            }
+            ItemStatus::Ready => {
+                query.push(
+                    " AND dedupe_status != 'suspected_duplicate' \
+                     AND recognition_status = 'succeeded' \
+                     AND confirmation_status = 'confirmed'",
+                );
+            }
+        }
+    }
+    if let Some(period) = filter.suggested_period {
+        query.push(" AND suggested_period = ").push_bind(period);
+    }
+    if let Some(category) = filter.category {
+        query
+            .push(" AND COALESCE(final_category, suggested_category) = ")
+            .push_bind(category_str(category));
+    }
+    if let Some(source_type) = filter.source_type {
+        query
+            .push(" AND source_type = ")
+            .push_bind(source_type_str(source_type));
+    }
+    if let Some(batch_id) = filter.batch_id {
+        query
+            .push(" AND batch_id = ")
+            .push_bind(batch_id.to_string());
+    }
+    if let Some(search) = filter.query {
+        let pattern = format!("%{search}%");
+        query
+            .push(" AND (LOWER(original_name) LIKE LOWER(")
+            .push_bind(pattern.clone())
+            .push(") OR LOWER(company) LIKE LOWER(")
+            .push_bind(pattern.clone())
+            .push(") OR LOWER(city) LIKE LOWER(")
+            .push_bind(pattern.clone())
+            .push(") OR LOWER(note) LIKE LOWER(")
+            .push_bind(pattern)
+            .push("))");
+    }
+}
+
 fn validate_assigned_item_state(item: &NewItemRecord) -> Result<(), AppError> {
     if item.batch_id.is_none() {
         return Ok(());
@@ -906,15 +1036,10 @@ async fn validate_batch_summary_total(
             .fetch_all(&mut *connection)
             .await
             .map_err(|error| map_database_error("failed to validate batch summary", error))?;
-    amounts
-        .into_iter()
-        .try_fold(0_i64, |total, amount| {
-            total.checked_add(amount.unwrap_or(0))
-        })
-        .map(|_| ())
-        .ok_or_else(|| AppError::Internal {
-            message: "batch summary amount overflow".to_owned(),
-        })
+    amounts.into_iter().try_fold(0_i64, |total, amount| {
+        checked_add_amount_cents(total, amount.unwrap_or(0), "totalAmountCents")
+    })?;
+    Ok(())
 }
 
 impl DuplicateDiscardClaim {
@@ -1165,13 +1290,7 @@ impl TryFrom<DbItemRow> for InvoiceItem {
 }
 
 fn validate_amount(amount_cents: Option<i64>) -> Result<(), AppError> {
-    if amount_cents.is_some_and(|amount| amount < 0) {
-        return Err(AppError::validation(
-            "amount_cents",
-            "amount must be nonnegative",
-        ));
-    }
-    Ok(())
+    validate_optional_amount_cents(amount_cents, "amount_cents").map(|_| ())
 }
 
 fn validate_source(item: &NewItemRecord) -> Result<(), AppError> {

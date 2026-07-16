@@ -1,5 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(test)]
+use std::io::Read;
+#[cfg(unix)]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -27,6 +31,118 @@ pub struct StagedOriginal {
 pub struct PromotedOriginal {
     path: PathBuf,
     owned: bool,
+}
+
+pub(crate) struct OpenedContainedFile {
+    pub(crate) file: File,
+    pub(crate) length: u64,
+}
+
+pub(crate) fn open_contained_regular_file(
+    path: &Path,
+    root: &Path,
+    field: &str,
+) -> Result<OpenedContainedFile, AppError> {
+    open_contained_regular_file_with_hook(path, root, field, || {})
+}
+
+#[cfg(unix)]
+fn open_contained_regular_file_with_hook(
+    path: &Path,
+    root: &Path,
+    field: &str,
+    parent_anchored: impl FnOnce(),
+) -> Result<OpenedContainedFile, AppError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| AppError::validation(field, "票据文件不在应用存储目录内"))?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
+    }
+
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut parent = rustix::fs::open(root, directory_flags, Mode::empty())
+        .map(File::from)
+        .map_err(|_| AppError::Internal {
+            message: "failed to open application file storage".to_owned(),
+        })?;
+    if let Some(relative_parent) = relative.parent() {
+        for component in relative_parent.components() {
+            let Component::Normal(component) = component else {
+                return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
+            };
+            parent = rustix::fs::openat(&parent, component, directory_flags, Mode::empty())
+                .map(File::from)
+                .map_err(|_| AppError::validation(field, "票据文件路径无法读取"))?;
+        }
+    }
+
+    parent_anchored();
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| AppError::validation(field, "票据文件路径无法读取"))?;
+    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let file = rustix::fs::openat(&parent, file_name, file_flags, Mode::empty())
+        .map(File::from)
+        .map_err(|_| AppError::validation(field, "票据路径必须是普通文件"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
+    if !metadata.is_file() {
+        return Err(AppError::validation(field, "票据路径必须是普通文件"));
+    }
+    Ok(OpenedContainedFile {
+        file,
+        length: metadata.len(),
+    })
+}
+
+#[cfg(not(unix))]
+fn open_contained_regular_file_with_hook(
+    _path: &Path,
+    _root: &Path,
+    field: &str,
+    _parent_anchored: impl FnOnce(),
+) -> Result<OpenedContainedFile, AppError> {
+    Err(unsupported_contained_file_platform(field))
+}
+
+#[cfg(not(unix))]
+fn unsupported_contained_file_platform(field: &str) -> AppError {
+    AppError::validation(field, "当前平台不支持安全文件读取")
+}
+
+#[cfg(test)]
+pub(crate) fn read_contained_regular_file_with_hooks(
+    path: &Path,
+    root: &Path,
+    field: &str,
+    max_bytes: u64,
+    parent_anchored: impl FnOnce(),
+    before_read: impl FnOnce(),
+) -> Result<Vec<u8>, AppError> {
+    let mut opened = open_contained_regular_file_with_hook(path, root, field, parent_anchored)?;
+    if opened.length > max_bytes {
+        return Err(AppError::validation(field, "票据文件超过读取大小限制"));
+    }
+    before_read();
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.length).unwrap_or(0));
+    opened
+        .file
+        .by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(AppError::validation(field, "票据文件超过读取大小限制"));
+    }
+    Ok(bytes)
 }
 
 impl AppPaths {

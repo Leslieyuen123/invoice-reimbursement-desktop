@@ -2,8 +2,9 @@ use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
 
 use crate::db::accounts::{MailboxAccount, MailboxAccountRepository};
+use crate::db::batches::BatchSummary;
 use crate::domain::error::AppError;
-use crate::services::batches::{BatchDetail, BatchService};
+use crate::services::batches::BatchService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardCounts {
@@ -17,7 +18,7 @@ pub struct DashboardCounts {
 pub struct DashboardSnapshot {
     pub mailbox_accounts: Vec<MailboxAccount>,
     pub counts: DashboardCounts,
-    pub recent_batches: Vec<BatchDetail>,
+    pub recent_batches: Vec<BatchSummary>,
 }
 
 #[derive(Clone)]
@@ -54,11 +55,9 @@ impl DashboardService {
             message: "failed to load dashboard counts".to_owned(),
         })?;
         let recent_batches = BatchService::new(self.pool.clone())
-            .list()
+            .list_page(None, 5)
             .await?
-            .into_iter()
-            .take(5)
-            .collect();
+            .batches;
 
         Ok(DashboardSnapshot {
             mailbox_accounts: MailboxAccountRepository::new(self.pool.clone())

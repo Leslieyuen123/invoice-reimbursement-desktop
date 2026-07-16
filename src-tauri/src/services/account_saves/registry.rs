@@ -55,7 +55,10 @@ impl AccountSagaRegistry {
         state.next_task_id = state.next_task_id.wrapping_add(1);
         let inner = self.inner.clone();
         let task = tokio::spawn(async move {
-            let result = match tokio::spawn(future).await {
+            let result = match AbortOnDropJoinHandle::new(tokio::spawn(future))
+                .join()
+                .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(child_task_error()),
             };
@@ -135,6 +138,54 @@ impl AccountSagaRegistry {
 impl AccountSagaShutdown {
     pub async fn wait(&self) -> Result<(), AppError> {
         self.registry.wait_for_completion().await
+    }
+
+    pub async fn abort_and_wait(&self) -> Result<(), AppError> {
+        let (tasks, first_error) = {
+            let mut state = self
+                .registry
+                .inner
+                .state
+                .lock()
+                .expect("account saga lock poisoned");
+            (std::mem::take(&mut state.tasks), state.first_error.clone())
+        };
+        for task in tasks.values() {
+            task.abort();
+        }
+        for (_, task) in tasks {
+            let _ = task.await;
+        }
+        self.registry.inner.changed.notify_waiters();
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+struct AbortOnDropJoinHandle<T> {
+    task: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(task: JoinHandle<T>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("owned account saga task must be present")
+            .await;
+        self.task.take();
+        result
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -256,5 +307,50 @@ mod tests {
                 .to_string()
                 .contains("completed account saga failure")
         );
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_aborts_pending_child_and_retains_an_earlier_error() {
+        struct DropSignal(Arc<Notify>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let registry = AccountSagaRegistry::default();
+        let failed = registry.spawn(async {
+            Err::<(), _>(AppError::Internal {
+                message: "account saga failed before shutdown".to_owned(),
+            })
+        });
+        assert!(failed.await.unwrap().is_err());
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let child_started = started.clone();
+        let child_dropped = dropped.clone();
+        let pending = registry.spawn(async move {
+            let _drop_signal = DropSignal(child_dropped);
+            child_started.notify_one();
+            std::future::pending::<Result<(), AppError>>().await
+        });
+        started.notified().await;
+
+        let error = registry
+            .begin_shutdown()
+            .abort_and_wait()
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("account saga failed before shutdown")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("forced shutdown must abort the real saga child");
+        assert!(pending.await.is_err());
     }
 }

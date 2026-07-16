@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tauri::{Manager, Runtime};
 
@@ -95,11 +96,20 @@ fn shutdown_runtime<R: Runtime>(app: &tauri::AppHandle<R>) {
         .lock()
         .ok()
         .and_then(|mut scheduler| scheduler.take());
-    if let Some(scheduler) = scheduler {
-        let _ = tauri::async_runtime::block_on(scheduler.stop());
+    let report = tauri::async_runtime::block_on(
+        app.state::<AppState>()
+            .begin_application_shutdown(scheduler)
+            .wait(Duration::from_secs(10)),
+    );
+    if report.timed_out {
+        tracing::error!(
+            interrupted_sync_runs = report.interrupted_sync_runs,
+            "application shutdown exceeded the graceful deadline"
+        );
     }
-    let shutdown = app.state::<AppState>().begin_account_saga_shutdown();
-    let _ = tauri::async_runtime::block_on(shutdown.wait());
+    for error in report.errors {
+        tracing::error!(%error, "application shutdown component failed");
+    }
 }
 
 #[cfg(test)]

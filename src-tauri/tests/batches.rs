@@ -183,7 +183,7 @@ async fn recommend_includes_boundary_months_and_all_unassigned_item_states() {
         .await
         .expect("in-memory database should connect");
     let service = BatchService::new(pool.clone());
-    let items = ItemRepository::new(pool);
+    let items = ItemRepository::new(pool.clone());
 
     let mut candidates = vec![
         sample_item(3, Some("2026-03")),
@@ -265,7 +265,7 @@ async fn assign_is_idempotent_deduplicates_input_and_warns_only_for_outside_date
         .await
         .expect("in-memory database should connect");
     let service = BatchService::new(pool.clone());
-    let items = ItemRepository::new(pool);
+    let items = ItemRepository::new(pool.clone());
     let batch = service
         .create_month(2026, 2)
         .await
@@ -586,19 +586,25 @@ async fn summary_reports_amount_overflow_without_panicking() {
         .await
         .expect("in-memory database should connect");
     let service = BatchService::new(pool.clone());
-    let items = ItemRepository::new(pool);
+    let items = ItemRepository::new(pool.clone());
     let batch = service
         .create_month(2026, 2)
         .await
         .expect("batch should create");
     let mut maximum = sample_item(66, Some("2026-02"));
-    maximum.amount_cents = Some(i64::MAX);
+    maximum.amount_cents = None;
     let mut one = sample_item(67, Some("2026-02"));
     one.amount_cents = Some(1);
     items
         .insert(&maximum)
         .await
         .expect("maximum item should insert");
+    sqlx::query("UPDATE items SET amount_cents = ? WHERE id = ?")
+        .bind(i64::MAX)
+        .bind(maximum.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("raw overflow fixture should bypass repository validation");
     items
         .insert(&one)
         .await
@@ -609,12 +615,10 @@ async fn summary_reports_amount_overflow_without_panicking() {
         .await
         .expect_err("overflowing summary should return an error");
 
-    assert_eq!(
+    assert!(matches!(
         error,
-        AppError::Internal {
-            message: "batch summary amount overflow".to_owned(),
-        }
-    );
+        AppError::Validation { ref field, .. } if field == "totalAmountCents"
+    ));
     assert_eq!(
         items
             .get_by_id(maximum.id)
@@ -717,13 +721,19 @@ async fn update_rolls_back_batch_fields_when_detail_amounts_overflow() {
         .await
         .expect("batch should create");
     let mut maximum = sample_item(68, Some("2026-02"));
-    maximum.amount_cents = Some(i64::MAX);
+    maximum.amount_cents = None;
     let mut one = sample_item(69, Some("2026-02"));
     one.amount_cents = Some(1);
     items
         .insert(&maximum)
         .await
         .expect("maximum item should insert");
+    sqlx::query("UPDATE items SET amount_cents = ? WHERE id = ?")
+        .bind(i64::MAX)
+        .bind(maximum.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("raw overflow fixture should bypass repository validation");
     items
         .insert(&one)
         .await
@@ -750,12 +760,10 @@ async fn update_rolls_back_batch_fields_when_detail_amounts_overflow() {
         .await
         .expect_err("overflowing detail should fail the update");
 
-    assert_eq!(
+    assert!(matches!(
         error,
-        AppError::Internal {
-            message: "batch summary amount overflow".to_owned(),
-        }
-    );
+        AppError::Validation { ref field, .. } if field == "totalAmountCents"
+    ));
     let persisted = BatchRepository::new(pool)
         .get(batch.id)
         .await

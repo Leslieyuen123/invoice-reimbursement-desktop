@@ -1623,13 +1623,19 @@ async fn batch_repository_list_reports_stable_rust_amount_overflow() {
         .await
         .expect("overflowing batch should create");
     let mut maximum = sample_item("list-overflow-max", "sha-list-overflow-max");
-    maximum.amount_cents = Some(i64::MAX);
+    maximum.amount_cents = None;
     let mut one = sample_item("list-overflow-one", "sha-list-overflow-one");
     one.amount_cents = Some(1);
     items
         .insert(&maximum)
         .await
         .expect("maximum item should insert");
+    sqlx::query("UPDATE items SET amount_cents = ? WHERE id = ?")
+        .bind(i64::MAX)
+        .bind(maximum.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("raw overflow fixture should bypass repository validation");
     items
         .insert(&one)
         .await
@@ -1647,12 +1653,10 @@ async fn batch_repository_list_reports_stable_rust_amount_overflow() {
         .await
         .expect_err("one overflowing batch should fail the full list");
 
-    assert_eq!(
+    assert!(matches!(
         error,
-        AppError::Internal {
-            message: "batch summary amount overflow".to_owned(),
-        }
-    );
+        AppError::Validation { ref field, .. } if field == "totalAmountCents"
+    ));
 }
 
 #[tokio::test]
@@ -1871,11 +1875,17 @@ async fn assigned_public_inserts_roll_back_batch_total_overflow() {
             &format!("sha-maximum-{}", mode.label()),
         );
         maximum.batch_id = Some(batch.id);
-        maximum.amount_cents = Some(i64::MAX);
+        maximum.amount_cents = None;
         items
             .insert(&maximum)
             .await
             .expect("maximum item should insert");
+        sqlx::query("UPDATE items SET amount_cents = ? WHERE id = ?")
+            .bind(i64::MAX)
+            .bind(maximum.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("raw overflow fixture should bypass repository validation");
         sqlx::query("UPDATE batches SET status = 'exported', last_exported_at = ? WHERE id = ?")
             .bind("2026-07-14T08:00:00Z")
             .bind(batch.id.to_string())
@@ -1894,12 +1904,10 @@ async fn assigned_public_inserts_roll_back_batch_total_overflow() {
             .await
             .expect_err("overflowing assigned item should not insert");
 
-        assert_eq!(
+        assert!(matches!(
             error,
-            AppError::Internal {
-                message: "batch summary amount overflow".to_owned(),
-            }
-        );
+            AppError::Validation { ref field, .. } if field == "totalAmountCents"
+        ));
         assert!(matches!(
             items.get_by_id(candidate_id).await,
             Err(AppError::NotFound { ref entity, .. }) if entity == "item"

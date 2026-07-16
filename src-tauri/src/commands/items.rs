@@ -1,9 +1,11 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::db::items::{InvoiceItem, ItemFilter};
+use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
+use crate::db::items::{InvoiceItem, ItemFilter, ItemPageCursor};
+use crate::domain::amount::{validate_amount_cents, validate_optional_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, SourceType,
@@ -11,7 +13,7 @@ use crate::domain::model::{
 use crate::services::items::ItemReview;
 use crate::state::AppState;
 
-const MAX_PREVIEW_BYTES: u64 = crate::services::import::MAX_FILE_SIZE;
+pub use crate::services::preview::{PreviewPayload, PreviewVariant};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -53,15 +55,18 @@ pub struct InvoiceItemDto {
     pub updated_at: String,
 }
 
-impl From<InvoiceItem> for InvoiceItemDto {
-    fn from(item: InvoiceItem) -> Self {
+impl TryFrom<InvoiceItem> for InvoiceItemDto {
+    type Error = AppError;
+
+    fn try_from(item: InvoiceItem) -> Result<Self, Self::Error> {
         let status = item.status();
         let variant = if item.normalized_pdf_path.is_some() {
             "normalized"
         } else {
             "original"
         };
-        Self {
+        let amount_cents = validate_optional_amount_cents(item.amount_cents, "amountCents")?;
+        Ok(Self {
             id: item.id.to_string(),
             original_name: item.original_name,
             preview_url: format!("invoice-file://item/{}?variant={variant}", item.id),
@@ -73,7 +78,7 @@ impl From<InvoiceItem> for InvoiceItemDto {
             batch_id: item.batch_id.map(|id| id.to_string()),
             suggested_category: item.suggested_category,
             final_category: item.final_category,
-            amount_cents: item.amount_cents,
+            amount_cents,
             currency: item.currency,
             city: item.city,
             company: item.company,
@@ -86,7 +91,7 @@ impl From<InvoiceItem> for InvoiceItemDto {
             project_tag: item.project_tag,
             created_at: item.created_at.to_rfc3339(),
             updated_at: item.updated_at.to_rfc3339(),
-        }
+        })
     }
 }
 
@@ -98,11 +103,49 @@ pub async fn list(
         .item_service()
         .list(ItemFilter::try_from(filter)?)
         .await?;
-    Ok(items.into_iter().map(InvoiceItemDto::from).collect())
+    items.into_iter().map(InvoiceItemDto::try_from).collect()
+}
+
+pub async fn list_page(
+    state: &AppState,
+    filter: ItemFilterDto,
+    page: Option<PageRequestDto>,
+) -> Result<PageDto<InvoiceItemDto>, AppError> {
+    let page_size = validated_page_size(page.as_ref())?;
+    let cursor = page
+        .as_ref()
+        .and_then(|page| page.cursor.as_ref())
+        .map(parse_item_cursor)
+        .transpose()?;
+    let page = state
+        .item_service()
+        .list_page(ItemFilter::try_from(filter)?, cursor, page_size)
+        .await?;
+    Ok(PageDto {
+        items: page
+            .items
+            .into_iter()
+            .map(InvoiceItemDto::try_from)
+            .collect::<Result<Vec<_>, _>>()?,
+        next_cursor: page.next_cursor.map(|cursor| CursorDto {
+            sort_value: cursor.created_at.to_rfc3339(),
+            id: cursor.id.to_string(),
+        }),
+    })
+}
+
+fn parse_item_cursor(cursor: &CursorDto) -> Result<ItemPageCursor, AppError> {
+    Ok(ItemPageCursor {
+        created_at: DateTime::parse_from_rfc3339(&cursor.sort_value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|_| AppError::validation("cursor", "invalid item cursor"))?,
+        id: Uuid::parse_str(&cursor.id)
+            .map_err(|_| AppError::validation("cursor", "invalid item cursor"))?,
+    })
 }
 
 pub async fn get(state: &AppState, id: Uuid) -> Result<InvoiceItemDto, AppError> {
-    state.item_service().get(id).await.map(InvoiceItemDto::from)
+    state.item_service().get(id).await?.try_into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -130,17 +173,44 @@ pub async fn import_manual(
         items.push(
             service
                 .import_manual(&PathBuf::from(path))
-                .await
-                .map(InvoiceItemDto::from)?,
+                .await?
+                .try_into()?,
         );
     }
     Ok(items)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ManualImportOutcomeDto {
+    Imported { path: String, item: InvoiceItemDto },
+    Failed { path: String, error: AppError },
+}
+
+pub async fn import_manual_outcomes(
+    state: &AppState,
+    paths: Vec<String>,
+) -> Vec<ManualImportOutcomeDto> {
+    let service = state.import_service();
+    let mut outcomes = Vec::with_capacity(paths.len());
+    for path in paths {
+        let result = service
+            .import_manual(&PathBuf::from(&path))
+            .await
+            .and_then(InvoiceItemDto::try_from);
+        outcomes.push(match result {
+            Ok(item) => ManualImportOutcomeDto::Imported { path, item },
+            Err(error) => ManualImportOutcomeDto::Failed { path, error },
+        });
+    }
+    outcomes
 }
 
 pub async fn review(
     state: &AppState,
     input: ReviewItemInputDto,
 ) -> Result<InvoiceItemDto, AppError> {
+    validate_amount_cents(input.amount_cents, "amountCents")?;
     state
         .item_service()
         .review(ItemReview {
@@ -155,8 +225,8 @@ pub async fn review(
             event_tag: input.event_tag,
             project_tag: input.project_tag,
         })
-        .await
-        .map(InvoiceItemDto::from)
+        .await?
+        .try_into()
 }
 
 pub async fn resolve_duplicate(
@@ -167,28 +237,13 @@ pub async fn resolve_duplicate(
     state
         .item_service()
         .resolve_duplicate(id, keep)
-        .await
-        .map(|item| item.map(InvoiceItemDto::from))
+        .await?
+        .map(InvoiceItemDto::try_from)
+        .transpose()
 }
 
 pub async fn retry_recognition(state: &AppState, id: Uuid) -> Result<InvoiceItemDto, AppError> {
-    state
-        .recognition_service()
-        .retry(id)
-        .await
-        .map(InvoiceItemDto::from)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewVariant {
-    Original,
-    Normalized,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewPayload {
-    pub bytes: Vec<u8>,
-    pub mime_type: &'static str,
+    state.recognition_service().retry(id).await?.try_into()
 }
 
 pub fn parse_preview_uri(uri: &str) -> Result<(Uuid, PreviewVariant), AppError> {
@@ -225,26 +280,7 @@ pub async fn open_preview(
     id: Uuid,
     variant: PreviewVariant,
 ) -> Result<PreviewPayload, AppError> {
-    let item = state.item_service().get(id).await?;
-    let (path, root, mime_type) = match variant {
-        PreviewVariant::Original => (
-            PathBuf::from(item.original_path),
-            state.paths().originals.clone(),
-            preview_mime_type(&item.mime_type)?,
-        ),
-        PreviewVariant::Normalized => (
-            PathBuf::from(item.normalized_pdf_path.ok_or_else(|| AppError::NotFound {
-                entity: "item_preview".to_owned(),
-                message: "item preview is unavailable".to_owned(),
-            })?),
-            state.paths().normalized.clone(),
-            "application/pdf",
-        ),
-    };
-
-    tokio::task::spawn_blocking(move || read_preview(path, root, mime_type))
-        .await
-        .map_err(|_| preview_unavailable())?
+    state.preview_service().open(id, variant).await
 }
 
 pub async fn preview_response(
@@ -270,13 +306,20 @@ pub async fn preview_response(
             .header("Content-Security-Policy", "default-src 'none'; sandbox")
             .body(payload.bytes)
             .unwrap_or_else(|_| preview_http_error(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)),
-        Err(AppError::Validation { .. }) => {
-            preview_http_error(tauri::http::StatusCode::BAD_REQUEST)
+        Err(error) => preview_http_error(preview_error_status(&error)),
+    }
+}
+
+fn preview_error_status(error: &AppError) -> tauri::http::StatusCode {
+    match error {
+        AppError::Validation { .. } => tauri::http::StatusCode::BAD_REQUEST,
+        AppError::NotFound { .. } => tauri::http::StatusCode::NOT_FOUND,
+        AppError::Conflict { .. } => tauri::http::StatusCode::CONFLICT,
+        AppError::External { service, .. } if service == "preview_capacity" => {
+            tauri::http::StatusCode::SERVICE_UNAVAILABLE
         }
-        Err(AppError::NotFound { .. }) => preview_http_error(tauri::http::StatusCode::NOT_FOUND),
-        Err(AppError::Conflict { .. }) => preview_http_error(tauri::http::StatusCode::CONFLICT),
-        Err(AppError::External { .. } | AppError::Internal { .. }) => {
-            preview_http_error(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)
+        AppError::External { .. } | AppError::Internal { .. } => {
+            tauri::http::StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
@@ -294,56 +337,8 @@ fn preview_http_error(status: tauri::http::StatusCode) -> tauri::http::Response<
         .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
 }
 
-fn read_preview(
-    path: PathBuf,
-    root: PathBuf,
-    mime_type: &'static str,
-) -> Result<PreviewPayload, AppError> {
-    let canonical_root = std::fs::canonicalize(&root).map_err(|_| preview_unavailable())?;
-    let canonical_path = std::fs::canonicalize(&path).map_err(|_| preview_unavailable())?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(preview_unavailable());
-    }
-
-    let mut opened = crate::services::export::open_contained_regular_file(&path, &root, "preview")
-        .map_err(|_| preview_unavailable())?;
-    if opened.length > MAX_PREVIEW_BYTES {
-        return Err(preview_unavailable());
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(opened.length).unwrap_or(0));
-    opened
-        .file
-        .by_ref()
-        .take(MAX_PREVIEW_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| preview_unavailable())?;
-    if bytes.len() as u64 > MAX_PREVIEW_BYTES {
-        return Err(preview_unavailable());
-    }
-    Ok(PreviewPayload { bytes, mime_type })
-}
-
-fn preview_mime_type(mime_type: &str) -> Result<&'static str, AppError> {
-    match mime_type {
-        "application/pdf" => Ok("application/pdf"),
-        "image/png" => Ok("image/png"),
-        "image/jpeg" => Ok("image/jpeg"),
-        _ => Err(AppError::validation(
-            "preview",
-            "item type cannot be previewed",
-        )),
-    }
-}
-
 fn invalid_preview_request() -> AppError {
     AppError::validation("previewUrl", "invalid item preview URL")
-}
-
-fn preview_unavailable() -> AppError {
-    AppError::NotFound {
-        entity: "item_preview".to_owned(),
-        message: "item preview is unavailable".to_owned(),
-    }
 }
 
 impl TryFrom<ItemFilterDto> for ItemFilter {
@@ -367,11 +362,28 @@ impl TryFrom<ItemFilterDto> for ItemFilter {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::domain::error::AppError;
+
+    #[test]
+    fn preview_capacity_errors_map_to_service_unavailable() {
+        let status = super::preview_error_status(&AppError::External {
+            service: "preview_capacity".to_owned(),
+            retryable: true,
+            message: "preview capacity is exhausted".to_owned(),
+        });
+
+        assert_eq!(status, tauri::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
 pub(crate) mod ipc {
     use tauri::State;
     use uuid::Uuid;
 
-    use super::{InvoiceItemDto, ItemFilterDto, ReviewItemInputDto};
+    use super::{InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto, ReviewItemInputDto};
+    use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
     use crate::state::AppState;
 
@@ -379,8 +391,9 @@ pub(crate) mod ipc {
     pub async fn list_items(
         state: State<'_, AppState>,
         filter: ItemFilterDto,
-    ) -> Result<Vec<InvoiceItemDto>, AppError> {
-        super::list(&state, filter).await
+        page: Option<PageRequestDto>,
+    ) -> Result<PageDto<InvoiceItemDto>, AppError> {
+        super::list_page(&state, filter, page).await
     }
 
     #[tauri::command(rename_all = "camelCase")]
@@ -395,8 +408,8 @@ pub(crate) mod ipc {
     pub async fn import_manual_files(
         state: State<'_, AppState>,
         paths: Vec<String>,
-    ) -> Result<Vec<InvoiceItemDto>, AppError> {
-        super::import_manual(&state, paths).await
+    ) -> Result<Vec<ManualImportOutcomeDto>, AppError> {
+        Ok(super::import_manual_outcomes(&state, paths).await)
     }
 
     #[tauri::command(rename_all = "camelCase")]

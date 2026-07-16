@@ -1,7 +1,10 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::db::batches::Batch;
+use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
+use crate::db::batches::{Batch, BatchPageCursor, BatchSummary};
+use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::AppError;
 use crate::domain::model::BatchStatus;
 use crate::services::batches::{
@@ -30,6 +33,8 @@ impl TryFrom<(Batch, BatchDetailSummary)> for BatchDto {
     type Error = AppError;
 
     fn try_from((batch, summary): (Batch, BatchDetailSummary)) -> Result<Self, Self::Error> {
+        let total_amount_cents =
+            validate_amount_cents(summary.total_amount_cents, "totalAmountCents")?;
         Ok(Self {
             id: batch.id.to_string(),
             name: batch.name,
@@ -37,13 +42,43 @@ impl TryFrom<(Batch, BatchDetailSummary)> for BatchDto {
             end_date: batch.end_date.to_string(),
             status: batch.status,
             item_count: summary.item_count,
-            total_amount_cents: summary.total_amount_cents,
+            total_amount_cents,
             unconfirmed_count: summary.unconfirmed_count,
             note: batch.note,
             created_at: batch.created_at.to_rfc3339(),
             updated_at: batch.updated_at.to_rfc3339(),
             last_exported_at: batch.last_exported_at.map(|value| value.to_rfc3339()),
         })
+    }
+}
+
+impl TryFrom<BatchSummary> for BatchDto {
+    type Error = AppError;
+
+    fn try_from(batch: BatchSummary) -> Result<Self, Self::Error> {
+        let total_amount_cents =
+            validate_amount_cents(batch.total_amount_cents, "totalAmountCents")?;
+        Ok(Self {
+            id: batch.id.to_string(),
+            name: batch.name,
+            start_date: batch.start_date.to_string(),
+            end_date: batch.end_date.to_string(),
+            status: batch.status,
+            item_count: u64::try_from(batch.item_count).map_err(|_| invalid_batch_summary())?,
+            total_amount_cents,
+            unconfirmed_count: u64::try_from(batch.unconfirmed_count)
+                .map_err(|_| invalid_batch_summary())?,
+            note: batch.note,
+            created_at: batch.created_at.to_rfc3339(),
+            updated_at: batch.updated_at.to_rfc3339(),
+            last_exported_at: batch.last_exported_at.map(|value| value.to_rfc3339()),
+        })
+    }
+}
+
+fn invalid_batch_summary() -> AppError {
+    AppError::Internal {
+        message: "batch summary count was invalid".to_owned(),
     }
 }
 
@@ -54,12 +89,14 @@ pub struct CategorySummaryDto {
     pub amount_cents: i64,
 }
 
-impl From<CategorySummary> for CategorySummaryDto {
-    fn from(summary: CategorySummary) -> Self {
-        Self {
+impl TryFrom<CategorySummary> for CategorySummaryDto {
+    type Error = AppError;
+
+    fn try_from(summary: CategorySummary) -> Result<Self, Self::Error> {
+        Ok(Self {
             item_count: summary.item_count,
-            amount_cents: summary.amount_cents,
-        }
+            amount_cents: validate_amount_cents(summary.amount_cents, "amountCents")?,
+        })
     }
 }
 
@@ -75,17 +112,22 @@ pub struct BatchDetailSummaryDto {
     pub unconfirmed_count: u64,
 }
 
-impl From<BatchDetailSummary> for BatchDetailSummaryDto {
-    fn from(summary: BatchDetailSummary) -> Self {
-        Self {
+impl TryFrom<BatchDetailSummary> for BatchDetailSummaryDto {
+    type Error = AppError;
+
+    fn try_from(summary: BatchDetailSummary) -> Result<Self, Self::Error> {
+        Ok(Self {
             item_count: summary.item_count,
-            total_amount_cents: summary.total_amount_cents,
-            transport: summary.transport.into(),
-            dining: summary.dining.into(),
-            accommodation: summary.accommodation.into(),
-            hospitality: summary.hospitality.into(),
+            total_amount_cents: validate_amount_cents(
+                summary.total_amount_cents,
+                "totalAmountCents",
+            )?,
+            transport: summary.transport.try_into()?,
+            dining: summary.dining.try_into()?,
+            accommodation: summary.accommodation.try_into()?,
+            hospitality: summary.hospitality.try_into()?,
             unconfirmed_count: summary.unconfirmed_count,
-        }
+        })
     }
 }
 
@@ -110,8 +152,11 @@ impl TryFrom<BatchDetail> for BatchDetailDto {
         } = detail;
         Ok(Self {
             batch: BatchDto::try_from((batch, summary.clone()))?,
-            items: items.into_iter().map(Into::into).collect(),
-            summary: summary.into(),
+            items: items
+                .into_iter()
+                .map(crate::commands::items::InvoiceItemDto::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            summary: summary.try_into()?,
             warnings,
         })
     }
@@ -127,12 +172,43 @@ pub struct NewBatchInputDto {
 }
 
 pub async fn list(state: &AppState) -> Result<Vec<BatchDto>, AppError> {
-    BatchService::new(state.pool().clone())
-        .list()
-        .await?
-        .into_iter()
-        .map(|detail| BatchDto::try_from((detail.batch, detail.summary)))
-        .collect()
+    Ok(list_page(state, None).await?.items)
+}
+
+pub async fn list_page(
+    state: &AppState,
+    page: Option<PageRequestDto>,
+) -> Result<PageDto<BatchDto>, AppError> {
+    let page_size = validated_page_size(page.as_ref())?;
+    let cursor = page
+        .as_ref()
+        .and_then(|page| page.cursor.as_ref())
+        .map(parse_batch_cursor)
+        .transpose()?;
+    let page = BatchService::new(state.pool().clone())
+        .list_page(cursor, page_size)
+        .await?;
+    Ok(PageDto {
+        items: page
+            .batches
+            .into_iter()
+            .map(BatchDto::try_from)
+            .collect::<Result<Vec<_>, _>>()?,
+        next_cursor: page.next_cursor.map(|cursor| CursorDto {
+            sort_value: cursor.updated_at.to_rfc3339(),
+            id: cursor.id.to_string(),
+        }),
+    })
+}
+
+fn parse_batch_cursor(cursor: &CursorDto) -> Result<BatchPageCursor, AppError> {
+    Ok(BatchPageCursor {
+        updated_at: DateTime::parse_from_rfc3339(&cursor.sort_value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|_| AppError::validation("cursor", "invalid batch cursor"))?,
+        id: Uuid::parse_str(&cursor.id)
+            .map_err(|_| AppError::validation("cursor", "invalid batch cursor"))?,
+    })
 }
 
 pub async fn get(state: &AppState, id: Uuid) -> Result<BatchDetailDto, AppError> {
@@ -193,12 +269,16 @@ pub(crate) mod ipc {
     use uuid::Uuid;
 
     use super::{BatchDetailDto, BatchDto, NewBatchInputDto};
+    use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
     use crate::state::AppState;
 
     #[tauri::command]
-    pub async fn list_batches(state: State<'_, AppState>) -> Result<Vec<BatchDto>, AppError> {
-        super::list(&state).await
+    pub async fn list_batches(
+        state: State<'_, AppState>,
+        page: Option<PageRequestDto>,
+    ) -> Result<PageDto<BatchDto>, AppError> {
+        super::list_page(&state, page).await
     }
 
     #[tauri::command(rename_all = "camelCase")]

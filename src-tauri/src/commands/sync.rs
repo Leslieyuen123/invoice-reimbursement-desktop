@@ -4,7 +4,10 @@ use crate::domain::error::AppError;
 use crate::state::AppState;
 
 pub async fn now(state: &AppState, account_id: Uuid) -> Result<(), AppError> {
-    state.application_scheduler().sync_now(account_id).await
+    let scheduler = state.application_scheduler();
+    state
+        .run_tracked_operation(async move { scheduler.sync_now(account_id).await })
+        .await
 }
 
 pub(crate) mod ipc {

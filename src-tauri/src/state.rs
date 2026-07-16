@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
@@ -16,9 +17,11 @@ use crate::services::export::{ExportCoordinator, ExportService};
 use crate::services::import::ImportService;
 use crate::services::items::ItemService;
 use crate::services::operations::AccountOperationCoordinator;
+use crate::services::preview::{PreviewCoordinator, PreviewService};
 use crate::services::recognition::RecognitionService;
 use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
 use crate::services::settings::{BackgroundSyncGate, SettingsService};
+use crate::services::shutdown::{ApplicationShutdown, RuntimeOperationCoordinator};
 use crate::services::sync::SyncService;
 
 #[derive(Clone)]
@@ -33,8 +36,10 @@ pub struct AppState {
     account_operations: AccountOperationCoordinator,
     account_saves: AccountSaveCoordinator,
     export_coordinator: ExportCoordinator,
+    preview_coordinator: PreviewCoordinator,
     background_sync_gate: BackgroundSyncGate,
     application_scheduler: Scheduler,
+    runtime_operations: RuntimeOperationCoordinator,
 }
 
 impl AppState {
@@ -105,8 +110,10 @@ impl AppState {
             account_operations,
             account_saves,
             export_coordinator: ExportCoordinator::default(),
+            preview_coordinator: PreviewCoordinator::default(),
             background_sync_gate,
             application_scheduler,
+            runtime_operations: RuntimeOperationCoordinator::default(),
         }
     }
 
@@ -138,6 +145,14 @@ impl AppState {
             self.pool.clone(),
             self.paths.clone(),
             self.export_coordinator.clone(),
+        )
+    }
+
+    pub fn preview_service(&self) -> PreviewService {
+        PreviewService::new(
+            self.pool.clone(),
+            self.paths.clone(),
+            self.preview_coordinator.clone(),
         )
     }
 
@@ -211,6 +226,29 @@ impl AppState {
 
     pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {
         self.account_saves.begin_shutdown()
+    }
+
+    pub async fn run_tracked_operation<T, F>(
+        &self,
+        future: F,
+    ) -> Result<T, crate::domain::error::AppError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, crate::domain::error::AppError>> + Send + 'static,
+    {
+        self.runtime_operations.run(future).await
+    }
+
+    pub fn begin_application_shutdown(
+        &self,
+        scheduler: Option<crate::services::scheduler::SchedulerHandle>,
+    ) -> ApplicationShutdown {
+        ApplicationShutdown::new(
+            scheduler,
+            self.runtime_operations.begin_shutdown(),
+            self.account_saves.begin_shutdown(),
+            self.pool.clone(),
+        )
     }
 }
 

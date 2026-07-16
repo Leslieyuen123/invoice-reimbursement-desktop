@@ -4,8 +4,9 @@ use chrono::{NaiveDate, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
-use crate::db::batches::{Batch, BatchRepository};
+use crate::db::batches::{Batch, BatchPage, BatchPageCursor, BatchRepository, BatchSummary};
 use crate::db::items::{InvoiceItem, ItemRepository};
+use crate::domain::amount::checked_add_amount_cents;
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, NewBatch, RecognitionStatus,
@@ -54,13 +55,18 @@ impl BatchService {
         Self { pool }
     }
 
-    pub async fn list(&self) -> Result<Vec<BatchDetail>, AppError> {
-        let batches = BatchRepository::new(self.pool.clone()).list().await?;
-        let mut details = Vec::with_capacity(batches.len());
-        for batch in batches {
-            details.push(self.get(batch.id).await?);
-        }
-        Ok(details)
+    pub async fn list(&self) -> Result<Vec<BatchSummary>, AppError> {
+        BatchRepository::new(self.pool.clone()).list().await
+    }
+
+    pub async fn list_page(
+        &self,
+        cursor: Option<BatchPageCursor>,
+        page_size: usize,
+    ) -> Result<BatchPage, AppError> {
+        BatchRepository::new(self.pool.clone())
+            .list_page(cursor, page_size)
+            .await
     }
 
     pub async fn create_month(&self, year: i32, month: u32) -> Result<Batch, AppError> {
@@ -364,20 +370,18 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 
 fn build_summary(items: &[InvoiceItem]) -> Result<BatchDetailSummary, AppError> {
     let mut summary = BatchDetailSummary {
-        item_count: u64::try_from(items.len()).map_err(|_| summary_overflow())?,
+        item_count: u64::try_from(items.len()).map_err(|_| summary_count_overflow())?,
         ..BatchDetailSummary::default()
     };
     for item in items {
         let amount = item.amount_cents.unwrap_or(0);
-        summary.total_amount_cents = summary
-            .total_amount_cents
-            .checked_add(amount)
-            .ok_or_else(summary_overflow)?;
+        summary.total_amount_cents =
+            checked_add_amount_cents(summary.total_amount_cents, amount, "totalAmountCents")?;
         if item.confirmation_status != ConfirmationStatus::Confirmed {
             summary.unconfirmed_count = summary
                 .unconfirmed_count
                 .checked_add(1)
-                .ok_or_else(summary_overflow)?;
+                .ok_or_else(summary_count_overflow)?;
         }
         if let Some(category) = item.final_category {
             let category_summary = match category {
@@ -389,19 +393,17 @@ fn build_summary(items: &[InvoiceItem]) -> Result<BatchDetailSummary, AppError> 
             category_summary.item_count = category_summary
                 .item_count
                 .checked_add(1)
-                .ok_or_else(summary_overflow)?;
-            category_summary.amount_cents = category_summary
-                .amount_cents
-                .checked_add(amount)
-                .ok_or_else(summary_overflow)?;
+                .ok_or_else(summary_count_overflow)?;
+            category_summary.amount_cents =
+                checked_add_amount_cents(category_summary.amount_cents, amount, "amountCents")?;
         }
     }
     Ok(summary)
 }
 
-fn summary_overflow() -> AppError {
+fn summary_count_overflow() -> AppError {
     AppError::Internal {
-        message: "batch summary amount overflow".to_owned(),
+        message: "batch summary count overflow".to_owned(),
     }
 }
 
@@ -415,13 +417,10 @@ async fn validate_summary_total(
             .fetch_all(&mut *connection)
             .await
             .map_err(|error| database_error("failed to validate batch summary", error))?;
-    amounts
-        .into_iter()
-        .try_fold(0_i64, |total, amount| {
-            total.checked_add(amount.unwrap_or(0))
-        })
-        .map(|_| ())
-        .ok_or_else(summary_overflow)
+    amounts.into_iter().try_fold(0_i64, |total, amount| {
+        checked_add_amount_cents(total, amount.unwrap_or(0), "totalAmountCents")
+    })?;
+    Ok(())
 }
 
 async fn finish_unit_transaction(

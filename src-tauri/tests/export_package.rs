@@ -611,6 +611,11 @@ async fn xlsx_rejects_cents_that_cannot_round_trip_through_numeric_cell() {
         .execute(&app.pool)
         .await
         .unwrap();
+    sqlx::query("UPDATE items SET amount_cents = 0 WHERE id = ?")
+        .bind(app.item_ids[1].to_string())
+        .execute(&app.pool)
+        .await
+        .unwrap();
 
     let error = app.exports.export(app.batch_id).await.unwrap_err();
 

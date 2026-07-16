@@ -463,6 +463,49 @@ async fn item_write_adapters_delegate_to_import_recognition_and_review_services(
 }
 
 #[tokio::test]
+async fn multi_file_import_reports_each_result_without_stopping_after_an_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let state = AppState::with_gateway(
+        pool,
+        paths,
+        Arc::new(MemoryCredentialStore::default()),
+        Arc::new(SuccessfulGateway),
+    );
+    let missing = directory.path().join("missing.pdf");
+    let valid = directory.path().join("valid.pdf");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/text-invoice.pdf"),
+        &valid,
+    )
+    .unwrap();
+
+    let outcomes = items::import_manual_outcomes(
+        &state,
+        vec![
+            missing.to_string_lossy().into_owned(),
+            valid.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(
+        &outcomes[0],
+        items::ManualImportOutcomeDto::Failed { path, error }
+            if path == missing.to_string_lossy().as_ref()
+                && matches!(error, AppError::Validation { .. })
+    ));
+    assert!(matches!(
+        &outcomes[1],
+        items::ManualImportOutcomeDto::Imported { path, item }
+            if path == valid.to_string_lossy().as_ref()
+                && item.original_name == "valid.pdf"
+    ));
+}
+
+#[tokio::test]
 async fn export_adapter_reuses_the_state_export_coordinator() {
     let app = TestApp::with_dashboard_fixture().await;
     let batch = batches::create_month(&app.state, 2026, 9).await.unwrap();

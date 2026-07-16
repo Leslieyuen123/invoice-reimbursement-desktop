@@ -5,6 +5,47 @@ pub mod items;
 pub mod settings;
 pub mod sync;
 
+use serde::{Deserialize, Serialize};
+
+pub const DEFAULT_PAGE_SIZE: u32 = 50;
+pub const MAX_PAGE_SIZE: u32 = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CursorDto {
+    pub sort_value: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PageRequestDto {
+    pub cursor: Option<CursorDto>,
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageDto<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<CursorDto>,
+}
+
+pub(crate) fn validated_page_size(
+    request: Option<&PageRequestDto>,
+) -> Result<usize, crate::domain::error::AppError> {
+    let page_size = request
+        .and_then(|request| request.page_size)
+        .unwrap_or(DEFAULT_PAGE_SIZE);
+    if page_size == 0 || page_size > MAX_PAGE_SIZE {
+        return Err(crate::domain::error::AppError::validation(
+            "pageSize",
+            format!("page size must be between 1 and {MAX_PAGE_SIZE}"),
+        ));
+    }
+    Ok(page_size as usize)
+}
+
 pub const COMMAND_NAMES: &[&str] = &[
     "get_dashboard",
     "list_items",

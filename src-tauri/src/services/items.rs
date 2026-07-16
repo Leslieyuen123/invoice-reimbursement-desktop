@@ -11,7 +11,10 @@ use chrono::NaiveDate;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use crate::db::items::{InvoiceItem, ItemFilter, ItemRepository, ReviewedItemFields};
+use crate::db::items::{
+    InvoiceItem, ItemFilter, ItemPage, ItemPageCursor, ItemRepository, ReviewedItemFields,
+};
+use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::AppError;
 use crate::domain::model::Category;
 use crate::infra::files::AppPaths;
@@ -118,6 +121,15 @@ impl ItemService {
         self.items.list(filter).await
     }
 
+    pub async fn list_page(
+        &self,
+        filter: ItemFilter,
+        cursor: Option<ItemPageCursor>,
+        page_size: usize,
+    ) -> Result<ItemPage, AppError> {
+        self.items.list_page(filter, cursor, page_size).await
+    }
+
     pub async fn get(&self, id: Uuid) -> Result<InvoiceItem, AppError> {
         self.items.get_by_id(id).await
     }
@@ -130,12 +142,7 @@ impl ItemService {
             .map(parse_invoice_date)
             .transpose()?;
         validate_period(&review.suggested_period)?;
-        if review.amount_cents < 0 {
-            return Err(AppError::validation(
-                "amount_cents",
-                "amount must not be negative",
-            ));
-        }
+        validate_amount_cents(review.amount_cents, "amount_cents")?;
 
         self.items
             .review_item(

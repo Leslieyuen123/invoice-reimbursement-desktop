@@ -1,6 +1,7 @@
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::AppError;
 use crate::services::export::ExportResult;
 use crate::state::AppState;
@@ -13,22 +14,27 @@ pub struct ExportResultDto {
     pub total_amount_cents: i64,
 }
 
-impl From<ExportResult> for ExportResultDto {
-    fn from(result: ExportResult) -> Self {
-        Self {
+impl TryFrom<ExportResult> for ExportResultDto {
+    type Error = AppError;
+
+    fn try_from(result: ExportResult) -> Result<Self, Self::Error> {
+        Ok(Self {
             directory: result.directory.to_string_lossy().into_owned(),
             item_count: result.item_count,
-            total_amount_cents: result.total_amount_cents,
-        }
+            total_amount_cents: validate_amount_cents(
+                result.total_amount_cents,
+                "totalAmountCents",
+            )?,
+        })
     }
 }
 
 pub async fn run(state: &AppState, batch_id: Uuid) -> Result<ExportResultDto, AppError> {
+    let service = state.export_service();
     state
-        .export_service()
-        .export(batch_id)
-        .await
-        .map(Into::into)
+        .run_tracked_operation(async move { service.export(batch_id).await })
+        .await?
+        .try_into()
 }
 
 pub(crate) mod ipc {

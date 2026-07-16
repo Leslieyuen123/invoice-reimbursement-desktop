@@ -26,7 +26,7 @@ pub async fn load(state: &AppState) -> Result<DashboardDto, AppError> {
     let recent_batches = snapshot
         .recent_batches
         .into_iter()
-        .map(|detail| BatchDto::try_from((detail.batch, detail.summary)))
+        .map(BatchDto::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(DashboardDto {

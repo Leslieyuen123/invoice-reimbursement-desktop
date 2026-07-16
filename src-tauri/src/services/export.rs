@@ -1,9 +1,4 @@
 use std::fs;
-use std::fs::File;
-#[cfg(test)]
-use std::io::Read;
-#[cfg(unix)]
-use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,13 +12,16 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::db::batches::{BatchExportClaim, BatchRepository};
+use crate::domain::amount::{checked_add_amount_cents, validate_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{ItemStatus, RecognitionStatus};
 use crate::infra::exporters::{
     DEFAULT_EXPORT_LIMITS, ExportItem, ExportLimits, generate_artifacts, prepare_merged_pdf,
     publish_directory,
 };
-use crate::infra::files::{AppPaths, sync_directory};
+use crate::infra::files::{
+    AppPaths, OpenedContainedFile, open_contained_regular_file, sync_directory,
+};
 
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 
@@ -200,14 +198,13 @@ impl ExportService {
         });
         let mut total_amount_cents = 0_i64;
         for item in &items {
-            total_amount_cents = total_amount_cents
-                .checked_add(
-                    item.amount_cents
-                        .ok_or_else(|| AppError::validation("amountCents", "票据金额不能为空"))?,
-                )
-                .ok_or_else(|| AppError::Internal {
-                    message: "batch export amount overflow".to_owned(),
-                })?;
+            let amount_cents = validate_amount_cents(
+                item.amount_cents
+                    .ok_or_else(|| AppError::validation("amountCents", "票据金额不能为空"))?,
+                "amountCents",
+            )?;
+            total_amount_cents =
+                checked_add_amount_cents(total_amount_cents, amount_cents, "totalAmountCents")?;
         }
 
         let exported_at = Utc::now();
@@ -476,10 +473,7 @@ struct PendingExportItem {
     archive_name: String,
 }
 
-pub(crate) struct OpenedSourceFile {
-    pub(crate) file: File,
-    pub(crate) length: u64,
-}
+type OpenedSourceFile = OpenedContainedFile;
 
 fn prepare_export_items(
     paths: &AppPaths,
@@ -606,113 +600,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-pub(crate) fn open_contained_regular_file(
-    path: &Path,
-    root: &Path,
-    field: &str,
-) -> Result<OpenedSourceFile, AppError> {
-    open_contained_regular_file_with_hook(path, root, field, || {})
-}
-
-#[cfg(unix)]
-fn open_contained_regular_file_with_hook(
-    path: &Path,
-    root: &Path,
-    field: &str,
-    parent_anchored: impl FnOnce(),
-) -> Result<OpenedSourceFile, AppError> {
-    use rustix::fs::{Mode, OFlags};
-
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| AppError::validation(field, "票据文件不在应用存储目录内"))?;
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
-    }
-
-    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut parent = rustix::fs::open(root, directory_flags, Mode::empty())
-        .map(File::from)
-        .map_err(|_| AppError::Internal {
-            message: "failed to open application file storage".to_owned(),
-        })?;
-    if let Some(relative_parent) = relative.parent() {
-        for component in relative_parent.components() {
-            let Component::Normal(component) = component else {
-                return Err(AppError::validation(field, "票据文件不在应用存储目录内"));
-            };
-            parent = rustix::fs::openat(&parent, component, directory_flags, Mode::empty())
-                .map(File::from)
-                .map_err(|_| AppError::validation(field, "票据文件路径无法读取"))?;
-        }
-    }
-
-    parent_anchored();
-    let file_name = relative
-        .file_name()
-        .ok_or_else(|| AppError::validation(field, "票据文件路径无法读取"))?;
-    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-    let file = rustix::fs::openat(&parent, file_name, file_flags, Mode::empty())
-        .map(File::from)
-        .map_err(|_| AppError::validation(field, "票据路径必须是普通文件"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
-    if !metadata.is_file() {
-        return Err(AppError::validation(field, "票据路径必须是普通文件"));
-    }
-    Ok(OpenedSourceFile {
-        file,
-        length: metadata.len(),
-    })
-}
-
-#[cfg(not(unix))]
-fn open_contained_regular_file_with_hook(
-    _path: &Path,
-    _root: &Path,
-    field: &str,
-    _parent_anchored: impl FnOnce(),
-) -> Result<OpenedSourceFile, AppError> {
-    Err(unsupported_export_source_platform(field))
-}
-
-#[cfg(not(unix))]
-fn unsupported_export_source_platform(field: &str) -> AppError {
-    AppError::validation(field, "当前平台不支持安全导出源文件读取")
-}
-
-#[cfg(test)]
-fn read_contained_regular_file_with_hooks(
-    path: &Path,
-    root: &Path,
-    field: &str,
-    max_bytes: u64,
-    parent_anchored: impl FnOnce(),
-    before_read: impl FnOnce(),
-) -> Result<Vec<u8>, AppError> {
-    let mut opened = open_contained_regular_file_with_hook(path, root, field, parent_anchored)?;
-    if opened.length > max_bytes {
-        return Err(AppError::validation(field, "票据文件超过导出大小限制"));
-    }
-    before_read();
-    let mut bytes = Vec::with_capacity(usize::try_from(opened.length).unwrap_or(0));
-    opened
-        .file
-        .by_ref()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(AppError::validation(field, "票据文件超过导出大小限制"));
-    }
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -730,7 +617,7 @@ mod tests {
 
     use super::{
         DirectoryPublisher, ExportCommitter, ExportCoordinator, ExportService, GenerationHook,
-        OwnedExportDirectory, read_contained_regular_file_with_hooks, sha256_hex,
+        OwnedExportDirectory, sha256_hex,
     };
     use crate::db;
     use crate::db::batches::{BatchExportClaim, BatchRepository};
@@ -740,7 +627,7 @@ mod tests {
         BatchStatus, Category, ConfirmationStatus, DedupeStatus, NewBatch, RecognitionStatus,
         SourceType,
     };
-    use crate::infra::files::AppPaths;
+    use crate::infra::files::{AppPaths, read_contained_regular_file_with_hooks};
 
     struct GatedRealPublisher {
         published: Mutex<Option<oneshot::Sender<PathBuf>>>,
@@ -1147,7 +1034,7 @@ mod tests {
 
     #[test]
     fn non_unix_export_source_open_fails_closed_by_construction() {
-        let source = include_str!("export.rs");
+        let source = include_str!("../infra/files.rs");
         let start = source
             .find("#[cfg(not(unix))]\nfn open_contained_regular_file_with_hook")
             .unwrap();
@@ -1157,7 +1044,7 @@ mod tests {
 
         assert!(!implementation.contains("canonicalize"));
         assert!(!implementation.contains("File::open"));
-        assert!(implementation.contains("unsupported_export_source_platform(field)"));
+        assert!(implementation.contains("unsupported_contained_file_platform(field)"));
     }
 
     #[test]
