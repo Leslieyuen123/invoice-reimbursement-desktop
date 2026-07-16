@@ -27,7 +27,7 @@ use crate::infra::files::{
 };
 pub use crate::services::export_recovery::ExportRecoveryReport;
 use crate::services::export_recovery::{
-    ExportJournal, clear_committed_marker, write_generation_marker,
+    ExportCommitOutcome, ExportJournal, PendingExportIdentity, write_generation_marker,
 };
 
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
@@ -188,12 +188,14 @@ pub struct ExportService {
     coordinator: ExportCoordinator,
     publisher: Arc<dyn DirectoryPublisher>,
     committer: Arc<dyn ExportCommitter>,
+    outcome_classifier: Arc<dyn ExportOutcomeClassifier>,
     generation_hook: Arc<dyn GenerationHook>,
 }
 
 impl ExportService {
     pub fn new(pool: SqlitePool, paths: AppPaths, coordinator: ExportCoordinator) -> Self {
         Self {
+            outcome_classifier: default_outcome_classifier(&pool),
             pool,
             paths,
             coordinator,
@@ -210,6 +212,7 @@ impl ExportService {
         publisher: Arc<dyn DirectoryPublisher>,
     ) -> Self {
         Self {
+            outcome_classifier: default_outcome_classifier(&pool),
             pool,
             paths,
             coordinator: ExportCoordinator::default(),
@@ -226,6 +229,7 @@ impl ExportService {
         committer: Arc<dyn ExportCommitter>,
     ) -> Self {
         Self {
+            outcome_classifier: default_outcome_classifier(&pool),
             pool,
             paths,
             coordinator: ExportCoordinator::default(),
@@ -242,6 +246,7 @@ impl ExportService {
         generation_hook: Arc<dyn GenerationHook>,
     ) -> Self {
         Self {
+            outcome_classifier: default_outcome_classifier(&pool),
             pool,
             paths,
             coordinator: ExportCoordinator::default(),
@@ -259,6 +264,7 @@ impl ExportService {
         generation_hook: Arc<dyn GenerationHook>,
     ) -> Self {
         Self {
+            outcome_classifier: default_outcome_classifier(&pool),
             pool,
             paths,
             coordinator,
@@ -437,6 +443,7 @@ impl ExportService {
             }
         };
         let committer = self.committer.clone();
+        let outcome_classifier = self.outcome_classifier.clone();
         let publisher = self.publisher.clone();
         let publication_active_export = active_export.clone();
         let publication = self.coordinator.spawn_internal(async move {
@@ -458,8 +465,10 @@ impl ExportService {
             let _active_export = active_export;
             finalize_export(
                 committer,
+                outcome_classifier,
                 finalizer_journal,
                 finalizer_paths,
+                staging_component,
                 final_component,
                 operation_id,
                 batch_id,
@@ -516,8 +525,10 @@ async fn finish_failed_export(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_export(
     committer: Arc<dyn ExportCommitter>,
+    outcome_classifier: Arc<dyn ExportOutcomeClassifier>,
     journal: ExportJournal,
     paths: AppPaths,
+    staging_component: String,
     final_component: String,
     operation_id: Uuid,
     batch_id: Uuid,
@@ -525,21 +536,97 @@ async fn finalize_export(
     published: OwnedExportDirectory,
     claim: BatchExportClaim,
 ) -> Result<PathBuf, AppError> {
-    if let Err(error) = committer.commit(claim, operation_id, exported_at).await {
-        let finalization_error = published.cleanup_after(error);
-        tracing::error!(
-            %batch_id,
-            error = %finalization_error,
-            "export finalization failed"
-        );
-        return Err(finish_failed_export(&journal, &paths, operation_id, finalization_error).await);
-    }
-
     let directory = published.commit();
-    journal.advance(operation_id, "committed").await?;
-    clear_committed_marker(&paths.exports, &final_component, operation_id)?;
-    journal.finish(operation_id).await?;
+    let expected = PendingExportIdentity::new(
+        operation_id,
+        batch_id,
+        staging_component,
+        final_component,
+        exported_at,
+    );
+    match committer.commit(claim, operation_id, exported_at).await {
+        Ok(()) => finish_confirmed_export(&journal, &paths, &expected, directory).await,
+        Err(commit_error) => match outcome_classifier.classify(&expected).await {
+            ExportCommitOutcome::ConfirmedCommitted => {
+                finish_confirmed_export(&journal, &paths, &expected, directory).await
+            }
+            ExportCommitOutcome::ConfirmedUncommitted => {
+                tracing::error!(
+                    %batch_id,
+                    error = %commit_error,
+                    "export finalization failed"
+                );
+                match journal.rollback_uncommitted(&paths, &expected).await {
+                    Ok(()) => Err(commit_error),
+                    Err(recovery_error) => {
+                        tracing::error!(
+                            %batch_id,
+                            error = %recovery_error,
+                            "uncommitted export rollback failed"
+                        );
+                        Err(recoverable_finalization_error(
+                            "uncommitted export rollback is pending recovery",
+                        ))
+                    }
+                }
+            }
+            ExportCommitOutcome::Indeterminate(outcome_error) => {
+                tracing::error!(
+                    %batch_id,
+                    commit_error = %commit_error,
+                    outcome_error = %outcome_error,
+                    "export commit outcome is indeterminate"
+                );
+                if let Err(record_error) = journal.record_indeterminate(operation_id).await {
+                    tracing::error!(
+                        %batch_id,
+                        error = %record_error,
+                        "failed to persist indeterminate export outcome"
+                    );
+                }
+                Err(recoverable_finalization_error(
+                    "export commit outcome is indeterminate; restart recovery is required",
+                ))
+            }
+        },
+    }
+}
+
+async fn finish_confirmed_export(
+    journal: &ExportJournal,
+    paths: &AppPaths,
+    expected: &PendingExportIdentity,
+    directory: PathBuf,
+) -> Result<PathBuf, AppError> {
+    if let Err(cleanup_error) = journal.advance(expected.operation_id, "committed").await {
+        tracing::error!(
+            batch_id = %expected.batch_id,
+            error = %cleanup_error,
+            "committed export journal transition failed"
+        );
+        return Err(recoverable_finalization_error(
+            "committed export cleanup is pending recovery",
+        ));
+    }
+    if let Err(cleanup_error) = journal.preserve_committed(paths, expected).await {
+        tracing::error!(
+            batch_id = %expected.batch_id,
+            error = %cleanup_error,
+            "committed export recovery cleanup failed"
+        );
+        return Err(recoverable_finalization_error(
+            "committed export cleanup is pending recovery",
+        ));
+    }
     Ok(directory)
+}
+
+fn recoverable_finalization_error(message: &str) -> AppError {
+    AppError::External {
+        service: "export_recovery".to_owned(),
+        retryable: true,
+        message: message.to_owned(),
+    }
 }
 
 fn export_directory_name(batch_name: &str, exported_at: &DateTime<Utc>) -> String {
@@ -578,6 +665,28 @@ trait ExportCommitter: Send + Sync {
         operation_id: Uuid,
         exported_at: DateTime<Utc>,
     ) -> Result<(), AppError>;
+}
+
+#[async_trait::async_trait]
+trait ExportOutcomeClassifier: Send + Sync {
+    async fn classify(&self, expected: &PendingExportIdentity) -> ExportCommitOutcome;
+}
+
+struct SqliteExportOutcomeClassifier {
+    journal: ExportJournal,
+}
+
+#[async_trait::async_trait]
+impl ExportOutcomeClassifier for SqliteExportOutcomeClassifier {
+    async fn classify(&self, expected: &PendingExportIdentity) -> ExportCommitOutcome {
+        self.journal.classify_commit_outcome(expected).await
+    }
+}
+
+fn default_outcome_classifier(pool: &SqlitePool) -> Arc<dyn ExportOutcomeClassifier> {
+    Arc::new(SqliteExportOutcomeClassifier {
+        journal: ExportJournal::new(pool.clone()),
+    })
 }
 
 struct SqliteExportCommitter;
@@ -693,20 +802,6 @@ impl OwnedExportDirectory {
     fn commit(mut self) -> PathBuf {
         self.owned = false;
         self.path.clone()
-    }
-
-    fn cleanup_after(mut self, error: AppError) -> AppError {
-        self.owned = false;
-        match remove_export_directory(&self.path) {
-            Ok(()) => error,
-            Err(cleanup_error) => AppError::External {
-                service: "filesystem_sync".to_owned(),
-                retryable: false,
-                message: format!(
-                    "export failed and package cleanup was incomplete; manual recovery is required: original error: {error}; cleanup error: {cleanup_error}"
-                ),
-            },
-        }
     }
 }
 
@@ -885,8 +980,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        DirectoryPublisher, ExportCommitter, ExportCoordinator, ExportService, GenerationHook,
-        OwnedExportDirectory, sha256_hex,
+        DirectoryPublisher, ExportCommitter, ExportCoordinator, ExportOutcomeClassifier,
+        ExportService, GenerationHook, OwnedExportDirectory, sha256_hex,
     };
     use crate::db;
     use crate::db::batches::{BatchExportClaim, BatchRepository};
@@ -912,6 +1007,12 @@ mod tests {
         started: Mutex<Option<oneshot::Sender<()>>>,
         release: Arc<Notify>,
     }
+
+    struct CommitThenFailCommitter;
+
+    struct IndeterminateOutcomeClassifier;
+
+    struct MarkerTamperingPublisher;
 
     #[cfg(unix)]
     struct SymlinkReplacingFailingPublisher {
@@ -1035,6 +1136,37 @@ mod tests {
     }
 
     #[async_trait]
+    impl ExportCommitter for CommitThenFailCommitter {
+        async fn commit(
+            &self,
+            claim: BatchExportClaim,
+            operation_id: Uuid,
+            exported_at: DateTime<Utc>,
+        ) -> Result<(), AppError> {
+            claim.commit(operation_id, exported_at).await?;
+            Err(AppError::External {
+                service: "sqlite".to_owned(),
+                retryable: true,
+                message: "injected ambiguous commit outcome".to_owned(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ExportOutcomeClassifier for IndeterminateOutcomeClassifier {
+        async fn classify(
+            &self,
+            _expected: &crate::services::export_recovery::PendingExportIdentity,
+        ) -> crate::services::export_recovery::ExportCommitOutcome {
+            crate::services::export_recovery::ExportCommitOutcome::Indeterminate(
+                AppError::Internal {
+                    message: "injected outcome read failure at /private/export.db".to_owned(),
+                },
+            )
+        }
+    }
+
+    #[async_trait]
     impl DirectoryPublisher for GatedRealPublisher {
         async fn publish(
             &self,
@@ -1054,6 +1186,27 @@ mod tests {
                 .send(published.path().to_path_buf())
                 .unwrap();
             self.release.notified().await;
+            Ok(published)
+        }
+    }
+
+    #[async_trait]
+    impl DirectoryPublisher for MarkerTamperingPublisher {
+        async fn publish(
+            &self,
+            staging: OwnedExportDirectory,
+            destination: PathBuf,
+        ) -> Result<OwnedExportDirectory, AppError> {
+            let published = tokio::task::spawn_blocking(move || staging.publish(destination))
+                .await
+                .map_err(|_| AppError::Internal {
+                    message: "test publisher task failed".to_owned(),
+                })??;
+            let marker_path = published.path().join(".invoice-export-recovery.json");
+            let mut marker: serde_json::Value =
+                serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+            marker["final_component"] = serde_json::json!("tampered-final-component");
+            fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
             Ok(published)
         }
     }
@@ -1240,6 +1393,266 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.status, BatchStatus::Exported);
         assert!(persisted.last_exported_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn commit_error_after_durable_commit_preserves_package_and_returns_success() {
+        let fixture = export_fixture("提交结果歧义测试").await;
+        let service = ExportService::with_committer(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            Arc::new(CommitThenFailCommitter),
+        );
+
+        let result = service.export(fixture.batch_id).await.unwrap();
+
+        assert!(result.directory.is_dir());
+        assert!(
+            !result
+                .directory
+                .join(".invoice-export-recovery.json")
+                .exists()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let batch = BatchRepository::new(fixture.pool)
+            .get(fixture.batch_id)
+            .await
+            .unwrap();
+        assert_eq!(batch.status, BatchStatus::Exported);
+        assert!(batch.last_exported_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_reexport_commit_is_not_confused_with_previous_export() {
+        let fixture = export_fixture("首次成功导出").await;
+        let initial = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            ExportCoordinator::default(),
+        )
+        .export(fixture.batch_id)
+        .await
+        .unwrap();
+        let previous_exported_at = BatchRepository::new(fixture.pool.clone())
+            .get(fixture.batch_id)
+            .await
+            .unwrap()
+            .last_exported_at
+            .unwrap();
+        BatchRepository::new(fixture.pool.clone())
+            .update(
+                fixture.batch_id,
+                NewBatch::try_new("再次导出", "2026-07-01", "2026-07-31", None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let service = ExportService::with_committer(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            Arc::new(CommitThenFailCommitter),
+        );
+
+        let result = service.export(fixture.batch_id).await.unwrap();
+
+        assert!(initial.directory.is_dir());
+        assert!(result.directory.is_dir());
+        assert_ne!(initial.directory, result.directory);
+        let batch = BatchRepository::new(fixture.pool)
+            .get(fixture.batch_id)
+            .await
+            .unwrap();
+        assert_eq!(batch.status, BatchStatus::Exported);
+        assert!(batch.last_exported_at.unwrap() > previous_exported_at);
+    }
+
+    #[tokio::test]
+    async fn indeterminate_commit_outcome_preserves_durable_recovery_state_until_restart() {
+        let fixture = export_fixture("不可判定提交测试").await;
+        let service = ExportService {
+            pool: fixture.pool.clone(),
+            paths: fixture.paths.clone(),
+            coordinator: ExportCoordinator::default(),
+            publisher: Arc::new(super::AtomicDirectoryPublisher),
+            committer: Arc::new(CommitThenFailCommitter),
+            outcome_classifier: Arc::new(IndeterminateOutcomeClassifier),
+            generation_hook: Arc::new(super::NoopGenerationHook),
+        };
+
+        let error = service.export(fixture.batch_id).await.unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AppError::External {
+                service,
+                retryable: true,
+                ..
+            } if service == "export_recovery"
+        ));
+        assert!(!error.to_string().contains("/private/export.db"));
+        let final_directory = fs::read_dir(&fixture.paths.exports)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(final_directory.is_dir());
+        assert!(
+            final_directory
+                .join(".invoice-export-recovery.json")
+                .is_file()
+        );
+        let journal = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT state, last_error FROM pending_exports WHERE batch_id = ?",
+        )
+        .bind(fixture.batch_id.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(journal.0, "published");
+        assert_eq!(
+            journal.1.as_deref(),
+            Some("export_commit_outcome_indeterminate")
+        );
+        assert!(!journal.1.unwrap().contains("/private/export.db"));
+
+        let restarted = ExportService::new(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            ExportCoordinator::default(),
+        );
+        let report = restarted.reconcile_pending().await.unwrap();
+
+        assert_eq!(report.preserved, 1);
+        assert!(final_directory.is_dir());
+        assert!(
+            !final_directory
+                .join(".invoice-export-recovery.json")
+                .exists()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_marker_must_match_every_durable_operation_field() {
+        let fixture = export_fixture("marker完整性测试").await;
+        let service = ExportService::with_publisher(
+            fixture.pool.clone(),
+            fixture.paths.clone(),
+            Arc::new(MarkerTamperingPublisher),
+        );
+
+        let error = service.export(fixture.batch_id).await.unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AppError::External {
+                service,
+                retryable: true,
+                ..
+            } if service == "export_recovery"
+        ));
+        let final_directory = fs::read_dir(&fixture.paths.exports)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(final_directory.is_dir());
+        assert!(
+            final_directory
+                .join(".invoice-export-recovery.json")
+                .is_file()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let batch = BatchRepository::new(fixture.pool)
+            .get(fixture.batch_id)
+            .await
+            .unwrap();
+        assert_eq!(batch.status, BatchStatus::Exported);
+        assert!(batch.last_exported_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn uncommitted_rollback_preflights_all_markers_before_removing_any_directory() {
+        let fixture = export_fixture("回滚marker预检测试").await;
+        let operation_id = Uuid::new_v4();
+        let exported_at = Utc::now();
+        let staging_component = format!("export-{operation_id}");
+        let final_component = "rollback-marker-preflight";
+        let staging = fixture.paths.staging.join(&staging_component);
+        let final_directory = fixture.paths.exports.join(final_component);
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&final_directory).unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &staging,
+            operation_id,
+            fixture.batch_id,
+            &staging_component,
+            final_component,
+            exported_at,
+        )
+        .unwrap();
+        crate::services::export_recovery::write_generation_marker(
+            &final_directory,
+            operation_id,
+            fixture.batch_id,
+            &staging_component,
+            "tampered-final-component",
+            exported_at,
+        )
+        .unwrap();
+        let journal = crate::services::export_recovery::ExportJournal::new(fixture.pool.clone());
+        journal
+            .create(
+                operation_id,
+                fixture.batch_id,
+                &staging_component,
+                final_component,
+                exported_at,
+            )
+            .await
+            .unwrap();
+        let expected = crate::services::export_recovery::PendingExportIdentity::new(
+            operation_id,
+            fixture.batch_id,
+            staging_component,
+            final_component.to_owned(),
+            exported_at,
+        );
+
+        let error = journal
+            .rollback_uncommitted(&fixture.paths, &expected)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mismatched recovery marker"));
+        assert!(staging.is_dir());
+        assert!(final_directory.is_dir());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1503,6 +1916,7 @@ mod tests {
         let coordinator = ExportCoordinator::default();
         let (committed_tx, committed_rx) = oneshot::channel();
         let release = Arc::new(Notify::new());
+        let outcome_classifier = super::default_outcome_classifier(&fixture.pool);
         let service = ExportService {
             pool: fixture.pool,
             paths: fixture.paths,
@@ -1512,6 +1926,7 @@ mod tests {
                 committed: Mutex::new(Some(committed_tx)),
                 release: release.clone(),
             }),
+            outcome_classifier,
             generation_hook: Arc::new(super::NoopGenerationHook),
         };
         let batch_id = fixture.batch_id;

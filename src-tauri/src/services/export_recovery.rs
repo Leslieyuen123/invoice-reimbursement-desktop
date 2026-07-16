@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::db::batches::BatchRepository;
 use crate::domain::error::AppError;
 use crate::infra::files::{AppPaths, sync_directory};
 
@@ -47,6 +46,75 @@ struct PendingExportRow {
     final_component: String,
     exported_at: String,
     state: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingExportIdentity {
+    pub(crate) operation_id: Uuid,
+    pub(crate) batch_id: Uuid,
+    pub(crate) staging_component: String,
+    pub(crate) final_component: String,
+    pub(crate) exported_at: DateTime<Utc>,
+}
+
+impl PendingExportIdentity {
+    pub(crate) fn new(
+        operation_id: Uuid,
+        batch_id: Uuid,
+        staging_component: String,
+        final_component: String,
+        exported_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            operation_id,
+            batch_id,
+            staging_component,
+            final_component,
+            exported_at,
+        }
+    }
+
+    fn from_row(row: &PendingExportRow) -> Result<Self, AppError> {
+        if !matches!(row.state.as_str(), "generating" | "published" | "committed") {
+            return Err(recovery_error("journal contains an invalid export state"));
+        }
+        let operation_id = Uuid::parse_str(&row.operation_id)
+            .map_err(|_| recovery_error("journal contains an invalid operation identity"))?;
+        let batch_id = Uuid::parse_str(&row.batch_id)
+            .map_err(|_| recovery_error("journal contains an invalid batch identity"))?;
+        let exported_at = DateTime::parse_from_rfc3339(&row.exported_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|_| recovery_error("journal contains an invalid export timestamp"))?;
+        validate_component(&row.staging_component, Some("export-"))?;
+        validate_component(&row.final_component, None)?;
+        Ok(Self::new(
+            operation_id,
+            batch_id,
+            row.staging_component.clone(),
+            row.final_component.clone(),
+            exported_at,
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ExportCommitOutcome {
+    ConfirmedCommitted,
+    ConfirmedUncommitted,
+    Indeterminate(AppError),
+}
+
+#[derive(FromRow)]
+struct CommitOutcomeRow {
+    operation_id: String,
+    batch_id: String,
+    staging_component: String,
+    final_component: String,
+    exported_at: String,
+    state: String,
+    persisted_batch_id: Option<String>,
+    batch_status: Option<String>,
+    last_exported_at: Option<String>,
 }
 
 impl ExportJournal {
@@ -117,6 +185,164 @@ impl ExportJournal {
             .await
             .map(|_| ())
             .map_err(|_| internal_error("failed to clear export recovery journal"))
+    }
+
+    pub(crate) async fn classify_commit_outcome(
+        &self,
+        expected: &PendingExportIdentity,
+    ) -> ExportCommitOutcome {
+        let mut connection = match self.pool.acquire().await {
+            Ok(connection) => connection,
+            Err(_) => {
+                return ExportCommitOutcome::Indeterminate(outcome_error(
+                    "failed to acquire a fresh export outcome connection",
+                ));
+            }
+        };
+        let row = match sqlx::query_as::<_, CommitOutcomeRow>(
+            "SELECT p.operation_id, p.batch_id, p.staging_component, p.final_component,
+                    p.exported_at, p.state, b.id AS persisted_batch_id,
+                    b.status AS batch_status, b.last_exported_at
+             FROM pending_exports p
+             LEFT JOIN batches b ON b.id = p.batch_id
+             WHERE p.operation_id = ?",
+        )
+        .bind(expected.operation_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return ExportCommitOutcome::Indeterminate(outcome_error(
+                    "export outcome journal is missing",
+                ));
+            }
+            Err(_) => {
+                return ExportCommitOutcome::Indeterminate(outcome_error(
+                    "failed to read durable export outcome",
+                ));
+            }
+        };
+
+        let exported_at = expected.exported_at.to_rfc3339();
+        if row.operation_id != expected.operation_id.to_string()
+            || row.batch_id != expected.batch_id.to_string()
+            || row.staging_component != expected.staging_component
+            || row.final_component != expected.final_component
+            || row.exported_at != exported_at
+            || !matches!(row.state.as_str(), "generating" | "published" | "committed")
+        {
+            return ExportCommitOutcome::Indeterminate(outcome_error(
+                "export outcome journal does not match the active operation",
+            ));
+        }
+
+        if row.persisted_batch_id.as_deref() != Some(row.batch_id.as_str()) {
+            return ExportCommitOutcome::Indeterminate(outcome_error(
+                "export outcome batch is missing",
+            ));
+        }
+
+        let batch_has_current_export = row.batch_status.as_deref() == Some("exported")
+            && row.last_exported_at.as_deref() == Some(exported_at.as_str());
+        match (row.state.as_str(), batch_has_current_export) {
+            ("published" | "committed", true) => ExportCommitOutcome::ConfirmedCommitted,
+            ("generating", false) => ExportCommitOutcome::ConfirmedUncommitted,
+            _ => ExportCommitOutcome::Indeterminate(outcome_error(
+                "export journal and batch outcome disagree",
+            )),
+        }
+    }
+
+    pub(crate) async fn preserve_committed(
+        &self,
+        paths: &AppPaths,
+        expected: &PendingExportIdentity,
+    ) -> Result<(), AppError> {
+        verify_recovery_directory(&paths.exports, &expected.final_component)?;
+        if let Some(marker) = read_recovery_marker(&paths.exports, &expected.final_component)?
+            && !marker_matches_identity(&marker, expected)?
+        {
+            return Err(recovery_error(
+                "committed export package has a mismatched recovery marker",
+            ));
+        }
+        let owns_staging = owned_recovery_directory_exists(
+            &paths.staging,
+            &expected.staging_component,
+            expected,
+            "export staging directory has no recovery marker",
+            "export staging directory has a mismatched recovery marker",
+            false,
+        )?;
+        if owns_staging {
+            remove_recovery_directory(
+                &paths.staging,
+                &expected.staging_component,
+                expected.operation_id,
+                "staging",
+            )?;
+        }
+        clear_committed_marker(&paths.exports, &expected.final_component, expected)?;
+        self.finish(expected.operation_id).await
+    }
+
+    pub(crate) async fn rollback_uncommitted(
+        &self,
+        paths: &AppPaths,
+        expected: &PendingExportIdentity,
+    ) -> Result<(), AppError> {
+        self.rollback_uncommitted_with_policy(paths, expected, false)
+            .await
+    }
+
+    async fn rollback_uncommitted_with_policy(
+        &self,
+        paths: &AppPaths,
+        expected: &PendingExportIdentity,
+        allow_unmarked_existing_final: bool,
+    ) -> Result<(), AppError> {
+        let owns_staging = owned_recovery_directory_exists(
+            &paths.staging,
+            &expected.staging_component,
+            expected,
+            "export staging directory has no recovery marker",
+            "export staging directory has a mismatched recovery marker",
+            false,
+        )?;
+        let owns_final = owned_recovery_directory_exists(
+            &paths.exports,
+            &expected.final_component,
+            expected,
+            "export package has no recovery marker",
+            "export package has a mismatched recovery marker",
+            allow_unmarked_existing_final,
+        )?;
+        if owns_staging {
+            remove_recovery_directory(
+                &paths.staging,
+                &expected.staging_component,
+                expected.operation_id,
+                "staging",
+            )?;
+        }
+        if owns_final {
+            remove_recovery_directory(
+                &paths.exports,
+                &expected.final_component,
+                expected.operation_id,
+                "final",
+            )?;
+        }
+        self.finish(expected.operation_id).await
+    }
+
+    pub(crate) async fn record_indeterminate(&self, operation_id: Uuid) -> Result<(), AppError> {
+        self.record_error_message(
+            &operation_id.to_string(),
+            "export_commit_outcome_indeterminate",
+        )
+        .await
     }
 
     pub(crate) async fn reconcile(
@@ -232,54 +458,34 @@ impl ExportJournal {
         operation_id: Uuid,
         row: &PendingExportRow,
     ) -> Result<RecoveryDisposition, AppError> {
-        let batch_id = Uuid::parse_str(&row.batch_id)
-            .map_err(|_| recovery_error("journal contains an invalid batch identity"))?;
-        let exported_at = DateTime::parse_from_rfc3339(&row.exported_at)
-            .map(|value| value.with_timezone(&Utc))
-            .map_err(|_| recovery_error("journal contains an invalid export timestamp"))?;
-        if !matches!(row.state.as_str(), "generating" | "published" | "committed") {
-            return Err(recovery_error("journal contains an invalid export state"));
+        let expected = PendingExportIdentity::from_row(row)?;
+        if expected.operation_id != operation_id {
+            return Err(recovery_error("journal operation identity changed"));
         }
-        validate_component(&row.staging_component, Some("export-"))?;
-        validate_component(&row.final_component, None)?;
-
-        let committed = match BatchRepository::new(self.pool.clone()).get(batch_id).await {
-            Ok(batch) => batch
-                .last_exported_at
-                .is_some_and(|value| value == exported_at),
-            Err(AppError::NotFound { .. }) => false,
-            Err(error) => return Err(error),
-        };
-
-        if committed {
-            verify_recovery_directory(&paths.exports, &row.final_component)?;
-            if let Some(marker) = read_recovery_marker(&paths.exports, &row.final_component)? {
-                if !marker_matches_pending(&marker, row, operation_id)? {
-                    return Err(recovery_error(
-                        "committed export package has a mismatched recovery marker",
-                    ));
-                }
-                clear_recovery_marker(&paths.exports, &row.final_component)?;
+        match self.classify_commit_outcome(&expected).await {
+            ExportCommitOutcome::ConfirmedCommitted => {
+                self.preserve_committed(paths, &expected).await?;
+                Ok(RecoveryDisposition::Preserved)
             }
-            remove_owned_staging_directory(paths, row, operation_id)?;
-            self.finish(operation_id).await?;
-            return Ok(RecoveryDisposition::Preserved);
+            ExportCommitOutcome::ConfirmedUncommitted => {
+                self.rollback_uncommitted_with_policy(paths, &expected, true)
+                    .await?;
+                Ok(RecoveryDisposition::RolledBack)
+            }
+            ExportCommitOutcome::Indeterminate(error) => Err(error),
         }
-
-        remove_owned_staging_directory(paths, row, operation_id)?;
-        let owns_final = read_recovery_marker(&paths.exports, &row.final_component)?
-            .map(|marker| marker_matches_pending(&marker, row, operation_id))
-            .transpose()?
-            .unwrap_or(false);
-        if owns_final {
-            remove_recovery_directory(&paths.exports, &row.final_component, operation_id, "final")?;
-        }
-        self.finish(operation_id).await?;
-        Ok(RecoveryDisposition::RolledBack)
     }
 
     async fn record_error(&self, operation_id: &str, error: &AppError) -> Result<(), AppError> {
         let message = error.to_string().chars().take(512).collect::<String>();
+        self.record_error_message(operation_id, &message).await
+    }
+
+    async fn record_error_message(
+        &self,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<(), AppError> {
         sqlx::query(
             "UPDATE pending_exports SET interrupted = 1, last_error = ?, updated_at = ?
              WHERE operation_id = ?",
@@ -328,10 +534,10 @@ pub(crate) fn write_generation_marker(
 pub(crate) fn clear_committed_marker(
     root: &Path,
     final_component: &str,
-    operation_id: Uuid,
+    expected: &PendingExportIdentity,
 ) -> Result<(), AppError> {
     match read_recovery_marker(root, final_component)? {
-        Some(marker) if marker.operation_id == operation_id.to_string() => {
+        Some(marker) if marker_matches_identity(&marker, expected)? => {
             clear_recovery_marker(root, final_component)
         }
         Some(_) => Err(recovery_error(
@@ -356,44 +562,35 @@ fn validate_marker(marker: &RecoveryMarker, staging_component: &str) -> Result<(
     Ok(())
 }
 
-fn marker_matches_pending(
+fn marker_matches_identity(
     marker: &RecoveryMarker,
-    row: &PendingExportRow,
-    operation_id: Uuid,
+    expected: &PendingExportIdentity,
 ) -> Result<bool, AppError> {
-    validate_marker(marker, &row.staging_component)?;
-    Ok(marker.operation_id == operation_id.to_string()
-        && marker.batch_id == row.batch_id
-        && marker.staging_component == row.staging_component
-        && marker.final_component == row.final_component
-        && marker.exported_at == row.exported_at)
+    validate_marker(marker, &expected.staging_component)?;
+    Ok(marker.operation_id == expected.operation_id.to_string()
+        && marker.batch_id == expected.batch_id.to_string()
+        && marker.staging_component == expected.staging_component
+        && marker.final_component == expected.final_component
+        && marker.exported_at == expected.exported_at.to_rfc3339())
 }
 
-fn remove_owned_staging_directory(
-    paths: &AppPaths,
-    row: &PendingExportRow,
-    operation_id: Uuid,
-) -> Result<(), AppError> {
-    let marker = match read_recovery_marker(&paths.staging, &row.staging_component)? {
-        Some(marker) => marker,
-        None if recovery_directory_exists(&paths.staging, &row.staging_component)? => {
-            return Err(recovery_error(
-                "export staging directory has no recovery marker",
-            ));
-        }
-        None => return Ok(()),
-    };
-    if !marker_matches_pending(&marker, row, operation_id)? {
-        return Err(recovery_error(
-            "export staging directory has a mismatched recovery marker",
-        ));
+fn owned_recovery_directory_exists(
+    root: &Path,
+    component: &str,
+    expected: &PendingExportIdentity,
+    missing_marker_message: &'static str,
+    mismatched_marker_message: &'static str,
+    allow_unmarked_existing: bool,
+) -> Result<bool, AppError> {
+    match read_recovery_marker(root, component)? {
+        Some(marker) if marker_matches_identity(&marker, expected)? => Ok(true),
+        Some(_) => Err(recovery_error(mismatched_marker_message)),
+        None => match recovery_directory_exists(root, component)? {
+            true if allow_unmarked_existing => Ok(false),
+            true => Err(recovery_error(missing_marker_message)),
+            false => Ok(false),
+        },
     }
-    remove_recovery_directory(
-        &paths.staging,
-        &row.staging_component,
-        operation_id,
-        "staging",
-    )
 }
 
 #[cfg(unix)]
@@ -664,6 +861,14 @@ fn recovery_error(message: &str) -> AppError {
     AppError::External {
         service: "export_recovery".to_owned(),
         retryable: false,
+        message: message.to_owned(),
+    }
+}
+
+fn outcome_error(message: &str) -> AppError {
+    AppError::External {
+        service: "export_recovery".to_owned(),
+        retryable: true,
         message: message.to_owned(),
     }
 }
