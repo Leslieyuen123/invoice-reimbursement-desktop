@@ -1,4 +1,5 @@
 import type { InvoiceItemDto } from "../../types";
+import { formatAmountCents } from "../../lib/amount";
 
 interface InboxTableProps {
   items: InvoiceItemDto[];
@@ -96,6 +97,7 @@ export function InboxTable({
             <td>
               <button
                 type="button"
+                data-inbox-item-id={item.id}
                 onClick={(event) => onSelect(item, event.currentTarget)}
               >
                 {item.originalName}
@@ -111,7 +113,7 @@ export function InboxTable({
             <td>
               {item.amountCents === null
                 ? "待确认"
-                : `¥${(item.amountCents / 100).toFixed(2)}`}
+                : `¥${formatAmountCents(item.amountCents)}`}
             </td>
             <td>{sourceLabels[item.sourceType]}</td>
             <td>

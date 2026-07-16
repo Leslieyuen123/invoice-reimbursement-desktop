@@ -576,12 +576,43 @@ async fn preview_resolver_allows_only_database_owned_item_variants() {
         .body(Vec::new())
         .unwrap();
     let response = items::preview_response(&state, &request).await;
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), tauri::http::StatusCode::PARTIAL_CONTENT);
     assert_eq!(response.headers()["content-type"], "application/pdf");
     assert_eq!(response.headers()["access-control-allow-origin"], "*");
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(response.headers()["cache-control"], "no-store");
-    assert_eq!(response.body(), b"normalized-bytes");
+    assert_eq!(response.headers()["accept-ranges"], "bytes");
+    assert_eq!(response.headers()["content-length"], "1");
+    assert_eq!(
+        response.headers()["content-range"],
+        format!("bytes 0-0/{}", b"normalized-bytes".len()).as_str()
+    );
+    assert_eq!(response.body(), b"n");
+
+    let full_response = items::preview_response(
+        &state,
+        &preview_request(
+            tauri::http::Method::GET,
+            &format!("invoice-file://item/{item_id}?variant=normalized"),
+        ),
+    )
+    .await;
+    assert_eq!(full_response.status(), tauri::http::StatusCode::OK);
+    assert_eq!(full_response.headers()["content-type"], "application/pdf");
+    assert_eq!(full_response.body(), b"normalized-bytes");
+
+    for unsupported_range in ["bytes=0-1", "bytes=0-0,2-2", "items=0-0"] {
+        let request = tauri::http::Request::builder()
+            .method(tauri::http::Method::GET)
+            .uri(format!("invoice-file://item/{item_id}?variant=normalized"))
+            .header(tauri::http::header::RANGE, unsupported_range)
+            .body(Vec::new())
+            .unwrap();
+        let response = items::preview_response(&state, &request).await;
+        assert_eq!(response.status(), tauri::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        assert_eq!(response.body(), b"Preview unavailable");
+    }
 }
 
 #[tokio::test]

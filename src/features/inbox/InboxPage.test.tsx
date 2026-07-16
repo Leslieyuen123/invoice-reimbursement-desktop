@@ -185,8 +185,9 @@ describe("InboxPage", () => {
 
   it("keeps per-file import outcomes and retries only the failed file", async () => {
     const user = userEvent.setup();
+    const serverItems: InvoiceItemDto[] = [];
     mockCommand("get_dashboard", new Promise(() => undefined));
-    mockCommand("list_items", { items: [], nextCursor: null });
+    mockCommand("list_items", () => ({ items: serverItems, nextCursor: null }));
     openDialogMock.mockResolvedValue([
       "/Users/finance/出租车电子发票.pdf",
       "/Users/finance/损坏附件.pdf",
@@ -196,11 +197,13 @@ describe("InboxPage", () => {
       importAttempt += 1;
       const paths = (arguments_ as { paths: string[] }).paths;
       if (importAttempt === 1) {
+        const imported = pendingInvoiceFixture({ sourceType: "manual_upload" });
+        serverItems.push(imported);
         return [
           {
             status: "imported" as const,
             path: paths[0],
-            item: pendingInvoiceFixture({ sourceType: "manual_upload" }),
+            item: imported,
           },
           {
             status: "failed" as const,
@@ -213,15 +216,17 @@ describe("InboxPage", () => {
           },
         ];
       }
+      const recovered = pendingInvoiceFixture({
+        id: "invoice-recovered",
+        originalName: "损坏附件.pdf",
+        sourceType: "manual_upload",
+      });
+      serverItems.push(recovered);
       return [
         {
           status: "imported" as const,
           path: paths[0],
-          item: pendingInvoiceFixture({
-            id: "invoice-recovered",
-            originalName: "损坏附件.pdf",
-            sourceType: "manual_upload",
-          }),
+          item: recovered,
         },
       ];
     });
@@ -251,6 +256,131 @@ describe("InboxPage", () => {
     ]);
   });
 
+  it("retires a local save when an equal-or-newer server record is refetched", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const serverItem = pendingInvoiceFixture({
+      originalName: "后台同步结果.pdf",
+      updatedAt: "2026-07-15T10:01:00+08:00",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return {
+        items: [listAttempt === 1 ? pendingInvoiceFixture() : serverItem],
+        nextCursor: null,
+      };
+    });
+    mockCommand(
+      "review_item",
+      pendingInvoiceFixture({
+        originalName: "本地保存响应.pdf",
+        updatedAt: "2026-07-15T10:00:00+08:00",
+      }),
+    );
+
+    renderAppAt("/inbox");
+    await user.click(await screen.findByText("出租车电子发票.pdf"));
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+
+    expect(
+      await screen.findByRole("button", { name: "后台同步结果.pdf" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("本地保存响应.pdf")).not.toBeInTheDocument();
+    expect(listAttempt).toBe(2);
+  });
+
+  it("retires an imported cache record when the server refetches the same id", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const imported = pendingInvoiceFixture({
+      id: "invoice-imported",
+      originalName: "本地导入记录.pdf",
+      sourceType: "manual_upload",
+      updatedAt: "2026-07-15T10:00:00+08:00",
+    });
+    const serverItem = {
+      ...imported,
+      originalName: "服务器导入记录.pdf",
+      updatedAt: "2026-07-15T10:01:00+08:00",
+    };
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return {
+        items: listAttempt === 1 ? [] : [serverItem],
+        nextCursor: null,
+      };
+    });
+    openDialogMock.mockResolvedValue(["/Users/finance/导入票据.pdf"]);
+    mockCommand("import_manual_files", [
+      {
+        status: "imported" as const,
+        path: "/Users/finance/导入票据.pdf",
+        item: imported,
+      },
+    ]);
+
+    renderAppAt("/inbox");
+    await screen.findByText("当前筛选下没有票据");
+    await user.click(screen.getByRole("button", { name: "选择文件" }));
+
+    expect(await screen.findByText("服务器导入记录.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("本地导入记录.pdf")).not.toBeInTheDocument();
+    expect(listAttempt).toBe(2);
+  });
+
+  it("does not retain a deletion tombstone over a newer server record", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const duplicate = pendingInvoiceFixture({
+      status: "suspected_duplicate",
+      dedupeStatus: "suspected_duplicate",
+    });
+    const serverItem = {
+      ...duplicate,
+      originalName: "重新同步票据.pdf",
+      updatedAt: "2026-07-15T10:01:00+08:00",
+    };
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return {
+        items: [listAttempt === 1 ? duplicate : serverItem],
+        nextCursor: null,
+      };
+    });
+    mockCommand("resolve_duplicate", null);
+
+    renderAppAt("/inbox?status=suspected_duplicate");
+    await user.click(await screen.findByText("出租车电子发票.pdf"));
+    await user.click(screen.getByRole("button", { name: "删除重复" }));
+
+    expect(await screen.findByText("重新同步票据.pdf")).toBeInTheDocument();
+    expect(listAttempt).toBe(2);
+  });
+
+  it("replaces import outcomes for a path instead of accumulating duplicates", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [], nextCursor: null });
+    openDialogMock.mockResolvedValue(["/Users/finance/同一票据.pdf"]);
+    mockCommand("import_manual_files", [
+      {
+        status: "imported" as const,
+        path: "/Users/finance/同一票据.pdf",
+        item: pendingInvoiceFixture({ sourceType: "manual_upload" }),
+      },
+    ]);
+
+    renderAppAt("/inbox");
+    await screen.findByText("当前筛选下没有票据");
+    await user.click(screen.getByRole("button", { name: "选择文件" }));
+    await user.click(screen.getByRole("button", { name: "选择文件" }));
+
+    expect(screen.getAllByText("已导入：同一票据.pdf")).toHaveLength(1);
+  });
+
   it("rejects amount input with more than two decimal places", async () => {
     const user = userEvent.setup();
     mockCommand("get_dashboard", new Promise(() => undefined));
@@ -267,6 +397,45 @@ describe("InboxPage", () => {
 
     expect(await screen.findByText("金额最多保留两位小数")).toBeInTheDocument();
     expect(commandCalls("review_item")).toHaveLength(0);
+  });
+
+  it("submits an untouched safe-integer boundary amount without changing cents", async () => {
+    const user = userEvent.setup();
+    const boundaryCents = 9_007_199_254_740_990;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture({ amountCents: boundaryCents })],
+      nextCursor: null,
+    });
+    mockCommand("review_item", pendingInvoiceFixture({ amountCents: boundaryCents }));
+
+    renderAppAt("/inbox");
+    await user.click(await screen.findByText("出租车电子发票.pdf"));
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+
+    await waitFor(() => expect(commandCalls("review_item")).toHaveLength(1));
+    expect(commandCalls("review_item")[0].amountCents).toBe(boundaryCents);
+  });
+
+  it("formats safe-integer boundary cents exactly in every inbox amount view", async () => {
+    const user = userEvent.setup();
+    const boundaryCents = 9_007_199_254_740_990;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture({ amountCents: boundaryCents })],
+      nextCursor: null,
+    });
+
+    renderAppAt("/inbox");
+    const opener = await screen.findByRole("button", {
+      name: "出租车电子发票.pdf",
+    });
+    expect(within(opener.closest("tr")!).getByText("¥90071992547409.90")).toBeInTheDocument();
+    await user.click(opener);
+
+    const dialog = screen.getByRole("dialog", { name: "票据详情" });
+    expect(within(dialog).getByLabelText("金额")).toHaveValue("90071992547409.90");
+    expect(within(dialog).getByText("¥90071992547409.90")).toBeInTheDocument();
   });
 
   it("shows complete editable details and detects a failed preview response", async () => {
@@ -369,6 +538,104 @@ describe("InboxPage", () => {
     expect(secondOpener).toHaveFocus();
   });
 
+  it("focuses the next visible row after deleting the active item", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const first = pendingInvoiceFixture({
+      status: "suspected_duplicate",
+      dedupeStatus: "suspected_duplicate",
+    });
+    const second = pendingInvoiceFixture({
+      id: "invoice-duplicate-two",
+      originalName: "出租车电子发票-副本.pdf",
+      status: "suspected_duplicate",
+      dedupeStatus: "suspected_duplicate",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return { items: listAttempt === 1 ? [first, second] : [second], nextCursor: null };
+    });
+    mockCommand("resolve_duplicate", null);
+
+    renderAppAt("/inbox?status=suspected_duplicate");
+    await user.click(await screen.findByRole("button", { name: "出租车电子发票.pdf" }));
+    await user.click(screen.getByRole("button", { name: "删除重复" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "票据详情" })).not.toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole("button", { name: "出租车电子发票-副本.pdf" }),
+    ).toHaveFocus();
+  });
+
+  it("focuses the previous visible row after save removes the last item", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const first = pendingInvoiceFixture();
+    const second = pendingInvoiceFixture({
+      id: "invoice-hotel",
+      originalName: "酒店住宿发票.pdf",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return { items: listAttempt === 1 ? [first, second] : [first], nextCursor: null };
+    });
+    mockCommand(
+      "review_item",
+      pendingInvoiceFixture({
+        ...second,
+        status: "ready",
+        confirmationStatus: "confirmed",
+        updatedAt: "2026-07-15T10:00:00+08:00",
+      }),
+    );
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await user.click(await screen.findByRole("button", { name: "酒店住宿发票.pdf" }));
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "酒店住宿发票.pdf" })).not.toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
+
+    expect(screen.getByRole("button", { name: "出租车电子发票.pdf" })).toHaveFocus();
+  });
+
+  it("focuses the status controls when keep removes the only visible row", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const duplicate = pendingInvoiceFixture({
+      status: "suspected_duplicate",
+      dedupeStatus: "suspected_duplicate",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return { items: listAttempt === 1 ? [duplicate] : [], nextCursor: null };
+    });
+    mockCommand(
+      "resolve_duplicate",
+      pendingInvoiceFixture({
+        status: "pending_confirmation",
+        dedupeStatus: "resolved",
+        updatedAt: "2026-07-15T10:00:00+08:00",
+      }),
+    );
+
+    renderAppAt("/inbox?status=suspected_duplicate");
+    await user.click(await screen.findByRole("button", { name: "出租车电子发票.pdf" }));
+    await user.click(screen.getByRole("button", { name: "确认保留" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "出租车电子发票.pdf" })).not.toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
+
+    expect(screen.getByRole("tablist", { name: "票据状态" })).toHaveFocus();
+  });
+
   it("does not reopen a closed drawer when a save response arrives", async () => {
     const user = userEvent.setup();
     let resolveSave: ((item: InvoiceItemDto) => void) | undefined;
@@ -406,15 +673,16 @@ describe("InboxPage", () => {
   it("keeps a reopened drawer isolated from an older save response", async () => {
     const user = userEvent.setup();
     let resolveSave: ((item: InvoiceItemDto) => void) | undefined;
+    let serverItem = pendingInvoiceFixture();
     mockCommand("get_dashboard", new Promise(() => undefined));
-    mockCommand("list_items", {
-      items: [pendingInvoiceFixture()],
-      nextCursor: null,
-    });
+    mockCommand("list_items", () => ({ items: [serverItem], nextCursor: null }));
     mockCommand(
       "review_item",
       new Promise<InvoiceItemDto>((resolve) => {
-        resolveSave = resolve;
+        resolveSave = (item) => {
+          serverItem = item;
+          resolve(item);
+        };
       }),
     );
 
@@ -432,11 +700,14 @@ describe("InboxPage", () => {
           originalName: "旧保存响应.pdf",
           status: "ready",
           confirmationStatus: "confirmed",
+          updatedAt: "2026-07-15T09:44:00+08:00",
         }),
       );
     });
 
-    expect(screen.getByRole("button", { name: "旧保存响应.pdf" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "旧保存响应.pdf" }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
       "出租车电子发票.pdf",
     );
@@ -445,15 +716,16 @@ describe("InboxPage", () => {
   it("keeps a reopened drawer isolated from an older recognition response", async () => {
     const user = userEvent.setup();
     let resolveRetry: ((item: InvoiceItemDto) => void) | undefined;
+    let serverItem = pendingInvoiceFixture();
     mockCommand("get_dashboard", new Promise(() => undefined));
-    mockCommand("list_items", {
-      items: [pendingInvoiceFixture()],
-      nextCursor: null,
-    });
+    mockCommand("list_items", () => ({ items: [serverItem], nextCursor: null }));
     mockCommand(
       "retry_recognition",
       new Promise<InvoiceItemDto>((resolve) => {
-        resolveRetry = resolve;
+        resolveRetry = (item) => {
+          serverItem = item;
+          resolve(item);
+        };
       }),
     );
 
@@ -471,11 +743,14 @@ describe("InboxPage", () => {
           originalName: "旧识别响应.pdf",
           status: "pending_recognition",
           recognitionStatus: "pending",
+          updatedAt: "2026-07-15T09:44:00+08:00",
         }),
       );
     });
 
-    expect(screen.getByRole("button", { name: "旧识别响应.pdf" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "旧识别响应.pdf" }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
       "出租车电子发票.pdf",
     );
@@ -488,12 +763,16 @@ describe("InboxPage", () => {
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
     });
+    let serverItems = [duplicate];
     mockCommand("get_dashboard", new Promise(() => undefined));
-    mockCommand("list_items", { items: [duplicate], nextCursor: null });
+    mockCommand("list_items", () => ({ items: serverItems, nextCursor: null }));
     mockCommand(
       "resolve_duplicate",
       new Promise<null>((resolve) => {
-        resolveDeletion = resolve;
+        resolveDeletion = (item) => {
+          serverItems = [];
+          resolve(item);
+        };
       }),
     );
 
@@ -509,9 +788,11 @@ describe("InboxPage", () => {
       resolveDeletion?.(null);
     });
 
-    expect(
-      screen.queryByRole("button", { name: "出租车电子发票.pdf" }),
-    ).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "出租车电子发票.pdf" }),
+      ).not.toBeInTheDocument();
+    });
     expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
       "出租车电子发票.pdf",
     );
@@ -599,16 +880,29 @@ describe("InboxPage", () => {
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
     });
+    let serverItems = [duplicateOne, duplicateTwo];
     mockCommand("get_dashboard", new Promise(() => undefined));
-    mockCommand("list_items", {
-      items: [duplicateOne, duplicateTwo],
-      nextCursor: null,
+    mockCommand("list_items", (arguments_) => {
+      const { status } = (arguments_ as { filter: { status?: string } }).filter;
+      return {
+        items: serverItems.filter((item) => !status || item.status === status),
+        nextCursor: null,
+      };
     });
     mockCommand("resolve_duplicate", (arguments_) => {
       const request = arguments_ as { itemId: string; keep: boolean };
-      return request.keep
-        ? pendingInvoiceFixture({ status: "pending_confirmation", dedupeStatus: "resolved" })
-        : null;
+      if (!request.keep) {
+        serverItems = serverItems.filter((item) => item.id !== request.itemId);
+        return null;
+      }
+      const kept = pendingInvoiceFixture({
+        status: "pending_confirmation",
+        dedupeStatus: "resolved",
+      });
+      serverItems = serverItems.map((item) =>
+        item.id === request.itemId ? kept : item,
+      );
+      return kept;
     });
 
     renderAppAt("/inbox?status=suspected_duplicate");
@@ -703,22 +997,31 @@ describe("InboxPage", () => {
 
   it("opens the suspected-duplicate filter after importing a duplicate", async () => {
     const user = userEvent.setup();
+    const serverItems: InvoiceItemDto[] = [];
     mockCommand("get_dashboard", new Promise(() => undefined));
-    mockCommand("list_items", { items: [], nextCursor: null });
+    mockCommand("list_items", (arguments_) => {
+      const { status } = (arguments_ as { filter: { status?: string } }).filter;
+      return {
+        items: serverItems.filter((item) => !status || item.status === status),
+        nextCursor: null,
+      };
+    });
     openDialogMock.mockResolvedValue(["/Users/finance/重复票据.pdf"]);
-    mockCommand("import_manual_files", [
-      {
+    mockCommand("import_manual_files", () => {
+      const imported = pendingInvoiceFixture({
+        id: "invoice-imported-duplicate",
+        originalName: "重复票据.pdf",
+        sourceType: "manual_upload",
+        status: "suspected_duplicate",
+        dedupeStatus: "suspected_duplicate",
+      });
+      serverItems.push(imported);
+      return [{
         status: "imported" as const,
         path: "/Users/finance/重复票据.pdf",
-        item: pendingInvoiceFixture({
-          id: "invoice-imported-duplicate",
-          originalName: "重复票据.pdf",
-          sourceType: "manual_upload",
-          status: "suspected_duplicate",
-          dedupeStatus: "suspected_duplicate",
-        }),
-      },
-    ]);
+        item: imported,
+      }];
+    });
 
     renderAppAt("/inbox");
     await screen.findByText("当前筛选下没有票据");

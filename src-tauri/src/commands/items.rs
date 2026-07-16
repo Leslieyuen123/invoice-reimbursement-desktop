@@ -13,7 +13,7 @@ use crate::domain::model::{
 use crate::services::items::ItemReview;
 use crate::state::AppState;
 
-pub use crate::services::preview::{PreviewPayload, PreviewVariant};
+pub use crate::services::preview::{PreviewPayload, PreviewRangePayload, PreviewVariant};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -288,6 +288,14 @@ pub async fn open_preview(
     state.preview_service().open(id, variant).await
 }
 
+pub async fn open_preview_first_byte(
+    state: &AppState,
+    id: Uuid,
+    variant: PreviewVariant,
+) -> Result<PreviewRangePayload, AppError> {
+    state.preview_service().open_first_byte(id, variant).await
+}
+
 pub async fn preview_response(
     state: &AppState,
     request: &tauri::http::Request<Vec<u8>>,
@@ -295,19 +303,43 @@ pub async fn preview_response(
     if request.method() != tauri::http::Method::GET {
         return preview_http_error(tauri::http::StatusCode::METHOD_NOT_ALLOWED);
     }
-    let result = match parse_preview_uri(&request.uri().to_string()) {
-        Ok((id, variant)) => open_preview(state, id, variant).await,
-        Err(error) => Err(error),
+    let (id, variant) = match parse_preview_uri(&request.uri().to_string()) {
+        Ok(parsed) => parsed,
+        Err(error) => return preview_http_error(preview_error_status(&error)),
     };
-    match result {
-        Ok(payload) => preview_response_builder(tauri::http::StatusCode::OK)
-            .header(tauri::http::header::CONTENT_TYPE, payload.mime_type)
-            .header(tauri::http::header::CONTENT_LENGTH, payload.bytes.len())
-            .header("Content-Disposition", "inline")
-            .header("Content-Security-Policy", "default-src 'none'; sandbox")
-            .body(payload.bytes)
-            .unwrap_or_else(|_| preview_http_error(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)),
-        Err(error) => preview_http_error(preview_error_status(&error)),
+    match request.headers().get(tauri::http::header::RANGE) {
+        None => match open_preview(state, id, variant).await {
+            Ok(payload) => preview_response_builder(tauri::http::StatusCode::OK)
+                .header(tauri::http::header::CONTENT_TYPE, payload.mime_type)
+                .header(tauri::http::header::CONTENT_LENGTH, payload.bytes.len())
+                .header("Content-Disposition", "inline")
+                .header("Content-Security-Policy", "default-src 'none'; sandbox")
+                .body(payload.bytes)
+                .unwrap_or_else(|_| {
+                    preview_http_error(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)
+                }),
+            Err(error) => preview_http_error(preview_error_status(&error)),
+        },
+        Some(range) if range.as_bytes() == b"bytes=0-0" => {
+            match open_preview_first_byte(state, id, variant).await {
+                Ok(payload) => preview_response_builder(tauri::http::StatusCode::PARTIAL_CONTENT)
+                    .header(tauri::http::header::CONTENT_TYPE, payload.mime_type)
+                    .header(tauri::http::header::CONTENT_LENGTH, 1)
+                    .header(tauri::http::header::ACCEPT_RANGES, "bytes")
+                    .header(
+                        tauri::http::header::CONTENT_RANGE,
+                        format!("bytes 0-0/{}", payload.total_length),
+                    )
+                    .header("Content-Disposition", "inline")
+                    .header("Content-Security-Policy", "default-src 'none'; sandbox")
+                    .body(vec![payload.first_byte])
+                    .unwrap_or_else(|_| {
+                        preview_http_error(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    }),
+                Err(error) => preview_http_error(preview_error_status(&error)),
+            }
+        }
+        Some(_) => preview_http_error(tauri::http::StatusCode::BAD_REQUEST),
     }
 }
 

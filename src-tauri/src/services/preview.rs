@@ -25,6 +25,13 @@ pub struct PreviewPayload {
     pub mime_type: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRangePayload {
+    pub first_byte: u8,
+    pub total_length: u64,
+    pub mime_type: &'static str,
+}
+
 pub trait PreviewFileReader: Send + Sync {
     fn read(
         &self,
@@ -33,6 +40,14 @@ pub trait PreviewFileReader: Send + Sync {
         mime_type: &'static str,
         max_bytes: u64,
     ) -> Result<PreviewPayload, AppError>;
+
+    fn read_first_byte(
+        &self,
+        path: PathBuf,
+        root: PathBuf,
+        mime_type: &'static str,
+        max_bytes: u64,
+    ) -> Result<PreviewRangePayload, AppError>;
 }
 
 #[derive(Clone)]
@@ -122,6 +137,42 @@ impl PreviewService {
             message: "preview reader task failed".to_owned(),
         })?
     }
+
+    pub async fn open_first_byte(
+        &self,
+        id: Uuid,
+        variant: PreviewVariant,
+    ) -> Result<PreviewRangePayload, AppError> {
+        let permit = self
+            .coordinator
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| preview_capacity_exhausted())?;
+        let item = ItemRepository::new(self.pool.clone()).get_by_id(id).await?;
+        let (path, root, mime_type) = match variant {
+            PreviewVariant::Original => (
+                PathBuf::from(item.original_path),
+                self.paths.originals.clone(),
+                preview_mime_type(&item.mime_type)?,
+            ),
+            PreviewVariant::Normalized => (
+                PathBuf::from(item.normalized_pdf_path.ok_or_else(preview_unavailable)?),
+                self.paths.normalized.clone(),
+                "application/pdf",
+            ),
+        };
+        let reader = self.reader.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            reader.read_first_byte(path, root, mime_type, MAX_PREVIEW_BYTES)
+        })
+        .await
+        .map_err(|_| AppError::Internal {
+            message: "preview reader task failed".to_owned(),
+        })?
+    }
 }
 
 struct FileSystemPreviewReader;
@@ -151,6 +202,30 @@ impl PreviewFileReader for FileSystemPreviewReader {
             return Err(preview_unavailable());
         }
         Ok(PreviewPayload { bytes, mime_type })
+    }
+
+    fn read_first_byte(
+        &self,
+        path: PathBuf,
+        root: PathBuf,
+        mime_type: &'static str,
+        max_bytes: u64,
+    ) -> Result<PreviewRangePayload, AppError> {
+        let mut opened = open_contained_regular_file(&path, &root, "preview")
+            .map_err(|_| preview_unavailable())?;
+        if opened.length == 0 || opened.length > max_bytes {
+            return Err(preview_unavailable());
+        }
+        let mut first_byte = [0_u8; 1];
+        opened
+            .file
+            .read_exact(&mut first_byte)
+            .map_err(|_| preview_unavailable())?;
+        Ok(PreviewRangePayload {
+            first_byte: first_byte[0],
+            total_length: opened.length,
+            mime_type,
+        })
     }
 }
 

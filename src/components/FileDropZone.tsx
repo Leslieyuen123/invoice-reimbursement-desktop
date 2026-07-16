@@ -1,7 +1,7 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FilePlus2, Upload } from "lucide-react";
-import { useEffect, useState } from "react";
+import { FilePlus2, Upload, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
 interface FileDropZoneProps {
   disabled?: boolean;
@@ -14,6 +14,12 @@ function isTauriRuntime() {
 
 export function FileDropZone({ disabled = false, onPaths }: FileDropZoneProps) {
   const [dragActive, setDragActive] = useState(false);
+  const [error, setError] = useState<"dialog" | "listener" | null>(null);
+  const disabledRef = useRef(disabled);
+  const onPathsRef = useRef(onPaths);
+
+  disabledRef.current = disabled;
+  onPathsRef.current = onPaths;
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -28,27 +34,39 @@ export function FileDropZone({ disabled = false, onPaths }: FileDropZoneProps) {
           setDragActive(false);
         } else if (payload.type === "drop") {
           setDragActive(false);
-          if (!disabled && payload.paths.length > 0) onPaths(payload.paths);
+          if (!disabledRef.current && payload.paths.length > 0) {
+            onPathsRef.current(payload.paths);
+          }
         }
       })
       .then((stopListening) => {
         if (disposed) stopListening();
         else unlisten = stopListening;
+      })
+      .catch(() => {
+        if (!disposed) setError("listener");
       });
 
     return () => {
       disposed = true;
       unlisten?.();
     };
-  }, [disabled, onPaths]);
+  }, []);
 
   async function selectFiles() {
-    const selected = await open({
-      multiple: true,
-      directory: false,
-      title: "选择票据文件",
-    });
-    if (Array.isArray(selected) && selected.length > 0) onPaths(selected);
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: true,
+        directory: false,
+        title: "选择票据文件",
+      });
+      if (Array.isArray(selected) && selected.length > 0) {
+        onPathsRef.current(selected);
+      }
+    } catch {
+      setError("dialog");
+    }
   }
 
   return (
@@ -56,8 +74,29 @@ export function FileDropZone({ disabled = false, onPaths }: FileDropZoneProps) {
       className={`file-drop-zone${dragActive ? " is-dragging" : ""}`}
       aria-label="手动上传票据"
     >
-      <Upload size={17} strokeWidth={1.7} aria-hidden="true" />
-      <span>{dragActive ? "松开以导入票据" : "拖入票据文件"}</span>
+      {error ? (
+        <>
+          <div role="alert">
+            {error === "dialog"
+              ? "无法打开文件选择器，请重试"
+              : "拖放导入暂不可用，请使用选择文件"}
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            onClick={() => setError(null)}
+            aria-label="清除上传错误"
+            title="清除错误"
+          >
+            <X size={16} strokeWidth={1.8} aria-hidden="true" />
+          </button>
+        </>
+      ) : (
+        <>
+          <Upload size={17} strokeWidth={1.7} aria-hidden="true" />
+          <span>{dragActive ? "松开以导入票据" : "拖入票据文件"}</span>
+        </>
+      )}
       <button
         className="button button-secondary"
         type="button"

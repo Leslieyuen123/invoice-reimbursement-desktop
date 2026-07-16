@@ -1,4 +1,8 @@
-import { useInfiniteQuery } from "@tanstack/react-query";
+import {
+  type InfiniteData,
+  useInfiniteQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { Check, RotateCcw, Search, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
@@ -12,6 +16,7 @@ import type {
   ItemFilter,
   ItemStatus,
   ManualImportOutcomeDto,
+  PageDto,
   SourceType,
 } from "../../types";
 import { InboxTable } from "./InboxTable";
@@ -51,22 +56,82 @@ function statusFromSearch(value: string | null): ItemStatus | undefined {
 }
 
 interface DrawerSelection {
+  fallbackItemIds: string[];
   item: InvoiceItemDto;
   opener: HTMLButtonElement;
   sessionId: number;
 }
 
+type ItemListData = InfiniteData<PageDto<InvoiceItemDto>>;
+
+function matchesItemFilter(item: InvoiceItemDto, filter: ItemFilter) {
+  if (filter.status && item.status !== filter.status) return false;
+  if (filter.suggestedPeriod && item.suggestedPeriod !== filter.suggestedPeriod) {
+    return false;
+  }
+  if (
+    filter.category &&
+    (item.finalCategory ?? item.suggestedCategory) !== filter.category
+  ) {
+    return false;
+  }
+  if (filter.sourceType && item.sourceType !== filter.sourceType) return false;
+  if (filter.query) {
+    const haystack = [item.originalName, item.city, item.company]
+      .filter(Boolean)
+      .join(" ")
+      .toLocaleLowerCase("zh-CN");
+    if (!haystack.includes(filter.query.toLocaleLowerCase("zh-CN"))) return false;
+  }
+  return true;
+}
+
+function reconcileItemList(
+  data: ItemListData,
+  filter: ItemFilter,
+  item: InvoiceItemDto,
+  insert: boolean,
+) {
+  const exists = data.pages.some((page) =>
+    page.items.some((candidate) => candidate.id === item.id),
+  );
+  const matches = matchesItemFilter(item, filter);
+  const pages = data.pages.map((page) => ({
+    ...page,
+    items: page.items.flatMap((candidate) =>
+      candidate.id === item.id ? (matches ? [item] : []) : [candidate],
+    ),
+  }));
+  if (insert && !exists && matches && pages[0]) {
+    pages[0] = { ...pages[0], items: [item, ...pages[0].items] };
+  }
+  return { ...data, pages };
+}
+
+function removeItemFromList(data: ItemListData, itemId: string) {
+  return {
+    ...data,
+    pages: data.pages.map((page) => ({
+      ...page,
+      items: page.items.filter((item) => item.id !== itemId),
+    })),
+  };
+}
+
 export function InboxPage() {
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const [selection, setSelection] = useState<DrawerSelection | null>(null);
   const nextSessionId = useRef(0);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const pendingFocusRef = useRef<DrawerSelection | null>(null);
+  const selectionRef = useRef(selection);
+  const statusTabsRef = useRef<HTMLDivElement>(null);
+  selectionRef.current = selection;
   const [suggestedPeriod, setSuggestedPeriod] = useState("");
   const [category, setCategory] = useState<Category | "">("");
   const [sourceType, setSourceType] = useState<SourceType | "">("");
   const [query, setQuery] = useState("");
-  const [importedItems, setImportedItems] = useState<InvoiceItemDto[]>([]);
-  const [updatedItems, setUpdatedItems] = useState<InvoiceItemDto[]>([]);
-  const [deletedItemIds, setDeletedItemIds] = useState<string[]>([]);
   const [importOutcomes, setImportOutcomes] = useState<
     ManualImportOutcomeDto[]
   >([]);
@@ -92,67 +157,109 @@ export function InboxPage() {
     getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
   });
   const queriedItems = itemsQuery.data?.pages.flatMap((page) => page.items) ?? [];
-  const items = useMemo(() => {
-    const byId = new Map<string, InvoiceItemDto>();
-    for (const item of [...queriedItems, ...importedItems, ...updatedItems]) {
-      byId.set(item.id, item);
-    }
-    return [...byId.values()].filter((item) => {
-      if (deletedItemIds.includes(item.id)) return false;
-      if (filter.status && item.status !== filter.status) return false;
-      if (
-        filter.suggestedPeriod &&
-        item.suggestedPeriod !== filter.suggestedPeriod
-      ) {
-        return false;
-      }
-      if (
-        filter.category &&
-        (item.finalCategory ?? item.suggestedCategory) !== filter.category
-      ) {
-        return false;
-      }
-      if (filter.sourceType && item.sourceType !== filter.sourceType) return false;
-      if (filter.query) {
-        const haystack = [item.originalName, item.city, item.company]
-          .filter(Boolean)
-          .join(" ")
-          .toLocaleLowerCase("zh-CN");
-        if (!haystack.includes(filter.query.toLocaleLowerCase("zh-CN"))) return false;
-      }
-      return true;
+  const items = queriedItems.filter((item) => matchesItemFilter(item, filter));
+
+  useEffect(() => {
+    setSelection((current) => {
+      if (!current) return current;
+      const serverItem = itemsQuery.data?.pages
+        .flatMap((page) => page.items)
+        .find((item) => item.id === current.item.id);
+      if (!serverItem || serverItem === current.item) return current;
+      const serverUpdatedAt = Date.parse(serverItem.updatedAt);
+      const currentUpdatedAt = Date.parse(current.item.updatedAt);
+      return serverUpdatedAt >= currentUpdatedAt
+        ? { ...current, item: serverItem }
+        : current;
     });
-  }, [deletedItemIds, filter, importedItems, queriedItems, updatedItems]);
+  }, [itemsQuery.data]);
+
+  function reconcileCachedItem(item: InvoiceItemDto, insert: boolean) {
+    for (const [queryKey, data] of queryClient.getQueriesData<ItemListData>({
+      queryKey: queryKeys.itemLists,
+    })) {
+      if (!data) continue;
+      const cachedFilter = queryKey[3] as ItemFilter;
+      queryClient.setQueryData(
+        queryKey,
+        reconcileItemList(data, cachedFilter, item, insert),
+      );
+    }
+  }
+
+  function invalidateItemLists() {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
+  }
 
   function updateItem(item: InvoiceItemDto, sessionId: number) {
-    setUpdatedItems((current) => [
-      ...current.filter((candidate) => candidate.id !== item.id),
-      item,
-    ]);
+    reconcileCachedItem(item, false);
     setSelection((current) =>
       current?.sessionId === sessionId ? { ...current, item } : current,
     );
+    invalidateItemLists();
   }
 
   function deleteItem(itemId: string, sessionId: number) {
-    setDeletedItemIds((current) =>
-      current.includes(itemId) ? current : [...current, itemId],
-    );
-    setSelection((current) =>
-      current?.sessionId === sessionId ? null : current,
-    );
+    for (const [queryKey, data] of queryClient.getQueriesData<ItemListData>({
+      queryKey: queryKeys.itemLists,
+    })) {
+      if (data) queryClient.setQueryData(queryKey, removeItemFromList(data, itemId));
+    }
+    dismissDrawer(sessionId);
+    invalidateItemLists();
   }
 
   function openItem(item: InvoiceItemDto, opener: HTMLButtonElement) {
+    const itemIndex = items.findIndex((candidate) => candidate.id === item.id);
+    const followingIds = items.slice(itemIndex + 1).map((candidate) => candidate.id);
+    const precedingIds = items
+      .slice(0, itemIndex)
+      .reverse()
+      .map((candidate) => candidate.id);
     nextSessionId.current += 1;
-    setSelection({ item, opener, sessionId: nextSessionId.current });
+    setSelection({
+      fallbackItemIds: [...followingIds, ...precedingIds],
+      item,
+      opener,
+      sessionId: nextSessionId.current,
+    });
   }
 
-  function closeDrawer(sessionId: number, opener: HTMLButtonElement) {
-    if (selection?.sessionId !== sessionId) return;
+  function dismissDrawer(sessionId: number) {
+    const current = selectionRef.current;
+    if (current?.sessionId !== sessionId) return;
+    pendingFocusRef.current = current;
     setSelection(null);
-    opener.focus();
   }
+
+  useEffect(() => {
+    if (selection) return;
+    const dismissed = pendingFocusRef.current;
+    if (!dismissed) return;
+    pendingFocusRef.current = null;
+
+    const canFocus = (element: HTMLElement | null): element is HTMLElement =>
+      Boolean(element?.isConnected && !element.closest("[hidden]"));
+    let target: HTMLElement | null = canFocus(dismissed.opener)
+      ? dismissed.opener
+      : null;
+    if (!target) {
+      const rowButtons = [
+        ...(pageRef.current?.querySelectorAll<HTMLButtonElement>(
+          "[data-inbox-item-id]",
+        ) ?? []),
+      ];
+      target =
+        dismissed.fallbackItemIds
+          .map((itemId) =>
+            rowButtons.find((button) => button.dataset.inboxItemId === itemId),
+          )
+          .find((button): button is HTMLButtonElement => canFocus(button ?? null)) ??
+        null;
+    }
+    if (!target && canFocus(statusTabsRef.current)) target = statusTabsRef.current;
+    target?.focus();
+  }, [items, selection]);
 
   useEffect(() => {
     setSelection(null);
@@ -166,24 +273,19 @@ export function InboxPage() {
   }
 
   const importPaths = useCallback(
-    async (paths: string[], retryPath?: string) => {
+    async (paths: string[]) => {
       setImportingPaths((current) => [...current, ...paths]);
       try {
         const outcomes = await api.importManualFiles(paths);
-        setImportedItems((current) => {
-          const byId = new Map(current.map((item) => [item.id, item]));
-          for (const outcome of outcomes) {
-            if (outcome.status === "imported") byId.set(outcome.item.id, outcome.item);
-          }
-          return [...byId.values()];
-        });
+        for (const outcome of outcomes) {
+          if (outcome.status === "imported") reconcileCachedItem(outcome.item, true);
+        }
         setImportOutcomes((current) => {
-          if (!retryPath) return [...current, ...outcomes];
-          const replacement = outcomes[0];
-          return current.map((outcome) =>
-            outcome.path === retryPath && replacement ? replacement : outcome,
-          );
+          const byPath = new Map(current.map((outcome) => [outcome.path, outcome]));
+          for (const outcome of outcomes) byPath.set(outcome.path, outcome);
+          return [...byPath.values()];
         });
+        invalidateItemLists();
         if (
           outcomes.some(
             (outcome) =>
@@ -207,7 +309,7 @@ export function InboxPage() {
   }
 
   return (
-    <div className="inbox-page">
+    <div className="inbox-page" ref={pageRef}>
       <header className="inbox-heading">
         <div>
           <h1>待处理池</h1>
@@ -238,9 +340,7 @@ export function InboxPage() {
                     type="button"
                     aria-label={`重试 ${fileName(outcome.path)}`}
                     disabled={importingPaths.includes(outcome.path)}
-                    onClick={() =>
-                      void importPaths([outcome.path], outcome.path)
-                    }
+                    onClick={() => void importPaths([outcome.path])}
                   >
                     <RotateCcw size={14} strokeWidth={1.8} aria-hidden="true" />
                     重试
@@ -252,7 +352,13 @@ export function InboxPage() {
         </ol>
       ) : null}
 
-      <div className="inbox-status-tabs" role="tablist" aria-label="票据状态">
+      <div
+        className="inbox-status-tabs"
+        role="tablist"
+        aria-label="票据状态"
+        ref={statusTabsRef}
+        tabIndex={-1}
+      >
         {statusTabs.map((tab) => (
           <button
             type="button"
@@ -346,7 +452,7 @@ export function InboxPage() {
         <ItemDrawer
           key={`${selection.item.id}:${selection.sessionId}`}
           item={selection.item}
-          onClose={() => closeDrawer(selection.sessionId, selection.opener)}
+          onClose={() => dismissDrawer(selection.sessionId)}
           onDeleted={(itemId) => deleteItem(itemId, selection.sessionId)}
           onSaved={(item) => updateItem(item, selection.sessionId)}
         />

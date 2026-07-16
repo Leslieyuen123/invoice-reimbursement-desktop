@@ -2,6 +2,7 @@ import { Check, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../lib/api";
+import { formatAmountCents } from "../../lib/amount";
 import {
   MAX_SAFE_AMOUNT_CENTS,
   type AppError,
@@ -29,7 +30,7 @@ interface ItemDrawerProps {
 }
 
 function initialAmount(item: InvoiceItemDto) {
-  return item.amountCents === null ? "" : (item.amountCents / 100).toFixed(2);
+  return item.amountCents === null ? "" : formatAmountCents(item.amountCents);
 }
 
 function parseYuanToCents(value: string):
@@ -232,7 +233,7 @@ export function ItemDrawer({
                 <dd>
                   {item.amountCents === null
                     ? "未识别"
-                    : `¥${(item.amountCents / 100).toFixed(2)}`}
+                    : `¥${formatAmountCents(item.amountCents)}`}
                 </dd>
               </div>
             </dl>

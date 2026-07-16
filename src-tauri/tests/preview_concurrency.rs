@@ -7,7 +7,8 @@ use invoice_reimbursement::db;
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::services::preview::{
-    PreviewCoordinator, PreviewFileReader, PreviewPayload, PreviewService, PreviewVariant,
+    PreviewCoordinator, PreviewFileReader, PreviewPayload, PreviewRangePayload, PreviewService,
+    PreviewVariant,
 };
 use uuid::Uuid;
 
@@ -58,6 +59,21 @@ impl PreviewFileReader for BlockingReader {
             mime_type,
         })
     }
+
+    fn read_first_byte(
+        &self,
+        path: PathBuf,
+        root: PathBuf,
+        mime_type: &'static str,
+        max_bytes: u64,
+    ) -> Result<PreviewRangePayload, AppError> {
+        let payload = self.read(path, root, mime_type, max_bytes)?;
+        Ok(PreviewRangePayload {
+            first_byte: payload.bytes[0],
+            total_length: payload.bytes.len() as u64,
+            mime_type,
+        })
+    }
 }
 
 struct PanicOnceReader {
@@ -77,6 +93,21 @@ impl PreviewFileReader for PanicOnceReader {
         }
         Ok(PreviewPayload {
             bytes: b"recovered".to_vec(),
+            mime_type,
+        })
+    }
+
+    fn read_first_byte(
+        &self,
+        path: PathBuf,
+        root: PathBuf,
+        mime_type: &'static str,
+        max_bytes: u64,
+    ) -> Result<PreviewRangePayload, AppError> {
+        let payload = self.read(path, root, mime_type, max_bytes)?;
+        Ok(PreviewRangePayload {
+            first_byte: payload.bytes[0],
+            total_length: payload.bytes.len() as u64,
             mime_type,
         })
     }
