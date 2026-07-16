@@ -6,7 +6,13 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import {
+  type InfiniteData,
+  QueryClient,
+  QueryClientProvider,
+} from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -14,12 +20,14 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 import { open } from "@tauri-apps/plugin-dialog";
 import { App } from "../../app/App";
+import { queryKeys } from "../../lib/queryKeys";
 import {
   invokeMock,
   mockCommand,
   resetMockApi,
 } from "../../test/mockApi";
-import type { InvoiceItemDto } from "../../types";
+import type { InvoiceItemDto, PageDto } from "../../types";
+import { InboxPage } from "./InboxPage";
 
 const openDialogMock = vi.mocked(open);
 const fetchMock = vi.fn<typeof fetch>();
@@ -59,6 +67,16 @@ function pendingInvoiceFixture(
 function renderAppAt(path: string) {
   window.history.replaceState({}, "", path);
   return render(<App />);
+}
+
+function renderInboxAt(path: string, queryClient: QueryClient) {
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[path]}>
+        <InboxPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
 }
 
 function commandCalls(command: string) {
@@ -381,6 +399,121 @@ describe("InboxPage", () => {
     expect(screen.getAllByText("已导入：同一票据.pdf")).toHaveLength(1);
   });
 
+  it("bounds optimistic imports when the authoritative refetch fails", async () => {
+    const user = userEvent.setup();
+    const pageSize = 50;
+    const firstCursor = {
+      sortValue: "2026-07-15T09:00:00+08:00",
+      id: "seed-050",
+    };
+    const secondCursor = {
+      sortValue: "2026-07-15T08:00:00+08:00",
+      id: "seed-100",
+    };
+    const seedItems = Array.from({ length: pageSize * 2 }, (_, index) =>
+      pendingInvoiceFixture({
+        id: `seed-${String(index + 1).padStart(3, "0")}`,
+        originalName: `原有票据-${String(index + 1).padStart(3, "0")}.pdf`,
+        sourceType: "manual_upload",
+      }),
+    );
+    const activeKey = queryKeys.items({});
+    const manualKey = queryKeys.items({ sourceType: "manual_upload" });
+    const activeData: InfiniteData<PageDto<InvoiceItemDto>> = {
+      pages: [{ items: seedItems.slice(0, pageSize), nextCursor: firstCursor }],
+      pageParams: [undefined],
+    };
+    const manualData: InfiniteData<PageDto<InvoiceItemDto>> = {
+      pages: [
+        { items: seedItems.slice(0, pageSize), nextCursor: firstCursor },
+        { items: seedItems.slice(pageSize), nextCursor: secondCursor },
+      ],
+      pageParams: [undefined, firstCursor],
+    };
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+      },
+    });
+    queryClient.setQueryData(activeKey, activeData);
+    queryClient.setQueryData(manualKey, manualData);
+
+    const paths = Array.from(
+      { length: pageSize + 5 },
+      (_, index) =>
+        `/Users/finance/批量导入-${String(index + 1).padStart(3, "0")}.pdf`,
+    );
+    const outcomes = paths.map((path, index) => ({
+      status: "imported" as const,
+      path,
+      item: pendingInvoiceFixture({
+        id: `imported-${String(index + 1).padStart(3, "0")}`,
+        originalName: path.split("/").at(-1),
+        sourceType: "manual_upload",
+      }),
+    }));
+    mockCommand("list_items", async () => {
+      throw new Error("权威刷新失败");
+    });
+    mockCommand("import_manual_files", outcomes);
+    openDialogMock.mockResolvedValue(paths);
+
+    renderInboxAt("/inbox", queryClient);
+    expect(
+      screen.getByRole("table").querySelectorAll("[data-inbox-item-id]"),
+    ).toHaveLength(pageSize);
+    await user.click(screen.getByRole("button", { name: "选择文件" }));
+
+    const outcomeList = await screen.findByRole("list", { name: "导入结果" });
+    const outcomeRows = within(outcomeList).getAllByRole("listitem");
+    expect(outcomeRows).toHaveLength(paths.length);
+    expect(outcomeRows.map((row) => row.textContent)).toEqual(
+      paths.map((path) => `已导入：${path.split("/").at(-1)}`),
+    );
+    expect(outcomeRows.every((row) => row.dataset.status === "imported")).toBe(
+      true,
+    );
+    expect(within(outcomeList).queryByRole("alert")).not.toBeInTheDocument();
+    await waitFor(() => expect(commandCalls("list_items")).toHaveLength(1));
+
+    const cachedLists = queryClient.getQueriesData<
+      InfiniteData<PageDto<InvoiceItemDto>>
+    >({ queryKey: queryKeys.itemLists });
+    expect(cachedLists).toHaveLength(2);
+    for (const [, data] of cachedLists) {
+      expect(data).toBeDefined();
+      for (const page of data?.pages ?? []) {
+        expect(page.items.length).toBeLessThanOrEqual(pageSize);
+      }
+    }
+    expect(queryClient.getQueryData<typeof activeData>(activeKey)?.pages).toHaveLength(
+      1,
+    );
+    expect(
+      queryClient.getQueryData<typeof activeData>(activeKey)?.pages[0].nextCursor,
+    ).toEqual(firstCursor);
+    expect(queryClient.getQueryData<typeof manualData>(manualKey)?.pages).toHaveLength(
+      2,
+    );
+    expect(
+      queryClient.getQueryData<typeof manualData>(manualKey)?.pages.map(
+        (page) => page.nextCursor,
+      ),
+    ).toEqual([firstCursor, secondCursor]);
+
+    const table = screen.getByRole("table");
+    expect(table.querySelectorAll("[data-inbox-item-id]")).toHaveLength(pageSize);
+    expect(
+      within(table).getByRole("button", { name: "批量导入-055.pdf" }),
+    ).toBeInTheDocument();
+    expect(
+      within(table).queryByRole("button", { name: "批量导入-001.pdf" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(outcomeList).getByText("已导入：批量导入-001.pdf"),
+    ).toBeInTheDocument();
+  });
+
   it("rejects amount input with more than two decimal places", async () => {
     const user = userEvent.setup();
     mockCommand("get_dashboard", new Promise(() => undefined));
@@ -570,6 +703,36 @@ describe("InboxPage", () => {
     ).toHaveFocus();
   });
 
+  it("focuses the selected status tab after deleting the only visible row", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const duplicate = pendingInvoiceFixture({
+      status: "suspected_duplicate",
+      dedupeStatus: "suspected_duplicate",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return { items: listAttempt === 1 ? [duplicate] : [], nextCursor: null };
+    });
+    mockCommand("resolve_duplicate", null);
+
+    renderAppAt("/inbox?status=suspected_duplicate");
+    await user.click(
+      await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
+    );
+    await user.click(screen.getByRole("button", { name: "删除重复" }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "票据详情" }),
+      ).not.toBeInTheDocument();
+    });
+    const selectedTab = screen.getByRole("tab", { name: "疑似重复" });
+    expect(selectedTab).toHaveAttribute("aria-selected", "true");
+    expect(selectedTab).toHaveFocus();
+  });
+
   it("focuses the previous visible row after save removes the last item", async () => {
     const user = userEvent.setup();
     let listAttempt = 0;
@@ -604,7 +767,42 @@ describe("InboxPage", () => {
     expect(screen.getByRole("button", { name: "出租车电子发票.pdf" })).toHaveFocus();
   });
 
-  it("focuses the status controls when keep removes the only visible row", async () => {
+  it("focuses the selected status tab after save removes the only visible row", async () => {
+    const user = userEvent.setup();
+    let listAttempt = 0;
+    const pendingItem = pendingInvoiceFixture();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => {
+      listAttempt += 1;
+      return { items: listAttempt === 1 ? [pendingItem] : [], nextCursor: null };
+    });
+    mockCommand(
+      "review_item",
+      pendingInvoiceFixture({
+        status: "ready",
+        confirmationStatus: "confirmed",
+        updatedAt: "2026-07-15T10:00:00+08:00",
+      }),
+    );
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await user.click(
+      await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "出租车电子发票.pdf" }),
+      ).not.toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
+
+    const selectedTab = screen.getByRole("tab", { name: "待确认" });
+    expect(selectedTab).toHaveAttribute("aria-selected", "true");
+    expect(selectedTab).toHaveFocus();
+  });
+
+  it("focuses the selected status tab when keep removes the only visible row", async () => {
     const user = userEvent.setup();
     let listAttempt = 0;
     const duplicate = pendingInvoiceFixture({
@@ -633,7 +831,9 @@ describe("InboxPage", () => {
     });
     await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
 
-    expect(screen.getByRole("tablist", { name: "票据状态" })).toHaveFocus();
+    const selectedTab = screen.getByRole("tab", { name: "疑似重复" });
+    expect(selectedTab).toHaveAttribute("aria-selected", "true");
+    expect(selectedTab).toHaveFocus();
   });
 
   it("does not reopen a closed drawer when a save response arrives", async () => {

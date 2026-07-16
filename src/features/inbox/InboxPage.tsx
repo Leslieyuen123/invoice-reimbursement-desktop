@@ -30,6 +30,8 @@ const itemStatuses: ItemStatus[] = [
   "ready",
 ];
 
+const INBOX_PAGE_SIZE = 50;
+
 const statusTabs: Array<{ value?: ItemStatus; label: string }> = [
   { label: "全部" },
   { value: "pending_recognition", label: "待识别" },
@@ -91,6 +93,7 @@ function reconcileItemList(
   filter: ItemFilter,
   item: InvoiceItemDto,
   insert: boolean,
+  pageSize: number,
 ) {
   const exists = data.pages.some((page) =>
     page.items.some((candidate) => candidate.id === item.id),
@@ -100,10 +103,14 @@ function reconcileItemList(
     ...page,
     items: page.items.flatMap((candidate) =>
       candidate.id === item.id ? (matches ? [item] : []) : [candidate],
-    ),
+    ).slice(0, pageSize),
   }));
   if (insert && !exists && matches && pages[0]) {
-    pages[0] = { ...pages[0], items: [item, ...pages[0].items] };
+    // Keep cursor boundaries intact; a refetch restores any evicted page-one tail.
+    pages[0] = {
+      ...pages[0],
+      items: [item, ...pages[0].items].slice(0, pageSize),
+    };
   }
   return { ...data, pages };
 }
@@ -153,7 +160,7 @@ export function InboxPage() {
       | { sortValue: string; id: string }
       | undefined,
     queryFn: ({ pageParam }) =>
-      api.listItems(filter, { cursor: pageParam, pageSize: 50 }),
+      api.listItems(filter, { cursor: pageParam, pageSize: INBOX_PAGE_SIZE }),
     getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
   });
   const queriedItems = itemsQuery.data?.pages.flatMap((page) => page.items) ?? [];
@@ -182,7 +189,7 @@ export function InboxPage() {
       const cachedFilter = queryKey[3] as ItemFilter;
       queryClient.setQueryData(
         queryKey,
-        reconcileItemList(data, cachedFilter, item, insert),
+        reconcileItemList(data, cachedFilter, item, insert, INBOX_PAGE_SIZE),
       );
     }
   }
@@ -257,7 +264,11 @@ export function InboxPage() {
           .find((button): button is HTMLButtonElement => canFocus(button ?? null)) ??
         null;
     }
-    if (!target && canFocus(statusTabsRef.current)) target = statusTabsRef.current;
+    const selectedStatusTab =
+      statusTabsRef.current?.querySelector<HTMLButtonElement>(
+        '[role="tab"][aria-selected="true"]',
+      ) ?? null;
+    if (!target && canFocus(selectedStatusTab)) target = selectedStatusTab;
     target?.focus();
   }, [items, selection]);
 
@@ -357,7 +368,6 @@ export function InboxPage() {
         role="tablist"
         aria-label="票据状态"
         ref={statusTabsRef}
-        tabIndex={-1}
       >
         {statusTabs.map((tab) => (
           <button
