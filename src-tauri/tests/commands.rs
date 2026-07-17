@@ -430,6 +430,79 @@ async fn export_recovery_error_is_scoped_to_the_root_that_failed() {
     );
 }
 
+#[tokio::test]
+async fn returning_to_a_repaired_export_root_does_not_restore_its_old_failure() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let root_a = app._directory.path().join("root-a");
+    let root_b = app._directory.path().join("root-b");
+    let preferences = serde_json::json!({
+        "backgroundSyncEnabled": true,
+        "exportDirectory": root_a.to_string_lossy(),
+        "batchDirectoryPattern": "{batchName}-{timestamp}",
+    });
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?)")
+        .bind(preferences.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(app.state.pool())
+        .await
+        .unwrap();
+    app.state.reconcile_exports().await.unwrap_err();
+
+    std::fs::create_dir(&root_b).unwrap();
+    settings::save_preferences(
+        &app.state,
+        settings::PreferencesInputDto {
+            background_sync_enabled: true,
+            export_directory: root_b.to_string_lossy().into_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settings::storage_status(&app.state)
+            .await
+            .unwrap()
+            .recovery_error,
+        None
+    );
+
+    std::fs::create_dir(&root_a).unwrap();
+    settings::save_preferences(
+        &app.state,
+        settings::PreferencesInputDto {
+            background_sync_enabled: true,
+            export_directory: root_a.to_string_lossy().into_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let repaired = settings::storage_status(&app.state).await.unwrap();
+    assert_eq!(repaired.recovery_error, None);
+    assert_eq!(
+        std::path::Path::new(&repaired.export_directory),
+        root_a.canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn manual_export_recovery_is_rejected_after_tracked_operations_close() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let shutdown = app.state.begin_application_shutdown(None);
+
+    let error = settings::retry_export_recovery(&app.state)
+        .await
+        .expect_err("manual recovery must enter the tracked-operation gate");
+
+    assert!(
+        matches!(error, AppError::Conflict { ref message } if message.contains("shutting down"))
+    );
+    let report = shutdown.wait(std::time::Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+}
+
 #[test]
 fn planned_commands_build_a_tauri_invoke_handler() {
     let _handler = invoice_reimbursement::commands::invoke_handler::<tauri::Wry>();

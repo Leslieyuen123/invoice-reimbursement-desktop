@@ -10,7 +10,9 @@ use dashmap::mapref::entry::Entry;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::sync::{
+    Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore, oneshot,
+};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -45,6 +47,7 @@ pub struct ExportCoordinator {
     active_exports: Arc<DashMap<Uuid, ()>>,
     generation_slots: Arc<Semaphore>,
     lifecycle: Arc<ExportLifecycleInner>,
+    operation_gate: Arc<RwLock<()>>,
 }
 
 #[derive(Default)]
@@ -71,12 +74,14 @@ impl Default for ExportCoordinator {
             active_exports: Arc::new(DashMap::new()),
             generation_slots: Arc::new(Semaphore::new(2)),
             lifecycle: Arc::new(ExportLifecycleInner::default()),
+            operation_gate: Arc::new(RwLock::new(())),
         }
     }
 }
 
 impl ExportCoordinator {
-    fn acquire_export(&self, batch_id: Uuid) -> Result<ActiveExport, AppError> {
+    async fn acquire_export(&self, batch_id: Uuid) -> Result<ActiveExport, AppError> {
+        let operation_guard = self.operation_gate.clone().read_owned().await;
         let state = self
             .lifecycle
             .state
@@ -90,8 +95,13 @@ impl ExportCoordinator {
         ActiveExport::acquire(
             self.active_exports.clone(),
             self.lifecycle.clone(),
+            operation_guard,
             batch_id,
         )
+    }
+
+    async fn acquire_recovery(&self) -> OwnedRwLockWriteGuard<()> {
+        self.operation_gate.clone().write_owned().await
     }
 
     fn spawn_internal<T, F>(&self, future: F) -> oneshot::Receiver<Result<T, AppError>>
@@ -300,7 +310,7 @@ impl ExportService {
     }
 
     pub async fn export(&self, batch_id: Uuid) -> Result<ExportResult, AppError> {
-        let active_export = self.coordinator.acquire_export(batch_id)?;
+        let active_export = self.coordinator.acquire_export(batch_id).await?;
         let preference_guard = self.preference_gate.read().await;
         let paths = self.effective_paths().await?;
         let batches = BatchRepository::new(self.pool.clone());
@@ -521,6 +531,7 @@ impl ExportService {
     pub(crate) async fn reconcile_pending_with_root(
         &self,
     ) -> (Option<String>, Result<ExportRecoveryReport, AppError>) {
+        let _recovery_guard = self.coordinator.acquire_recovery().await;
         let _preference_guard = self.preference_gate.read().await;
         let preferences = match load_preferences(&self.pool).await {
             Ok(preferences) => preferences,
@@ -788,6 +799,7 @@ struct ActiveExport {
 struct ActiveExportLease {
     active_exports: Arc<DashMap<Uuid, ()>>,
     lifecycle: Arc<ExportLifecycleInner>,
+    _operation_guard: OwnedRwLockReadGuard<()>,
     batch_id: Uuid,
 }
 
@@ -795,6 +807,7 @@ impl ActiveExport {
     fn acquire(
         active_exports: Arc<DashMap<Uuid, ()>>,
         lifecycle: Arc<ExportLifecycleInner>,
+        operation_guard: OwnedRwLockReadGuard<()>,
         batch_id: Uuid,
     ) -> Result<Self, AppError> {
         match active_exports.entry(batch_id) {
@@ -811,6 +824,7 @@ impl ActiveExport {
             _lease: Arc::new(ActiveExportLease {
                 active_exports,
                 lifecycle,
+                _operation_guard: operation_guard,
                 batch_id,
             }),
         })
@@ -1054,6 +1068,11 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    struct PreCommitGatedRealCommitter {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<Notify>,
+    }
+
     struct GatedFailingCommitter {
         started: Mutex<Option<oneshot::Sender<()>>>,
         release: Arc<Notify>,
@@ -1165,6 +1184,26 @@ mod tests {
             }
             self.release.notified().await;
             result
+        }
+    }
+
+    #[async_trait]
+    impl ExportCommitter for PreCommitGatedRealCommitter {
+        async fn commit(
+            &self,
+            claim: BatchExportClaim,
+            operation_id: Uuid,
+            exported_at: DateTime<Utc>,
+        ) -> Result<(), AppError> {
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            self.release.notified().await;
+            claim.commit(operation_id, exported_at).await.map(|_| ())
         }
     }
 
@@ -2416,6 +2455,92 @@ mod tests {
             .await
             .expect("shutdown should finish after finalization")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_gate_enters_only_after_the_live_export_lease_is_released() {
+        let coordinator = ExportCoordinator::default();
+        let active = coordinator.acquire_export(Uuid::new_v4()).await.unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let recovery_coordinator = coordinator.clone();
+        let recovery_order = order.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_order.lock().unwrap().push("attempted");
+            attempted_tx.send(()).unwrap();
+            let _guard = recovery_coordinator.acquire_recovery().await;
+            recovery_order.lock().unwrap().push("acquired");
+            acquired_tx.send(()).unwrap();
+        });
+
+        attempted_rx.await.unwrap();
+        order.lock().unwrap().push("released");
+        drop(active);
+        acquired_rx.await.unwrap();
+        recovery.await.unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["attempted", "released", "acquired"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_waits_for_live_export_finalization_and_preserves_its_package() {
+        let fixture = export_fixture("live recovery exclusion").await;
+        let coordinator = ExportCoordinator::default();
+        let (commit_started_tx, commit_started_rx) = oneshot::channel();
+        let commit_release = Arc::new(Notify::new());
+        let service = ExportService {
+            pool: fixture.pool.clone(),
+            paths: fixture.paths.clone(),
+            coordinator,
+            publisher: Arc::new(super::AtomicDirectoryPublisher),
+            committer: Arc::new(PreCommitGatedRealCommitter {
+                started: Mutex::new(Some(commit_started_tx)),
+                release: commit_release.clone(),
+            }),
+            outcome_classifier: super::default_outcome_classifier(&fixture.pool),
+            generation_hook: Arc::new(super::NoopGenerationHook),
+            preference_gate: Default::default(),
+        };
+        let batch_id = fixture.batch_id;
+        let export_service = service.clone();
+        let export = tokio::spawn(async move { export_service.export(batch_id).await });
+        commit_started_rx.await.unwrap();
+        let final_directory = fs::read_dir(&fixture.paths.exports)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .expect("publisher must create the final package before commit");
+        assert!(final_directory.is_dir());
+
+        let (recovery_attempted_tx, recovery_attempted_rx) = oneshot::channel();
+        let recovery_service = service.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_attempted_tx.send(()).unwrap();
+            recovery_service.reconcile_pending().await
+        });
+        recovery_attempted_rx.await.unwrap();
+        commit_release.notify_one();
+
+        let result = export.await.unwrap().unwrap();
+        recovery.await.unwrap().unwrap();
+        let batch = BatchRepository::new(fixture.pool.clone())
+            .get(batch_id)
+            .await
+            .unwrap();
+        assert_eq!(batch.status, BatchStatus::Exported);
+        assert_eq!(result.directory, final_directory);
+        assert!(final_directory.is_dir());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

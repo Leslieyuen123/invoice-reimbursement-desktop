@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -42,13 +43,7 @@ pub struct AppState {
     export_preference_gate: ExportPreferenceGate,
     application_scheduler: Scheduler,
     runtime_operations: RuntimeOperationCoordinator,
-    export_recovery_failure: Arc<RwLock<Option<ExportRecoveryFailure>>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExportRecoveryFailure {
-    export_directory: String,
-    message: String,
+    export_recovery_failures: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -125,7 +120,7 @@ impl AppState {
             export_preference_gate,
             application_scheduler,
             runtime_operations: RuntimeOperationCoordinator::default(),
-            export_recovery_failure: Arc::new(RwLock::new(None)),
+            export_recovery_failures: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -242,18 +237,17 @@ impl AppState {
         &self,
     ) -> Result<crate::services::export::ExportRecoveryReport, crate::domain::error::AppError> {
         let (export_directory, result) = self.export_service().reconcile_pending_with_root().await;
-        let mut failure = self.export_recovery_failure.write().await;
+        let mut failures = self.export_recovery_failures.write().await;
         match result {
             Ok(report) => {
-                *failure = None;
+                if let Some(export_directory) = export_directory {
+                    failures.remove(&export_directory);
+                }
                 Ok(report)
             }
             Err(error) => {
                 if let Some(export_directory) = export_directory {
-                    *failure = Some(ExportRecoveryFailure {
-                        export_directory,
-                        message: error.to_string(),
-                    });
+                    failures.insert(export_directory, error.to_string());
                 }
                 Err(error)
             }
@@ -261,12 +255,18 @@ impl AppState {
     }
 
     pub async fn export_recovery_error(&self, export_directory: &str) -> Option<String> {
-        self.export_recovery_failure
+        self.export_recovery_failures
             .read()
             .await
-            .as_ref()
-            .filter(|failure| failure.export_directory == export_directory)
-            .map(|failure| failure.message.clone())
+            .get(export_directory)
+            .cloned()
+    }
+
+    pub async fn clear_export_recovery_error(&self, export_directory: &str) {
+        self.export_recovery_failures
+            .write()
+            .await
+            .remove(export_directory);
     }
 
     pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {

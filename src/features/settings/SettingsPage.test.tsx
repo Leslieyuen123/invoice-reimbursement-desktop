@@ -308,6 +308,8 @@ describe("Settings page", () => {
     const alert = await screen.findByRole("alert", { name: "无法读取存储状态" });
     expect(screen.getByRole("button", { name: "选择导出目录" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "保存运行设置" })).toBeEnabled();
+    expect(screen.getAllByText("存储状态读取失败")).not.toHaveLength(0);
+    expect(screen.queryByText("正在读取")).not.toBeInTheDocument();
 
     unavailable = false;
     await user.click(within(alert).getByRole("button", { name: "重试" }));
@@ -349,6 +351,35 @@ describe("Settings page", () => {
         screen.queryByRole("alert", { name: "导出恢复失败" }),
       ).not.toBeInTheDocument(),
     );
+  });
+
+  it("refreshes the recovery status after a manual retry fails", async () => {
+    const user = userEvent.setup();
+    let retryFailed = false;
+    mockSettingsCommands();
+    mockCommand("get_storage_status", () => ({
+      ...storageFixture,
+      availableBytes: null,
+      recoveryError: retryFailed
+        ? "latest recovery failure"
+        : "initial recovery failure",
+    }));
+    mockCommand("retry_export_recovery", () => {
+      retryFailed = true;
+      throw new Error("recovery retry failed");
+    });
+
+    renderAppAt("/settings");
+
+    const alert = await screen.findByRole("alert", { name: "导出恢复失败" });
+    expect(alert).toHaveTextContent("initial recovery failure");
+    await user.click(within(alert).getByRole("button", { name: "重试导出恢复" }));
+
+    await waitFor(() =>
+      expect(commandCalls("retry_export_recovery")).toHaveLength(1),
+    );
+    expect(await screen.findByText("latest recovery failure")).toBeInTheDocument();
+    expect(screen.queryByText("initial recovery failure")).not.toBeInTheDocument();
   });
 
   it("retries a failed settings load and focuses a linked mailbox form", async () => {

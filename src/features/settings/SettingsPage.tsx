@@ -57,7 +57,7 @@ export function SettingsPage() {
   });
   const recoveryMutation = useMutation({
     mutationFn: api.retryExportRecovery,
-    onSuccess: async () => {
+    onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.storageStatus });
     },
   });
@@ -98,6 +98,9 @@ export function SettingsPage() {
 
   const accounts = accountsQuery.data;
   const storage = storageQuery.data;
+  const storageStatusFallback = storageQuery.isError
+    ? "存储状态读取失败"
+    : "正在读取";
 
   async function chooseExportDirectory() {
     const selected = await open({
@@ -207,18 +210,20 @@ export function SettingsPage() {
 
           <div className="settings-storage-row">
             <span>本地数据目录</span>
-            <code>{storage?.localDataDirectory ?? "正在读取"}</code>
+            <code>{storage?.localDataDirectory ?? storageStatusFallback}</code>
           </div>
           <div className="settings-storage-row">
             <span>当前有效导出目录</span>
-            <code>{storage?.exportDirectory ?? exportDirectory}</code>
+            <code>{storage?.exportDirectory ?? storageStatusFallback}</code>
           </div>
           <div className="settings-storage-row">
             <span>可用空间</span>
             <strong>
               {storage?.availableBytes == null
-                ? storageQuery.isPending
-                  ? "正在读取"
+                ? storageQuery.isError
+                  ? "存储状态读取失败"
+                  : storageQuery.isPending
+                    ? "正在读取"
                   : "存储目录不可用"
                 : `${formatBytes(storage.availableBytes)} 可用`}
             </strong>

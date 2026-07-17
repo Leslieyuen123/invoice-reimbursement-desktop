@@ -188,14 +188,18 @@ pub async fn save_preferences(
     state
         .paths()
         .for_export_directory(input.export_directory.trim())?;
-    state
+    let preferences = state
         .settings_service()
         .save_preferences(PreferencesInput {
             background_sync_enabled: input.background_sync_enabled,
             export_directory: input.export_directory,
             batch_directory_pattern: input.batch_directory_pattern,
         })
-        .await
+        .await?;
+    state
+        .clear_export_recovery_error(&preferences.export_directory)
+        .await;
+    Ok(preferences)
 }
 
 pub async fn storage_status(state: &AppState) -> Result<StorageStatusDto, AppError> {
@@ -241,8 +245,13 @@ pub async fn storage_status(state: &AppState) -> Result<StorageStatusDto, AppErr
 }
 
 pub async fn retry_export_recovery(state: &AppState) -> Result<StorageStatusDto, AppError> {
-    state.reconcile_exports().await?;
-    storage_status(state).await
+    let operation_state = state.clone();
+    state
+        .run_tracked_operation(async move {
+            operation_state.reconcile_exports().await?;
+            storage_status(&operation_state).await
+        })
+        .await
 }
 
 #[cfg(unix)]
