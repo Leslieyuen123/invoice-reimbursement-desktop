@@ -188,18 +188,14 @@ pub async fn save_preferences(
     state
         .paths()
         .for_export_directory(input.export_directory.trim())?;
-    let preferences = state
+    state
         .settings_service()
         .save_preferences(PreferencesInput {
             background_sync_enabled: input.background_sync_enabled,
             export_directory: input.export_directory,
             batch_directory_pattern: input.batch_directory_pattern,
         })
-        .await?;
-    state
-        .clear_export_recovery_error(&preferences.export_directory)
-        .await;
-    Ok(preferences)
+        .await
 }
 
 pub async fn storage_status(state: &AppState) -> Result<StorageStatusDto, AppError> {

@@ -262,13 +262,6 @@ impl AppState {
             .cloned()
     }
 
-    pub async fn clear_export_recovery_error(&self, export_directory: &str) {
-        self.export_recovery_failures
-            .write()
-            .await
-            .remove(export_directory);
-    }
-
     pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {
         self.account_saves.begin_shutdown()
     }

@@ -430,8 +430,55 @@ async fn export_recovery_error_is_scoped_to_the_root_that_failed() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn returning_to_a_repaired_export_root_does_not_restore_its_old_failure() {
+async fn saving_unrelated_preferences_does_not_hide_a_recovery_failure() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let recovery_directory = app
+        .state
+        .paths()
+        .exports
+        .join("malformed-save-preservation");
+    let recovery_marker = recovery_directory.join(".invoice-export-recovery.json");
+    std::fs::create_dir(&recovery_directory).unwrap();
+    std::fs::write(&recovery_marker, b"{not-json").unwrap();
+
+    app.state
+        .reconcile_exports()
+        .await
+        .expect_err("the malformed marker must keep recovery pending");
+    let failed = settings::storage_status(&app.state).await.unwrap();
+    assert!(failed.recovery_error.is_some());
+
+    let preferences = settings::get_preferences(&app.state).await.unwrap();
+    settings::save_preferences(
+        &app.state,
+        settings::PreferencesInputDto {
+            background_sync_enabled: !preferences.background_sync_enabled,
+            export_directory: preferences.export_directory,
+            batch_directory_pattern: preferences.batch_directory_pattern,
+        },
+    )
+    .await
+    .unwrap();
+
+    let after_save = settings::storage_status(&app.state).await.unwrap();
+    assert_eq!(after_save.recovery_error, failed.recovery_error);
+    assert!(recovery_marker.is_file());
+
+    std::fs::remove_file(&recovery_marker).unwrap();
+    app.state.reconcile_exports().await.unwrap();
+    assert_eq!(
+        settings::storage_status(&app.state)
+            .await
+            .unwrap()
+            .recovery_error,
+        None
+    );
+}
+
+#[tokio::test]
+async fn successful_recovery_clears_only_the_repaired_export_root_failure() {
     let app = TestApp::with_dashboard_fixture().await;
     let root_a = app._directory.path().join("root-a");
     let root_b = app._directory.path().join("root-b");
@@ -478,6 +525,15 @@ async fn returning_to_a_repaired_export_root_does_not_restore_its_old_failure() 
     )
     .await
     .unwrap();
+
+    assert!(
+        settings::storage_status(&app.state)
+            .await
+            .unwrap()
+            .recovery_error
+            .is_some()
+    );
+    settings::retry_export_recovery(&app.state).await.unwrap();
 
     let repaired = settings::storage_status(&app.state).await.unwrap();
     assert_eq!(repaired.recovery_error, None);
