@@ -10,7 +10,7 @@ import {
   SlidersHorizontal,
   Trash2,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { formatAmountCents } from "../../lib/amount";
@@ -20,8 +20,10 @@ import type {
   AppError,
   BatchDetailDto,
   Category,
+  CursorDto,
   ExportResultDto,
   InvoiceItemDto,
+  ItemStatus,
 } from "../../types";
 import { AssignItemsDialog } from "./AssignItemsDialog";
 import "./Batches.css";
@@ -32,6 +34,9 @@ const exportFiles = [
   "originals.zip",
   "manifest.json",
 ] as const;
+
+const RECOMMEND_PAGE_SIZE = 200;
+const MAX_RECOMMEND_PAGES = 5;
 
 const categories = [
   ["交通", "transport"],
@@ -45,6 +50,14 @@ const categoryLabels: Record<Category, string> = {
   dining: "餐饮",
   accommodation: "住宿",
   hospitality: "招待",
+};
+
+const statusLabels: Record<ItemStatus, string> = {
+  pending_recognition: "待识别",
+  pending_confirmation: "待确认",
+  recognition_failed: "识别失败",
+  suspected_duplicate: "疑似重复",
+  ready: "可纳入批次",
 };
 
 function categoryLabel(category: Category | null) {
@@ -77,6 +90,7 @@ export function BatchDetailPage() {
   const [assignDialogSession, setAssignDialogSession] = useState(0);
   const nextDialogSession = useRef(0);
   const assignDialogOpener = useRef<HTMLButtonElement | null>(null);
+  const removeDialogRef = useRef<HTMLDivElement | null>(null);
   const [removeTarget, setRemoveTarget] = useState<{
     item: InvoiceItemDto;
     opener: HTMLButtonElement;
@@ -111,13 +125,28 @@ export function BatchDetailPage() {
     setRecommendPending(true);
     setRecommendError(null);
     try {
-      const page = await api.listBatchCandidates(batchId, undefined, {
-        pageSize: 50,
-      });
-      if (session !== routeSession.current) return;
-      const itemIds = page.items
-        .filter((candidate) => candidate.eligible)
-        .map((candidate) => candidate.item.id);
+      const itemIds: string[] = [];
+      let cursor: CursorDto | undefined;
+      for (let pageIndex = 0; pageIndex < MAX_RECOMMEND_PAGES; pageIndex += 1) {
+        const page = await api.listBatchCandidates(batchId, undefined, {
+          cursor,
+          pageSize: RECOMMEND_PAGE_SIZE,
+        });
+        if (session !== routeSession.current) return;
+        itemIds.push(
+          ...page.items
+            .filter((candidate) => candidate.eligible)
+            .map((candidate) => candidate.item.id),
+        );
+        if (!page.nextCursor) break;
+        if (pageIndex === MAX_RECOMMEND_PAGES - 1) {
+          setRecommendError(
+            "候选票据超过 1000 张，请使用“调整票据”分批归属",
+          );
+          return;
+        }
+        cursor = page.nextCursor;
+      }
       if (itemIds.length === 0) {
         setRecommendError("当前日期范围内没有可加入的推荐票据");
         return;
@@ -188,18 +217,48 @@ export function BatchDetailPage() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
   }
 
+  function closeRemoveDialog() {
+    if (!removeTarget) return;
+    const { opener } = removeTarget;
+    setRemoveTarget(null);
+    queueMicrotask(() => opener.focus());
+  }
+
+  function handleRemoveDialogKeys(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (!removePending) closeRemoveDialog();
+      return;
+    }
+    if (event.key !== "Tab" || !removeDialogRef.current) return;
+    const focusable = Array.from(
+      removeDialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), [href], select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last?.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   async function confirmRemoval() {
     if (!removeTarget) return;
     const session = routeSession.current;
-    const { item, opener } = removeTarget;
+    const { item } = removeTarget;
     setRemovePending(true);
     setRemoveError(null);
     try {
       const detail = await api.removeItemFromBatch(batchId, item.id);
       if (session !== routeSession.current) return;
       queryClient.setQueryData(queryKeys.batch(batchId), detail);
-      setRemoveTarget(null);
-      queueMicrotask(() => opener.focus());
+      closeRemoveDialog();
       void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
       void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
@@ -336,6 +395,7 @@ export function BatchDetailPage() {
                 <th>文件</th>
                 <th>日期</th>
                 <th>分类</th>
+                <th>状态</th>
                 <th>公司</th>
                 <th>金额</th>
                 <th aria-label="操作" />
@@ -344,7 +404,7 @@ export function BatchDetailPage() {
             <tbody>
               {detail.items.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="batch-empty-row">尚未归属票据</td>
+                  <td colSpan={7} className="batch-empty-row">尚未归属票据</td>
                 </tr>
               ) : (
                 detail.items.map((item) => (
@@ -352,8 +412,13 @@ export function BatchDetailPage() {
                     <td title={item.originalName}>{item.originalName}</td>
                     <td>{item.invoiceDate ?? "日期待补充"}</td>
                     <td>{categoryLabel(item.finalCategory ?? item.suggestedCategory)}</td>
+                    <td>{statusLabels[item.status]}</td>
                     <td title={item.company ?? undefined}>{item.company ?? "-"}</td>
-                    <td>¥{formatAmountCents(item.amountCents ?? 0)}</td>
+                    <td>
+                      {item.amountCents === null
+                        ? "金额待补充"
+                        : `¥${formatAmountCents(item.amountCents)}`}
+                    </td>
                     <td>
                       <button
                         type="button"
@@ -437,10 +502,12 @@ export function BatchDetailPage() {
       {removeTarget ? (
         <div className="batch-dialog-backdrop" role="presentation">
           <div
+            ref={removeDialogRef}
             className="batch-confirm-dialog"
             role="dialog"
             aria-modal="true"
             aria-labelledby="remove-confirm-title"
+            onKeyDown={handleRemoveDialogKeys}
           >
             <h2 id="remove-confirm-title">确认移出票据</h2>
             <p>“{removeTarget.item.originalName}”将回到未归属票据池。</p>
@@ -450,11 +517,8 @@ export function BatchDetailPage() {
                 type="button"
                 className="button button-secondary"
                 disabled={removePending}
-                onClick={() => {
-                  const opener = removeTarget.opener;
-                  setRemoveTarget(null);
-                  queueMicrotask(() => opener.focus());
-                }}
+                autoFocus
+                onClick={closeRemoveDialog}
               >
                 取消
               </button>

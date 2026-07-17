@@ -66,6 +66,7 @@ export function AssignItemsDialog({
   });
 
   useEffect(() => {
+    mounted.current = true;
     return () => {
       mounted.current = false;
     };
@@ -184,11 +185,19 @@ export function AssignItemsDialog({
             candidatesQuery.data.items.map((candidate) => {
               const item = candidate.item;
               const reason = disabledCopy(candidate.disabledReason);
+              const warnings = [
+                candidate.outsideBatchRange ? "日期超出批次范围" : null,
+                reason,
+              ].filter((warning): warning is string => warning !== null);
+              const warningId = warnings.length
+                ? `batch-candidate-warning-${item.id}`
+                : undefined;
               return (
                 <label className="batch-candidate-row" key={item.id}>
                   <input
                     type="checkbox"
                     aria-label={item.originalName}
+                    aria-describedby={warningId}
                     disabled={!candidate.eligible}
                     checked={selectedIds.has(item.id)}
                     onChange={(event) => {
@@ -205,10 +214,12 @@ export function AssignItemsDialog({
                     <span>{item.invoiceDate ?? "日期待补充"} · {item.company ?? "公司待补充"}</span>
                   </span>
                   <span className="batch-candidate-amount">
-                    ¥{formatAmountCents(item.amountCents ?? 0)}
+                    {item.amountCents === null
+                      ? "金额待补充"
+                      : `¥${formatAmountCents(item.amountCents)}`}
                   </span>
-                  <span className="batch-candidate-warning">
-                    {candidate.outsideBatchRange ? "日期超出批次范围" : reason}
+                  <span id={warningId} className="batch-candidate-warning">
+                    {warnings.join("；")}
                   </span>
                 </label>
               );

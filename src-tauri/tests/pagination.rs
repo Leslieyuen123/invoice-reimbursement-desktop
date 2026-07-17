@@ -237,6 +237,49 @@ async fn batch_candidate_search_marks_outside_dates_and_excludes_assigned_items(
 }
 
 #[tokio::test]
+async fn batch_candidate_search_treats_like_wildcards_as_literals() {
+    let fixture = Fixture::new().await;
+    let batch_id = Uuid::parse_str(&fixture.expected_batch_ids[0]).unwrap();
+    for (id, name) in [
+        (20_u128, "literal%percent.pdf"),
+        (21, "literalXpercent.pdf"),
+        (22, "literal_under_score.pdf"),
+        (23, "literalXunderXscore.pdf"),
+    ] {
+        sqlx::query("UPDATE items SET original_name = ? WHERE id = ?")
+            .bind(name)
+            .bind(Uuid::from_u128(id).to_string())
+            .execute(fixture.state.pool())
+            .await
+            .unwrap();
+    }
+
+    let percent = batches::list_candidates(&fixture.state, batch_id, Some("%".to_owned()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        percent
+            .items
+            .iter()
+            .map(|candidate| candidate.item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![Uuid::from_u128(20).to_string()]
+    );
+
+    let underscore = batches::list_candidates(&fixture.state, batch_id, Some("_".to_owned()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        underscore
+            .items
+            .iter()
+            .map(|candidate| candidate.item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![Uuid::from_u128(22).to_string()]
+    );
+}
+
+#[tokio::test]
 async fn batch_candidate_pages_seek_stably_and_validate_requests() {
     let fixture = Fixture::new().await;
     let batch_id = Uuid::parse_str(&fixture.expected_batch_ids[0]).unwrap();

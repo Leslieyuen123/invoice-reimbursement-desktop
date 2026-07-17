@@ -939,17 +939,24 @@ fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
 }
 
 fn push_item_search_filter(query: &mut QueryBuilder<'_, Sqlite>, search: String) {
-    let pattern = format!("%{search}%");
+    let mut escaped = String::with_capacity(search.len());
+    for character in search.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    let pattern = format!("%{escaped}%");
     query
         .push(" AND (LOWER(original_name) LIKE LOWER(")
         .push_bind(pattern.clone())
-        .push(") OR LOWER(company) LIKE LOWER(")
+        .push(") ESCAPE '\\' OR LOWER(company) LIKE LOWER(")
         .push_bind(pattern.clone())
-        .push(") OR LOWER(city) LIKE LOWER(")
+        .push(") ESCAPE '\\' OR LOWER(city) LIKE LOWER(")
         .push_bind(pattern.clone())
-        .push(") OR LOWER(note) LIKE LOWER(")
+        .push(") ESCAPE '\\' OR LOWER(note) LIKE LOWER(")
         .push_bind(pattern)
-        .push("))");
+        .push(") ESCAPE '\\')");
 }
 
 fn validate_assigned_item_state(item: &NewItemRecord) -> Result<(), AppError> {

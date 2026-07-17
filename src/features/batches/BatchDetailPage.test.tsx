@@ -1,5 +1,6 @@
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -135,6 +136,15 @@ function renderAppAt(path: string) {
   return render(<App />);
 }
 
+function renderStrictAppAt(path: string) {
+  window.history.replaceState({}, "", path);
+  return render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+}
+
 function commandCalls(command: string) {
   return invokeMock.mock.calls
     .filter(([wireCommand]) => wireCommand === command)
@@ -204,6 +214,71 @@ describe("Batch workspace", () => {
     await user.click(screen.getByRole("button", { name: "加入推荐票据" }));
     await user.click(screen.getByRole("button", { name: "导出报销包" }));
     expect(await screen.findByText(/merged\.pdf/)).toBeInTheDocument();
+  });
+
+  it("continues recommendations after a disabled-only candidate page", async () => {
+    const user = userEvent.setup();
+    const nextCursor = {
+      sortValue: "2026-07-15T09:45:00+08:00",
+      id: "invoice-disabled",
+    };
+    const disabled = candidateFixture(
+      itemFixture({ id: "invoice-disabled", originalName: "疑似重复发票.pdf" }),
+      { eligible: false, disabledReason: "suspected_duplicate" },
+    );
+    const eligible = candidateFixture(
+      itemFixture({ id: "invoice-page-two", originalName: "第二页车票.pdf" }),
+    );
+    mockDetail(detailFixture());
+    mockCommand("list_batch_candidates", (arguments_) => {
+      const page = (arguments_ as { page: { cursor?: typeof nextCursor } }).page;
+      return page.cursor
+        ? { items: [eligible], nextCursor: null }
+        : { items: [disabled], nextCursor };
+    });
+    mockCommand(
+      "assign_items_to_batch",
+      detailFixture([{ ...eligible.item, batchId: "batch-summer" }]),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "加入推荐票据" }));
+
+    await waitFor(() => {
+      expect(commandCalls("assign_items_to_batch")[0]).toEqual({
+        batchId: "batch-summer",
+        itemIds: ["invoice-page-two"],
+      });
+    });
+    expect(commandCalls("list_batch_candidates")).toEqual([
+      { batchId: "batch-summer", page: { pageSize: 200 } },
+      { batchId: "batch-summer", page: { cursor: nextCursor, pageSize: 200 } },
+    ]);
+  });
+
+  it("refuses automatic recommendations when more than five full pages exist", async () => {
+    const user = userEvent.setup();
+    let pageNumber = 0;
+    mockDetail(detailFixture());
+    mockCommand("list_batch_candidates", () => {
+      pageNumber += 1;
+      return {
+        items: [candidateFixture(itemFixture({ id: `invoice-${pageNumber}` }))],
+        nextCursor: {
+          sortValue: `2026-07-${String(20 - pageNumber).padStart(2, "0")}T09:00:00+08:00`,
+          id: `invoice-${pageNumber}`,
+        },
+      };
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "加入推荐票据" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "候选票据超过 1000 张，请使用“调整票据”分批归属",
+    );
+    expect(commandCalls("list_batch_candidates")).toHaveLength(5);
+    expect(commandCalls("assign_items_to_batch")).toHaveLength(0);
   });
 
   it("defaults monthly creation to the current year and month", async () => {
@@ -372,6 +447,32 @@ describe("Batch workspace", () => {
     });
   });
 
+  it("describes every warning on an outside-range disabled candidate", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(
+      itemFixture({
+        id: "invoice-outside-duplicate",
+        originalName: "范围外重复发票.pdf",
+      }),
+      {
+        outsideBatchRange: true,
+        eligible: false,
+        disabledReason: "suspected_duplicate",
+      },
+    );
+    mockDetail(detailFixture(), [candidate]);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const checkbox = await screen.findByRole("checkbox", { name: "范围外重复发票.pdf" });
+
+    expect(checkbox).toBeDisabled();
+    expect(checkbox).toHaveAccessibleDescription(
+      "日期超出批次范围；疑似重复，不能归属",
+    );
+    expect(screen.getByText("日期超出批次范围；疑似重复，不能归属")).toBeInTheDocument();
+  });
+
   it("does not let an earlier dialog session replace reopened candidate results", async () => {
     const user = userEvent.setup();
     const first = deferred<{ items: BatchCandidateDto[]; nextCursor: null }>();
@@ -404,6 +505,102 @@ describe("Batch workspace", () => {
     expect(await screen.findByText("新会话票据.pdf")).toBeInTheDocument();
   });
 
+  it("accepts a successful candidate assignment under StrictMode", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture(), [candidateFixture(itemFixture())]);
+
+    renderStrictAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(dialog).findByRole("checkbox", { name: "高铁电子发票.pdf" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "归属所选票据" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "调整票据归属" })).not.toBeInTheDocument();
+    });
+    expect(
+      within(screen.getByRole("region", { name: "已归属票据" })).getByText(
+        "高铁电子发票.pdf",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows assigned item status with Chinese copy", async () => {
+    mockDetail(
+      detailFixture([
+        itemFixture({
+          batchId: "batch-summer",
+          status: "pending_confirmation",
+          confirmationStatus: "pending",
+        }),
+      ]),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    const assignedItems = await screen.findByRole("region", { name: "已归属票据" });
+
+    expect(within(assignedItems).getByRole("columnheader", { name: "状态" })).toBeInTheDocument();
+    expect(within(assignedItems).getByText("待确认")).toBeInTheDocument();
+  });
+
+  it("distinguishes unknown and zero amounts in assigned rows", async () => {
+    mockDetail(
+      detailFixture([
+        itemFixture({
+          id: "invoice-unknown-amount",
+          originalName: "金额未知发票.pdf",
+          batchId: "batch-summer",
+          amountCents: null,
+        }),
+        itemFixture({
+          id: "invoice-zero-amount",
+          originalName: "零金额发票.pdf",
+          batchId: "batch-summer",
+          amountCents: 0,
+        }),
+      ]),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    const assignedItems = await screen.findByRole("region", { name: "已归属票据" });
+    const unknownRow = within(assignedItems).getByText("金额未知发票.pdf").closest("tr");
+    const zeroRow = within(assignedItems).getByText("零金额发票.pdf").closest("tr");
+
+    expect(within(unknownRow!).getByText("金额待补充")).toBeInTheDocument();
+    expect(within(zeroRow!).getByText("¥0.00")).toBeInTheDocument();
+  });
+
+  it("distinguishes unknown and zero amounts in candidate rows", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture(), [
+      candidateFixture(
+        itemFixture({
+          id: "candidate-unknown-amount",
+          originalName: "候选金额未知.pdf",
+          amountCents: null,
+        }),
+      ),
+      candidateFixture(
+        itemFixture({
+          id: "candidate-zero-amount",
+          originalName: "候选零金额.pdf",
+          amountCents: 0,
+        }),
+      ),
+    ]);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    const unknownRow = (await within(dialog).findByText("候选金额未知.pdf")).closest("label");
+    const zeroRow = within(dialog).getByText("候选零金额.pdf").closest("label");
+
+    expect(within(unknownRow!).getByText("金额待补充")).toBeInTheDocument();
+    expect(within(zeroRow!).getByText("¥0.00")).toBeInTheDocument();
+  });
+
   it("requires an accessible confirmation before removing an assigned item", async () => {
     const user = userEvent.setup();
     mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
@@ -423,6 +620,28 @@ describe("Batch workspace", () => {
         itemId: "invoice-train",
       });
     });
+  });
+
+  it("contains removal confirmation focus and restores it after Escape", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
+
+    renderAppAt("/batches/batch-summer");
+    const opener = await screen.findByRole("button", { name: "移出 高铁电子发票.pdf" });
+    await user.click(opener);
+    const confirmation = screen.getByRole("dialog", { name: "确认移出票据" });
+    const cancel = within(confirmation).getByRole("button", { name: "取消" });
+    const confirm = within(confirmation).getByRole("button", { name: "确认移出" });
+
+    expect(cancel).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(confirm).toHaveFocus();
+    await user.tab();
+    expect(cancel).toHaveFocus();
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog", { name: "确认移出票据" })).not.toBeInTheDocument();
+    await waitFor(() => expect(opener).toHaveFocus());
   });
 
   it("blocks export until every assigned item is confirmed", async () => {
