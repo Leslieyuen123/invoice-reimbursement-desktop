@@ -17,6 +17,9 @@ export function FileDropZone({ disabled = false, onPaths }: FileDropZoneProps) {
   const [error, setError] = useState<"dialog" | "listener" | null>(null);
   const disabledRef = useRef(disabled);
   const onPathsRef = useRef(onPaths);
+  const browserInputRef = useRef<HTMLInputElement>(null);
+  const browserInputEnabled =
+    import.meta.env.DEV && import.meta.env.VITE_BROWSER_COMMAND_BRIDGE === "1";
 
   disabledRef.current = disabled;
   onPathsRef.current = onPaths;
@@ -55,6 +58,10 @@ export function FileDropZone({ disabled = false, onPaths }: FileDropZoneProps) {
 
   async function selectFiles() {
     setError(null);
+    if (browserInputEnabled) {
+      browserInputRef.current?.click();
+      return;
+    }
     try {
       const selected = await open({
         multiple: true,
@@ -106,6 +113,21 @@ export function FileDropZone({ disabled = false, onPaths }: FileDropZoneProps) {
         <FilePlus2 size={16} strokeWidth={1.7} aria-hidden="true" />
         选择文件
       </button>
+      {browserInputEnabled ? (
+        <input
+          ref={browserInputRef}
+          className="sr-only"
+          type="file"
+          multiple
+          aria-label="选择票据文件"
+          disabled={disabled}
+          onChange={(event) => {
+            const paths = Array.from(event.currentTarget.files ?? [], (file) => file.name);
+            if (paths.length > 0) onPathsRef.current(paths);
+            event.currentTarget.value = "";
+          }}
+        />
+      ) : null}
     </div>
   );
 }

@@ -14,6 +14,9 @@ describe("App", () => {
     expect(screen.getByLabelText("发票报销")).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "主导航" })).toBeInTheDocument();
     expect(
+      screen.getByRole("link", { name: "跳到主要内容" }),
+    ).toHaveAttribute("href", "#app-main");
+    expect(
       screen.getByRole("status", { name: "正在加载控制台" }),
     ).toBeInTheDocument();
   });

@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: macOS quality gates
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: sidecars/ocr/uv.lock
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Sync frozen OCR environment
+        run: uv sync --project sidecars/ocr --frozen
+
+      - name: Test OCR sidecar
+        run: uv run --project sidecars/ocr pytest sidecars/ocr/test_main.py -q
+
+      - name: Build OCR sidecar
+        run: bash scripts/build-ocr-sidecar.sh
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-features
+
+      - name: Test browser flow
+        run: npm run test:e2e
+
+  bundle:
+    name: unsigned macOS bundle
+    needs: gates
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: sidecars/ocr/uv.lock
+
+      - run: npm ci
+      - run: uv sync --project sidecars/ocr --frozen
+      - run: bash scripts/build-ocr-sidecar.sh
+      - name: Build unsigned app and DMG
+        run: npm run tauri build -- --bundles app,dmg
+      - name: Verify Apple Silicon bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_app="src-tauri/target/release/bundle/macos/发票报销.app"
+          dmg_files=(src-tauri/target/release/bundle/dmg/*_aarch64.dmg)
+          test -d "$bundle_app"
+          test "${#dmg_files[@]}" -eq 1
+          test -f "${dmg_files[0]}"
+          test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
+          test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-ocr")" = "arm64"
+          hdiutil verify "${dmg_files[0]}"
+
+          mount_dir="$(mktemp -d)"
+          mounted=0
+          cleanup() {
+            if [[ "$mounted" -eq 1 ]]; then
+              hdiutil detach "$mount_dir" -quiet || true
+            fi
+            rmdir "$mount_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          hdiutil attach "${dmg_files[0]}" -nobrowse -readonly -mountpoint "$mount_dir" -quiet
+          mounted=1
+          mounted_app="$(find "$mount_dir" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$mounted_app"
+          test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
+          test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-ocr")" = "arm64"
+          hdiutil detach "$mount_dir" -quiet
+          mounted=0
+          rmdir "$mount_dir"
+          trap - EXIT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-macos-bundle
+          path: |
+            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

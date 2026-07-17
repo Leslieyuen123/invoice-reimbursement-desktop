@@ -12,7 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "发票报销"
+        "title": "发票报销",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 700,
+        "center": true,
+        "resizable": true
       }
     ],
     "security": {
@@ -21,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["app", "dmg"],
     "icon": ["icons/icon.png"],
     "externalBin": ["binaries/invoice-ocr"]
   }

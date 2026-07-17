@@ -139,7 +139,7 @@ pub fn run() {
                 tauri::async_runtime::block_on(state.dashboard_service().load())?
                     .counts
                     .pending_confirmation;
-            let scheduler = state.application_scheduler().start();
+            let scheduler = start_application_scheduler(&state);
             app.manage(state);
             app.manage(RuntimeTasks {
                 scheduler: Mutex::new(Some(scheduler)),
@@ -239,6 +239,11 @@ fn initialize_state<R: Runtime>(
     tauri::async_runtime::block_on(state.reconcile_account_saves())?;
     tauri::async_runtime::block_on(reconcile_exports_on_startup(&state));
     Ok(state)
+}
+
+fn start_application_scheduler(state: &AppState) -> SchedulerHandle {
+    let scheduler = state.application_scheduler();
+    tauri::async_runtime::block_on(async move { scheduler.start() })
 }
 
 async fn reconcile_exports_on_startup(state: &AppState) {
@@ -406,6 +411,28 @@ mod tests {
     #[test]
     fn graceful_shutdown_deadline_is_exactly_ten_seconds() {
         assert_eq!(super::SHUTDOWN_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn application_scheduler_starts_from_the_synchronous_tauri_setup_context() {
+        use std::sync::Arc;
+
+        use crate::db;
+        use crate::infra::credentials::MemoryCredentialStore;
+        use crate::infra::files::AppPaths;
+        use crate::state::AppState;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pool = tauri::async_runtime::block_on(db::connect("sqlite::memory:")).unwrap();
+        let state = AppState::new(
+            pool,
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+            Arc::new(MemoryCredentialStore::default()),
+        );
+
+        let scheduler = super::start_application_scheduler(&state);
+
+        tauri::async_runtime::block_on(scheduler.stop()).unwrap();
     }
 
     #[tokio::test]

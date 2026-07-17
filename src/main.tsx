@@ -9,8 +9,22 @@ if (!rootElement) {
   throw new Error("Root element was not found");
 }
 
-createRoot(rootElement).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+async function bootstrap() {
+  if (
+    import.meta.env.DEV &&
+    import.meta.env.VITE_BROWSER_COMMAND_BRIDGE === "1"
+  ) {
+    const { installBrowserCommandBridge } = await import(
+      "./test/browserCommandBridge"
+    );
+    installBrowserCommandBridge();
+  }
+
+  createRoot(rootElement!).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+}
+
+void bootstrap();

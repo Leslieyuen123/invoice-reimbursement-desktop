@@ -54,6 +54,9 @@ export function AppShell() {
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#app-main">
+        跳到主要内容
+      </a>
       <aside className="app-sidebar">
         <div className="app-identity" aria-label="发票报销">
           <span className="app-identity-mark" aria-hidden="true">
@@ -107,7 +110,7 @@ export function AppShell() {
         <div className="app-error-slot">
           <AppErrorBanner accounts={dashboardQuery.data?.mailboxAccounts ?? []} />
         </div>
-        <main className="app-main">
+        <main className="app-main" id="app-main" tabIndex={-1}>
           <Outlet />
         </main>
       </div>
