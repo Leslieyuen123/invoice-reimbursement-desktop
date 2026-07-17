@@ -80,7 +80,6 @@ export function BatchDetailPage() {
   const { batchId = "" } = useParams();
   const queryClient = useQueryClient();
   const routeSession = useRef(0);
-  const contentRevision = useRef(0);
   const [recommendPending, setRecommendPending] = useState(false);
   const [recommendError, setRecommendError] = useState<string | null>(null);
   const [exportPending, setExportPending] = useState(false);
@@ -108,6 +107,12 @@ export function BatchDetailPage() {
     queryFn: () => api.getBatch(batchId),
     enabled: Boolean(batchId),
   });
+  const { data: batchContentRevision } = useQuery({
+    queryKey: queryKeys.batchContentRevision(batchId),
+    queryFn: () => 0,
+    initialData: 0,
+    enabled: false,
+  });
 
   useEffect(() => {
     routeSession.current += 1;
@@ -128,6 +133,13 @@ export function BatchDetailPage() {
   }, [batchId]);
 
   useEffect(() => {
+    setExportPending(false);
+    setExportResult(null);
+    setExportError(null);
+    setRevealError(null);
+  }, [batchContentRevision]);
+
+  useEffect(() => {
     if (removePending) removeCancelRef.current?.focus();
   }, [removePending]);
 
@@ -144,12 +156,17 @@ export function BatchDetailPage() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
   }
 
-  function clearExportFeedback() {
-    contentRevision.current += 1;
-    setExportPending(false);
-    setExportResult(null);
-    setExportError(null);
-    setRevealError(null);
+  function getBatchContentRevision(operationBatchId: string) {
+    return queryClient.getQueryData<number>(
+      queryKeys.batchContentRevision(operationBatchId),
+    ) ?? 0;
+  }
+
+  function advanceBatchContentRevision(operationBatchId: string) {
+    queryClient.setQueryData<number>(
+      queryKeys.batchContentRevision(operationBatchId),
+      (revision = 0) => revision + 1,
+    );
   }
 
   async function assignRecommendations() {
@@ -186,8 +203,8 @@ export function BatchDetailPage() {
       }
       await api.assignItemsToBatch(operationBatchId, itemIds);
       reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
       if (session !== routeSession.current) return;
-      clearExportFeedback();
     } catch (error) {
       if (session === routeSession.current) {
         setRecommendError(errorMessage(error, "推荐票据加入失败"));
@@ -199,8 +216,8 @@ export function BatchDetailPage() {
 
   async function runExport() {
     const session = routeSession.current;
-    const operationContentRevision = contentRevision.current;
     const operationBatchId = batchId;
+    const operationContentRevision = getBatchContentRevision(operationBatchId);
     setExportPending(true);
     setExportError(null);
     setRevealError(null);
@@ -215,20 +232,20 @@ export function BatchDetailPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
       if (
         session !== routeSession.current ||
-        operationContentRevision !== contentRevision.current
+        operationContentRevision !== getBatchContentRevision(operationBatchId)
       ) return;
       setExportResult(result);
     } catch (error) {
       if (
         session === routeSession.current &&
-        operationContentRevision === contentRevision.current
+        operationContentRevision === getBatchContentRevision(operationBatchId)
       ) {
         setExportError(errorMessage(error, "报销包导出失败"));
       }
     } finally {
       if (
         session === routeSession.current &&
-        operationContentRevision === contentRevision.current
+        operationContentRevision === getBatchContentRevision(operationBatchId)
       ) {
         setExportPending(false);
       }
@@ -238,7 +255,8 @@ export function BatchDetailPage() {
   async function revealExport() {
     if (!exportResult) return;
     const session = routeSession.current;
-    const operationContentRevision = contentRevision.current;
+    const operationBatchId = batchId;
+    const operationContentRevision = getBatchContentRevision(operationBatchId);
     setRevealError(null);
     try {
       const mergedPdf = await join(exportResult.directory, "merged.pdf");
@@ -246,7 +264,7 @@ export function BatchDetailPage() {
     } catch {
       if (
         session === routeSession.current &&
-        operationContentRevision === contentRevision.current
+        operationContentRevision === getBatchContentRevision(operationBatchId)
       ) {
         setRevealError("无法在文件夹中显示，请从导出目录手动打开报销包");
       }
@@ -262,11 +280,6 @@ export function BatchDetailPage() {
   function acceptAssignedDetail(_detail: BatchDetailDto, sessionId: number) {
     if (sessionId !== assignDialogSession) return;
     closeAssignDialog();
-  }
-
-  function acceptAssignedCommit(operationRouteSession: number) {
-    if (operationRouteSession !== routeSession.current) return;
-    clearExportFeedback();
   }
 
   function closeRemoveDialog(preferFallback = false) {
@@ -318,8 +331,8 @@ export function BatchDetailPage() {
     try {
       await api.removeItemFromBatch(operationBatchId, item.id);
       reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
       if (session !== routeSession.current) return;
-      clearExportFeedback();
       closeRemoveDialog(true);
     } catch (error) {
       if (
@@ -564,8 +577,6 @@ export function BatchDetailPage() {
         <AssignItemsDialog
           batchId={batchId}
           sessionId={assignDialogSession}
-          routeSessionId={routeSession.current}
-          onContentCommitted={acceptAssignedCommit}
           onAssigned={acceptAssignedDetail}
           onClose={closeAssignDialog}
         />

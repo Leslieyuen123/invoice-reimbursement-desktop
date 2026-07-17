@@ -1140,6 +1140,51 @@ describe("Batch workspace", () => {
     expect(screen.getByText("高铁电子发票.pdf")).toBeInTheDocument();
   });
 
+  it("clears a remounted batch export when an old assignment commits", async () => {
+    const user = userEvent.setup();
+    const assignment = deferred<BatchDetailDto>();
+    const candidate = candidateFixture(itemFixture());
+    let serverDetail = detailFixture([]);
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", () => serverDetail);
+    mockCommand("list_batch_candidates", {
+      items: [candidate],
+      nextCursor: null,
+    });
+    mockCommand("list_batches", () => ({
+      items: [serverDetail.batch],
+      nextCursor: null,
+    }));
+    mockCommand("assign_items_to_batch", assignment.promise);
+    mockCommand("export_batch", {
+      directory: "/Users/finance/current-export",
+      itemCount: 0,
+      totalAmountCents: 0,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(dialog).findByRole("checkbox", { name: "高铁电子发票.pdf" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "归属所选票据" }));
+    await user.click(within(dialog).getByRole("button", { name: "关闭调整票据" }));
+
+    await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
+    await user.click(await screen.findByRole("link", { name: /6-8 月整理批次/ }));
+    await user.click(await screen.findByRole("button", { name: "导出报销包" }));
+    expect(await screen.findByText("merged.pdf")).toBeInTheDocument();
+
+    serverDetail = detailFixture([
+      { ...candidate.item, batchId: "batch-summer" },
+    ]);
+    await act(async () => assignment.resolve(serverDetail));
+
+    expect(await screen.findByText("高铁电子发票.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("merged.pdf")).not.toBeInTheDocument();
+  });
+
   it("keeps current-route export feedback when an old assignment commits", async () => {
     const user = userEvent.setup();
     const assignment = deferred<BatchDetailDto>();
