@@ -113,6 +113,9 @@ export function AssignItemsDialog({
     try {
       const detail = await api.assignItemsToBatch(batchId, [...selectedIds]);
       queryClient.setQueryData(queryKeys.batch(batchId), detail);
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.batchCandidateLists(batchId),
+      });
       void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
       void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });

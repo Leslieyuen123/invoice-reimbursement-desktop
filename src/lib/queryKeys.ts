@@ -16,6 +16,14 @@ export const queryKeys = {
     [...batchLists, page] as const,
   batch: (batchId: string) =>
     ["invoice-reimbursement", "batches", "detail", batchId] as const,
+  batchCandidateLists: (batchId: string) =>
+    [
+      "invoice-reimbursement",
+      "batches",
+      "detail",
+      batchId,
+      "candidates",
+    ] as const,
   batchCandidates: (
     batchId: string,
     query: string,

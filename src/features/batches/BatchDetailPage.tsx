@@ -93,9 +93,12 @@ export function BatchDetailPage() {
   const removeFocusFallbackRef = useRef<HTMLButtonElement | null>(null);
   const removeDialogRef = useRef<HTMLDivElement | null>(null);
   const removeCancelRef = useRef<HTMLButtonElement | null>(null);
+  const nextRemoveDialogSession = useRef(0);
+  const activeRemoveDialogSession = useRef<number | null>(null);
   const [removeTarget, setRemoveTarget] = useState<{
     item: InvoiceItemDto;
     opener: HTMLButtonElement;
+    sessionId: number;
   } | null>(null);
   const [removePending, setRemovePending] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
@@ -114,6 +117,7 @@ export function BatchDetailPage() {
     setExportError(null);
     setRevealError(null);
     setAssignDialogOpen(false);
+    activeRemoveDialogSession.current = null;
     setRemoveTarget(null);
     setRemovePending(false);
     setRemoveError(null);
@@ -131,6 +135,9 @@ export function BatchDetailPage() {
     detail: BatchDetailDto,
   ) {
     queryClient.setQueryData(queryKeys.batch(operationBatchId), detail);
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.batchCandidateLists(operationBatchId),
+    });
     void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
     void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
     void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
@@ -233,7 +240,9 @@ export function BatchDetailPage() {
 
   function closeRemoveDialog(preferFallback = false) {
     if (!removeTarget) return;
-    const { opener } = removeTarget;
+    const { opener, sessionId } = removeTarget;
+    if (activeRemoveDialogSession.current !== sessionId) return;
+    activeRemoveDialogSession.current = null;
     setRemoveTarget(null);
     queueMicrotask(() => {
       if (!preferFallback && opener.isConnected) {
@@ -272,7 +281,7 @@ export function BatchDetailPage() {
     if (!removeTarget) return;
     const session = routeSession.current;
     const operationBatchId = batchId;
-    const { item } = removeTarget;
+    const { item, sessionId: removeDialogSession } = removeTarget;
     setRemovePending(true);
     setRemoveError(null);
     try {
@@ -281,7 +290,10 @@ export function BatchDetailPage() {
       if (session !== routeSession.current) return;
       closeRemoveDialog(true);
     } catch (error) {
-      if (session === routeSession.current) {
+      if (
+        session === routeSession.current &&
+        removeDialogSession === activeRemoveDialogSession.current
+      ) {
         setRemoveError(errorMessage(error, "票据移出失败"));
       }
     } finally {
@@ -445,8 +457,15 @@ export function BatchDetailPage() {
                         aria-label={`移出 ${item.originalName}`}
                         title="移出票据"
                         onClick={(event) => {
+                          nextRemoveDialogSession.current += 1;
+                          activeRemoveDialogSession.current =
+                            nextRemoveDialogSession.current;
                           setRemoveError(null);
-                          setRemoveTarget({ item, opener: event.currentTarget });
+                          setRemoveTarget({
+                            item,
+                            opener: event.currentTarget,
+                            sessionId: nextRemoveDialogSession.current,
+                          });
                         }}
                       >
                         <Trash2 size={15} strokeWidth={1.7} aria-hidden="true" />

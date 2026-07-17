@@ -565,6 +565,46 @@ describe("Batch workspace", () => {
     expect(commandCalls("get_batch")).toHaveLength(1);
   });
 
+  it("refreshes reopened candidates after a pending assignment commits", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(itemFixture());
+    const assignment = deferred<BatchDetailDto>();
+    let serverCandidates = [candidate];
+    mockDetail(detailFixture(), serverCandidates);
+    mockCommand("list_batch_candidates", () => ({
+      items: serverCandidates,
+      nextCursor: null,
+    }));
+    mockCommand("assign_items_to_batch", assignment.promise);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const firstDialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(firstDialog).findByRole("checkbox", { name: "高铁电子发票.pdf" }),
+    );
+    await user.click(within(firstDialog).getByRole("button", { name: "归属所选票据" }));
+    await user.click(within(firstDialog).getByRole("button", { name: "关闭调整票据" }));
+    await user.click(screen.getByRole("button", { name: "调整票据" }));
+    const secondDialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    expect(
+      await within(secondDialog).findByText("高铁电子发票.pdf"),
+    ).toBeInTheDocument();
+
+    serverCandidates = [];
+    await act(async () => {
+      assignment.resolve(
+        detailFixture([{ ...candidate.item, batchId: "batch-summer" }]),
+      );
+    });
+
+    expect(
+      await within(secondDialog).findByText("当前日期范围内没有未归属票据"),
+    ).toBeInTheDocument();
+    expect(within(secondDialog).queryByText("高铁电子发票.pdf")).not.toBeInTheDocument();
+    expect(commandCalls("list_batch_candidates")).toHaveLength(3);
+  });
+
   it("reconciles a committed recommendation after route navigation", async () => {
     const user = userEvent.setup();
     const candidate = candidateFixture(itemFixture());
@@ -747,6 +787,78 @@ describe("Batch workspace", () => {
     await user.tab({ shift: true });
     expect(cancel).toHaveFocus();
     expect(commandCalls("remove_item_from_batch")).toHaveLength(1);
+  });
+
+  it("keeps a newer removal dialog intact when an earlier removal completes", async () => {
+    const user = userEvent.setup();
+    const removal = deferred<BatchDetailDto>();
+    const first = { ...itemFixture(), batchId: "batch-summer" };
+    const second = itemFixture({
+      id: "invoice-hotel",
+      originalName: "酒店发票.pdf",
+      batchId: "batch-summer",
+    });
+    mockDetail(detailFixture([first, second]));
+    mockCommand("remove_item_from_batch", removal.promise);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("button", { name: "移出 高铁电子发票.pdf" }),
+    );
+    const firstDialog = screen.getByRole("dialog", { name: "确认移出票据" });
+    await user.click(within(firstDialog).getByRole("button", { name: "确认移出" }));
+    await user.click(within(firstDialog).getByRole("button", { name: "取消" }));
+    await user.click(screen.getByRole("button", { name: "移出 酒店发票.pdf" }));
+    const secondDialog = screen.getByRole("dialog", { name: "确认移出票据" });
+    const secondCancel = within(secondDialog).getByRole("button", { name: "取消" });
+    expect(secondDialog).toHaveTextContent("酒店发票.pdf");
+    expect(secondCancel).toHaveFocus();
+
+    await act(async () => removal.resolve(detailFixture([second])));
+
+    expect(screen.getByRole("dialog", { name: "确认移出票据" })).toBe(secondDialog);
+    expect(secondDialog).toHaveTextContent("酒店发票.pdf");
+    expect(secondCancel).toHaveFocus();
+    expect(
+      within(secondDialog).getByRole("button", { name: "确认移出" }),
+    ).toBeEnabled();
+    expect(commandCalls("remove_item_from_batch")).toHaveLength(1);
+  });
+
+  it("refreshes active candidates after a pending removal commits", async () => {
+    const user = userEvent.setup();
+    const removal = deferred<BatchDetailDto>();
+    const assigned = { ...itemFixture(), batchId: "batch-summer" };
+    let serverCandidates: BatchCandidateDto[] = [];
+    mockDetail(detailFixture([assigned]));
+    mockCommand("remove_item_from_batch", removal.promise);
+    mockCommand("list_batch_candidates", () => ({
+      items: serverCandidates,
+      nextCursor: null,
+    }));
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("button", { name: "移出 高铁电子发票.pdf" }),
+    );
+    const removalDialog = screen.getByRole("dialog", { name: "确认移出票据" });
+    await user.click(within(removalDialog).getByRole("button", { name: "确认移出" }));
+    await user.click(within(removalDialog).getByRole("button", { name: "取消" }));
+    await user.click(screen.getByRole("button", { name: "调整票据" }));
+    const assignmentDialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    expect(
+      await within(assignmentDialog).findByText("当前日期范围内没有未归属票据"),
+    ).toBeInTheDocument();
+
+    serverCandidates = [
+      candidateFixture({ ...assigned, batchId: null }),
+    ];
+    await act(async () => removal.resolve(detailFixture([])));
+
+    expect(
+      await within(assignmentDialog).findByText("高铁电子发票.pdf"),
+    ).toBeInTheDocument();
+    expect(commandCalls("list_batch_candidates")).toHaveLength(2);
   });
 
   it("focuses a stable fallback after successful removal", async () => {
