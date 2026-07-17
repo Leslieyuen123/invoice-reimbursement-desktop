@@ -171,6 +171,40 @@ impl AppPaths {
         Ok(paths)
     }
 
+    pub fn for_export_directory(&self, preference: &str) -> Result<Self, AppError> {
+        let preference = preference.trim();
+        if preference == "exports" {
+            return Ok(self.clone());
+        }
+        let requested = Path::new(preference);
+        if !requested.is_absolute() {
+            return Err(AppError::validation(
+                "export_directory",
+                "导出目录必须是绝对路径",
+            ));
+        }
+        let metadata = fs::symlink_metadata(requested)
+            .map_err(|_| AppError::validation("export_directory", "导出目录不存在或无法访问"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AppError::validation(
+                "export_directory",
+                "导出目录必须是安全的普通目录",
+            ));
+        }
+        let exports = fs::canonicalize(requested)
+            .map_err(|_| AppError::validation("export_directory", "导出目录无法安全解析"))?;
+        let staging = exports.join(".invoice-reimbursement-staging");
+        ensure_storage_directory(&exports, &staging)
+            .map_err(|_| AppError::validation("export_directory", "导出目录不可写或不安全"))?;
+        sync_directory(&exports)
+            .map_err(|_| AppError::validation("export_directory", "导出目录无法同步"))?;
+
+        let mut paths = self.clone();
+        paths.exports = exports;
+        paths.staging = staging;
+        Ok(paths)
+    }
+
     pub fn persist_original(
         &self,
         source: impl AsRef<Path>,

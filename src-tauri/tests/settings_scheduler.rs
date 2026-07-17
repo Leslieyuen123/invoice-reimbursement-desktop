@@ -1532,6 +1532,40 @@ async fn invalid_preferences_are_rejected_without_overwriting_saved_values() {
 }
 
 #[tokio::test]
+async fn export_directory_cannot_change_while_recovery_work_is_pending() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let service = settings_service(pool.clone());
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO pending_exports (
+            operation_id, batch_id, staging_component, final_component, exported_at, state,
+            created_at, updated_at
+         ) VALUES (?, ?, ?, 'pending-package', ?, 'generating', ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(Uuid::new_v4().to_string())
+    .bind(format!("export-{}", Uuid::new_v4()))
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = service
+        .save_preferences(PreferencesInput {
+            background_sync_enabled: true,
+            export_directory: "/tmp/different-root".to_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, AppError::Conflict { .. }));
+    assert_eq!(service.preferences().await.unwrap(), Preferences::default());
+}
+
+#[tokio::test]
 async fn persisted_legacy_batch_pattern_is_reported_as_invalid() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)")

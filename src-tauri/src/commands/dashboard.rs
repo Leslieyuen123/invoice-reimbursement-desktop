@@ -18,11 +18,8 @@ pub struct DashboardDto {
 
 pub async fn load(state: &AppState) -> Result<DashboardDto, AppError> {
     let snapshot = state.dashboard_service().load().await?;
-    let mailbox_accounts = snapshot
-        .mailbox_accounts
-        .into_iter()
-        .map(MailboxAccountDto::from)
-        .collect();
+    let mailbox_accounts =
+        crate::commands::settings::account_dtos(state, snapshot.mailbox_accounts).await?;
     let recent_batches = snapshot
         .recent_batches
         .into_iter()

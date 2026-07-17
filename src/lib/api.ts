@@ -17,6 +17,7 @@ import type {
   PreferencesInputDto,
   ReviewItemInputDto,
   SaveMailboxAccountInputDto,
+  StorageStatusDto,
   TestMailboxAccountInputDto,
 } from "../types";
 
@@ -94,6 +95,7 @@ export const api = {
   getPreferences: () => call<PreferencesDto>("get_preferences"),
   savePreferences: (input: PreferencesInputDto) =>
     call<PreferencesDto>("save_preferences", { input }),
+  getStorageStatus: () => call<StorageStatusDto>("get_storage_status"),
   syncAccountNow: (accountId: string) =>
     call<void>("sync_account_now", { accountId }),
 };

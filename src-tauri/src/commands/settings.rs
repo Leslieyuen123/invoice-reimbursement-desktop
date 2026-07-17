@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::db::accounts::{MailboxAccount, MailboxProvider};
+use crate::db::accounts::{
+    MailboxAccount, MailboxAccountRepository, MailboxProvider, SyncRetryState,
+};
 use crate::domain::error::AppError;
 use crate::services::settings::{
     Preferences, PreferencesInput, SaveAccountInput, TestAccountInput,
@@ -20,10 +22,29 @@ pub struct MailboxAccountDto {
     pub sync_interval_minutes: i64,
     pub last_synced_at: Option<String>,
     pub last_error: Option<String>,
+    pub last_error_kind: Option<MailboxErrorKind>,
+    pub last_error_at: Option<String>,
 }
 
-impl From<MailboxAccount> for MailboxAccountDto {
-    fn from(account: MailboxAccount) -> Self {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxErrorKind {
+    Authentication,
+    Network,
+    Unknown,
+}
+
+impl MailboxAccountDto {
+    fn from_account(account: MailboxAccount, retry: Option<SyncRetryState>) -> Self {
+        let last_error_kind = account.last_error.as_ref().map(|_| match retry {
+            Some(retry) if retry.suspended => MailboxErrorKind::Authentication,
+            Some(_) => MailboxErrorKind::Network,
+            None => MailboxErrorKind::Unknown,
+        });
+        let last_error_at = account
+            .last_error
+            .as_ref()
+            .map(|_| account.updated_at.to_rfc3339());
         Self {
             id: account.id.to_string(),
             provider: account.provider,
@@ -34,8 +55,18 @@ impl From<MailboxAccount> for MailboxAccountDto {
             sync_interval_minutes: account.sync_interval_minutes,
             last_synced_at: account.last_synced_at.map(|value| value.to_rfc3339()),
             last_error: account.last_error,
+            last_error_kind,
+            last_error_at,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatusDto {
+    pub local_data_directory: String,
+    pub export_directory: String,
+    pub available_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -112,24 +143,31 @@ pub struct PreferencesInputDto {
 }
 
 pub async fn list_accounts(state: &AppState) -> Result<Vec<MailboxAccountDto>, AppError> {
-    Ok(state
-        .settings_service()
-        .list_accounts()
-        .await?
-        .into_iter()
-        .map(Into::into)
-        .collect())
+    account_dtos(state, state.settings_service().list_accounts().await?).await
+}
+
+pub async fn account_dtos(
+    state: &AppState,
+    accounts: Vec<MailboxAccount>,
+) -> Result<Vec<MailboxAccountDto>, AppError> {
+    let repository = MailboxAccountRepository::new(state.pool().clone());
+    let mut dtos = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let retry = repository.get_retry_state(account.id).await?;
+        dtos.push(MailboxAccountDto::from_account(account, retry));
+    }
+    Ok(dtos)
 }
 
 pub async fn save_account(
     state: &AppState,
     input: SaveMailboxAccountInput,
 ) -> Result<MailboxAccountDto, AppError> {
-    state
-        .settings_service()
-        .save_account(input.into())
-        .await
-        .map(Into::into)
+    let account = state.settings_service().save_account(input.into()).await?;
+    let retry = MailboxAccountRepository::new(state.pool().clone())
+        .get_retry_state(account.id)
+        .await?;
+    Ok(MailboxAccountDto::from_account(account, retry))
 }
 
 pub async fn test_account(
@@ -152,6 +190,9 @@ pub async fn save_preferences(
     input: PreferencesInputDto,
 ) -> Result<Preferences, AppError> {
     state
+        .paths()
+        .for_export_directory(input.export_directory.trim())?;
+    state
         .settings_service()
         .save_preferences(PreferencesInput {
             background_sync_enabled: input.background_sync_enabled,
@@ -161,13 +202,47 @@ pub async fn save_preferences(
         .await
 }
 
+pub async fn storage_status(state: &AppState) -> Result<StorageStatusDto, AppError> {
+    let preferences = state.settings_service().preferences().await?;
+    let effective = state
+        .paths()
+        .for_export_directory(&preferences.export_directory)?;
+    let local_data_directory = state
+        .paths()
+        .root
+        .parent()
+        .unwrap_or(&state.paths().root)
+        .to_string_lossy()
+        .into_owned();
+    let available_bytes = available_bytes(&effective.exports)?;
+    Ok(StorageStatusDto {
+        local_data_directory,
+        export_directory: effective.exports.to_string_lossy().into_owned(),
+        available_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn available_bytes(path: &std::path::Path) -> Result<u64, AppError> {
+    rustix::fs::statvfs(path)
+        .map(|status| status.f_bavail.saturating_mul(status.f_frsize))
+        .map_err(|_| AppError::Internal {
+            message: "failed to inspect available export storage".to_owned(),
+        })
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &std::path::Path) -> Result<u64, AppError> {
+    Ok(0)
+}
+
 pub(crate) mod ipc {
     use tauri::State;
     use uuid::Uuid;
 
     use super::{
         MailboxAccountDto, Preferences, PreferencesInputDto, SaveMailboxAccountInput,
-        TestMailboxAccountInput,
+        StorageStatusDto, TestMailboxAccountInput,
     };
     use crate::domain::error::AppError;
     use crate::state::AppState;
@@ -214,5 +289,12 @@ pub(crate) mod ipc {
         input: PreferencesInputDto,
     ) -> Result<Preferences, AppError> {
         super::save_preferences(&state, input).await
+    }
+
+    #[tauri::command]
+    pub async fn get_storage_status(
+        state: State<'_, AppState>,
+    ) -> Result<StorageStatusDto, AppError> {
+        super::storage_status(&state).await
     }
 }

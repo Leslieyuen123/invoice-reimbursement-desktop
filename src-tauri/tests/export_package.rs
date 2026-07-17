@@ -181,6 +181,118 @@ async fn exports_pdf_xlsx_originals_and_manifest() {
 }
 
 #[tokio::test]
+async fn next_export_uses_the_saved_custom_root_without_moving_history() {
+    let app = TestApp::with_exportable_batch().await;
+    let custom_root = app._directory.path().join("chosen-exports");
+    fs::create_dir(&custom_root).unwrap();
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?)")
+        .bind(
+            serde_json::json!({
+                "backgroundSyncEnabled": true,
+                "exportDirectory": custom_root.to_string_lossy(),
+                "batchDirectoryPattern": "{batchName}-{timestamp}",
+            })
+            .to_string(),
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let historical = app.paths.exports.join("historical-package");
+    fs::create_dir(&historical).unwrap();
+    let result = app.exports.export(app.batch_id).await.unwrap();
+
+    assert_eq!(
+        result.directory.parent(),
+        Some(custom_root.canonicalize().unwrap().as_path())
+    );
+    assert!(result.directory.join("manifest.json").is_file());
+    assert!(historical.is_dir(), "historical packages must not move");
+}
+
+#[tokio::test]
+async fn restart_recovery_uses_the_durable_custom_root() {
+    let app = TestApp::with_exportable_batch().await;
+    let custom_root = app._directory.path().join("chosen-recovery-root");
+    let staging_root = custom_root.join(".invoice-reimbursement-staging");
+    fs::create_dir(&custom_root).unwrap();
+    fs::create_dir(&staging_root).unwrap();
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?)")
+        .bind(
+            serde_json::json!({
+                "backgroundSyncEnabled": true,
+                "exportDirectory": custom_root.to_string_lossy(),
+                "batchDirectoryPattern": "{batchName}-{timestamp}",
+            })
+            .to_string(),
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let operation_id = Uuid::new_v4();
+    let exported_at = Utc.with_ymd_and_hms(2026, 7, 17, 1, 40, 0).unwrap();
+    let staging_component = format!("export-{operation_id}");
+    let final_component = "interrupted-package";
+    let staging = staging_root.join(&staging_component);
+    let final_directory = custom_root.join(final_component);
+    for directory in [&staging, &final_directory] {
+        fs::create_dir(directory).unwrap();
+        fs::write(
+            directory.join(".invoice-export-recovery.json"),
+            serde_json::json!({
+                "operation_id": operation_id.to_string(),
+                "batch_id": app.batch_id.to_string(),
+                "staging_component": staging_component,
+                "final_component": final_component,
+                "exported_at": exported_at.to_rfc3339(),
+                "state": "generating",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO pending_exports (
+            operation_id, batch_id, staging_component, final_component, exported_at, state,
+            interrupted, last_error, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, 'generating', 1, 'application_shutdown_interrupted', ?, ?)",
+    )
+    .bind(operation_id.to_string())
+    .bind(app.batch_id.to_string())
+    .bind(&staging_component)
+    .bind(final_component)
+    .bind(exported_at.to_rfc3339())
+    .bind(&now)
+    .bind(&now)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    drop(app.exports);
+    let restarted = ExportService::new(
+        app.pool.clone(),
+        app.paths.clone(),
+        ExportCoordinator::default(),
+    );
+    let report = restarted.reconcile_pending().await.unwrap();
+
+    assert_eq!(report.rolled_back, 1);
+    assert!(!staging.exists());
+    assert!(!final_directory.exists());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn zip_names_use_sequence_id_prefix_and_sanitized_basename() {
     let app = TestApp::with_exportable_batch().await;
     let result = app.exports.export(app.batch_id).await.unwrap();

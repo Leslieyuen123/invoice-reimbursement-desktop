@@ -27,6 +27,8 @@ function dashboardFixture(
         syncIntervalMinutes: 15,
         lastSyncedAt: "2026-07-16T08:30:00+08:00",
         lastError: null,
+        lastErrorKind: null,
+        lastErrorAt: null,
       },
       {
         id: "paused-account",
@@ -38,6 +40,8 @@ function dashboardFixture(
         syncIntervalMinutes: 30,
         lastSyncedAt: null,
         lastError: null,
+        lastErrorKind: null,
+        lastErrorAt: null,
       },
     ],
     recentlyAddedCount: 7,

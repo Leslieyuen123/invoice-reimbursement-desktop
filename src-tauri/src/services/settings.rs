@@ -65,6 +65,21 @@ pub struct BackgroundSyncGate {
     lock: Arc<RwLock<()>>,
 }
 
+#[derive(Clone, Default)]
+pub struct ExportPreferenceGate {
+    lock: Arc<RwLock<()>>,
+}
+
+impl ExportPreferenceGate {
+    pub(crate) async fn read(&self) -> RwLockReadGuard<'_, ()> {
+        self.lock.read().await
+    }
+
+    async fn write(&self) -> RwLockWriteGuard<'_, ()> {
+        self.lock.write().await
+    }
+}
+
 impl BackgroundSyncGate {
     pub(crate) async fn read(&self) -> RwLockReadGuard<'_, ()> {
         self.lock.read().await
@@ -82,6 +97,7 @@ pub struct SettingsService {
     credentials: Arc<dyn CredentialStore>,
     accounts: MailboxAccountRepository,
     background_gate: BackgroundSyncGate,
+    export_preference_gate: ExportPreferenceGate,
     operations: AccountOperationCoordinator,
     account_saves: AccountSaveCoordinator,
 }
@@ -92,6 +108,7 @@ impl SettingsService {
         gateway: Arc<dyn ImapGateway>,
         credentials: Arc<dyn CredentialStore>,
         background_gate: BackgroundSyncGate,
+        export_preference_gate: ExportPreferenceGate,
         operations: AccountOperationCoordinator,
         account_saves: AccountSaveCoordinator,
     ) -> Self {
@@ -101,6 +118,7 @@ impl SettingsService {
             gateway,
             credentials,
             background_gate,
+            export_preference_gate,
             operations,
             account_saves,
         }
@@ -191,12 +209,26 @@ impl SettingsService {
     }
 
     pub async fn save_preferences(&self, input: PreferencesInput) -> Result<Preferences, AppError> {
+        let _export_preference_guard = self.export_preference_gate.write().await;
         let preferences = Preferences {
             background_sync_enabled: input.background_sync_enabled,
             export_directory: input.export_directory.trim().to_owned(),
             batch_directory_pattern: input.batch_directory_pattern.trim().to_owned(),
         };
         validate_preferences(&preferences)?;
+        let current = load_preferences(&self.pool).await?;
+        if current.export_directory != preferences.export_directory {
+            let pending_exports =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_exports")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(database_error)?;
+            if pending_exports != 0 {
+                return Err(AppError::Conflict {
+                    message: "导出恢复完成前不能更改导出目录".to_owned(),
+                });
+            }
+        }
         let value_json = serde_json::to_string(&preferences).map_err(|_| AppError::Internal {
             message: "failed to serialize preferences".to_owned(),
         })?;
@@ -261,6 +293,14 @@ fn validate_preferences(preferences: &Preferences) -> Result<(), AppError> {
         return Err(AppError::validation(
             "export_directory",
             "export directory must not be blank or contain NUL",
+        ));
+    }
+    if preferences.export_directory != "exports"
+        && !std::path::Path::new(&preferences.export_directory).is_absolute()
+    {
+        return Err(AppError::validation(
+            "export_directory",
+            "export directory must be an absolute path or exports",
         ));
     }
     if preferences.batch_directory_pattern != "{batchName}-{timestamp}" {

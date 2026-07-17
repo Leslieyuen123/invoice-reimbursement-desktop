@@ -6,6 +6,7 @@ use invoice_reimbursement::commands::{
     COMMAND_NAMES, batches, dashboard, export, items, settings, sync as sync_commands,
 };
 use invoice_reimbursement::db;
+use invoice_reimbursement::db::accounts::MailboxAccountRepository;
 use invoice_reimbursement::db::accounts::{MailboxProvider, SyncCursor};
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::domain::model::{Category, ItemStatus};
@@ -240,9 +241,93 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "delete_mailbox_account",
             "get_preferences",
             "save_preferences",
+            "get_storage_status",
             "sync_account_now",
         ]
     );
+}
+
+#[tokio::test]
+async fn mailbox_dtos_expose_durable_network_failure_kind_and_time() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let account_id = sqlx::query_scalar::<_, String>("SELECT id FROM mailbox_accounts LIMIT 1")
+        .fetch_one(app.state.pool())
+        .await
+        .unwrap();
+    let account_id = Uuid::parse_str(&account_id).unwrap();
+    let failed_at = chrono::DateTime::parse_from_rfc3339("2026-07-17T09:40:00+08:00")
+        .unwrap()
+        .with_timezone(&Utc);
+    MailboxAccountRepository::new(app.state.pool().clone())
+        .record_retryable_failure(account_id, failed_at, "network timeout")
+        .await
+        .unwrap();
+
+    let account = settings::list_accounts(&app.state)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|account| account.id == account_id.to_string())
+        .unwrap();
+
+    assert_eq!(
+        account.last_error_kind,
+        Some(settings::MailboxErrorKind::Network)
+    );
+    assert_eq!(
+        account.last_error_at.as_deref(),
+        Some("2026-07-17T01:40:00+00:00")
+    );
+}
+
+#[tokio::test]
+async fn mailbox_dtos_expose_durable_authentication_suspension() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let account_id = sqlx::query_scalar::<_, String>("SELECT id FROM mailbox_accounts LIMIT 1")
+        .fetch_one(app.state.pool())
+        .await
+        .unwrap();
+    let account_id = Uuid::parse_str(&account_id).unwrap();
+    let failed_at = chrono::DateTime::parse_from_rfc3339("2026-07-17T09:45:00+08:00")
+        .unwrap()
+        .with_timezone(&Utc);
+    MailboxAccountRepository::new(app.state.pool().clone())
+        .suspend_retry(account_id, failed_at, "authentication failed")
+        .await
+        .unwrap();
+
+    let account = settings::list_accounts(&app.state)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|account| account.id == account_id.to_string())
+        .unwrap();
+
+    assert_eq!(
+        account.last_error_kind,
+        Some(settings::MailboxErrorKind::Authentication)
+    );
+    assert_eq!(
+        account.last_error_at.as_deref(),
+        Some("2026-07-17T01:45:00+00:00")
+    );
+}
+
+#[tokio::test]
+async fn storage_status_reports_actual_and_effective_directories() {
+    let app = TestApp::with_dashboard_fixture().await;
+
+    let status = settings::storage_status(&app.state).await.unwrap();
+
+    assert_eq!(
+        std::path::Path::new(&status.local_data_directory),
+        app.state.paths().root.parent().unwrap()
+    );
+    assert_eq!(
+        std::path::Path::new(&status.export_directory),
+        app.state.paths().exports
+    );
+    assert!(status.available_bytes > 0);
 }
 
 #[test]
@@ -320,6 +405,8 @@ async fn batch_adapters_use_service_summaries_for_assignment_and_removal() {
 #[tokio::test]
 async fn settings_adapters_preserve_account_saga_and_preferences() {
     let app = TestApp::with_dashboard_fixture().await;
+    let chosen_exports = app._directory.path().join("approved-exports");
+    std::fs::create_dir(&chosen_exports).unwrap();
     assert_eq!(settings::list_accounts(&app.state).await.unwrap().len(), 1);
     assert!(
         settings::get_preferences(&app.state)
@@ -332,7 +419,7 @@ async fn settings_adapters_preserve_account_saga_and_preferences() {
         &app.state,
         settings::PreferencesInputDto {
             background_sync_enabled: false,
-            export_directory: "exports/approved".to_owned(),
+            export_directory: chosen_exports.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
         },
     )
@@ -769,7 +856,9 @@ fn tauri_security_configuration_is_narrow_and_blocks_remote_scripts() {
         serde_json::json!([
             "core:default",
             "dialog:allow-open",
-            "opener:allow-reveal-item-in-dir"
+            "opener:allow-reveal-item-in-dir",
+            "opener:allow-open-url",
+            "opener:allow-default-urls"
         ])
     );
 }

@@ -23,6 +23,8 @@ export type DedupeStatus = "unique" | "suspected_duplicate" | "resolved";
 
 export type MailboxProvider = "gmail" | "qq";
 
+export type MailboxErrorKind = "authentication" | "network" | "unknown";
+
 export type AmountCents = number;
 
 export const MAX_SAFE_AMOUNT_CENTS = Number.MAX_SAFE_INTEGER;
@@ -106,6 +108,8 @@ export interface MailboxAccountDto {
   syncIntervalMinutes: number;
   lastSyncedAt: string | null;
   lastError: string | null;
+  lastErrorKind: MailboxErrorKind | null;
+  lastErrorAt: string | null;
 }
 
 export interface DashboardDto {
@@ -130,6 +134,12 @@ export interface PreferencesDto {
   backgroundSyncEnabled: boolean;
   exportDirectory: string;
   batchDirectoryPattern: string;
+}
+
+export interface StorageStatusDto {
+  localDataDirectory: string;
+  exportDirectory: string;
+  availableBytes: number;
 }
 
 export interface ReviewItemInputDto {

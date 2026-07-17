@@ -198,6 +198,7 @@ const commandCases: Array<{
     invokeArguments: { accountId: "account-1" },
   },
   { method: "getPreferences", arguments_: [], command: "get_preferences" },
+  { method: "getStorageStatus", arguments_: [], command: "get_storage_status" },
   {
     method: "savePreferences",
     arguments_: [preferencesInput],

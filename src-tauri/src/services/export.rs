@@ -29,6 +29,7 @@ pub use crate::services::export_recovery::ExportRecoveryReport;
 use crate::services::export_recovery::{
     ExportCommitOutcome, ExportJournal, PendingExportIdentity, write_generation_marker,
 };
+use crate::services::settings::{ExportPreferenceGate, load_preferences};
 
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 
@@ -190,6 +191,7 @@ pub struct ExportService {
     committer: Arc<dyn ExportCommitter>,
     outcome_classifier: Arc<dyn ExportOutcomeClassifier>,
     generation_hook: Arc<dyn GenerationHook>,
+    preference_gate: ExportPreferenceGate,
 }
 
 impl ExportService {
@@ -202,6 +204,25 @@ impl ExportService {
             publisher: Arc::new(AtomicDirectoryPublisher),
             committer: Arc::new(SqliteExportCommitter),
             generation_hook: Arc::new(NoopGenerationHook),
+            preference_gate: ExportPreferenceGate::default(),
+        }
+    }
+
+    pub(crate) fn with_preference_gate(
+        pool: SqlitePool,
+        paths: AppPaths,
+        coordinator: ExportCoordinator,
+        preference_gate: ExportPreferenceGate,
+    ) -> Self {
+        Self {
+            outcome_classifier: default_outcome_classifier(&pool),
+            pool,
+            paths,
+            coordinator,
+            publisher: Arc::new(AtomicDirectoryPublisher),
+            committer: Arc::new(SqliteExportCommitter),
+            generation_hook: Arc::new(NoopGenerationHook),
+            preference_gate,
         }
     }
 
@@ -219,6 +240,7 @@ impl ExportService {
             publisher,
             committer: Arc::new(SqliteExportCommitter),
             generation_hook: Arc::new(NoopGenerationHook),
+            preference_gate: ExportPreferenceGate::default(),
         }
     }
 
@@ -236,6 +258,7 @@ impl ExportService {
             publisher: Arc::new(AtomicDirectoryPublisher),
             committer,
             generation_hook: Arc::new(NoopGenerationHook),
+            preference_gate: ExportPreferenceGate::default(),
         }
     }
 
@@ -253,6 +276,7 @@ impl ExportService {
             publisher: Arc::new(AtomicDirectoryPublisher),
             committer: Arc::new(SqliteExportCommitter),
             generation_hook,
+            preference_gate: ExportPreferenceGate::default(),
         }
     }
 
@@ -271,11 +295,14 @@ impl ExportService {
             publisher: Arc::new(AtomicDirectoryPublisher),
             committer: Arc::new(SqliteExportCommitter),
             generation_hook,
+            preference_gate: ExportPreferenceGate::default(),
         }
     }
 
     pub async fn export(&self, batch_id: Uuid) -> Result<ExportResult, AppError> {
         let active_export = self.coordinator.acquire_export(batch_id)?;
+        let preference_guard = self.preference_gate.read().await;
+        let paths = self.effective_paths().await?;
         let batches = BatchRepository::new(self.pool.clone());
         let snapshot = batches.export_snapshot(batch_id).await?;
         let batch = snapshot.batch.clone();
@@ -350,8 +377,8 @@ impl ExportService {
         let operation_id = Uuid::new_v4();
         let staging_component = format!("export-{operation_id}");
         let final_component = export_directory_name(&batch.name, &exported_at);
-        let staging_path = self.paths.staging.join(&staging_component);
-        let directory = self.paths.exports.join(&final_component);
+        let staging_path = paths.staging.join(&staging_component);
+        let directory = paths.exports.join(&final_component);
         let journal = ExportJournal::new(self.pool.clone());
         let generation_slot = self
             .coordinator
@@ -362,7 +389,7 @@ impl ExportService {
             .map_err(|_| AppError::Internal {
                 message: "export generation coordinator closed".to_owned(),
             })?;
-        let generation_paths = self.paths.clone();
+        let generation_paths = paths.clone();
         let generation_batch = batch.clone();
         let generation_items = items.clone();
         let generation_active_export = active_export.clone();
@@ -421,7 +448,7 @@ impl ExportService {
                 return Err(error);
             }
             (Err(error), Ok(())) => {
-                return Err(finish_failed_export(&journal, &self.paths, operation_id, error).await);
+                return Err(finish_failed_export(&journal, &paths, operation_id, error).await);
             }
             (Err(generation_error), Err(journal_error)) => {
                 return Err(AppError::External {
@@ -434,12 +461,13 @@ impl ExportService {
                 });
             }
         };
+        drop(preference_guard);
 
         let claim = match batches.claim_export(&snapshot).await {
             Ok(claim) => claim,
             Err(error) => {
                 drop(staging);
-                return Err(finish_failed_export(&journal, &self.paths, operation_id, error).await);
+                return Err(finish_failed_export(&journal, &paths, operation_id, error).await);
             }
         };
         let committer = self.committer.clone();
@@ -450,17 +478,16 @@ impl ExportService {
             let _active_export = publication_active_export;
             publisher.publish(staging, directory).await
         });
-        let published = match await_internal(publication, "export publisher task was interrupted")
-            .await
-        {
-            Ok(published) => published,
-            Err(error) => {
-                drop(claim);
-                return Err(finish_failed_export(&journal, &self.paths, operation_id, error).await);
-            }
-        };
+        let published =
+            match await_internal(publication, "export publisher task was interrupted").await {
+                Ok(published) => published,
+                Err(error) => {
+                    drop(claim);
+                    return Err(finish_failed_export(&journal, &paths, operation_id, error).await);
+                }
+            };
         let finalizer_journal = journal.clone();
-        let finalizer_paths = self.paths.clone();
+        let finalizer_paths = paths;
         let finalizer = self.coordinator.spawn_internal(async move {
             let _active_export = active_export;
             finalize_export(
@@ -488,9 +515,17 @@ impl ExportService {
     }
 
     pub async fn reconcile_pending(&self) -> Result<ExportRecoveryReport, AppError> {
+        let _preference_guard = self.preference_gate.read().await;
+        let paths = self.effective_paths().await?;
         ExportJournal::new(self.pool.clone())
-            .reconcile(&self.paths)
+            .reconcile(&paths)
             .await
+    }
+
+    async fn effective_paths(&self) -> Result<AppPaths, AppError> {
+        let preferences = load_preferences(&self.pool).await?;
+        self.paths
+            .for_export_directory(&preferences.export_directory)
     }
 }
 
@@ -1514,6 +1549,7 @@ mod tests {
             committer: Arc::new(CommitThenFailCommitter),
             outcome_classifier: Arc::new(IndeterminateOutcomeClassifier),
             generation_hook: Arc::new(super::NoopGenerationHook),
+            preference_gate: Default::default(),
         };
 
         let error = service.export(fixture.batch_id).await.unwrap_err();
@@ -1589,6 +1625,7 @@ mod tests {
                 pool: fixture.pool.clone(),
             }),
             generation_hook: Arc::new(super::NoopGenerationHook),
+            preference_gate: Default::default(),
         };
 
         let error = service.export(fixture.batch_id).await.unwrap_err();
@@ -2342,6 +2379,7 @@ mod tests {
             }),
             outcome_classifier,
             generation_hook: Arc::new(super::NoopGenerationHook),
+            preference_gate: Default::default(),
         };
         let batch_id = fixture.batch_id;
         let export = tokio::spawn(async move { service.export(batch_id).await });

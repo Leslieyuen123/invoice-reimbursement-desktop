@@ -10,6 +10,7 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 
 import { api } from "../lib/api";
 import { queryKeys } from "../lib/queryKeys";
+import { AppErrorBanner } from "../components/AppErrorBanner";
 import "./AppShell.css";
 
 const navigation = [
@@ -99,6 +100,9 @@ export function AppShell() {
             {synchronizationStatus.label}
           </div>
         </header>
+        <div className="app-error-slot">
+          <AppErrorBanner accounts={dashboardQuery.data?.mailboxAccounts ?? []} />
+        </div>
         <main className="app-main">
           <Outlet />
         </main>

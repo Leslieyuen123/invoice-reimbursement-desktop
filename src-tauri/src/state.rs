@@ -20,7 +20,7 @@ use crate::services::operations::AccountOperationCoordinator;
 use crate::services::preview::{PreviewCoordinator, PreviewService};
 use crate::services::recognition::RecognitionService;
 use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
-use crate::services::settings::{BackgroundSyncGate, SettingsService};
+use crate::services::settings::{BackgroundSyncGate, ExportPreferenceGate, SettingsService};
 use crate::services::shutdown::{ApplicationShutdown, RuntimeOperationCoordinator};
 use crate::services::sync::SyncService;
 
@@ -38,6 +38,7 @@ pub struct AppState {
     export_coordinator: ExportCoordinator,
     preview_coordinator: PreviewCoordinator,
     background_sync_gate: BackgroundSyncGate,
+    export_preference_gate: ExportPreferenceGate,
     application_scheduler: Scheduler,
     runtime_operations: RuntimeOperationCoordinator,
 }
@@ -81,6 +82,7 @@ impl AppState {
             account_operations.clone(),
         );
         let background_sync_gate = BackgroundSyncGate::default();
+        let export_preference_gate = ExportPreferenceGate::default();
         let items = ItemRepository::new(pool.clone());
         let import_service = ImportService::new(items.clone(), paths.clone());
         let item_service = ItemService::new(items.clone(), paths.clone());
@@ -112,6 +114,7 @@ impl AppState {
             export_coordinator: ExportCoordinator::default(),
             preview_coordinator: PreviewCoordinator::default(),
             background_sync_gate,
+            export_preference_gate,
             application_scheduler,
             runtime_operations: RuntimeOperationCoordinator::default(),
         }
@@ -135,16 +138,18 @@ impl AppState {
             self.gateway.clone(),
             self.credentials.clone(),
             self.background_sync_gate.clone(),
+            self.export_preference_gate.clone(),
             self.account_operations.clone(),
             self.account_saves.clone(),
         )
     }
 
     pub fn export_service(&self) -> ExportService {
-        ExportService::new(
+        ExportService::with_preference_gate(
             self.pool.clone(),
             self.paths.clone(),
             self.export_coordinator.clone(),
+            self.export_preference_gate.clone(),
         )
     }
 

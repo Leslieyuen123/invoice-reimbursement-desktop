@@ -81,6 +81,25 @@ fn app_paths_reject_a_storage_subdirectory_symlink_escape() {
 
 #[cfg(unix)]
 #[test]
+fn custom_export_root_rejects_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let real = directory.path().join("real-exports");
+    let linked = directory.path().join("linked-exports");
+    fs::create_dir(&real).unwrap();
+    symlink(&real, &linked).unwrap();
+
+    let error = paths
+        .for_export_directory(linked.to_str().unwrap())
+        .unwrap_err();
+
+    assert!(matches!(error, AppError::Validation { ref field, .. } if field == "export_directory"));
+}
+
+#[cfg(unix)]
+#[test]
 fn storage_directories_and_original_files_are_private() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -42,4 +42,5 @@ export const queryKeys = {
     ] as const,
   mailboxAccounts: ["invoice-reimbursement", "mailbox-accounts"] as const,
   preferences: ["invoice-reimbursement", "preferences"] as const,
+  storageStatus: ["invoice-reimbursement", "storage-status"] as const,
 };

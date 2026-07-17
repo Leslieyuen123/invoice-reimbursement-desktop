@@ -12,16 +12,8 @@ import { BatchDetailPage } from "../features/batches/BatchDetailPage";
 import { BatchListPage } from "../features/batches/BatchListPage";
 import { CreateBatchDialog } from "../features/batches/CreateBatchDialog";
 import { InboxPage } from "../features/inbox/InboxPage";
+import { SettingsPage } from "../features/settings/SettingsPage";
 import { AppShell } from "./AppShell";
-
-function PlaceholderPage({ title }: { title: string }) {
-  return (
-    <section className="placeholder-page">
-      <h1>{title}</h1>
-      <div className="placeholder-empty">暂无可显示内容</div>
-    </section>
-  );
-}
 
 export function App() {
   const [queryClient] = useState(
@@ -47,7 +39,7 @@ export function App() {
             <Route path="batches" element={<BatchListPage />} />
             <Route path="batches/new" element={<CreateBatchDialog />} />
             <Route path="batches/:batchId" element={<BatchDetailPage />} />
-            <Route path="settings" element={<PlaceholderPage title="设置" />} />
+            <Route path="settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

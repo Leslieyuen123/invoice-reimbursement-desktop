@@ -68,6 +68,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "delete_mailbox_account",
     "get_preferences",
     "save_preferences",
+    "get_storage_status",
     "sync_account_now",
 ];
 
@@ -95,6 +96,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
         settings::ipc::delete_mailbox_account,
         settings::ipc::get_preferences,
         settings::ipc::save_preferences,
+        settings::ipc::get_storage_status,
         sync::ipc::sync_account_now,
     ]
 }
