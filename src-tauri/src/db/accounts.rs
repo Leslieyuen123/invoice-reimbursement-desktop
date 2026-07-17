@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::domain::error::{AppError, sanitize_message};
 
 const ACCOUNT_COLUMNS: &str = "id, provider, email, imap_host, imap_port, enabled, \
-    sync_interval_minutes, last_synced_at, last_error, created_at, updated_at";
+    sync_interval_minutes, last_synced_at, last_error, last_error_at, created_at, updated_at";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +28,7 @@ pub struct MailboxAccount {
     pub sync_interval_minutes: i64,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    pub last_error_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -369,7 +370,8 @@ impl MailboxAccountRepository {
             .await
             .map_err(|error| map_database_error("failed to clear mailbox retry state", error))?;
         let result = sqlx::query(
-            "UPDATE mailbox_accounts SET last_error = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE mailbox_accounts SET last_error = NULL, last_error_at = NULL, \
+                updated_at = ? WHERE id = ?",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(account_id.to_string())
@@ -525,8 +527,8 @@ impl MailboxAccountRepository {
             .await
             .map_err(|error| map_database_error("failed to update sync cursor", error))?;
             let account_update = sqlx::query(
-                "UPDATE mailbox_accounts SET last_synced_at = ?, last_error = NULL, updated_at = ? \
-                 WHERE id = ?",
+                "UPDATE mailbox_accounts SET last_synced_at = ?, last_error = NULL, \
+                    last_error_at = NULL, updated_at = ? WHERE id = ?",
             )
             .bind(&now)
             .bind(&now)
@@ -580,9 +582,11 @@ impl MailboxAccountRepository {
                 });
             }
             let account_update = sqlx::query(
-                "UPDATE mailbox_accounts SET last_error = ?, updated_at = ? WHERE id = ?",
+                "UPDATE mailbox_accounts SET last_error = ?, last_error_at = ?, \
+                    updated_at = ? WHERE id = ?",
             )
             .bind(&message)
+            .bind(&now)
             .bind(&now)
             .bind(run.account_id.to_string())
             .execute(&mut *transaction)
@@ -616,14 +620,18 @@ async fn update_last_error_in_transaction(
     updated_at: &str,
 ) -> Result<(), AppError> {
     let message = message.map(sanitize_error_message);
-    let result =
-        sqlx::query("UPDATE mailbox_accounts SET last_error = ?, updated_at = ? WHERE id = ?")
-            .bind(message)
-            .bind(updated_at)
-            .bind(account_id.to_string())
-            .execute(&mut **transaction)
-            .await
-            .map_err(|error| map_database_error("failed to update mailbox error", error))?;
+    let last_error_at = message.as_ref().map(|_| updated_at);
+    let result = sqlx::query(
+        "UPDATE mailbox_accounts SET last_error = ?, last_error_at = ?, updated_at = ? \
+         WHERE id = ?",
+    )
+    .bind(message)
+    .bind(last_error_at)
+    .bind(updated_at)
+    .bind(account_id.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| map_database_error("failed to update mailbox error", error))?;
     if result.rows_affected() != 1 {
         return Err(account_not_found(account_id));
     }
@@ -665,6 +673,7 @@ struct DbMailboxAccountRow {
     sync_interval_minutes: i64,
     last_synced_at: Option<String>,
     last_error: Option<String>,
+    last_error_at: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -704,6 +713,7 @@ impl TryFrom<DbMailboxAccountRow> for MailboxAccount {
             sync_interval_minutes: row.sync_interval_minutes,
             last_synced_at: parse_optional_datetime(row.last_synced_at, "last_synced_at")?,
             last_error: row.last_error,
+            last_error_at: parse_optional_datetime(row.last_error_at, "last_error_at")?,
             created_at: parse_datetime(&row.created_at, "created_at")?,
             updated_at: parse_datetime(&row.updated_at, "updated_at")?,
         })

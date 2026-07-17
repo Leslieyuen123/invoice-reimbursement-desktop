@@ -67,6 +67,10 @@
   background: var(--panel);
 }
 
+.settings-add-account {
+  justify-self: start;
+}
+
 .settings-empty + .mailbox-account-form {
   border-radius: 0 0 var(--panel-radius) var(--panel-radius);
 }

@@ -343,12 +343,21 @@ a {
   background: rgba(193, 154, 99, 0.07);
 }
 
+.app-error-banner[data-kind="unknown"] {
+  border-left-color: var(--text-secondary);
+  background: var(--panel);
+}
+
 .app-error-banner > svg {
   color: var(--danger);
 }
 
 .app-error-banner[data-kind="network"] > svg {
   color: var(--warning);
+}
+
+.app-error-banner[data-kind="unknown"] > svg {
+  color: var(--text-secondary);
 }
 
 .app-error-copy {

@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Check, LoaderCircle, Save, TestTube2 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
@@ -45,8 +45,10 @@ function errorMessage(error: unknown) {
 
 export function MailboxAccountForm({
   account,
+  onSaved,
 }: {
   account?: MailboxAccountDto;
+  onSaved?: () => void;
 }) {
   const queryClient = useQueryClient();
   const initialProvider = account?.provider ?? "gmail";
@@ -63,7 +65,8 @@ export function MailboxAccountForm({
   const [syncIntervalMinutes, setSyncIntervalMinutes] = useState(
     String(account?.syncIntervalMinutes ?? 15),
   );
-  const [testedSignature, setTestedSignature] = useState<string | null>(null);
+  const connectionRevision = useRef(0);
+  const [testedRevision, setTestedRevision] = useState<number | null>(null);
   const [saved, setSaved] = useState(false);
 
   const connectionInput = useMemo<TestMailboxAccountInputDto>(
@@ -77,7 +80,6 @@ export function MailboxAccountForm({
     }),
     [account?.id, email, imapHost, imapPort, provider, secret],
   );
-  const connectionSignature = JSON.stringify(connectionInput);
   const interval = Number(syncIntervalMinutes);
   const connectionIsValid =
     email.trim().length > 0 &&
@@ -90,10 +92,13 @@ export function MailboxAccountForm({
     Number.isInteger(interval) && interval >= 5 && interval <= 1_440;
 
   const testMutation = useMutation({
-    mutationFn: () => api.testMailboxAccount(connectionInput),
-    onSuccess: () => {
-      setTestedSignature(connectionSignature);
-      setSaved(false);
+    mutationFn: ({ input }: { input: TestMailboxAccountInputDto; revision: number }) =>
+      api.testMailboxAccount(input),
+    onSuccess: (_, attempt) => {
+      if (attempt.revision === connectionRevision.current) {
+        setTestedRevision(attempt.revision);
+        setSaved(false);
+      }
     },
   });
   const saveMutation = useMutation({
@@ -107,6 +112,7 @@ export function MailboxAccountForm({
     },
     onSuccess: async () => {
       setSaved(true);
+      onSaved?.();
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.mailboxAccounts }),
         queryClient.invalidateQueries({ queryKey: queryKeys.dashboard }),
@@ -115,10 +121,17 @@ export function MailboxAccountForm({
   });
 
   function selectProvider(nextProvider: MailboxProvider) {
+    invalidateConnectionTest();
     setProvider(nextProvider);
     setImapHost(PROVIDER_DEFAULTS[nextProvider].host);
     setImapPort(String(PROVIDER_DEFAULTS[nextProvider].port));
+  }
+
+  function invalidateConnectionTest() {
+    connectionRevision.current += 1;
+    setTestedRevision(null);
     setSaved(false);
+    testMutation.reset();
   }
 
   return (
@@ -129,7 +142,7 @@ export function MailboxAccountForm({
       tabIndex={-1}
       onSubmit={(event) => {
         event.preventDefault();
-        if (testedSignature === connectionSignature && settingsAreValid) {
+        if (testedRevision === connectionRevision.current && settingsAreValid) {
           saveMutation.mutate();
         }
       }}
@@ -154,8 +167,8 @@ export function MailboxAccountForm({
             type="email"
             value={email}
             onChange={(event) => {
+              invalidateConnectionTest();
               setEmail(event.target.value);
-              setSaved(false);
             }}
             autoComplete="email"
           />
@@ -167,8 +180,8 @@ export function MailboxAccountForm({
             type="password"
             value={secret}
             onChange={(event) => {
+              invalidateConnectionTest();
               setSecret(event.target.value);
-              setSaved(false);
             }}
             autoComplete="new-password"
             placeholder={account ? "留空以保留钥匙串中的密码" : undefined}
@@ -191,8 +204,8 @@ export function MailboxAccountForm({
               <input
                 value={imapHost}
                 onChange={(event) => {
+                  invalidateConnectionTest();
                   setImapHost(event.target.value);
-                  setSaved(false);
                 }}
                 autoComplete="off"
               />
@@ -205,8 +218,8 @@ export function MailboxAccountForm({
                 max="65535"
                 value={imapPort}
                 onChange={(event) => {
+                  invalidateConnectionTest();
                   setImapPort(event.target.value);
-                  setSaved(false);
                 }}
               />
             </label>
@@ -240,7 +253,12 @@ export function MailboxAccountForm({
           className="button button-secondary"
           type="button"
           disabled={!connectionIsValid || testMutation.isPending}
-          onClick={() => testMutation.mutate()}
+          onClick={() =>
+            testMutation.mutate({
+              input: connectionInput,
+              revision: connectionRevision.current,
+            })
+          }
         >
           {testMutation.isPending ? (
             <LoaderCircle size={15} aria-hidden="true" />
@@ -253,7 +271,7 @@ export function MailboxAccountForm({
           className="button button-primary"
           type="submit"
           disabled={
-            testedSignature !== connectionSignature ||
+            testedRevision !== connectionRevision.current ||
             !settingsAreValid ||
             saveMutation.isPending
           }
@@ -262,7 +280,7 @@ export function MailboxAccountForm({
           保存账号
         </button>
         <span className="mailbox-form-feedback" aria-live="polite">
-          {testMutation.isSuccess && testedSignature === connectionSignature ? (
+          {testMutation.isSuccess && testedRevision === connectionRevision.current ? (
             <><Check size={14} aria-hidden="true" />连接成功</>
           ) : null}
           {saved ? "账号已保存" : null}

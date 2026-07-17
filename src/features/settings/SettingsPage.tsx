@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, FolderOpen, HardDrive, Mail, Save } from "lucide-react";
+import { AlertTriangle, FolderOpen, HardDrive, Mail, Plus, Save } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
@@ -26,6 +26,7 @@ export function SettingsPage() {
   });
   const [backgroundSyncEnabled, setBackgroundSyncEnabled] = useState(true);
   const [exportDirectory, setExportDirectory] = useState("exports");
+  const [isAddingAccount, setIsAddingAccount] = useState(false);
 
   useEffect(() => {
     if (preferencesQuery.data) {
@@ -128,7 +129,20 @@ export function SettingsPage() {
         {accounts.map((account) => (
           <MailboxAccountForm key={account.id} account={account} />
         ))}
-        {accounts.length === 0 ? <MailboxAccountForm /> : null}
+        {accounts.length === 0 || isAddingAccount ? (
+          <MailboxAccountForm
+            onSaved={isAddingAccount ? () => setIsAddingAccount(false) : undefined}
+          />
+        ) : (
+          <button
+            className="button button-secondary settings-add-account"
+            type="button"
+            onClick={() => setIsAddingAccount(true)}
+          >
+            <Plus size={15} aria-hidden="true" />
+            添加邮箱账号
+          </button>
+        )}
       </section>
 
       <section className="settings-section" aria-labelledby="runtime-settings-title">

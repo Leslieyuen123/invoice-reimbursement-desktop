@@ -53,6 +53,29 @@ fn tray_tooltip(pending_confirmation_count: u64) -> String {
     format!("发票报销，{pending_confirmation_count} 张待确认")
 }
 
+fn apply_tray_tooltip<E>(
+    pending_confirmation_count: u64,
+    set_tooltip: impl FnOnce(String) -> Result<(), E>,
+) -> Result<(), E> {
+    set_tooltip(tray_tooltip(pending_confirmation_count))
+}
+
+pub(crate) fn refresh_tray_tooltip<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    pending_confirmation_count: u64,
+) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    if apply_tray_tooltip(pending_confirmation_count, |tooltip| {
+        tray.set_tooltip(Some(tooltip))
+    })
+    .is_err()
+    {
+        tracing::warn!("failed to refresh tray pending-confirmation tooltip");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -157,15 +180,7 @@ fn sync_all_enabled_accounts<R: Runtime>(app: tauri::AppHandle<R>) {
             }
         }
         match state.dashboard_service().load().await {
-            Ok(snapshot) => {
-                if let Some(tray) = app.tray_by_id(TRAY_ID)
-                    && tray
-                        .set_tooltip(Some(tray_tooltip(snapshot.counts.pending_confirmation)))
-                        .is_err()
-                {
-                    tracing::warn!("failed to refresh tray pending-confirmation tooltip");
-                }
-            }
+            Ok(snapshot) => refresh_tray_tooltip(&app, snapshot.counts.pending_confirmation),
             Err(_) => tracing::warn!("failed to refresh tray status after sync all"),
         }
     });
@@ -263,5 +278,18 @@ mod tests {
             Some(super::TrayAction::Exit)
         );
         assert_eq!(super::tray_tooltip(4), "发票报销，4 张待确认");
+    }
+
+    #[test]
+    fn tray_refresh_applies_the_current_pending_count_to_the_runtime_setter() {
+        let mut applied = None;
+
+        super::apply_tray_tooltip(7, |tooltip| {
+            applied = Some(tooltip);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(applied.as_deref(), Some("发票报销，7 张待确认"));
     }
 }

@@ -198,6 +198,7 @@ export function InboxPage() {
 
   function invalidateItemLists() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
   }
 
   function updateItem(item: InvoiceItemDto, sessionId: number) {

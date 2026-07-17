@@ -1349,6 +1349,11 @@ async fn credential_delete_failure_leaves_account_disabled_and_recoverable() {
         .save_account(save_input(None, "delete-fails@example.com", "old-secret"))
         .await
         .unwrap();
+    let failed_at = Utc.with_ymd_and_hms(2026, 7, 17, 9, 45, 0).unwrap();
+    MailboxAccountRepository::new(pool.clone())
+        .suspend_retry(account.id, failed_at, "authentication failed")
+        .await
+        .unwrap();
     credentials.delete_fails(true);
 
     service.delete_account(account.id).await.unwrap_err();
@@ -1358,6 +1363,7 @@ async fn credential_delete_failure_leaves_account_disabled_and_recoverable() {
         .await
         .unwrap();
     assert!(!persisted.enabled);
+    assert_eq!(persisted.last_error_at, Some(failed_at));
     assert_eq!(
         credentials.get(&account.id.to_string()).unwrap(),
         Some("old-secret".to_owned())
@@ -2048,11 +2054,16 @@ async fn successful_manual_sync_clears_retry_state_and_last_error() {
     scheduler.tick(start).await.unwrap();
     assert!(scheduler.retry_state(account_id).await.unwrap().is_some());
     assert!(accounts.get(account_id).await.unwrap().last_error.is_some());
+    assert_eq!(
+        accounts.get(account_id).await.unwrap().last_error_at,
+        Some(start)
+    );
 
     scheduler.sync_now(account_id).await.unwrap();
 
     assert_eq!(scheduler.retry_state(account_id).await.unwrap(), None);
     assert_eq!(accounts.get(account_id).await.unwrap().last_error, None);
+    assert_eq!(accounts.get(account_id).await.unwrap().last_error_at, None);
 }
 
 #[tokio::test]
@@ -2706,7 +2717,20 @@ async fn legacy_committed_marker_migrates_and_cleans_without_live_account_depend
     through_0005.run(&pool).await.unwrap();
     let credentials = Arc::new(MemoryCredentialStore::default());
     let accounts = MailboxAccountRepository::new(pool.clone());
-    let account_id = insert_account(&accounts, "committed@example.com", true).await;
+    let account_id = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO mailbox_accounts (\
+            id, provider, email, imap_host, imap_port, enabled, sync_interval_minutes, \
+            created_at, updated_at\
+         ) VALUES (?, 'gmail', 'committed@example.com', 'imap.gmail.com', 993, 1, 15, ?, ?)",
+    )
+    .bind(account_id.to_string())
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
     let operation_id = Uuid::new_v4();
     insert_pending_save(
         &pool,

@@ -36,15 +36,30 @@ pub async fn load(state: &AppState) -> Result<DashboardDto, AppError> {
     })
 }
 
-pub(crate) mod ipc {
-    use tauri::State;
+pub async fn load_and_publish(
+    state: &AppState,
+    publish_pending_count: impl FnOnce(u64),
+) -> Result<DashboardDto, AppError> {
+    let dashboard = load(state).await?;
+    publish_pending_count(dashboard.pending_confirmation_count);
+    Ok(dashboard)
+}
 
-    use super::{DashboardDto, load};
+pub(crate) mod ipc {
+    use tauri::{AppHandle, Runtime, State};
+
+    use super::{DashboardDto, load_and_publish};
     use crate::domain::error::AppError;
     use crate::state::AppState;
 
     #[tauri::command]
-    pub async fn get_dashboard(state: State<'_, AppState>) -> Result<DashboardDto, AppError> {
-        load(&state).await
+    pub async fn get_dashboard<R: Runtime>(
+        app: AppHandle<R>,
+        state: State<'_, AppState>,
+    ) -> Result<DashboardDto, AppError> {
+        load_and_publish(&state, |pending_count| {
+            crate::refresh_tray_tooltip(&app, pending_count);
+        })
+        .await
     }
 }

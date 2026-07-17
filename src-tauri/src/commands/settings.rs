@@ -41,10 +41,7 @@ impl MailboxAccountDto {
             Some(_) => MailboxErrorKind::Network,
             None => MailboxErrorKind::Unknown,
         });
-        let last_error_at = account
-            .last_error
-            .as_ref()
-            .map(|_| account.updated_at.to_rfc3339());
+        let last_error_at = account.last_error_at.map(|value| value.to_rfc3339());
         Self {
             id: account.id.to_string(),
             provider: account.provider,

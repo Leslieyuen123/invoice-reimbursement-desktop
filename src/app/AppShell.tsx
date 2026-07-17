@@ -13,6 +13,8 @@ import { queryKeys } from "../lib/queryKeys";
 import { AppErrorBanner } from "../components/AppErrorBanner";
 import "./AppShell.css";
 
+const DASHBOARD_REFRESH_INTERVAL_MS = 15_000;
+
 const navigation = [
   { to: "/", label: "控制台", icon: LayoutDashboard, end: true },
   { to: "/inbox", label: "待处理池", icon: Inbox, end: false },
@@ -34,6 +36,8 @@ export function AppShell() {
   const dashboardQuery = useQuery({
     queryKey: queryKeys.dashboard,
     queryFn: api.getDashboard,
+    refetchInterval: DASHBOARD_REFRESH_INTERVAL_MS,
+    refetchIntervalInBackground: true,
   });
   const activeSyncs = useIsMutating({ mutationKey: ["sync-accounts"] });
   const requiresAttention =

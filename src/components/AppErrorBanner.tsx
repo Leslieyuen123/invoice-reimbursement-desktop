@@ -42,6 +42,12 @@ export function AppErrorBanner({ accounts }: { accounts: MailboxAccountDto[] }) 
     <div className="app-error-banners">
       {failedAccounts.map((account) => {
         const isNetwork = account.lastErrorKind === "network";
+        const isAuthentication = account.lastErrorKind === "authentication";
+        const bannerTitle = isNetwork
+          ? "邮箱网络连接失败"
+          : isAuthentication
+            ? "邮箱授权失效"
+            : "邮箱同步失败";
         const isRetrying =
           retryMutation.isPending && retryMutation.variables === account.id;
         return (
@@ -49,21 +55,21 @@ export function AppErrorBanner({ accounts }: { accounts: MailboxAccountDto[] }) 
             className="app-error-banner"
             data-kind={account.lastErrorKind}
             role="alert"
-            aria-label={isNetwork ? "邮箱网络连接失败" : "邮箱授权失效"}
+            aria-label={bannerTitle}
             key={account.id}
           >
-            {isNetwork ? (
-              <AlertTriangle size={17} aria-hidden="true" />
-            ) : (
+            {isAuthentication ? (
               <KeyRound size={17} aria-hidden="true" />
+            ) : (
+              <AlertTriangle size={17} aria-hidden="true" />
             )}
             <div className="app-error-copy">
-              <strong>{isNetwork ? "邮箱网络连接失败" : "邮箱授权失效"}</strong>
+              <strong>{bannerTitle}</strong>
               <span>
                 {account.email}
-                {isNetwork
-                  ? `，上次失败 ${formatFailureTime(account.lastErrorAt)}`
-                  : "，请更新授权信息后恢复同步"}
+                {isAuthentication
+                  ? "，请更新授权信息后恢复同步"
+                  : `，上次失败 ${formatFailureTime(account.lastErrorAt)}`}
               </span>
             </div>
             {isNetwork ? (
@@ -81,7 +87,7 @@ export function AppErrorBanner({ accounts }: { accounts: MailboxAccountDto[] }) 
                 className="button button-secondary"
                 to={`/settings?account=${encodeURIComponent(account.id)}`}
               >
-                前往账号设置
+                {isAuthentication ? "前往账号设置" : "检查账号设置"}
               </Link>
             )}
           </div>

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -119,7 +119,7 @@ describe("Settings page", () => {
     });
   });
 
-  it("preserves an existing keychain secret and invalidates a tested connection after edits", async () => {
+  it("preserves an existing keychain secret and requires another test after fields change and revert", async () => {
     const user = userEvent.setup();
     mockSettingsCommands();
     mockCommand("list_mailbox_accounts", [accountFixture]);
@@ -142,12 +142,42 @@ describe("Settings page", () => {
 
     await user.clear(screen.getByLabelText("邮箱地址"));
     await user.type(screen.getByLabelText("邮箱地址"), accountFixture.email);
+    expect(screen.getByRole("button", { name: "保存账号" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(await screen.findByText("连接成功")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "保存账号" }));
     await waitFor(() => expect(commandCalls("save_mailbox_account")).toHaveLength(1));
     expect(commandCalls("save_mailbox_account")[0]).toMatchObject({
       id: accountFixture.id,
       secret: "",
     });
+  });
+
+  it("ignores a successful connection test when fields change while it is pending", async () => {
+    const user = userEvent.setup();
+    let resolveConnection!: () => void;
+    const pendingConnection = new Promise<void>((resolve) => {
+      resolveConnection = resolve;
+    });
+    mockSettingsCommands();
+    mockCommand("list_mailbox_accounts", [accountFixture]);
+    mockCommand("test_mailbox_account", () => pendingConnection);
+
+    renderAppAt("/settings");
+
+    await screen.findByLabelText("邮箱地址");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    await waitFor(() => expect(commandCalls("test_mailbox_account")).toHaveLength(1));
+    await user.clear(screen.getByLabelText("邮箱地址"));
+    await user.type(screen.getByLabelText("邮箱地址"), "new@gmail.com");
+
+    await act(async () => {
+      resolveConnection();
+      await pendingConnection;
+    });
+
+    expect(screen.queryByText("连接成功")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存账号" })).toBeDisabled();
   });
 
   it("applies QQ defaults, opens credential help, and enforces sync interval bounds", async () => {
@@ -176,6 +206,41 @@ describe("Settings page", () => {
     await user.type(screen.getByLabelText("同步间隔（分钟）"), "5");
     expect(screen.getByRole("button", { name: "保存账号" })).toBeEnabled();
     expect(screen.getByRole("switch", { name: "启用此账号" })).toBeChecked();
+  });
+
+  it("adds another mailbox account and closes the temporary form after saving", async () => {
+    const user = userEvent.setup();
+    mockSettingsCommands();
+    mockCommand("list_mailbox_accounts", [accountFixture]);
+    mockCommand("test_mailbox_account", undefined);
+    mockCommand("save_mailbox_account", {
+      ...accountFixture,
+      id: "account-qq",
+      provider: "qq",
+      email: "finance@qq.com",
+      imapHost: "imap.qq.com",
+    });
+
+    renderAppAt("/settings");
+
+    await screen.findByRole("form", { name: accountFixture.email });
+    expect(screen.queryByRole("form", { name: "新邮箱账号" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "添加邮箱账号" }));
+    const newAccountForm = screen.getByRole("form", { name: "新邮箱账号" });
+    await user.selectOptions(within(newAccountForm).getByLabelText("邮箱类型"), "qq");
+    await user.type(within(newAccountForm).getByLabelText("邮箱地址"), "finance@qq.com");
+    await user.type(
+      within(newAccountForm).getByLabelText("应用专用密码"),
+      "authorization-code",
+    );
+    await user.click(within(newAccountForm).getByRole("button", { name: "测试连接" }));
+    await within(newAccountForm).findByText("连接成功");
+    await user.click(within(newAccountForm).getByRole("button", { name: "保存账号" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("form", { name: "新邮箱账号" })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: "添加邮箱账号" })).toBeInTheDocument();
   });
 
   it("shows storage status and saves the selected future export directory", async () => {
@@ -251,6 +316,83 @@ describe("Settings page", () => {
 
     const form = await screen.findByRole("form", { name: accountFixture.email });
     await waitFor(() => expect(form).toHaveFocus());
+  });
+
+  it("polls the dashboard so a durable mailbox failure appears without remounting", async () => {
+    vi.useFakeTimers();
+    try {
+      let failed = false;
+      mockSettingsCommands();
+      mockCommand("get_dashboard", () => ({
+        mailboxAccounts: failed
+          ? [
+              {
+                ...accountFixture,
+                lastError: "IMAP authentication failed",
+                lastErrorKind: "authentication",
+                lastErrorAt: "2026-07-17T09:40:00+08:00",
+              },
+            ]
+          : [accountFixture],
+        recentlyAddedCount: 0,
+        pendingConfirmationCount: 0,
+        recognitionFailedCount: 0,
+        suspectedDuplicateCount: 0,
+        recentBatches: [],
+      }));
+
+      renderAppAt("/settings");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(commandCalls("get_dashboard")).toHaveLength(1);
+      expect(
+        screen.queryByRole("alert", { name: "邮箱授权失效" }),
+      ).not.toBeInTheDocument();
+
+      failed = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+
+      expect(commandCalls("get_dashboard")).toHaveLength(2);
+      expect(
+        screen.getByRole("alert", { name: "邮箱授权失效" }),
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows unknown mailbox errors without claiming authorization failed", async () => {
+    mockSettingsCommands();
+    mockCommand("get_dashboard", {
+      mailboxAccounts: [
+        {
+          ...accountFixture,
+          lastError: "IMAP configuration failed",
+          lastErrorKind: "unknown",
+          lastErrorAt: "2026-07-17T09:40:00+08:00",
+        },
+      ],
+      recentlyAddedCount: 0,
+      pendingConfirmationCount: 0,
+      recognitionFailedCount: 0,
+      suspectedDuplicateCount: 0,
+      recentBatches: [],
+    });
+
+    renderAppAt("/");
+
+    const banner = await screen.findByRole("alert", { name: "邮箱同步失败" });
+    expect(banner).toHaveTextContent("2026/07/17");
+    expect(banner).not.toHaveTextContent("邮箱授权失效");
+    expect(
+      within(banner).getByRole("link", { name: "检查账号设置" }),
+    ).toHaveAttribute("href", `/settings?account=${accountFixture.id}`);
   });
 
   it("retries the exact network-failed account and clears durable error queries", async () => {

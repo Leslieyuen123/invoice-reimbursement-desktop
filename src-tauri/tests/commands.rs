@@ -194,6 +194,21 @@ async fn dashboard_counts_are_derived_from_persisted_state() {
 }
 
 #[tokio::test]
+async fn every_dashboard_response_publishes_its_pending_count() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let published = std::sync::Mutex::new(Vec::new());
+
+    let dto = dashboard::load_and_publish(&app.state, |count| {
+        published.lock().unwrap().push(count);
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(dto.pending_confirmation_count, 2);
+    assert_eq!(*published.lock().unwrap(), vec![2]);
+}
+
+#[tokio::test]
 async fn dashboard_is_zeroed_for_a_new_installation() {
     let directory = tempfile::tempdir().unwrap();
     let paths = AppPaths::create(directory.path().join("storage")).unwrap();

@@ -184,6 +184,62 @@ async fn migrations_upgrade_database_through_0004_with_pending_account_saves() {
 }
 
 #[tokio::test]
+async fn migration_backfills_error_time_only_from_durable_retry_state() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let current = sqlx::migrate!("./migrations");
+    let through_0008 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(current.iter().take(8).cloned().collect()),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0008.run(&pool).await.unwrap();
+    let retry_account = Uuid::new_v4();
+    let unknown_account = Uuid::new_v4();
+    insert_mailbox_account(&pool, retry_account).await;
+    insert_mailbox_account(&pool, unknown_account).await;
+    sqlx::query(
+        "UPDATE mailbox_accounts SET last_error = 'failed', updated_at = ? WHERE id IN (?, ?)",
+    )
+    .bind("2026-07-17T12:00:00Z")
+    .bind(retry_account.to_string())
+    .bind(unknown_account.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sync_retry_states \
+         (account_id, failures, next_retry_at, suspended, updated_at) \
+         VALUES (?, 1, '2026-07-17T09:41:00Z', 0, '2026-07-17T09:40:00Z')",
+    )
+    .bind(retry_account.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    current.run(&pool).await.unwrap();
+
+    let retry_error_at = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT last_error_at FROM mailbox_accounts WHERE id = ?",
+    )
+    .bind(retry_account.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let unknown_error_at = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT last_error_at FROM mailbox_accounts WHERE id = ?",
+    )
+    .bind(unknown_account.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry_error_at.as_deref(), Some("2026-07-17T09:40:00Z"));
+    assert_eq!(unknown_error_at, None);
+}
+
+#[tokio::test]
 async fn connect_enables_foreign_key_enforcement() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -2010,6 +2066,33 @@ async fn mailbox_account_repository_inserts_gets_lists_and_round_trips_providers
         missing_error,
         AppError::NotFound { ref entity, .. } if entity == "mailbox_account"
     ));
+}
+
+#[tokio::test]
+async fn mailbox_error_time_survives_an_unrelated_enabled_update() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = MailboxAccountRepository::new(pool);
+    let account = repository
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "timestamp@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let failed_at = Utc.with_ymd_and_hms(2026, 7, 17, 9, 40, 0).unwrap();
+    repository
+        .record_retryable_failure(account.id, failed_at, "network timeout")
+        .await
+        .unwrap();
+
+    repository.set_enabled(account.id, false).await.unwrap();
+
+    let persisted = repository.get(account.id).await.unwrap();
+    assert_eq!(persisted.last_error_at, Some(failed_at));
 }
 
 #[tokio::test]

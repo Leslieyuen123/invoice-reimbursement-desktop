@@ -137,6 +137,54 @@ describe("InboxPage", () => {
     expect(commandCalls("review_item")[0].amountCents).toBe(12850);
   });
 
+  it("invalidates the dashboard after reviewing an item", async () => {
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+    mockCommand(
+      "review_item",
+      pendingInvoiceFixture({ status: "ready", confirmationStatus: "confirmed" }),
+    );
+
+    renderInboxAt("/inbox?status=pending_confirmation", queryClient);
+    await user.click(await screen.findByRole("button", { name: "出租车电子发票.pdf" }));
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+
+    await waitFor(() => expect(commandCalls("review_item")).toHaveLength(1));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.dashboard });
+  });
+
+  it("invalidates the dashboard after importing an item", async () => {
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    const path = "/Users/finance/新发票.pdf";
+    mockCommand("list_items", { items: [], nextCursor: null });
+    openDialogMock.mockResolvedValue([path]);
+    mockCommand("import_manual_files", [
+      {
+        status: "imported" as const,
+        path,
+        item: pendingInvoiceFixture({ sourceType: "manual_upload" }),
+      },
+    ]);
+
+    renderInboxAt("/inbox", queryClient);
+    await screen.findByText("当前筛选下没有票据");
+    await user.click(screen.getByRole("button", { name: "选择文件" }));
+
+    await screen.findByText("已导入：新发票.pdf");
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.dashboard });
+  });
+
   it("resets bounded pagination when a filter changes", async () => {
     const user = userEvent.setup();
     mockCommand("get_dashboard", new Promise(() => undefined));
