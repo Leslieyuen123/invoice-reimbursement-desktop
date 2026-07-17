@@ -555,10 +555,13 @@ export function BatchDetailPage() {
                 ref={removeCancelRef}
                 type="button"
                 className="button button-secondary"
+                aria-disabled={removePending || undefined}
                 autoFocus
-                onClick={() => closeRemoveDialog()}
+                onClick={() => {
+                  if (!removePending) closeRemoveDialog();
+                }}
               >
-                取消
+                {removePending ? "正在移除" : "取消"}
               </button>
               <button
                 type="button"
@@ -566,7 +569,7 @@ export function BatchDetailPage() {
                 disabled={removePending}
                 onClick={() => void confirmRemoval()}
               >
-                {removePending ? "正在移出" : "确认移出"}
+                确认移出
               </button>
             </div>
           </div>
