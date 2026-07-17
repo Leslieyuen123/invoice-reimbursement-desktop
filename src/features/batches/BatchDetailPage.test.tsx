@@ -301,6 +301,32 @@ describe("Batch workspace", () => {
     });
   });
 
+  it("keeps the current route when creation succeeds after cancel", async () => {
+    const user = userEvent.setup();
+    const creation = deferred<BatchDto>();
+    const created = batchFixture({ id: "batch-late", name: "延迟创建批次" });
+    let serverBatches: BatchDto[] = [];
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("create_month_batch", creation.promise);
+    mockCommand("list_batches", () => ({
+      items: serverBatches,
+      nextCursor: null,
+    }));
+
+    renderAppAt("/batches/new");
+    await user.click(screen.getByRole("button", { name: "创建批次" }));
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
+
+    serverBatches = [created];
+    await act(async () => creation.resolve(created));
+
+    expect(window.location.pathname).toBe("/batches");
+    expect(
+      await screen.findByRole("link", { name: /延迟创建批次/ }),
+    ).toBeInTheDocument();
+  });
+
   it("keeps batch history bounded to one stable cursor page", async () => {
     const user = userEvent.setup();
     const nextCursor = {
@@ -534,7 +560,9 @@ describe("Batch workspace", () => {
     const committed = detailFixture([
       { ...candidate.item, batchId: "batch-summer" },
     ]);
-    mockDetail(detailFixture(), [candidate]);
+    let serverDetail = detailFixture();
+    mockDetail(serverDetail, [candidate]);
+    mockCommand("get_batch", () => serverDetail);
     mockCommand("assign_items_to_batch", assignment.promise);
     mockCommand("list_batches", {
       items: [committed.batch],
@@ -552,6 +580,7 @@ describe("Batch workspace", () => {
     await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
     expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
 
+    serverDetail = committed;
     await act(async () => assignment.resolve(committed));
     await user.click(
       await screen.findByRole("link", { name: /6-8 月整理批次/ }),
@@ -562,7 +591,7 @@ describe("Batch workspace", () => {
         "高铁电子发票.pdf",
       ),
     ).toBeInTheDocument();
-    expect(commandCalls("get_batch")).toHaveLength(1);
+    expect(commandCalls("get_batch")).toHaveLength(2);
   });
 
   it("refreshes reopened candidates after a pending assignment commits", async () => {
@@ -605,6 +634,67 @@ describe("Batch workspace", () => {
     expect(commandCalls("list_batch_candidates")).toHaveLength(3);
   });
 
+  it("uses authoritative detail when assignment responses finish in reverse", async () => {
+    const user = userEvent.setup();
+    const firstAssignment = deferred<BatchDetailDto>();
+    const secondAssignment = deferred<BatchDetailDto>();
+    const first = candidateFixture(itemFixture());
+    const second = candidateFixture(
+      itemFixture({
+        id: "invoice-hotel",
+        originalName: "酒店发票.pdf",
+      }),
+    );
+    let serverDetail = detailFixture([]);
+    let assignmentNumber = 0;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", () => serverDetail);
+    mockCommand("list_batch_candidates", {
+      items: [first, second],
+      nextCursor: null,
+    });
+    mockCommand("assign_items_to_batch", () => {
+      assignmentNumber += 1;
+      return assignmentNumber === 1
+        ? firstAssignment.promise
+        : secondAssignment.promise;
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const firstDialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(firstDialog).findByRole("checkbox", { name: "高铁电子发票.pdf" }),
+    );
+    await user.click(within(firstDialog).getByRole("button", { name: "归属所选票据" }));
+    await user.click(within(firstDialog).getByRole("button", { name: "关闭调整票据" }));
+
+    await user.click(screen.getByRole("button", { name: "调整票据" }));
+    const secondDialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(secondDialog).findByRole("checkbox", { name: "酒店发票.pdf" }),
+    );
+    await user.click(within(secondDialog).getByRole("button", { name: "归属所选票据" }));
+
+    const secondItem = { ...second.item, batchId: "batch-summer" };
+    serverDetail = detailFixture([secondItem]);
+    await act(async () => secondAssignment.resolve(serverDetail));
+    expect(
+      within(await screen.findByRole("region", { name: "已归属票据" })).getByText(
+        "酒店发票.pdf",
+      ),
+    ).toBeInTheDocument();
+
+    const firstItem = { ...first.item, batchId: "batch-summer" };
+    serverDetail = detailFixture([firstItem, secondItem]);
+    await act(async () => firstAssignment.resolve(detailFixture([firstItem])));
+
+    const assignedItems = await screen.findByRole("region", { name: "已归属票据" });
+    expect(within(assignedItems).getByText("高铁电子发票.pdf")).toBeInTheDocument();
+    expect(within(assignedItems).getByText("酒店发票.pdf")).toBeInTheDocument();
+    expect(commandCalls("get_batch")).toHaveLength(3);
+  });
+
   it("reconciles a committed recommendation after route navigation", async () => {
     const user = userEvent.setup();
     const candidate = candidateFixture(itemFixture());
@@ -612,7 +702,9 @@ describe("Batch workspace", () => {
     const committed = detailFixture([
       { ...candidate.item, batchId: "batch-summer" },
     ]);
-    mockDetail(detailFixture(), [candidate]);
+    let serverDetail = detailFixture();
+    mockDetail(serverDetail, [candidate]);
+    mockCommand("get_batch", () => serverDetail);
     mockCommand("assign_items_to_batch", assignment.promise);
     mockCommand("list_batches", {
       items: [committed.batch],
@@ -625,6 +717,7 @@ describe("Batch workspace", () => {
     await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
     expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
 
+    serverDetail = committed;
     await act(async () => assignment.resolve(committed));
     await user.click(
       await screen.findByRole("link", { name: /6-8 月整理批次/ }),
@@ -635,7 +728,7 @@ describe("Batch workspace", () => {
         "高铁电子发票.pdf",
       ),
     ).toBeInTheDocument();
-    expect(commandCalls("get_batch")).toHaveLength(1);
+    expect(commandCalls("get_batch")).toHaveLength(2);
     expect(screen.queryByText("merged.pdf")).not.toBeInTheDocument();
   });
 
@@ -738,7 +831,11 @@ describe("Batch workspace", () => {
     const user = userEvent.setup();
     const removal = deferred<BatchDetailDto>();
     const committed = detailFixture([]);
-    mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
+    let serverDetail = detailFixture([
+      { ...itemFixture(), batchId: "batch-summer" },
+    ]);
+    mockDetail(serverDetail);
+    mockCommand("get_batch", () => serverDetail);
     mockCommand("remove_item_from_batch", removal.promise);
     mockCommand("list_batches", {
       items: [committed.batch],
@@ -755,6 +852,7 @@ describe("Batch workspace", () => {
     await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
     expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
 
+    serverDetail = committed;
     await act(async () => removal.resolve(committed));
     await user.click(
       await screen.findByRole("link", { name: /6-8 月整理批次/ }),
@@ -762,7 +860,7 @@ describe("Batch workspace", () => {
 
     expect(await screen.findByText("尚未归属票据")).toBeInTheDocument();
     expect(screen.queryByText("高铁电子发票.pdf")).not.toBeInTheDocument();
-    expect(commandCalls("get_batch")).toHaveLength(1);
+    expect(commandCalls("get_batch")).toHaveLength(2);
   });
 
   it("keeps pending removal non-dismissible and focus-stable until success", async () => {
@@ -888,6 +986,69 @@ describe("Batch workspace", () => {
     expect(commandCalls("export_batch")).toHaveLength(2);
   });
 
+  it("clears export error feedback when recommendations change content", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(itemFixture());
+    mockDetail(detailFixture(), [candidate]);
+    mockCommand("export_batch", () =>
+      Promise.reject({
+        code: "external",
+        service: "filesystem",
+        retryable: true,
+        message: "旧报销包导出失败",
+      }),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "导出报销包" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("旧报销包导出失败");
+    expect(screen.getByRole("button", { name: "重试导出" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "加入推荐票据" }));
+    expect(
+      within(await screen.findByRole("region", { name: "已归属票据" })).getByText(
+        "高铁电子发票.pdf",
+      ),
+    ).toBeInTheDocument();
+
+    expect(screen.queryByText("旧报销包导出失败")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试导出" })).not.toBeInTheDocument();
+  });
+
+  it("ignores an in-flight export after recommendations change content", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(itemFixture());
+    const exportRequest = deferred<{
+      directory: string;
+      itemCount: number;
+      totalAmountCents: number;
+    }>();
+    mockDetail(detailFixture(), [candidate]);
+    mockCommand("export_batch", exportRequest.promise);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "导出报销包" }));
+    expect(screen.getByRole("button", { name: "正在生成报销文件" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "加入推荐票据" }));
+    expect(
+      within(await screen.findByRole("region", { name: "已归属票据" })).getByText(
+        "高铁电子发票.pdf",
+      ),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      exportRequest.resolve({
+        directory: "/Users/finance/stale-export",
+        itemCount: 0,
+        totalAmountCents: 0,
+      });
+    });
+
+    expect(screen.getByRole("button", { name: "导出报销包" })).toBeEnabled();
+    expect(screen.queryByText("merged.pdf")).not.toBeInTheDocument();
+  });
+
   it("shows a deterministic export stage and reports reveal failures safely", async () => {
     const user = userEvent.setup();
     const exportRequest = deferred<{
@@ -913,6 +1074,121 @@ describe("Batch workspace", () => {
     expect(await screen.findByText(/¥90071992547409\.91/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "在文件夹中显示" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("无法在文件夹中显示");
+  });
+
+  it("clears reveal feedback when removal changes content", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
+    mockCommand("export_batch", {
+      directory: "/Users/finance/old-export",
+      itemCount: 1,
+      totalAmountCents: 12_850,
+    });
+    revealMock.mockRejectedValue(new Error("Finder unavailable"));
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "导出报销包" }));
+    await user.click(await screen.findByRole("button", { name: "在文件夹中显示" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法在文件夹中显示");
+
+    await user.click(screen.getByRole("button", { name: "移出 高铁电子发票.pdf" }));
+    const confirmation = screen.getByRole("dialog", { name: "确认移出票据" });
+    await user.click(within(confirmation).getByRole("button", { name: "确认移出" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "确认移出票据" })).not.toBeInTheDocument();
+    });
+    expect(screen.queryByText("无法在文件夹中显示")).not.toBeInTheDocument();
+    expect(screen.queryByText("merged.pdf")).not.toBeInTheDocument();
+  });
+
+  it("clears export success when a closed-dialog assignment commits", async () => {
+    const user = userEvent.setup();
+    const assignment = deferred<BatchDetailDto>();
+    const candidate = candidateFixture(itemFixture());
+    let serverDetail = detailFixture([]);
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", () => serverDetail);
+    mockCommand("list_batch_candidates", {
+      items: [candidate],
+      nextCursor: null,
+    });
+    mockCommand("assign_items_to_batch", assignment.promise);
+    mockCommand("export_batch", {
+      directory: "/Users/finance/old-export",
+      itemCount: 0,
+      totalAmountCents: 0,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "导出报销包" }));
+    expect(await screen.findByText("merged.pdf")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(dialog).findByRole("checkbox", { name: "高铁电子发票.pdf" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "归属所选票据" }));
+    await user.click(within(dialog).getByRole("button", { name: "关闭调整票据" }));
+
+    serverDetail = detailFixture([
+      { ...candidate.item, batchId: "batch-summer" },
+    ]);
+    await act(async () => assignment.resolve(serverDetail));
+
+    await waitFor(() => expect(screen.queryByText("merged.pdf")).not.toBeInTheDocument());
+    expect(screen.getByText("高铁电子发票.pdf")).toBeInTheDocument();
+  });
+
+  it("keeps current-route export feedback when an old assignment commits", async () => {
+    const user = userEvent.setup();
+    const assignment = deferred<BatchDetailDto>();
+    const candidate = candidateFixture(itemFixture());
+    const otherDetail = {
+      ...detailFixture(),
+      batch: batchFixture({ id: "batch-other", name: "其他批次" }),
+    };
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", (arguments_) =>
+      (arguments_ as { batchId: string }).batchId === "batch-other"
+        ? otherDetail
+        : detailFixture(),
+    );
+    mockCommand("list_batch_candidates", {
+      items: [candidate],
+      nextCursor: null,
+    });
+    mockCommand("assign_items_to_batch", assignment.promise);
+    mockCommand("export_batch", {
+      directory: "/Users/finance/current-export",
+      itemCount: 0,
+      totalAmountCents: 0,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(dialog).findByRole("checkbox", { name: "高铁电子发票.pdf" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "归属所选票据" }));
+    await waitFor(() => expect(commandCalls("assign_items_to_batch")).toHaveLength(1));
+
+    await act(async () => {
+      window.history.pushState({}, "", "/batches/batch-other");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByRole("heading", { name: "其他批次" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "导出报销包" }));
+    expect(await screen.findByText("merged.pdf")).toBeInTheDocument();
+
+    await act(async () => {
+      assignment.resolve(
+        detailFixture([{ ...candidate.item, batchId: "batch-summer" }]),
+      );
+    });
+
+    expect(screen.getByText("merged.pdf")).toBeInTheDocument();
   });
 
   it("invalidates a committed export after route navigation", async () => {

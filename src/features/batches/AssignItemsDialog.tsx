@@ -22,6 +22,8 @@ const PAGE_SIZE = 50;
 interface AssignItemsDialogProps {
   batchId: string;
   sessionId: number;
+  routeSessionId: number;
+  onContentCommitted: (routeSessionId: number) => void;
   onAssigned: (detail: BatchDetailDto, sessionId: number) => void;
   onClose: () => void;
 }
@@ -47,6 +49,8 @@ function disabledCopy(reason: "recognition_failed" | "suspected_duplicate" | nul
 export function AssignItemsDialog({
   batchId,
   sessionId,
+  routeSessionId,
+  onContentCommitted,
   onAssigned,
   onClose,
 }: AssignItemsDialogProps) {
@@ -112,13 +116,17 @@ export function AssignItemsDialog({
     setAssignError(null);
     try {
       const detail = await api.assignItemsToBatch(batchId, [...selectedIds]);
-      queryClient.setQueryData(queryKeys.batch(batchId), detail);
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.batch(batchId),
+        exact: true,
+      });
       void queryClient.invalidateQueries({
         queryKey: queryKeys.batchCandidateLists(batchId),
       });
       void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
       void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
+      onContentCommitted(routeSessionId);
       if (!mounted.current) return;
       onAssigned(detail, sessionId);
     } catch (error) {

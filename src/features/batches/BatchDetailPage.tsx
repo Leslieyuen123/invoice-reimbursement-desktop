@@ -80,6 +80,7 @@ export function BatchDetailPage() {
   const { batchId = "" } = useParams();
   const queryClient = useQueryClient();
   const routeSession = useRef(0);
+  const contentRevision = useRef(0);
   const [recommendPending, setRecommendPending] = useState(false);
   const [recommendError, setRecommendError] = useState<string | null>(null);
   const [exportPending, setExportPending] = useState(false);
@@ -130,17 +131,25 @@ export function BatchDetailPage() {
     if (removePending) removeCancelRef.current?.focus();
   }, [removePending]);
 
-  function reconcileBatchDetail(
-    operationBatchId: string,
-    detail: BatchDetailDto,
-  ) {
-    queryClient.setQueryData(queryKeys.batch(operationBatchId), detail);
+  function reconcileBatchDetail(operationBatchId: string) {
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.batch(operationBatchId),
+      exact: true,
+    });
     void queryClient.invalidateQueries({
       queryKey: queryKeys.batchCandidateLists(operationBatchId),
     });
     void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
     void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
     void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
+  }
+
+  function clearExportFeedback() {
+    contentRevision.current += 1;
+    setExportPending(false);
+    setExportResult(null);
+    setExportError(null);
+    setRevealError(null);
   }
 
   async function assignRecommendations() {
@@ -175,9 +184,10 @@ export function BatchDetailPage() {
         setRecommendError("当前日期范围内没有可加入的推荐票据");
         return;
       }
-      const detail = await api.assignItemsToBatch(operationBatchId, itemIds);
-      reconcileBatchDetail(operationBatchId, detail);
+      await api.assignItemsToBatch(operationBatchId, itemIds);
+      reconcileBatchDetail(operationBatchId);
       if (session !== routeSession.current) return;
+      clearExportFeedback();
     } catch (error) {
       if (session === routeSession.current) {
         setRecommendError(errorMessage(error, "推荐票据加入失败"));
@@ -189,6 +199,7 @@ export function BatchDetailPage() {
 
   async function runExport() {
     const session = routeSession.current;
+    const operationContentRevision = contentRevision.current;
     const operationBatchId = batchId;
     setExportPending(true);
     setExportError(null);
@@ -202,26 +213,41 @@ export function BatchDetailPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
       void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
-      if (session !== routeSession.current) return;
+      if (
+        session !== routeSession.current ||
+        operationContentRevision !== contentRevision.current
+      ) return;
       setExportResult(result);
     } catch (error) {
-      if (session === routeSession.current) {
+      if (
+        session === routeSession.current &&
+        operationContentRevision === contentRevision.current
+      ) {
         setExportError(errorMessage(error, "报销包导出失败"));
       }
     } finally {
-      if (session === routeSession.current) setExportPending(false);
+      if (
+        session === routeSession.current &&
+        operationContentRevision === contentRevision.current
+      ) {
+        setExportPending(false);
+      }
     }
   }
 
   async function revealExport() {
     if (!exportResult) return;
     const session = routeSession.current;
+    const operationContentRevision = contentRevision.current;
     setRevealError(null);
     try {
       const mergedPdf = await join(exportResult.directory, "merged.pdf");
       await revealItemInDir(mergedPdf);
     } catch {
-      if (session === routeSession.current) {
+      if (
+        session === routeSession.current &&
+        operationContentRevision === contentRevision.current
+      ) {
         setRevealError("无法在文件夹中显示，请从导出目录手动打开报销包");
       }
     }
@@ -236,6 +262,11 @@ export function BatchDetailPage() {
   function acceptAssignedDetail(_detail: BatchDetailDto, sessionId: number) {
     if (sessionId !== assignDialogSession) return;
     closeAssignDialog();
+  }
+
+  function acceptAssignedCommit(operationRouteSession: number) {
+    if (operationRouteSession !== routeSession.current) return;
+    clearExportFeedback();
   }
 
   function closeRemoveDialog(preferFallback = false) {
@@ -285,9 +316,10 @@ export function BatchDetailPage() {
     setRemovePending(true);
     setRemoveError(null);
     try {
-      const detail = await api.removeItemFromBatch(operationBatchId, item.id);
-      reconcileBatchDetail(operationBatchId, detail);
+      await api.removeItemFromBatch(operationBatchId, item.id);
+      reconcileBatchDetail(operationBatchId);
       if (session !== routeSession.current) return;
+      clearExportFeedback();
       closeRemoveDialog(true);
     } catch (error) {
       if (
@@ -532,6 +564,8 @@ export function BatchDetailPage() {
         <AssignItemsDialog
           batchId={batchId}
           sessionId={assignDialogSession}
+          routeSessionId={routeSession.current}
+          onContentCommitted={acceptAssignedCommit}
           onAssigned={acceptAssignedDetail}
           onClose={closeAssignDialog}
         />

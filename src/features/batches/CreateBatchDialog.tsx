@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CalendarRange, CircleAlert } from "lucide-react";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { api } from "../../lib/api";
@@ -44,6 +44,7 @@ export function CreateBatchDialog() {
   const now = new Date();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const viewActive = useRef(true);
   const [searchParams] = useSearchParams();
   const [mode, setMode] = useState<BatchMode>(
     searchParams.get("type") === "custom" ? "custom" : "month",
@@ -54,6 +55,12 @@ export function CreateBatchDialog() {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [note, setNote] = useState("");
+  useEffect(() => {
+    viewActive.current = true;
+    return () => {
+      viewActive.current = false;
+    };
+  }, []);
   const createMutation = useMutation({
     mutationFn: () =>
       mode === "month"
@@ -68,7 +75,9 @@ export function CreateBatchDialog() {
       queryClient.setQueryData(queryKeys.batch(batch.id), emptyBatchDetail(batch));
       void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
-      navigate(`/batches/${batch.id}`, { replace: true });
+      if (viewActive.current) {
+        navigate(`/batches/${batch.id}`, { replace: true });
+      }
     },
   });
 
