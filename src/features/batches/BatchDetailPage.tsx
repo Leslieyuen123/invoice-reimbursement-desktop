@@ -90,7 +90,9 @@ export function BatchDetailPage() {
   const [assignDialogSession, setAssignDialogSession] = useState(0);
   const nextDialogSession = useRef(0);
   const assignDialogOpener = useRef<HTMLButtonElement | null>(null);
+  const removeFocusFallbackRef = useRef<HTMLButtonElement | null>(null);
   const removeDialogRef = useRef<HTMLDivElement | null>(null);
+  const removeCancelRef = useRef<HTMLButtonElement | null>(null);
   const [removeTarget, setRemoveTarget] = useState<{
     item: InvoiceItemDto;
     opener: HTMLButtonElement;
@@ -120,15 +122,30 @@ export function BatchDetailPage() {
     };
   }, [batchId]);
 
+  useEffect(() => {
+    if (removePending) removeCancelRef.current?.focus();
+  }, [removePending]);
+
+  function reconcileBatchDetail(
+    operationBatchId: string,
+    detail: BatchDetailDto,
+  ) {
+    queryClient.setQueryData(queryKeys.batch(operationBatchId), detail);
+    void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
+  }
+
   async function assignRecommendations() {
     const session = routeSession.current;
+    const operationBatchId = batchId;
     setRecommendPending(true);
     setRecommendError(null);
     try {
       const itemIds: string[] = [];
       let cursor: CursorDto | undefined;
       for (let pageIndex = 0; pageIndex < MAX_RECOMMEND_PAGES; pageIndex += 1) {
-        const page = await api.listBatchCandidates(batchId, undefined, {
+        const page = await api.listBatchCandidates(operationBatchId, undefined, {
           cursor,
           pageSize: RECOMMEND_PAGE_SIZE,
         });
@@ -151,12 +168,9 @@ export function BatchDetailPage() {
         setRecommendError("当前日期范围内没有可加入的推荐票据");
         return;
       }
-      const detail = await api.assignItemsToBatch(batchId, itemIds);
+      const detail = await api.assignItemsToBatch(operationBatchId, itemIds);
+      reconcileBatchDetail(operationBatchId, detail);
       if (session !== routeSession.current) return;
-      queryClient.setQueryData(queryKeys.batch(batchId), detail);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
     } catch (error) {
       if (session === routeSession.current) {
         setRecommendError(errorMessage(error, "推荐票据加入失败"));
@@ -168,17 +182,21 @@ export function BatchDetailPage() {
 
   async function runExport() {
     const session = routeSession.current;
+    const operationBatchId = batchId;
     setExportPending(true);
     setExportError(null);
     setRevealError(null);
     setExportResult(null);
     try {
-      const result = await api.exportBatch(batchId);
-      if (session !== routeSession.current) return;
-      setExportResult(result);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.batch(batchId) });
+      const result = await api.exportBatch(operationBatchId);
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.batch(operationBatchId),
+      });
       void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
+      if (session !== routeSession.current) return;
+      setExportResult(result);
     } catch (error) {
       if (session === routeSession.current) {
         setExportError(errorMessage(error, "报销包导出失败"));
@@ -208,20 +226,22 @@ export function BatchDetailPage() {
     queueMicrotask(() => opener?.focus());
   }
 
-  function acceptAssignedDetail(detail: BatchDetailDto, sessionId: number) {
+  function acceptAssignedDetail(_detail: BatchDetailDto, sessionId: number) {
     if (sessionId !== assignDialogSession) return;
-    queryClient.setQueryData(queryKeys.batch(batchId), detail);
     closeAssignDialog();
-    void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
   }
 
-  function closeRemoveDialog() {
+  function closeRemoveDialog(preferFallback = false) {
     if (!removeTarget) return;
     const { opener } = removeTarget;
     setRemoveTarget(null);
-    queueMicrotask(() => opener.focus());
+    queueMicrotask(() => {
+      if (!preferFallback && opener.isConnected) {
+        opener.focus();
+      } else {
+        removeFocusFallbackRef.current?.focus();
+      }
+    });
   }
 
   function handleRemoveDialogKeys(event: KeyboardEvent<HTMLDivElement>) {
@@ -251,17 +271,15 @@ export function BatchDetailPage() {
   async function confirmRemoval() {
     if (!removeTarget) return;
     const session = routeSession.current;
+    const operationBatchId = batchId;
     const { item } = removeTarget;
     setRemovePending(true);
     setRemoveError(null);
     try {
-      const detail = await api.removeItemFromBatch(batchId, item.id);
+      const detail = await api.removeItemFromBatch(operationBatchId, item.id);
+      reconcileBatchDetail(operationBatchId, detail);
       if (session !== routeSession.current) return;
-      queryClient.setQueryData(queryKeys.batch(batchId), detail);
-      closeRemoveDialog();
-      void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
+      closeRemoveDialog(true);
     } catch (error) {
       if (session === routeSession.current) {
         setRemoveError(errorMessage(error, "票据移出失败"));
@@ -312,6 +330,7 @@ export function BatchDetailPage() {
         </div>
         <div className="batch-detail-actions">
           <button
+            ref={removeFocusFallbackRef}
             type="button"
             className="button button-secondary"
             onClick={(event) => {
@@ -514,11 +533,11 @@ export function BatchDetailPage() {
             {removeError ? <div className="batch-inline-error" role="alert">{removeError}</div> : null}
             <div className="batch-form-actions">
               <button
+                ref={removeCancelRef}
                 type="button"
                 className="button button-secondary"
-                disabled={removePending}
                 autoFocus
-                onClick={closeRemoveDialog}
+                onClick={() => closeRemoveDialog()}
               >
                 取消
               </button>

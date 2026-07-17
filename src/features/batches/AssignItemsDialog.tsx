@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, CircleAlert, Search, X } from "lucide-react";
 import {
   type FormEvent,
@@ -50,6 +50,7 @@ export function AssignItemsDialog({
   onAssigned,
   onClose,
 }: AssignItemsDialogProps) {
+  const queryClient = useQueryClient();
   const dialogRef = useRef<HTMLDivElement>(null);
   const mounted = useRef(true);
   const [searchInput, setSearchInput] = useState("");
@@ -111,6 +112,10 @@ export function AssignItemsDialog({
     setAssignError(null);
     try {
       const detail = await api.assignItemsToBatch(batchId, [...selectedIds]);
+      queryClient.setQueryData(queryKeys.batch(batchId), detail);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.itemLists });
       if (!mounted.current) return;
       onAssigned(detail, sessionId);
     } catch (error) {

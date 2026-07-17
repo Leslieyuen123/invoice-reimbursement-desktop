@@ -527,6 +527,78 @@ describe("Batch workspace", () => {
     ).toBeInTheDocument();
   });
 
+  it("reconciles a committed assignment after the dialog closes", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(itemFixture());
+    const assignment = deferred<BatchDetailDto>();
+    const committed = detailFixture([
+      { ...candidate.item, batchId: "batch-summer" },
+    ]);
+    mockDetail(detailFixture(), [candidate]);
+    mockCommand("assign_items_to_batch", assignment.promise);
+    mockCommand("list_batches", {
+      items: [committed.batch],
+      nextCursor: null,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(dialog).findByRole("checkbox", { name: "高铁电子发票.pdf" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "归属所选票据" }));
+    await user.click(within(dialog).getByRole("button", { name: "关闭调整票据" }));
+    await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
+    expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
+
+    await act(async () => assignment.resolve(committed));
+    await user.click(
+      await screen.findByRole("link", { name: /6-8 月整理批次/ }),
+    );
+
+    expect(
+      within(await screen.findByRole("region", { name: "已归属票据" })).getByText(
+        "高铁电子发票.pdf",
+      ),
+    ).toBeInTheDocument();
+    expect(commandCalls("get_batch")).toHaveLength(1);
+  });
+
+  it("reconciles a committed recommendation after route navigation", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(itemFixture());
+    const assignment = deferred<BatchDetailDto>();
+    const committed = detailFixture([
+      { ...candidate.item, batchId: "batch-summer" },
+    ]);
+    mockDetail(detailFixture(), [candidate]);
+    mockCommand("assign_items_to_batch", assignment.promise);
+    mockCommand("list_batches", {
+      items: [committed.batch],
+      nextCursor: null,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "加入推荐票据" }));
+    await waitFor(() => expect(commandCalls("assign_items_to_batch")).toHaveLength(1));
+    await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
+    expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
+
+    await act(async () => assignment.resolve(committed));
+    await user.click(
+      await screen.findByRole("link", { name: /6-8 月整理批次/ }),
+    );
+
+    expect(
+      within(await screen.findByRole("region", { name: "已归属票据" })).getByText(
+        "高铁电子发票.pdf",
+      ),
+    ).toBeInTheDocument();
+    expect(commandCalls("get_batch")).toHaveLength(1);
+    expect(screen.queryByText("merged.pdf")).not.toBeInTheDocument();
+  });
+
   it("shows assigned item status with Chinese copy", async () => {
     mockDetail(
       detailFixture([
@@ -620,6 +692,80 @@ describe("Batch workspace", () => {
         itemId: "invoice-train",
       });
     });
+  });
+
+  it("reconciles a committed removal after route navigation", async () => {
+    const user = userEvent.setup();
+    const removal = deferred<BatchDetailDto>();
+    const committed = detailFixture([]);
+    mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
+    mockCommand("remove_item_from_batch", removal.promise);
+    mockCommand("list_batches", {
+      items: [committed.batch],
+      nextCursor: null,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("button", { name: "移出 高铁电子发票.pdf" }),
+    );
+    const confirmation = screen.getByRole("dialog", { name: "确认移出票据" });
+    await user.click(within(confirmation).getByRole("button", { name: "确认移出" }));
+    await waitFor(() => expect(commandCalls("remove_item_from_batch")).toHaveLength(1));
+    await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
+    expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
+
+    await act(async () => removal.resolve(committed));
+    await user.click(
+      await screen.findByRole("link", { name: /6-8 月整理批次/ }),
+    );
+
+    expect(await screen.findByText("尚未归属票据")).toBeInTheDocument();
+    expect(screen.queryByText("高铁电子发票.pdf")).not.toBeInTheDocument();
+    expect(commandCalls("get_batch")).toHaveLength(1);
+  });
+
+  it("keeps pending removal focus trapped on a safe control", async () => {
+    const user = userEvent.setup();
+    const removal = deferred<BatchDetailDto>();
+    mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
+    mockCommand("remove_item_from_batch", removal.promise);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("button", { name: "移出 高铁电子发票.pdf" }),
+    );
+    const confirmation = screen.getByRole("dialog", { name: "确认移出票据" });
+    await user.click(within(confirmation).getByRole("button", { name: "确认移出" }));
+    const cancel = within(confirmation).getByRole("button", { name: "取消" });
+
+    expect(within(confirmation).getByRole("button", { name: "正在移出" })).toBeDisabled();
+    expect(cancel).toBeEnabled();
+    await waitFor(() => expect(cancel).toHaveFocus());
+    await user.tab();
+    expect(cancel).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(cancel).toHaveFocus();
+    expect(commandCalls("remove_item_from_batch")).toHaveLength(1);
+  });
+
+  it("focuses a stable fallback after successful removal", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
+
+    renderAppAt("/batches/batch-summer");
+    const opener = await screen.findByRole("button", {
+      name: "移出 高铁电子发票.pdf",
+    });
+    await user.click(opener);
+    const confirmation = screen.getByRole("dialog", { name: "确认移出票据" });
+    await user.click(within(confirmation).getByRole("button", { name: "确认移出" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "确认移出票据" })).not.toBeInTheDocument();
+    });
+    expect(opener).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "调整票据" })).toHaveFocus();
   });
 
   it("contains removal confirmation focus and restores it after Escape", async () => {
@@ -717,6 +863,50 @@ describe("Batch workspace", () => {
     expect(await screen.findByText(/¥90071992547409\.91/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "在文件夹中显示" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("无法在文件夹中显示");
+  });
+
+  it("invalidates a committed export after route navigation", async () => {
+    const user = userEvent.setup();
+    const exportRequest = deferred<{
+      directory: string;
+      itemCount: number;
+      totalAmountCents: number;
+    }>();
+    let serverDetail = detailFixture();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", () => serverDetail);
+    mockCommand("list_batches", () => ({
+      items: [serverDetail.batch],
+      nextCursor: null,
+    }));
+    mockCommand("export_batch", exportRequest.promise);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "导出报销包" }));
+    await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
+    expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
+
+    serverDetail = {
+      ...serverDetail,
+      batch: batchFixture({
+        status: "exported",
+        lastExportedAt: "2026-07-17T10:00:00+08:00",
+      }),
+    };
+    await act(async () => {
+      exportRequest.resolve({
+        directory: "/Users/finance/stale-export",
+        itemCount: 0,
+        totalAmountCents: 0,
+      });
+    });
+    await user.click(
+      await screen.findByRole("link", { name: /6-8 月整理批次/ }),
+    );
+
+    expect(await screen.findByText("已导出")).toBeInTheDocument();
+    expect(commandCalls("get_batch")).toHaveLength(2);
+    expect(screen.queryByText("merged.pdf")).not.toBeInTheDocument();
   });
 
   it("ignores an export result after navigating to another route", async () => {
