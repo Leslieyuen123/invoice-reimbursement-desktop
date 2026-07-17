@@ -96,6 +96,8 @@ export const api = {
   savePreferences: (input: PreferencesInputDto) =>
     call<PreferencesDto>("save_preferences", { input }),
   getStorageStatus: () => call<StorageStatusDto>("get_storage_status"),
+  retryExportRecovery: () =>
+    call<StorageStatusDto>("retry_export_recovery"),
   syncAccountNow: (accountId: string) =>
     call<void>("sync_account_now", { accountId }),
 };

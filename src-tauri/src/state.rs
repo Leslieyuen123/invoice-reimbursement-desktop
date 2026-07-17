@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
+use tokio::sync::RwLock;
 
 use crate::db::accounts::MailboxAccountRepository;
 use crate::db::items::ItemRepository;
@@ -41,6 +42,13 @@ pub struct AppState {
     export_preference_gate: ExportPreferenceGate,
     application_scheduler: Scheduler,
     runtime_operations: RuntimeOperationCoordinator,
+    export_recovery_failure: Arc<RwLock<Option<ExportRecoveryFailure>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportRecoveryFailure {
+    export_directory: String,
+    message: String,
 }
 
 impl AppState {
@@ -117,6 +125,7 @@ impl AppState {
             export_preference_gate,
             application_scheduler,
             runtime_operations: RuntimeOperationCoordinator::default(),
+            export_recovery_failure: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -232,7 +241,32 @@ impl AppState {
     pub async fn reconcile_exports(
         &self,
     ) -> Result<crate::services::export::ExportRecoveryReport, crate::domain::error::AppError> {
-        self.export_service().reconcile_pending().await
+        let (export_directory, result) = self.export_service().reconcile_pending_with_root().await;
+        let mut failure = self.export_recovery_failure.write().await;
+        match result {
+            Ok(report) => {
+                *failure = None;
+                Ok(report)
+            }
+            Err(error) => {
+                if let Some(export_directory) = export_directory {
+                    *failure = Some(ExportRecoveryFailure {
+                        export_directory,
+                        message: error.to_string(),
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn export_recovery_error(&self, export_directory: &str) -> Option<String> {
+        self.export_recovery_failure
+            .read()
+            .await
+            .as_ref()
+            .filter(|failure| failure.export_directory == export_directory)
+            .map(|failure| failure.message.clone())
     }
 
     pub fn begin_account_saga_shutdown(&self) -> AccountSagaShutdown {

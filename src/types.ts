@@ -139,7 +139,8 @@ export interface PreferencesDto {
 export interface StorageStatusDto {
   localDataDirectory: string;
   exportDirectory: string;
-  availableBytes: number;
+  availableBytes: number | null;
+  recoveryError: string | null;
 }
 
 export interface ReviewItemInputDto {

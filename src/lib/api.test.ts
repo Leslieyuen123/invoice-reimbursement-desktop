@@ -200,6 +200,11 @@ const commandCases: Array<{
   { method: "getPreferences", arguments_: [], command: "get_preferences" },
   { method: "getStorageStatus", arguments_: [], command: "get_storage_status" },
   {
+    method: "retryExportRecovery",
+    arguments_: [],
+    command: "retry_export_recovery",
+  },
+  {
     method: "savePreferences",
     arguments_: [preferencesInput],
     command: "save_preferences",

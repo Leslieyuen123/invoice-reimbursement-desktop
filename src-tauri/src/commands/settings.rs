@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::accounts::{
-    MailboxAccount, MailboxAccountRepository, MailboxProvider, SyncRetryState,
+    MailboxAccount, MailboxAccountRepository, MailboxAccountWithRetryState, MailboxProvider,
+    SyncRetryState,
 };
 use crate::domain::error::AppError;
 use crate::services::settings::{
@@ -63,7 +64,8 @@ impl MailboxAccountDto {
 pub struct StorageStatusDto {
     pub local_data_directory: String,
     pub export_directory: String,
-    pub available_bytes: u64,
+    pub available_bytes: Option<u64>,
+    pub recovery_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -140,20 +142,17 @@ pub struct PreferencesInputDto {
 }
 
 pub async fn list_accounts(state: &AppState) -> Result<Vec<MailboxAccountDto>, AppError> {
-    account_dtos(state, state.settings_service().list_accounts().await?).await
+    let snapshots = MailboxAccountRepository::new(state.pool().clone())
+        .list_with_retry_states()
+        .await?;
+    Ok(account_dtos(snapshots))
 }
 
-pub async fn account_dtos(
-    state: &AppState,
-    accounts: Vec<MailboxAccount>,
-) -> Result<Vec<MailboxAccountDto>, AppError> {
-    let repository = MailboxAccountRepository::new(state.pool().clone());
-    let mut dtos = Vec::with_capacity(accounts.len());
-    for account in accounts {
-        let retry = repository.get_retry_state(account.id).await?;
-        dtos.push(MailboxAccountDto::from_account(account, retry));
-    }
-    Ok(dtos)
+pub fn account_dtos(snapshots: Vec<MailboxAccountWithRetryState>) -> Vec<MailboxAccountDto> {
+    snapshots
+        .into_iter()
+        .map(|snapshot| MailboxAccountDto::from_account(snapshot.account, snapshot.retry_state))
+        .collect()
 }
 
 pub async fn save_account(
@@ -201,9 +200,6 @@ pub async fn save_preferences(
 
 pub async fn storage_status(state: &AppState) -> Result<StorageStatusDto, AppError> {
     let preferences = state.settings_service().preferences().await?;
-    let effective = state
-        .paths()
-        .for_export_directory(&preferences.export_directory)?;
     let local_data_directory = state
         .paths()
         .root
@@ -211,12 +207,42 @@ pub async fn storage_status(state: &AppState) -> Result<StorageStatusDto, AppErr
         .unwrap_or(&state.paths().root)
         .to_string_lossy()
         .into_owned();
-    let available_bytes = available_bytes(&effective.exports)?;
+    let (export_directory, available_bytes, storage_error) = match state
+        .paths()
+        .for_export_directory(&preferences.export_directory)
+    {
+        Ok(effective) => {
+            let (available_bytes, error) = match available_bytes(&effective.exports) {
+                Ok(bytes) => (Some(bytes), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            (
+                effective.exports.to_string_lossy().into_owned(),
+                available_bytes,
+                error,
+            )
+        }
+        Err(error) => (
+            preferences.export_directory.clone(),
+            None,
+            Some(error.to_string()),
+        ),
+    };
+    let recovery_error = state
+        .export_recovery_error(&preferences.export_directory)
+        .await
+        .or(storage_error);
     Ok(StorageStatusDto {
         local_data_directory,
-        export_directory: effective.exports.to_string_lossy().into_owned(),
+        export_directory,
         available_bytes,
+        recovery_error,
     })
+}
+
+pub async fn retry_export_recovery(state: &AppState) -> Result<StorageStatusDto, AppError> {
+    state.reconcile_exports().await?;
+    storage_status(state).await
 }
 
 #[cfg(unix)]
@@ -293,5 +319,12 @@ pub(crate) mod ipc {
         state: State<'_, AppState>,
     ) -> Result<StorageStatusDto, AppError> {
         super::storage_status(&state).await
+    }
+
+    #[tauri::command]
+    pub async fn retry_export_recovery(
+        state: State<'_, AppState>,
+    ) -> Result<StorageStatusDto, AppError> {
+        super::retry_export_recovery(&state).await
     }
 }

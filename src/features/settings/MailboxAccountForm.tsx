@@ -111,6 +111,7 @@ export function MailboxAccountForm({
       return api.saveMailboxAccount(input);
     },
     onSuccess: async () => {
+      setSecret("");
       setSaved(true);
       onSaved?.();
       await Promise.all([

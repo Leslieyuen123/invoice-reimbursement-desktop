@@ -1,7 +1,7 @@
 use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
 
-use crate::db::accounts::{MailboxAccount, MailboxAccountRepository};
+use crate::db::accounts::{MailboxAccountRepository, MailboxAccountWithRetryState};
 use crate::db::batches::BatchSummary;
 use crate::domain::error::AppError;
 use crate::services::batches::BatchService;
@@ -16,7 +16,7 @@ pub struct DashboardCounts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardSnapshot {
-    pub mailbox_accounts: Vec<MailboxAccount>,
+    pub mailbox_accounts: Vec<MailboxAccountWithRetryState>,
     pub counts: DashboardCounts,
     pub recent_batches: Vec<BatchSummary>,
 }
@@ -60,7 +60,7 @@ impl DashboardService {
 
         Ok(DashboardSnapshot {
             mailbox_accounts: MailboxAccountRepository::new(self.pool.clone())
-                .list()
+                .list_with_retry_states()
                 .await?,
             counts: DashboardCounts {
                 recently_added: count(row.0)?,

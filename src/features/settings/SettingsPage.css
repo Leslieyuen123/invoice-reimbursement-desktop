@@ -181,6 +181,10 @@
   margin-left: auto;
 }
 
+.settings-storage-alert {
+  margin-bottom: 12px;
+}
+
 .settings-skeleton {
   height: 280px;
   border-radius: var(--panel-radius);

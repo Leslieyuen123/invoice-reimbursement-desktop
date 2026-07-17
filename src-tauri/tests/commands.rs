@@ -257,6 +257,7 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "get_preferences",
             "save_preferences",
             "get_storage_status",
+            "retry_export_recovery",
             "sync_account_now",
         ]
     );
@@ -342,7 +343,91 @@ async fn storage_status_reports_actual_and_effective_directories() {
         std::path::Path::new(&status.export_directory),
         app.state.paths().exports
     );
-    assert!(status.available_bytes > 0);
+    assert!(status.available_bytes.is_some_and(|bytes| bytes > 0));
+    assert_eq!(status.recovery_error, None);
+}
+
+#[tokio::test]
+async fn missing_saved_export_root_is_reported_without_hiding_storage_settings_and_can_retry() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let missing_root = app
+        ._directory
+        .path()
+        .join("temporarily-unavailable-exports");
+    let preferences = serde_json::json!({
+        "backgroundSyncEnabled": true,
+        "exportDirectory": missing_root.to_string_lossy(),
+        "batchDirectoryPattern": "{batchName}-{timestamp}",
+    });
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?)")
+        .bind(preferences.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(app.state.pool())
+        .await
+        .unwrap();
+
+    app.state
+        .reconcile_exports()
+        .await
+        .expect_err("the unavailable saved root should defer export recovery");
+
+    let unavailable = settings::storage_status(&app.state).await.unwrap();
+    assert_eq!(
+        std::path::Path::new(&unavailable.export_directory),
+        missing_root
+    );
+    assert_eq!(unavailable.available_bytes, None);
+    assert!(
+        unavailable
+            .recovery_error
+            .as_deref()
+            .is_some_and(|message| !message.is_empty())
+    );
+
+    std::fs::create_dir(&missing_root).unwrap();
+    settings::retry_export_recovery(&app.state).await.unwrap();
+
+    let recovered = settings::storage_status(&app.state).await.unwrap();
+    assert!(recovered.available_bytes.is_some_and(|bytes| bytes > 0));
+    assert_eq!(recovered.recovery_error, None);
+}
+
+#[tokio::test]
+async fn export_recovery_error_is_scoped_to_the_root_that_failed() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let missing_root = app._directory.path().join("old-unavailable-exports");
+    let replacement_root = app._directory.path().join("replacement-exports");
+    let preferences = serde_json::json!({
+        "backgroundSyncEnabled": true,
+        "exportDirectory": missing_root.to_string_lossy(),
+        "batchDirectoryPattern": "{batchName}-{timestamp}",
+    });
+    sqlx::query("INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?)")
+        .bind(preferences.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(app.state.pool())
+        .await
+        .unwrap();
+    app.state.reconcile_exports().await.unwrap_err();
+
+    std::fs::create_dir(&replacement_root).unwrap();
+    settings::save_preferences(
+        &app.state,
+        settings::PreferencesInputDto {
+            background_sync_enabled: true,
+            export_directory: replacement_root.to_string_lossy().into_owned(),
+            batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let status = settings::storage_status(&app.state).await.unwrap();
+    assert_eq!(status.recovery_error, None);
+    assert_eq!(
+        std::path::Path::new(&status.export_directory),
+        replacement_root.canonicalize().unwrap()
+    );
 }
 
 #[test]

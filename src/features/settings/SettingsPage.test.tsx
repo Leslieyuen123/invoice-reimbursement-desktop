@@ -38,6 +38,7 @@ const storageFixture = {
   exportDirectory:
     "/Users/person/Library/Application Support/com.invoice-desk.app/storage/exports",
   availableBytes: 128_849_018_880,
+  recoveryError: null,
 };
 
 function renderAppAt(path: string) {
@@ -151,6 +152,27 @@ describe("Settings page", () => {
       id: accountFixture.id,
       secret: "",
     });
+  });
+
+  it("clears an existing account replacement secret after saving", async () => {
+    const user = userEvent.setup();
+    mockSettingsCommands();
+    mockCommand("list_mailbox_accounts", [accountFixture]);
+    mockCommand("test_mailbox_account", undefined);
+    mockCommand("save_mailbox_account", accountFixture);
+
+    renderAppAt("/settings");
+
+    const secret = await screen.findByLabelText("应用专用密码");
+    await user.type(secret, "replacement-secret");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    await screen.findByText("连接成功");
+    await user.click(screen.getByRole("button", { name: "保存账号" }));
+    await waitFor(() =>
+      expect(commandCalls("save_mailbox_account")).toHaveLength(1),
+    );
+
+    expect(secret).toHaveValue("");
   });
 
   it("ignores a successful connection test when fields change while it is pending", async () => {
@@ -270,6 +292,63 @@ describe("Settings page", () => {
       exportDirectory: "/Users/person/Reimbursement Exports",
       batchDirectoryPattern: "{batchName}-{timestamp}",
     });
+  });
+
+  it("keeps settings editable when storage status cannot be loaded", async () => {
+    const user = userEvent.setup();
+    let unavailable = true;
+    mockSettingsCommands();
+    mockCommand("get_storage_status", () => {
+      if (unavailable) throw new Error("storage temporarily unavailable");
+      return storageFixture;
+    });
+
+    renderAppAt("/settings");
+
+    const alert = await screen.findByRole("alert", { name: "无法读取存储状态" });
+    expect(screen.getByRole("button", { name: "选择导出目录" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "保存运行设置" })).toBeEnabled();
+
+    unavailable = false;
+    await user.click(within(alert).getByRole("button", { name: "重试" }));
+    expect(await screen.findByText(storageFixture.exportDirectory)).toBeInTheDocument();
+  });
+
+  it("shows a retryable export recovery error without hiding directory controls", async () => {
+    const user = userEvent.setup();
+    let unavailable = true;
+    mockSettingsCommands();
+    mockCommand("get_storage_status", () =>
+      unavailable
+        ? {
+            ...storageFixture,
+            exportDirectory: "/Volumes/Finance/Exports",
+            availableBytes: null,
+            recoveryError: "saved export directory is unavailable",
+          }
+        : storageFixture,
+    );
+    mockCommand("retry_export_recovery", () => {
+      unavailable = false;
+    });
+
+    renderAppAt("/settings");
+
+    const alert = await screen.findByRole("alert", { name: "导出恢复失败" });
+    expect(alert).toHaveTextContent("saved export directory is unavailable");
+    expect(screen.getByRole("button", { name: "选择导出目录" })).toBeEnabled();
+    expect(screen.getByText("存储目录不可用")).toBeInTheDocument();
+
+    await user.click(within(alert).getByRole("button", { name: "重试导出恢复" }));
+
+    await waitFor(() =>
+      expect(commandCalls("retry_export_recovery")).toHaveLength(1),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("alert", { name: "导出恢复失败" }),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("retries a failed settings load and focuses a linked mailbox form", async () => {

@@ -515,11 +515,27 @@ impl ExportService {
     }
 
     pub async fn reconcile_pending(&self) -> Result<ExportRecoveryReport, AppError> {
+        self.reconcile_pending_with_root().await.1
+    }
+
+    pub(crate) async fn reconcile_pending_with_root(
+        &self,
+    ) -> (Option<String>, Result<ExportRecoveryReport, AppError>) {
         let _preference_guard = self.preference_gate.read().await;
-        let paths = self.effective_paths().await?;
-        ExportJournal::new(self.pool.clone())
-            .reconcile(&paths)
-            .await
+        let preferences = match load_preferences(&self.pool).await {
+            Ok(preferences) => preferences,
+            Err(error) => return (None, Err(error)),
+        };
+        let export_directory = preferences.export_directory.clone();
+        let result = match self.paths.for_export_directory(&export_directory) {
+            Ok(paths) => {
+                ExportJournal::new(self.pool.clone())
+                    .reconcile(&paths)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        (Some(export_directory), result)
     }
 
     async fn effective_paths(&self) -> Result<AppPaths, AppError> {

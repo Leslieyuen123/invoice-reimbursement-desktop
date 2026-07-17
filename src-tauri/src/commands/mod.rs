@@ -69,6 +69,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "get_preferences",
     "save_preferences",
     "get_storage_status",
+    "retry_export_recovery",
     "sync_account_now",
 ];
 
@@ -97,6 +98,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
         settings::ipc::get_preferences,
         settings::ipc::save_preferences,
         settings::ipc::get_storage_status,
+        settings::ipc::retry_export_recovery,
         sync::ipc::sync_account_now,
     ]
 }

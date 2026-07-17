@@ -55,11 +55,15 @@ export function SettingsPage() {
       ]);
     },
   });
+  const recoveryMutation = useMutation({
+    mutationFn: api.retryExportRecovery,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.storageStatus });
+    },
+  });
 
-  const isPending =
-    accountsQuery.isPending || preferencesQuery.isPending || storageQuery.isPending;
-  const isError =
-    accountsQuery.isError || preferencesQuery.isError || storageQuery.isError;
+  const isPending = accountsQuery.isPending || preferencesQuery.isPending;
+  const isError = accountsQuery.isError || preferencesQuery.isError;
 
   if (isPending) {
     return (
@@ -82,7 +86,6 @@ export function SettingsPage() {
               void Promise.all([
                 accountsQuery.refetch(),
                 preferencesQuery.refetch(),
-                storageQuery.refetch(),
               ])
             }
           >
@@ -154,6 +157,43 @@ export function SettingsPage() {
           </div>
         </div>
 
+        {storageQuery.isError ? (
+          <div
+            className="settings-load-error settings-storage-alert"
+            role="alert"
+            aria-label="无法读取存储状态"
+          >
+            <AlertTriangle size={18} aria-hidden="true" />
+            <span>无法读取存储状态，仍可选择并保存新的导出目录。</span>
+            <button
+              className="button button-secondary"
+              type="button"
+              onClick={() => void storageQuery.refetch()}
+            >
+              重试
+            </button>
+          </div>
+        ) : null}
+
+        {storage?.recoveryError ? (
+          <div
+            className="settings-load-error settings-storage-alert"
+            role="alert"
+            aria-label="导出恢复失败"
+          >
+            <AlertTriangle size={18} aria-hidden="true" />
+            <span>{storage.recoveryError}</span>
+            <button
+              className="button button-secondary"
+              type="button"
+              disabled={recoveryMutation.isPending}
+              onClick={() => recoveryMutation.mutate()}
+            >
+              重试导出恢复
+            </button>
+          </div>
+        ) : null}
+
         <div className="settings-runtime-grid">
           <label className="settings-switch settings-runtime-switch">
             <input
@@ -167,15 +207,21 @@ export function SettingsPage() {
 
           <div className="settings-storage-row">
             <span>本地数据目录</span>
-            <code>{storage.localDataDirectory}</code>
+            <code>{storage?.localDataDirectory ?? "正在读取"}</code>
           </div>
           <div className="settings-storage-row">
             <span>当前有效导出目录</span>
-            <code>{storage.exportDirectory}</code>
+            <code>{storage?.exportDirectory ?? exportDirectory}</code>
           </div>
           <div className="settings-storage-row">
             <span>可用空间</span>
-            <strong>{formatBytes(storage.availableBytes)} 可用</strong>
+            <strong>
+              {storage?.availableBytes == null
+                ? storageQuery.isPending
+                  ? "正在读取"
+                  : "存储目录不可用"
+                : `${formatBytes(storage.availableBytes)} 可用`}
+            </strong>
           </div>
 
           <label className="settings-field settings-export-field">

@@ -62,6 +62,12 @@ pub struct SyncRetryState {
     pub suspended: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxAccountWithRetryState {
+    pub account: MailboxAccount,
+    pub retry_state: Option<SyncRetryState>,
+}
+
 #[derive(Clone)]
 pub struct MailboxAccountRepository {
     pool: SqlitePool,
@@ -190,6 +196,28 @@ impl MailboxAccountRepository {
             .map_err(|error| map_database_error("failed to list mailbox accounts", error))?;
 
         rows.into_iter().map(MailboxAccount::try_from).collect()
+    }
+
+    pub async fn list_with_retry_states(
+        &self,
+    ) -> Result<Vec<MailboxAccountWithRetryState>, AppError> {
+        let rows = sqlx::query_as::<_, DbMailboxAccountWithRetryStateRow>(
+            "SELECT accounts.id, accounts.provider, accounts.email, accounts.imap_host, \
+                accounts.imap_port, accounts.enabled, accounts.sync_interval_minutes, \
+                accounts.last_synced_at, accounts.last_error, accounts.last_error_at, \
+                accounts.created_at, accounts.updated_at, retry.failures AS retry_failures, \
+                retry.next_retry_at AS retry_next_retry_at, retry.suspended AS retry_suspended \
+             FROM mailbox_accounts AS accounts \
+             LEFT JOIN sync_retry_states AS retry ON retry.account_id = accounts.id \
+             ORDER BY accounts.email ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| map_database_error("failed to list mailbox account statuses", error))?;
+
+        rows.into_iter()
+            .map(MailboxAccountWithRetryState::try_from)
+            .collect()
     }
 
     pub async fn set_enabled(&self, id: Uuid, enabled: bool) -> Result<(), AppError> {
@@ -683,6 +711,62 @@ struct DbSyncRetryStateRow {
     failures: i64,
     next_retry_at: Option<String>,
     suspended: i64,
+}
+
+#[derive(FromRow)]
+struct DbMailboxAccountWithRetryStateRow {
+    id: String,
+    provider: String,
+    email: String,
+    imap_host: String,
+    imap_port: i64,
+    enabled: i64,
+    sync_interval_minutes: i64,
+    last_synced_at: Option<String>,
+    last_error: Option<String>,
+    last_error_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+    retry_failures: Option<i64>,
+    retry_next_retry_at: Option<String>,
+    retry_suspended: Option<i64>,
+}
+
+impl TryFrom<DbMailboxAccountWithRetryStateRow> for MailboxAccountWithRetryState {
+    type Error = AppError;
+
+    fn try_from(row: DbMailboxAccountWithRetryStateRow) -> Result<Self, Self::Error> {
+        let retry_state = row
+            .retry_failures
+            .map(|failures| {
+                SyncRetryState::try_from(DbSyncRetryStateRow {
+                    failures,
+                    next_retry_at: row.retry_next_retry_at,
+                    suspended: row.retry_suspended.ok_or_else(|| {
+                        internal_error("missing joined retry suspension state", "NULL")
+                    })?,
+                })
+            })
+            .transpose()?;
+        let account = MailboxAccount::try_from(DbMailboxAccountRow {
+            id: row.id,
+            provider: row.provider,
+            email: row.email,
+            imap_host: row.imap_host,
+            imap_port: row.imap_port,
+            enabled: row.enabled,
+            sync_interval_minutes: row.sync_interval_minutes,
+            last_synced_at: row.last_synced_at,
+            last_error: row.last_error,
+            last_error_at: row.last_error_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })?;
+        Ok(Self {
+            account,
+            retry_state,
+        })
+    }
 }
 
 impl TryFrom<DbSyncRetryStateRow> for SyncRetryState {

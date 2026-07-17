@@ -25,6 +25,7 @@ struct RuntimeTasks {
 }
 
 const TRAY_ID: &str = "invoice-reimbursement-tray";
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TRAY_MENU_ITEMS: [(&str, &str); 3] = [
     ("show", "显示发票报销"),
     ("sync-all", "立即同步全部"),
@@ -60,6 +61,38 @@ fn apply_tray_tooltip<E>(
     set_tooltip(tray_tooltip(pending_confirmation_count))
 }
 
+fn handle_main_window_close_request<E>(
+    window_label: &str,
+    prevent_close: impl FnOnce(),
+    hide: impl FnOnce() -> Result<(), E>,
+) -> Result<bool, E> {
+    if window_label != "main" {
+        return Ok(false);
+    }
+    prevent_close();
+    hide()?;
+    Ok(true)
+}
+
+fn dispatch_tray_action(
+    action: TrayAction,
+    show: impl FnOnce(),
+    sync_all: impl FnOnce(),
+    exit: impl FnOnce(i32),
+) {
+    match action {
+        TrayAction::Show => show(),
+        TrayAction::SyncAll => sync_all(),
+        TrayAction::Exit => exit(0),
+    }
+}
+
+fn dispatch_run_event(event: &tauri::RunEvent, shutdown: impl FnOnce()) {
+    if matches!(event, tauri::RunEvent::Exit) {
+        shutdown();
+    }
+}
+
 pub(crate) fn refresh_tray_tooltip<R: Runtime>(
     app: &tauri::AppHandle<R>,
     pending_confirmation_count: u64,
@@ -83,13 +116,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(commands::invoke_handler())
         .on_window_event(|window, event| {
-            if window.label() == "main"
-                && let WindowEvent::CloseRequested { api, .. } = event
+            if let WindowEvent::CloseRequested { api, .. } = event
+                && handle_main_window_close_request(
+                    window.label(),
+                    || api.prevent_close(),
+                    || window.hide(),
+                )
+                .is_err()
             {
-                api.prevent_close();
-                if window.hide().is_err() {
-                    tracing::warn!("failed to hide the main window after close request");
-                }
+                tracing::warn!("failed to hide the main window after close request");
             }
         })
         .register_asynchronous_uri_scheme_protocol("invoice-file", |context, request, responder| {
@@ -116,9 +151,7 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app, event| {
-        if matches!(event, tauri::RunEvent::Exit) {
-            shutdown_runtime(app);
-        }
+        dispatch_run_event(&event, || shutdown_runtime(app));
     });
 }
 
@@ -138,11 +171,12 @@ fn setup_tray<R: Runtime>(
             let Some(action) = TrayAction::from_id(event.id().as_ref()) else {
                 return;
             };
-            match action {
-                TrayAction::Show => restore_main_window(app),
-                TrayAction::SyncAll => sync_all_enabled_accounts(app.clone()),
-                TrayAction::Exit => app.exit(0),
-            }
+            dispatch_tray_action(
+                action,
+                || restore_main_window(app),
+                || sync_all_enabled_accounts(app.clone()),
+                |code| app.exit(code),
+            );
         });
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
@@ -203,8 +237,14 @@ fn initialize_state<R: Runtime>(
         extractor,
     );
     tauri::async_runtime::block_on(state.reconcile_account_saves())?;
-    tauri::async_runtime::block_on(state.reconcile_exports())?;
+    tauri::async_runtime::block_on(reconcile_exports_on_startup(&state));
     Ok(state)
+}
+
+async fn reconcile_exports_on_startup(state: &AppState) {
+    if state.reconcile_exports().await.is_err() {
+        tracing::warn!("export recovery was deferred until storage becomes available");
+    }
 }
 
 fn sidecar_executable() -> Result<PathBuf, std::io::Error> {
@@ -232,7 +272,7 @@ fn shutdown_runtime<R: Runtime>(app: &tauri::AppHandle<R>) {
     let report = tauri::async_runtime::block_on(
         app.state::<AppState>()
             .begin_application_shutdown(scheduler)
-            .wait(Duration::from_secs(10)),
+            .wait(SHUTDOWN_TIMEOUT),
     );
     if report.timed_out {
         tracing::error!(
@@ -248,6 +288,9 @@ fn shutdown_runtime<R: Runtime>(app: &tauri::AppHandle<R>) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::time::Duration;
+
     #[test]
     fn exposes_the_desktop_entrypoint() {
         assert_eq!(env!("CARGO_PKG_NAME"), "invoice-reimbursement");
@@ -291,5 +334,118 @@ mod tests {
         .unwrap();
 
         assert_eq!(applied.as_deref(), Some("发票报销，7 张待确认"));
+    }
+
+    #[test]
+    fn main_window_close_request_prevents_close_and_hides_the_window() {
+        let prevented = Cell::new(false);
+        let hidden = Cell::new(false);
+
+        let handled = super::handle_main_window_close_request(
+            "main",
+            || prevented.set(true),
+            || {
+                hidden.set(true);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+
+        assert!(handled);
+        assert!(prevented.get());
+        assert!(hidden.get());
+    }
+
+    #[test]
+    fn non_main_window_close_request_is_left_to_the_runtime() {
+        let prevented = Cell::new(false);
+        let hidden = Cell::new(false);
+
+        let handled = super::handle_main_window_close_request(
+            "preview",
+            || prevented.set(true),
+            || {
+                hidden.set(true);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+
+        assert!(!handled);
+        assert!(!prevented.get());
+        assert!(!hidden.get());
+    }
+
+    #[test]
+    fn tray_exit_action_requests_application_exit_with_success_code() {
+        let exit_code = Cell::new(None);
+
+        super::dispatch_tray_action(
+            super::TrayAction::Exit,
+            || panic!("exit must not restore the window"),
+            || panic!("exit must not start synchronization"),
+            |code| exit_code.set(Some(code)),
+        );
+
+        assert_eq!(exit_code.get(), Some(0));
+    }
+
+    #[test]
+    fn only_runtime_exit_dispatches_graceful_shutdown() {
+        let shutdowns = Cell::new(0);
+        super::dispatch_run_event(&tauri::RunEvent::Ready, || {
+            shutdowns.set(shutdowns.get() + 1)
+        });
+        super::dispatch_run_event(&tauri::RunEvent::Exit, || {
+            shutdowns.set(shutdowns.get() + 1)
+        });
+
+        assert_eq!(shutdowns.get(), 1);
+    }
+
+    #[test]
+    fn graceful_shutdown_deadline_is_exactly_ten_seconds() {
+        assert_eq!(super::SHUTDOWN_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn startup_export_recovery_failure_is_recorded_without_aborting_startup() {
+        use std::sync::Arc;
+
+        use crate::db;
+        use crate::infra::credentials::MemoryCredentialStore;
+        use crate::infra::files::AppPaths;
+        use crate::infra::imap::NativeTlsImapGateway;
+        use crate::state::AppState;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing_root = directory.path().join("unmounted-exports");
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let preferences = serde_json::json!({
+            "backgroundSyncEnabled": true,
+            "exportDirectory": missing_root.to_string_lossy(),
+            "batchDirectoryPattern": "{batchName}-{timestamp}",
+        });
+        sqlx::query(
+            "INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?)",
+        )
+        .bind(preferences.to_string())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::with_gateway(
+            pool,
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(NativeTlsImapGateway::default()),
+        );
+
+        super::reconcile_exports_on_startup(&state).await;
+
+        let status = crate::commands::settings::storage_status(&state)
+            .await
+            .unwrap();
+        assert!(status.recovery_error.is_some());
     }
 }

@@ -14,6 +14,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, SqlitePool};
 use std::borrow::Cow;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -2066,6 +2068,169 @@ async fn mailbox_account_repository_inserts_gets_lists_and_round_trips_providers
         missing_error,
         AppError::NotFound { ref entity, .. } if entity == "mailbox_account"
     ));
+}
+
+#[tokio::test]
+async fn mailbox_account_status_snapshots_align_retry_state_across_multiple_accounts() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = MailboxAccountRepository::new(pool);
+    let active = repository
+        .insert(sample_account("a-active@example.com"))
+        .await
+        .unwrap();
+    let suspended = repository
+        .insert(sample_account("b-suspended@example.com"))
+        .await
+        .unwrap();
+    let healthy = repository
+        .insert(sample_account("c-healthy@example.com"))
+        .await
+        .unwrap();
+    let failed_at = Utc.with_ymd_and_hms(2026, 7, 17, 9, 40, 0).unwrap();
+    let active_retry = repository
+        .record_retryable_failure(active.id, failed_at, "network timeout")
+        .await
+        .unwrap();
+    let suspended_retry = repository
+        .suspend_retry(suspended.id, failed_at, "authentication failed")
+        .await
+        .unwrap();
+
+    let snapshots = repository.list_with_retry_states().await.unwrap();
+
+    assert_eq!(snapshots.len(), 3);
+    assert_eq!(snapshots[0].account.id, active.id);
+    assert_eq!(snapshots[0].retry_state, Some(active_retry));
+    assert_eq!(snapshots[1].account.id, suspended.id);
+    assert_eq!(snapshots[1].retry_state, Some(suspended_retry));
+    assert_eq!(snapshots[2].account.id, healthy.id);
+    assert_eq!(snapshots[2].retry_state, None);
+}
+
+#[tokio::test]
+async fn mailbox_account_status_snapshot_cannot_mix_account_and_retry_revisions() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        directory
+            .path()
+            .join("account-status-snapshot.sqlite3")
+            .display()
+    );
+    let options = SqliteConnectOptions::from_str(&database_url)
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
+    let setup_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&setup_pool)
+        .await
+        .unwrap();
+    let setup_repository = MailboxAccountRepository::new(setup_pool.clone());
+    let target = setup_repository
+        .insert(sample_account("a-target@example.com"))
+        .await
+        .unwrap();
+    let old_failed_at = Utc.with_ymd_and_hms(2026, 7, 17, 9, 40, 0).unwrap();
+    let old_retry = setup_repository
+        .record_retryable_failure(target.id, old_failed_at, "old network failure")
+        .await
+        .unwrap();
+    for index in 0..160 {
+        setup_repository
+            .insert(sample_account(&format!("filler-{index:03}@example.com")))
+            .await
+            .unwrap();
+    }
+    setup_pool.close().await;
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let read_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_connect({
+            let armed = armed.clone();
+            let release_rx = release_rx.clone();
+            move |connection, _| {
+                let armed = armed.clone();
+                let started_tx = started_tx.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    let mut progress_calls = 0;
+                    connection
+                        .lock_handle()
+                        .await?
+                        .set_progress_handler(10, move || {
+                            progress_calls += 1;
+                            if progress_calls >= 50 && armed.swap(false, Ordering::SeqCst) {
+                                started_tx.send(()).unwrap();
+                                release_rx.lock().unwrap().recv().unwrap();
+                            }
+                            true
+                        });
+                    Ok(())
+                })
+            }
+        })
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let writer_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let repository = MailboxAccountRepository::new(read_pool);
+    armed.store(true, Ordering::SeqCst);
+    let reader = tokio::spawn(async move { repository.list_with_retry_states().await.unwrap() });
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(3)))
+        .await
+        .unwrap()
+        .expect("status SELECT should reach the deterministic interleave point");
+
+    let new_failed_at = Utc.with_ymd_and_hms(2026, 7, 17, 10, 0, 0).unwrap();
+    let mut writer = writer_pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE mailbox_accounts SET last_error = 'new authentication failure', \
+            last_error_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(new_failed_at.to_rfc3339())
+    .bind(new_failed_at.to_rfc3339())
+    .bind(target.id.to_string())
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE sync_retry_states SET failures = 0, next_retry_at = NULL, suspended = 1, \
+            updated_at = ? WHERE account_id = ?",
+    )
+    .bind(new_failed_at.to_rfc3339())
+    .bind(target.id.to_string())
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    writer.commit().await.unwrap();
+    release_tx.send(()).unwrap();
+
+    let snapshots = reader.await.unwrap();
+    let snapshot = snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.account.id == target.id)
+        .unwrap();
+    assert_eq!(
+        snapshot.account.last_error.as_deref(),
+        Some("old network failure")
+    );
+    assert_eq!(snapshot.account.last_error_at, Some(old_failed_at));
+    assert_eq!(snapshot.retry_state, Some(old_retry));
 }
 
 #[tokio::test]
