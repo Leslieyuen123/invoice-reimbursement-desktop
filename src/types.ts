@@ -171,6 +171,17 @@ export interface BatchDetailDto {
   warnings: string[];
 }
 
+export type BatchCandidateDisabledReason =
+  | "recognition_failed"
+  | "suspected_duplicate";
+
+export interface BatchCandidateDto {
+  item: InvoiceItemDto;
+  outsideBatchRange: boolean;
+  eligible: boolean;
+  disabledReason: BatchCandidateDisabledReason | null;
+}
+
 export interface NewBatchInputDto {
   name: string;
   startDate: string;

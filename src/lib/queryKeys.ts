@@ -1,6 +1,7 @@
 import type { ItemFilter, PageRequestDto } from "../types";
 
 const itemLists = ["invoice-reimbursement", "items", "list"] as const;
+const batchLists = ["invoice-reimbursement", "batches", "list"] as const;
 
 export const queryKeys = {
   all: ["invoice-reimbursement"] as const,
@@ -10,10 +11,25 @@ export const queryKeys = {
     [...itemLists, filter, page] as const,
   item: (itemId: string) =>
     ["invoice-reimbursement", "items", "detail", itemId] as const,
+  batchLists,
   batches: (page?: PageRequestDto) =>
-    ["invoice-reimbursement", "batches", page] as const,
+    [...batchLists, page] as const,
   batch: (batchId: string) =>
-    ["invoice-reimbursement", "batches", batchId] as const,
+    ["invoice-reimbursement", "batches", "detail", batchId] as const,
+  batchCandidates: (
+    batchId: string,
+    query: string,
+    page?: PageRequestDto,
+  ) =>
+    [
+      "invoice-reimbursement",
+      "batches",
+      "detail",
+      batchId,
+      "candidates",
+      query,
+      page,
+    ] as const,
   mailboxAccounts: ["invoice-reimbursement", "mailbox-accounts"] as const,
   preferences: ["invoice-reimbursement", "preferences"] as const,
 };

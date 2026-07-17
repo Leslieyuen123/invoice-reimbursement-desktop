@@ -130,7 +130,7 @@ pub async fn list_page(
     })
 }
 
-fn parse_item_cursor(cursor: &CursorDto) -> Result<ItemPageCursor, AppError> {
+pub(crate) fn parse_item_cursor(cursor: &CursorDto) -> Result<ItemPageCursor, AppError> {
     Ok(ItemPageCursor {
         created_at: DateTime::parse_from_rfc3339(&cursor.sort_value)
             .map(|value| value.with_timezone(&Utc))

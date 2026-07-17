@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  BatchCandidateDto,
   BatchDetailDto,
   BatchDto,
   DashboardDto,
@@ -62,6 +63,16 @@ export const api = {
     call<PageDto<BatchDto>>("list_batches", { page }),
   getBatch: (batchId: string) =>
     call<BatchDetailDto>("get_batch", { batchId }),
+  listBatchCandidates: (
+    batchId: string,
+    query?: string,
+    page?: PageRequestDto,
+  ) =>
+    call<PageDto<BatchCandidateDto>>("list_batch_candidates", {
+      batchId,
+      query,
+      page,
+    }),
   createMonthBatch: (year: number, month: number) =>
     call<BatchDto>("create_month_batch", { year, month }),
   createCustomBatch: (input: NewBatchInputDto) =>

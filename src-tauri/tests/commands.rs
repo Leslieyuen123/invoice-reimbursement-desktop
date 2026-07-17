@@ -228,6 +228,7 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "retry_recognition",
             "list_batches",
             "get_batch",
+            "list_batch_candidates",
             "create_month_batch",
             "create_custom_batch",
             "assign_items_to_batch",
@@ -765,6 +766,10 @@ fn tauri_security_configuration_is_narrow_and_blocks_remote_scripts() {
             .unwrap();
     assert_eq!(
         capability["permissions"],
-        serde_json::json!(["core:default", "dialog:allow-open"])
+        serde_json::json!([
+            "core:default",
+            "dialog:allow-open",
+            "opener:allow-reveal-item-in-dir"
+        ])
     );
 }

@@ -125,6 +125,23 @@ const commandCases: Array<{
     invokeArguments: { batchId: "batch-1" },
   },
   {
+    method: "listBatchCandidates",
+    arguments_: [
+      "batch-1",
+      "酒店",
+      { cursor: { sortValue: "2026-07-16", id: "item-1" }, pageSize: 25 },
+    ],
+    command: "list_batch_candidates",
+    invokeArguments: {
+      batchId: "batch-1",
+      query: "酒店",
+      page: {
+        cursor: { sortValue: "2026-07-16", id: "item-1" },
+        pageSize: 25,
+      },
+    },
+  },
+  {
     method: "createMonthBatch",
     arguments_: [2026, 7],
     command: "create_month_batch",

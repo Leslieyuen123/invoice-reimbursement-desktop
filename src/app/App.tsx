@@ -8,6 +8,9 @@ import {
 } from "react-router-dom";
 
 import { DashboardPage } from "../features/dashboard/DashboardPage";
+import { BatchDetailPage } from "../features/batches/BatchDetailPage";
+import { BatchListPage } from "../features/batches/BatchListPage";
+import { CreateBatchDialog } from "../features/batches/CreateBatchDialog";
 import { InboxPage } from "../features/inbox/InboxPage";
 import { AppShell } from "./AppShell";
 
@@ -41,18 +44,9 @@ export function App() {
           <Route element={<AppShell />}>
             <Route index element={<DashboardPage />} />
             <Route path="inbox" element={<InboxPage />} />
-            <Route
-              path="batches"
-              element={<PlaceholderPage title="报销批次" />}
-            />
-            <Route
-              path="batches/new"
-              element={<PlaceholderPage title="新建批次" />}
-            />
-            <Route
-              path="batches/:batchId"
-              element={<PlaceholderPage title="批次详情" />}
-            />
+            <Route path="batches" element={<BatchListPage />} />
+            <Route path="batches/new" element={<CreateBatchDialog />} />
+            <Route path="batches/:batchId" element={<BatchDetailPage />} />
             <Route path="settings" element={<PlaceholderPage title="设置" />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

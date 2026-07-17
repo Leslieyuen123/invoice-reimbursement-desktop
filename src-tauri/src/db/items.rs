@@ -440,6 +440,72 @@ impl ItemRepository {
         rows.into_iter().map(InvoiceItem::try_from).collect()
     }
 
+    pub async fn list_batch_candidates(
+        &self,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        search: Option<String>,
+        cursor: Option<ItemPageCursor>,
+        page_size: usize,
+    ) -> Result<ItemPage, AppError> {
+        validate_page_size(page_size)?;
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
+        query
+            .push(ITEM_COLUMNS)
+            .push(" FROM items WHERE batch_id IS NULL");
+        if let Some(search) = search {
+            push_item_search_filter(&mut query, search);
+        } else {
+            query
+                .push(" AND invoice_date >= ")
+                .push_bind(start_date.to_string())
+                .push(" AND invoice_date <= ")
+                .push_bind(end_date.to_string());
+        }
+        if let Some(cursor) = cursor {
+            let created_at = cursor.created_at.to_rfc3339();
+            query
+                .push(" AND (created_at < ")
+                .push_bind(created_at.clone())
+                .push(" OR (created_at = ")
+                .push_bind(created_at)
+                .push(" AND id < ")
+                .push_bind(cursor.id.to_string())
+                .push("))");
+        }
+        let fetch_limit = page_size.checked_add(1).ok_or_else(|| AppError::Internal {
+            message: "batch candidate page size overflow".to_owned(),
+        })?;
+        query
+            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(
+                i64::try_from(fetch_limit)
+                    .map_err(|_| AppError::validation("pageSize", "page size is too large"))?,
+            );
+        let rows = query
+            .build_query_as::<DbItemRow>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to list batch candidates", error))?;
+        let has_next = rows.len() > page_size;
+        let mut rows = rows;
+        rows.truncate(page_size);
+        let items = rows
+            .into_iter()
+            .map(InvoiceItem::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = has_next.then(|| {
+            let last = items
+                .last()
+                .expect("nonempty batch candidate page must have a cursor row");
+            ItemPageCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }
+        });
+        Ok(ItemPage { items, next_cursor })
+    }
+
     pub(crate) async fn list_by_batch_with_connection(
         connection: &mut SqliteConnection,
         batch_id: Uuid,
@@ -868,18 +934,22 @@ fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
             .push_bind(batch_id.to_string());
     }
     if let Some(search) = filter.query {
-        let pattern = format!("%{search}%");
-        query
-            .push(" AND (LOWER(original_name) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") OR LOWER(company) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") OR LOWER(city) LIKE LOWER(")
-            .push_bind(pattern.clone())
-            .push(") OR LOWER(note) LIKE LOWER(")
-            .push_bind(pattern)
-            .push("))");
+        push_item_search_filter(query, search);
     }
+}
+
+fn push_item_search_filter(query: &mut QueryBuilder<'_, Sqlite>, search: String) {
+    let pattern = format!("%{search}%");
+    query
+        .push(" AND (LOWER(original_name) LIKE LOWER(")
+        .push_bind(pattern.clone())
+        .push(") OR LOWER(company) LIKE LOWER(")
+        .push_bind(pattern.clone())
+        .push(") OR LOWER(city) LIKE LOWER(")
+        .push_bind(pattern.clone())
+        .push(") OR LOWER(note) LIKE LOWER(")
+        .push_bind(pattern)
+        .push("))");
 }
 
 fn validate_assigned_item_state(item: &NewItemRecord) -> Result<(), AppError> {

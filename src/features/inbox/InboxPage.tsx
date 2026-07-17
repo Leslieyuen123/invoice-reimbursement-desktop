@@ -144,6 +144,7 @@ export function InboxPage() {
   >([]);
   const [importingPaths, setImportingPaths] = useState<string[]>([]);
   const status = statusFromSearch(searchParams.get("status"));
+  const batchId = searchParams.get("batchId")?.trim() || undefined;
   const filter = useMemo<ItemFilter>(
     () => ({
       ...(status ? { status } : {}),
@@ -151,8 +152,9 @@ export function InboxPage() {
       ...(category ? { category } : {}),
       ...(sourceType ? { sourceType } : {}),
       ...(query.trim() ? { query: query.trim() } : {}),
+      ...(batchId ? { batchId } : {}),
     }),
-    [category, query, sourceType, status, suggestedPeriod],
+    [batchId, category, query, sourceType, status, suggestedPeriod],
   );
   const itemsQuery = useInfiniteQuery({
     queryKey: queryKeys.items(filter),

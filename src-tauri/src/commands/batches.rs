@@ -6,7 +6,7 @@ use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
 use crate::db::batches::{Batch, BatchPageCursor, BatchSummary};
 use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::AppError;
-use crate::domain::model::BatchStatus;
+use crate::domain::model::{BatchStatus, DedupeStatus, RecognitionStatus};
 use crate::services::batches::{
     BatchDetail, BatchDetailSummary, BatchService, CategorySummary, NewBatchInput,
 };
@@ -171,6 +171,22 @@ pub struct NewBatchInputDto {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchCandidateDisabledReason {
+    RecognitionFailed,
+    SuspectedDuplicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCandidateDto {
+    pub item: crate::commands::items::InvoiceItemDto,
+    pub outside_batch_range: bool,
+    pub eligible: bool,
+    pub disabled_reason: Option<BatchCandidateDisabledReason>,
+}
+
 pub async fn list(state: &AppState) -> Result<Vec<BatchDto>, AppError> {
     Ok(list_page(state, None).await?.items)
 }
@@ -196,6 +212,53 @@ pub async fn list_page(
             .collect::<Result<Vec<_>, _>>()?,
         next_cursor: page.next_cursor.map(|cursor| CursorDto {
             sort_value: cursor.updated_at.to_rfc3339(),
+            id: cursor.id.to_string(),
+        }),
+    })
+}
+
+pub async fn list_candidates(
+    state: &AppState,
+    batch_id: Uuid,
+    query: Option<String>,
+    page: Option<PageRequestDto>,
+) -> Result<PageDto<BatchCandidateDto>, AppError> {
+    let page_size = validated_page_size(page.as_ref())?;
+    let cursor = page
+        .as_ref()
+        .and_then(|page| page.cursor.as_ref())
+        .map(crate::commands::items::parse_item_cursor)
+        .transpose()?;
+    let page = BatchService::new(state.pool().clone())
+        .list_candidates(batch_id, query, cursor, page_size)
+        .await?;
+    let batch = page.batch;
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| {
+            let outside_batch_range = item
+                .invoice_date
+                .is_none_or(|date| date < batch.start_date || date > batch.end_date);
+            let disabled_reason = if item.dedupe_status == DedupeStatus::SuspectedDuplicate {
+                Some(BatchCandidateDisabledReason::SuspectedDuplicate)
+            } else if item.recognition_status == RecognitionStatus::Failed {
+                Some(BatchCandidateDisabledReason::RecognitionFailed)
+            } else {
+                None
+            };
+            Ok(BatchCandidateDto {
+                item: crate::commands::items::InvoiceItemDto::try_from(item)?,
+                outside_batch_range,
+                eligible: disabled_reason.is_none(),
+                disabled_reason,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(PageDto {
+        items,
+        next_cursor: page.next_cursor.map(|cursor| CursorDto {
+            sort_value: cursor.created_at.to_rfc3339(),
             id: cursor.id.to_string(),
         }),
     })
@@ -268,7 +331,7 @@ pub(crate) mod ipc {
     use tauri::State;
     use uuid::Uuid;
 
-    use super::{BatchDetailDto, BatchDto, NewBatchInputDto};
+    use super::{BatchCandidateDto, BatchDetailDto, BatchDto, NewBatchInputDto};
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
     use crate::state::AppState;
@@ -287,6 +350,16 @@ pub(crate) mod ipc {
         batch_id: Uuid,
     ) -> Result<BatchDetailDto, AppError> {
         super::get(&state, batch_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn list_batch_candidates(
+        state: State<'_, AppState>,
+        batch_id: Uuid,
+        query: Option<String>,
+        page: Option<PageRequestDto>,
+    ) -> Result<PageDto<BatchCandidateDto>, AppError> {
+        super::list_candidates(&state, batch_id, query, page).await
     }
 
     #[tauri::command(rename_all = "camelCase")]

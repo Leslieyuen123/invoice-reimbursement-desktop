@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
+use invoice_reimbursement::commands::batches::BatchCandidateDisabledReason;
 use invoice_reimbursement::commands::{CursorDto, PageRequestDto, batches, dashboard, items};
 use invoice_reimbursement::db;
 use invoice_reimbursement::db::batches::BatchRepository;
@@ -130,6 +131,180 @@ async fn item_pages_are_bounded_and_seek_without_duplicates_or_omissions() {
     .await
     .unwrap_err();
     assert!(matches!(error, AppError::Validation { ref field, .. } if field == "pageSize"));
+}
+
+#[tokio::test]
+async fn batch_candidates_use_exact_dates_and_report_assignment_eligibility() {
+    let fixture = Fixture::new().await;
+    let batch_id = Uuid::parse_str(&fixture.expected_batch_ids[0]).unwrap();
+    for (id, invoice_date, recognition, dedupe) in [
+        (1_u128, Some("2026-01-01"), "failed", "unique"),
+        (2, Some("2026-12-31"), "succeeded", "suspected_duplicate"),
+        (3, Some("2025-12-31"), "succeeded", "unique"),
+        (4, None, "succeeded", "unique"),
+        (5, Some("2026-07-17"), "succeeded", "unique"),
+    ] {
+        sqlx::query(
+            "UPDATE items SET invoice_date = ?, recognition_status = ?, dedupe_status = ? \
+             WHERE id = ?",
+        )
+        .bind(invoice_date)
+        .bind(recognition)
+        .bind(dedupe)
+        .bind(Uuid::from_u128(id).to_string())
+        .execute(fixture.state.pool())
+        .await
+        .unwrap();
+    }
+
+    let page = batches::list_candidates(&fixture.state, batch_id, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|candidate| candidate.item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            Uuid::from_u128(5).to_string(),
+            Uuid::from_u128(2).to_string(),
+            Uuid::from_u128(1).to_string(),
+        ]
+    );
+    assert!(
+        page.items
+            .iter()
+            .all(|candidate| !candidate.outside_batch_range)
+    );
+    assert!(page.items[0].eligible);
+    assert_eq!(page.items[0].disabled_reason, None);
+    assert!(!page.items[1].eligible);
+    assert_eq!(
+        page.items[1].disabled_reason,
+        Some(BatchCandidateDisabledReason::SuspectedDuplicate)
+    );
+    assert!(!page.items[2].eligible);
+    assert_eq!(
+        page.items[2].disabled_reason,
+        Some(BatchCandidateDisabledReason::RecognitionFailed)
+    );
+}
+
+#[tokio::test]
+async fn batch_candidate_search_marks_outside_dates_and_excludes_assigned_items() {
+    let fixture = Fixture::new().await;
+    let batch_id = Uuid::parse_str(&fixture.expected_batch_ids[0]).unwrap();
+    for (id, invoice_date, name, assigned) in [
+        (10_u128, Some("2025-12-31"), "差旅检索-范围外.pdf", false),
+        (11, None, "差旅检索-无日期.pdf", false),
+        (12, Some("2026-07-17"), "差旅检索-范围内.pdf", false),
+        (13, Some("2026-07-17"), "差旅检索-已归属.pdf", true),
+    ] {
+        sqlx::query(
+            "UPDATE items SET invoice_date = ?, original_name = ?, batch_id = ? WHERE id = ?",
+        )
+        .bind(invoice_date)
+        .bind(name)
+        .bind(assigned.then(|| batch_id.to_string()))
+        .bind(Uuid::from_u128(id).to_string())
+        .execute(fixture.state.pool())
+        .await
+        .unwrap();
+    }
+
+    let page = batches::list_candidates(
+        &fixture.state,
+        batch_id,
+        Some("  差旅检索  ".to_owned()),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page.items.len(), 3);
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|candidate| (candidate.item.id.clone(), candidate.outside_batch_range))
+            .collect::<Vec<_>>(),
+        vec![
+            (Uuid::from_u128(12).to_string(), false),
+            (Uuid::from_u128(11).to_string(), true),
+            (Uuid::from_u128(10).to_string(), true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn batch_candidate_pages_seek_stably_and_validate_requests() {
+    let fixture = Fixture::new().await;
+    let batch_id = Uuid::parse_str(&fixture.expected_batch_ids[0]).unwrap();
+    let expected = fixture.expected_item_ids[2..].to_vec();
+    let mut ids = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = batches::list_candidates(
+            &fixture.state,
+            batch_id,
+            Some(".pdf".to_owned()),
+            Some(PageRequestDto {
+                cursor,
+                page_size: Some(37),
+            }),
+        )
+        .await
+        .unwrap();
+        ids.extend(page.items.into_iter().map(|candidate| candidate.item.id));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(ids, expected);
+    assert_eq!(ids.iter().collect::<HashSet<_>>().len(), expected.len());
+
+    for page_size in [0, 201] {
+        let error = batches::list_candidates(
+            &fixture.state,
+            batch_id,
+            None,
+            Some(PageRequestDto {
+                cursor: None,
+                page_size: Some(page_size),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Validation { ref field, .. } if field == "pageSize"));
+    }
+
+    let cursor_error = batches::list_candidates(
+        &fixture.state,
+        batch_id,
+        Some("pdf".to_owned()),
+        Some(PageRequestDto {
+            cursor: Some(CursorDto {
+                sort_value: "not-a-date".to_owned(),
+                id: Uuid::new_v4().to_string(),
+            }),
+            page_size: Some(5),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(cursor_error, AppError::Validation { ref field, .. } if field == "cursor"));
+
+    let query_error =
+        batches::list_candidates(&fixture.state, batch_id, Some("x".repeat(201)), None)
+            .await
+            .unwrap_err();
+    assert!(matches!(query_error, AppError::Validation { ref field, .. } if field == "query"));
+
+    let missing_error = batches::list_candidates(&fixture.state, Uuid::new_v4(), None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(missing_error, AppError::NotFound { ref entity, .. } if entity == "batch"));
 }
 
 #[tokio::test]

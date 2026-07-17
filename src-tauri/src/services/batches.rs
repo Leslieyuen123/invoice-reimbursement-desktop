@@ -5,7 +5,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::db::batches::{Batch, BatchPage, BatchPageCursor, BatchRepository, BatchSummary};
-use crate::db::items::{InvoiceItem, ItemRepository};
+use crate::db::items::{InvoiceItem, ItemPageCursor, ItemRepository};
 use crate::domain::amount::checked_add_amount_cents;
 use crate::domain::error::AppError;
 use crate::domain::model::{
@@ -43,6 +43,13 @@ pub struct BatchDetail {
     pub items: Vec<InvoiceItem>,
     pub summary: BatchDetailSummary,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchCandidatePage {
+    pub batch: Batch,
+    pub items: Vec<InvoiceItem>,
+    pub next_cursor: Option<ItemPageCursor>,
 }
 
 #[derive(Clone)]
@@ -157,6 +164,27 @@ impl BatchService {
                 &end_date.format("%Y-%m").to_string(),
             )
             .await
+    }
+
+    pub async fn list_candidates(
+        &self,
+        batch_id: Uuid,
+        query: Option<String>,
+        cursor: Option<ItemPageCursor>,
+        page_size: usize,
+    ) -> Result<BatchCandidatePage, AppError> {
+        let batch = BatchRepository::new(self.pool.clone())
+            .get(batch_id)
+            .await?;
+        let query = normalize_candidate_query(query)?;
+        let page = ItemRepository::new(self.pool.clone())
+            .list_batch_candidates(batch.start_date, batch.end_date, query, cursor, page_size)
+            .await?;
+        Ok(BatchCandidatePage {
+            batch,
+            items: page.items,
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub async fn assign_items(
@@ -355,6 +383,20 @@ impl BatchService {
             warnings,
         })
     }
+}
+
+fn normalize_candidate_query(query: Option<String>) -> Result<Option<String>, AppError> {
+    let query = query.map(|value| value.trim().to_owned());
+    let Some(query) = query.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if query.chars().count() > 200 || query.chars().any(char::is_control) {
+        return Err(AppError::validation(
+            "query",
+            "query must contain at most 200 printable characters",
+        ));
+    }
+    Ok(Some(query))
 }
 
 fn parse_date(value: &str, field: &str) -> Result<NaiveDate, AppError> {
