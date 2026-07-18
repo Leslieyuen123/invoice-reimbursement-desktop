@@ -358,8 +358,53 @@ describe("browser command bridge", () => {
     });
   });
 
+  it("treats a NEL-only candidate query as no query", async () => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture()],
+      items: [
+        invoiceFixture("inside"),
+        invoiceFixture("outside", { invoiceDate: "2026-06-30" }),
+      ],
+    });
+
+    const result = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      { batchId: "batch-1", query: "\u0085" },
+    );
+
+    expect(result.items.map(({ item }) => item.id)).toEqual(["inside"]);
+  });
+
+  it("preserves a BOM-only candidate query as searchable content", async () => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture()],
+      items: [invoiceFixture("inside")],
+    });
+
+    const result = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      { batchId: "batch-1", query: "\uFEFF" },
+    );
+
+    expect(result).toEqual({ items: [], nextCursor: null });
+  });
+
+  it("accepts a candidate query containing 200 astral code points", async () => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture()],
+      items: [invoiceFixture("inside")],
+    });
+
+    const result = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      { batchId: "batch-1", query: "😀".repeat(200) },
+    );
+
+    expect(result).toEqual({ items: [], nextCursor: null });
+  });
+
   it.each([
-    ["more than 200 Unicode characters", "票".repeat(201)],
+    ["more than 200 Unicode code points", "😀".repeat(201)],
     ["a control character", "候选\u0000票据"],
   ])("rejects a candidate query containing %s", async (_case, query) => {
     const bridge = createSeededBridge({ batches: [batchFixture()] });

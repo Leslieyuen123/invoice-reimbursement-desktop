@@ -84,7 +84,10 @@ function requiredObject<T>(arguments_: CommandArguments, name: string): T {
 }
 
 function normalizeCandidateQuery(value: unknown) {
-  const query = typeof value === "string" ? value.trim() : "";
+  const query =
+    typeof value === "string"
+      ? value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "")
+      : "";
   if (Array.from(query).length > 200 || /\p{Cc}/u.test(query)) {
     throw {
       code: "validation",
