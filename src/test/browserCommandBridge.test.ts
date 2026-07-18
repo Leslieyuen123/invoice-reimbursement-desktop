@@ -272,49 +272,84 @@ describe("browser command bridge", () => {
     expect(candidatePageTwo.items).toHaveLength(2);
   });
 
-  it("matches Rust candidate range and eligibility derivation", async () => {
+  it("matches Rust candidate range and searched outside-date derivation", async () => {
     const bridge = createSeededBridge({
       batches: [batchFixture()],
       items: [
         invoiceFixture("missing-date", {
+          originalName: "候选-无日期.png",
           invoiceDate: null,
           status: "pending_confirmation",
           confirmationStatus: "pending",
         }),
+        invoiceFixture("outside-date", {
+          originalName: "候选-范围外.png",
+          invoiceDate: "2026-06-30",
+        }),
         invoiceFixture("failed", {
+          originalName: "候选-识别失败.png",
           status: "ready",
           recognitionStatus: "failed",
         }),
         invoiceFixture("duplicate", {
+          originalName: "候选-疑似重复.png",
           status: "ready",
           recognitionStatus: "failed",
           dedupeStatus: "suspected_duplicate",
         }),
+        invoiceFixture("inside", {
+          originalName: "候选-范围内.png",
+        }),
       ],
     });
 
-    const result = await bridge<PageDto<BatchCandidateDto>>(
+    const inRange = await bridge<PageDto<BatchCandidateDto>>(
       "list_batch_candidates",
       { batchId: "batch-1" },
     );
-    expect(result.items).toEqual([
-      expect.objectContaining({
-        item: expect.objectContaining({ id: "missing-date" }),
-        outsideBatchRange: true,
-        eligible: true,
-        disabledReason: null,
-      }),
-      expect.objectContaining({
-        item: expect.objectContaining({ id: "failed" }),
-        eligible: false,
-        disabledReason: "recognition_failed",
-      }),
-      expect.objectContaining({
-        item: expect.objectContaining({ id: "duplicate" }),
-        eligible: false,
-        disabledReason: "suspected_duplicate",
-      }),
+    expect(inRange.items.map(({ item }) => item.id).sort()).toEqual([
+      "duplicate",
+      "failed",
+      "inside",
     ]);
+    expect(inRange.items.every((candidate) => !candidate.outsideBatchRange)).toBe(
+      true,
+    );
+
+    const searched = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      { batchId: "batch-1", query: "  候选  " },
+    );
+    const byId = Object.fromEntries(
+      searched.items.map((candidate) => [candidate.item.id, candidate]),
+    );
+    expect(Object.keys(byId).sort()).toEqual([
+      "duplicate",
+      "failed",
+      "inside",
+      "missing-date",
+      "outside-date",
+    ]);
+    expect(byId["missing-date"]).toMatchObject({
+      outsideBatchRange: true,
+      eligible: true,
+      disabledReason: null,
+    });
+    expect(byId["outside-date"]).toMatchObject({
+      outsideBatchRange: true,
+      eligible: true,
+      disabledReason: null,
+    });
+    expect(byId.failed).toMatchObject({
+      outsideBatchRange: false,
+      eligible: false,
+      disabledReason: "recognition_failed",
+    });
+    expect(byId.duplicate).toMatchObject({
+      outsideBatchRange: false,
+      eligible: false,
+      disabledReason: "suspected_duplicate",
+    });
   });
 
   it.each<ItemStatus>([

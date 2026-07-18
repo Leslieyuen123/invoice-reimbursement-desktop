@@ -5,6 +5,7 @@ import {
   type Page,
   type TestInfo,
 } from "@playwright/test";
+import { PNG } from "pngjs";
 
 const fixture = "src-tauri/tests/fixtures/text-invoice.pdf";
 
@@ -148,7 +149,33 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
   expect(previewGeometry.naturalHeight).toBeGreaterThan(0);
   expect(previewGeometry.contained).toBe(true);
   const previewPath = testInfo.outputPath("item-preview-image.png");
-  await previewImage.screenshot({ path: previewPath, animations: "disabled" });
+  const previewScreenshot = await previewImage.screenshot({
+    path: previewPath,
+    animations: "disabled",
+  });
+  const previewPng = PNG.sync.read(previewScreenshot);
+  let minimumLuminance = 255;
+  let maximumLuminance = 0;
+  let darkPixelCount = 0;
+  let lightPixelCount = 0;
+  for (let offset = 0; offset < previewPng.data.length; offset += 4) {
+    if (previewPng.data[offset + 3] === 0) continue;
+    const luminance = Math.round(
+      0.2126 * previewPng.data[offset] +
+        0.7152 * previewPng.data[offset + 1] +
+        0.0722 * previewPng.data[offset + 2],
+    );
+    minimumLuminance = Math.min(minimumLuminance, luminance);
+    maximumLuminance = Math.max(maximumLuminance, luminance);
+    if (luminance < 64) darkPixelCount += 1;
+    if (luminance > 192) lightPixelCount += 1;
+  }
+  const previewPixelRange = maximumLuminance - minimumLuminance;
+  expect(previewPng.width).toBeGreaterThan(0);
+  expect(previewPng.height).toBeGreaterThan(0);
+  expect(previewPixelRange).toBeGreaterThan(100);
+  expect(darkPixelCount).toBeGreaterThan(50);
+  expect(lightPixelCount).toBeGreaterThan(50);
   await testInfo.attach("item-preview-image", {
     path: previewPath,
     contentType: "image/png",

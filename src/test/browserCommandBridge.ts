@@ -339,9 +339,25 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       const batchId = requiredString(arguments_, "batchId");
       const batch = state.batches.find((candidate) => candidate.id === batchId);
       if (!batch) throw notFound("batch");
-      const query = typeof arguments_.query === "string" ? arguments_.query.toLocaleLowerCase("zh-CN") : "";
+      const query =
+        typeof arguments_.query === "string"
+          ? arguments_.query.trim().toLocaleLowerCase("zh-CN")
+          : "";
       const candidates = state.items
-        .filter((item) => item.batchId === null && (!query || item.originalName.toLocaleLowerCase("zh-CN").includes(query)))
+        .filter((item) => {
+          if (item.batchId !== null) return false;
+          if (query) {
+            return [item.originalName, item.company, item.city, item.note].some(
+              (value) =>
+                value?.toLocaleLowerCase("zh-CN").includes(query) ?? false,
+            );
+          }
+          return (
+            item.invoiceDate !== null &&
+            item.invoiceDate >= batch.startDate &&
+            item.invoiceDate <= batch.endDate
+          );
+        })
         .map<BatchCandidateDto>((item) => ({
           item: { ...item },
           outsideBatchRange:

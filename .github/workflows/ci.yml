@@ -125,11 +125,21 @@ jobs:
           test -f "${dmg_files[0]}"
           test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
           test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-ocr")" = "arm64"
-          minimum_system_version="$(
+          plist_minimum_system_version="$(
+            /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+              "$bundle_app/Contents/Info.plist"
+          )"
+          main_minimum_system_version="$(
             otool -l "$bundle_app/Contents/MacOS/invoice-reimbursement" |
               awk '$1 == "minos" { print $2; exit }'
           )"
-          test "$minimum_system_version" = "11.0"
+          ocr_minimum_system_version="$(
+            otool -l "$bundle_app/Contents/MacOS/invoice-ocr" |
+              awk '$1 == "minos" { print $2; exit }'
+          )"
+          test "$plist_minimum_system_version" = "11.0"
+          test "$main_minimum_system_version" = "11.0"
+          test "$ocr_minimum_system_version" = "11.0"
           hdiutil verify "${dmg_files[0]}"
 
           mount_dir="$(mktemp -d)"

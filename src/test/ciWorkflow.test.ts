@@ -29,8 +29,12 @@ describe("release workflow", () => {
   });
 
   it("checks the packaged deployment target", () => {
+    expect(workflow).toContain("Print :LSMinimumSystemVersion");
     expect(workflow).toContain('otool -l "$bundle_app/Contents/MacOS/invoice-reimbursement"');
-    expect(workflow).toContain('test "$minimum_system_version" = "11.0"');
+    expect(workflow).toContain('otool -l "$bundle_app/Contents/MacOS/invoice-ocr"');
+    expect(workflow).toContain('test "$plist_minimum_system_version" = "11.0"');
+    expect(workflow).toContain('test "$main_minimum_system_version" = "11.0"');
+    expect(workflow).toContain('test "$ocr_minimum_system_version" = "11.0"');
   });
 
   it("verifies the standalone app and mounted DMG payload before upload", () => {
@@ -93,5 +97,13 @@ describe("browser acceptance harness", () => {
     expect(e2eFlow).toContain("image.complete");
     expect(e2eFlow).toContain("image.naturalWidth > 0");
     expect(e2eFlow).toContain("image.naturalHeight > 0");
+  });
+
+  it("parses the preview screenshot and rejects blank pixel evidence", () => {
+    expect(e2eFlow).toContain('from "pngjs"');
+    expect(e2eFlow).toContain("PNG.sync.read(previewScreenshot)");
+    expect(e2eFlow).toContain("previewPixelRange");
+    expect(e2eFlow).toContain("darkPixelCount");
+    expect(e2eFlow).toContain("lightPixelCount");
   });
 });

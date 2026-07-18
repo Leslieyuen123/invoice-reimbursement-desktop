@@ -1330,6 +1330,7 @@ a {
 .item-preview-surface {
   min-width: 0;
   min-height: 0;
+  contain: size layout paint;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--panel-radius);

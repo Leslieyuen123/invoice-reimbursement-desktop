@@ -21,7 +21,7 @@
 - [ ] `npm run test:e2e` 在 800×700、1440×900、1728×1117 全部通过
 - [ ] `npm run tauri build -- --bundles app,dmg`
 - [ ] `.app`、`.dmg` 和内置 `invoice-ocr` 都是 arm64：`file <path>`
-- [ ] `otool -l <app-binary>` 的 `LC_BUILD_VERSION minos` 为 `11.0`
+- [ ] `Info.plist` 的 `LSMinimumSystemVersion`，以及主程序和内置 `invoice-ocr` 的 `LC_BUILD_VERSION minos` 均为 `11.0`
 - [ ] 生产 `dist/` 不含 `VITE_BROWSER_COMMAND_BRIDGE`、`__INVOICE_COMMAND_BRIDGE__` 或 `Simulated browser command failure`
 
 ## 安装、升级和数据生命周期

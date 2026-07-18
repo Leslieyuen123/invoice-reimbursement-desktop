@@ -1,33 +1,35 @@
-import { screen } from "@testing-library/dom";
+import { screen, waitFor } from "@testing-library/dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { installBrowserCommandBridgeMock } = vi.hoisted(() => ({
+  installBrowserCommandBridgeMock: vi.fn(() => {
+    throw new Error("secret app password: do-not-render");
+  }),
+}));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(() => new Promise(() => undefined)),
+}));
+vi.mock("./test/browserCommandBridge", () => ({
+  installBrowserCommandBridge: installBrowserCommandBridgeMock,
 }));
 
 describe("desktop bootstrap", () => {
   beforeEach(() => {
     document.body.innerHTML = '<div id="root"></div>';
+    vi.stubEnv("VITE_BROWSER_COMMAND_BRIDGE", "1");
   });
 
   afterEach(() => {
     document.body.innerHTML = "";
+    vi.unstubAllEnvs();
   });
 
-  it("renders a generic visible alert without leaking bootstrap error details", async () => {
-    const mainModule = (await import("./main")) as typeof import("./main") & {
-      renderBootstrapFailure?: (root: HTMLElement, error: unknown) => void;
-    };
-    const root = document.getElementById("root");
-    if (!root) throw new Error("test root missing");
+  it("renders the fatal fallback when the real top-level bootstrap rejects", async () => {
+    await import("./main");
 
-    expect(mainModule.renderBootstrapFailure).toBeTypeOf("function");
-    mainModule.renderBootstrapFailure?.(
-      root,
-      new Error("secret app password: do-not-render"),
-    );
-
-    expect(screen.getByRole("alert")).toHaveTextContent("应用无法启动");
+    await waitFor(() => expect(installBrowserCommandBridgeMock).toHaveBeenCalled());
+    expect(await screen.findByRole("alert")).toHaveTextContent("应用无法启动");
     expect(screen.getByRole("alert")).not.toHaveTextContent("do-not-render");
   });
 });

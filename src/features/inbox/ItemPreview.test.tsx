@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -5,6 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ItemPreview } from "./ItemPreview";
 
 const fetchMock = vi.fn<typeof fetch>();
+const appShellCss = readFileSync(
+  resolve(process.cwd(), "src/app/AppShell.css"),
+  "utf8",
+);
 
 describe("ItemPreview", () => {
   beforeEach(() => {
@@ -14,6 +21,12 @@ describe("ItemPreview", () => {
   });
 
   afterEach(() => vi.unstubAllGlobals());
+
+  it("contains preview layout and paint inside its allocated surface", () => {
+    expect(appShellCss).toMatch(
+      /\.item-preview-surface\s*\{[^}]*contain:\s*size layout paint;/s,
+    );
+  });
 
   it("aborts an unfinished preview check when it unmounts", async () => {
     let requestSignal: AbortSignal | undefined;
