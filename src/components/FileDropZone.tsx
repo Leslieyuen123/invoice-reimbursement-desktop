@@ -116,10 +116,12 @@ export function FileDropZone({ disabled = false, onPaths }: FileDropZoneProps) {
       {browserInputEnabled ? (
         <input
           ref={browserInputRef}
-          className="sr-only"
+          data-testid="browser-file-input"
           type="file"
           multiple
-          aria-label="选择票据文件"
+          hidden
+          tabIndex={-1}
+          aria-hidden="true"
           disabled={disabled}
           onChange={(event) => {
             const paths = Array.from(event.currentTarget.files ?? [], (file) => file.name);

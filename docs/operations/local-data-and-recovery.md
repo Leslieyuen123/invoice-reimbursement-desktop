@@ -1,13 +1,15 @@
 # 本地数据、备份与恢复
 
-本文适用于 macOS 版本 `com.invoice-desk.app`。操作前先确认 Finder 中显示的是预期用户的主目录；不要在应用运行时移动、替换或编辑数据文件。
+本文适用于正式 macOS 版本 `com.invoice-desk.desktop`。操作前先确认 Finder 中显示的是预期用户的主目录；不要在应用运行时移动、替换或编辑数据文件。
+
+开发阶段曾使用 `com.invoice-desk.app`。旧预发布目录不是正式数据源，正式版不会自动读取或迁移该目录；如需保留预发布测试数据，应先保留只读副本，再由熟悉 SQLite migration 和文件存储布局的人员审核迁移，不能直接覆盖正式目录。钥匙串 service 仍为 `com.invoice-desk.credentials`。
 
 ## 数据位置
 
 默认应用数据目录：
 
 ```text
-~/Library/Application Support/com.invoice-desk.app/
+~/Library/Application Support/com.invoice-desk.desktop/
 ├── invoice.sqlite3
 └── storage/
     ├── originals/
@@ -30,7 +32,7 @@
 
 1. 在菜单栏托盘选择“退出”，不要只点窗口关闭按钮；关闭窗口只会隐藏应用。
 2. 最多等待 10 秒让同步、导出和数据库连接正常收口，确认“活动监视器”中没有“发票报销”进程。
-3. 复制整个 `~/Library/Application Support/com.invoice-desk.app/`，不要只复制 SQLite 或 `originals/`。
+3. 复制整个 `~/Library/Application Support/com.invoice-desk.desktop/`，不要只复制 SQLite 或 `originals/`。
 4. 若设置页的导出目录在数据目录之外，单独复制整个自定义导出目录，包含隐藏的 `.invoice-reimbursement-staging/` 和 `.invoice-export-recovery.json`。
 5. 对备份计算校验值并记录应用版本：`shasum -a 256 <备份归档>`。
 6. 如需迁移邮箱，另行在受控流程中重新取得 QQ/Gmail 授权码；普通文件备份不包含钥匙串 secret。
@@ -41,7 +43,7 @@
 
 1. 安装相同版本或更新版本的应用，但先不要配置邮箱或导入新票据。
 2. 退出应用并确认进程结束。
-3. 将现有数据目录改名留存，例如 `com.invoice-desk.app.before-restore`，不要直接覆盖后删除唯一副本。
+3. 将现有数据目录改名留存，例如 `com.invoice-desk.desktop.before-restore`，不要直接覆盖后删除唯一副本。
 4. 把备份恢复到原路径，保持目录所有者为当前用户；自定义导出目录也恢复到数据库记录的绝对路径。
 5. 启动应用。应用会先执行 SQLite migration，再恢复未完成的邮箱保存与导出事务。
 6. 在设置页确认本地数据目录、当前有效导出目录、可用空间与“导出恢复失败”状态。
@@ -63,7 +65,7 @@
 1. 退出应用，重新挂载同一卷并确认原绝对路径存在且可写。
 2. 确认目标是普通目录，不是 symlink、alias 或指向网络位置的替身。
 3. 重新启动，在设置页选择“重试导出恢复”。
-4. 原卷无法恢复时，先完整备份数据库和旧卷内容，再选择一个已创建、可写的普通绝对目录作为之后的导出目录；旧根上的 pending 恢复仍需保留并单独处理。
+4. 原卷无法恢复时，先完整备份数据库、旧卷内容和所有 marker。存在 `pending_exports` 时，不能在设置页直接改用新的导出根目录：恢复逻辑依赖数据库记录的原绝对路径，必须先恢复同一路径；若该路径永久无法恢复，只能在副本上由熟悉恢复日志和 marker 契约的人员制定迁移方案，不能把未完成事务当作普通导出目录搬迁。
 
 应用会 canonicalize 自定义导出根，拒绝相对路径、symlink 根和非普通目录。读取票据时逐层使用 no-follow 语义，拒绝 `..`、越过 `originals/normalized` 根的路径、symlink 与非普通文件。不要通过 symlink 搬迁数据目录或导出目录。
 
@@ -71,7 +73,7 @@
 
 | 现象 | 检查 | 处理 |
 |---|---|---|
-| 首启为空 | 当前 macOS 用户、bundle identifier、数据目录路径 | 退出后恢复到当前用户的 `Application Support/com.invoice-desk.app/` |
+| 首启为空 | 当前 macOS 用户、bundle identifier、数据目录路径 | 退出后恢复到当前用户的 `Application Support/com.invoice-desk.desktop/` |
 | 票据存在但预览失败 | `originals/`、`normalized/` 所有者和普通文件属性 | 从同一备份恢复缺失文件，不创建 symlink |
 | 设置页显示导出恢复失败 | 外接盘挂载、可写空间、marker 与数据库是否成套 | 恢复原路径后点“重试导出恢复”；保留失败现场 |
 | 邮箱提示授权失败 | 钥匙串 service、授权码是否失效 | 重新输入服务商授权码；不要把密码写入备份目录 |

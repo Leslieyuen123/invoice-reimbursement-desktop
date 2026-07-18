@@ -11,28 +11,28 @@ permissions:
 jobs:
   gates:
     name: macOS quality gates
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Verify Apple Silicon runner
         run: test "$(uname -m)" = "arm64"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: src-tauri -> target
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           enable-cache: true
           cache-dependency-glob: sidecars/ocr/uv.lock
@@ -61,6 +61,15 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Reject browser bridge code in production
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R -n -E 'VITE_BROWSER_COMMAND_BRIDGE|__INVOICE_COMMAND_BRIDGE__|Simulated browser command failure' dist; then
+            echo "development browser bridge marker found in production dist" >&2
+            exit 1
+          fi
+
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
@@ -76,26 +85,26 @@ jobs:
   bundle:
     name: unsigned macOS bundle
     needs: gates
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Verify Apple Silicon runner
         run: test "$(uname -m)" = "arm64"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: src-tauri -> target
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           enable-cache: true
           cache-dependency-glob: sidecars/ocr/uv.lock
@@ -116,6 +125,11 @@ jobs:
           test -f "${dmg_files[0]}"
           test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
           test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-ocr")" = "arm64"
+          minimum_system_version="$(
+            otool -l "$bundle_app/Contents/MacOS/invoice-reimbursement" |
+              awk '$1 == "minos" { print $2; exit }'
+          )"
+          test "$minimum_system_version" = "11.0"
           hdiutil verify "${dmg_files[0]}"
 
           mount_dir="$(mktemp -d)"
@@ -137,7 +151,7 @@ jobs:
           mounted=0
           rmdir "$mount_dir"
           trap - EXIT
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-macos-bundle
           path: |

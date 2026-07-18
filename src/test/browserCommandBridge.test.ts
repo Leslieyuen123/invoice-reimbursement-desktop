@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+
+import * as apiModule from "../lib/api";
 
 import type {
+  BatchCandidateDto,
   BatchDetailDto,
   BatchDto,
   ExportResultDto,
   InvoiceItemDto,
+  ItemStatus,
   ManualImportOutcomeDto,
   PageDto,
   StorageStatusDto,
@@ -12,38 +16,80 @@ import type {
 import {
   browserCommandNames,
   createBrowserCommandBridge,
+  installBrowserCommandBridge,
 } from "./browserCommandBridge";
 
-const frontendCommands = [
-  "assign_items_to_batch",
-  "create_custom_batch",
-  "create_month_batch",
-  "delete_mailbox_account",
-  "export_batch",
-  "get_batch",
-  "get_dashboard",
-  "get_item",
-  "get_preferences",
-  "get_storage_status",
-  "import_manual_files",
-  "list_batch_candidates",
-  "list_batches",
-  "list_items",
-  "list_mailbox_accounts",
-  "remove_item_from_batch",
-  "resolve_duplicate",
-  "retry_export_recovery",
-  "retry_recognition",
-  "review_item",
-  "save_mailbox_account",
-  "save_preferences",
-  "sync_account_now",
-  "test_mailbox_account",
-] as const;
+function invoiceFixture(
+  id: string,
+  overrides: Partial<InvoiceItemDto> = {},
+): InvoiceItemDto {
+  return {
+    id,
+    originalName: `${id}.png`,
+    previewUrl: "/src-tauri/tests/fixtures/image-invoice.png",
+    sourceType: "manual_upload",
+    sourceAccountId: null,
+    fetchedAt: "2026-07-17T08:00:00Z",
+    invoiceDate: "2026-07-15",
+    suggestedPeriod: "2026-07",
+    batchId: null,
+    suggestedCategory: "dining",
+    finalCategory: "dining",
+    amountCents: 12_850,
+    currency: "CNY",
+    city: "上海",
+    company: "测试餐厅",
+    status: "ready",
+    recognitionStatus: "succeeded",
+    confirmationStatus: "confirmed",
+    dedupeStatus: "unique",
+    note: null,
+    eventTag: null,
+    projectTag: null,
+    createdAt: "2026-07-17T08:00:00Z",
+    updatedAt: "2026-07-17T08:00:00Z",
+    ...overrides,
+  };
+}
+
+function batchFixture(id = "batch-1", overrides: Partial<BatchDto> = {}): BatchDto {
+  return {
+    id,
+    name: "2026 年 7 月报销",
+    startDate: "2026-07-01",
+    endDate: "2026-07-31",
+    status: "draft",
+    itemCount: 0,
+    totalAmountCents: 0,
+    unconfirmedCount: 0,
+    note: null,
+    createdAt: "2026-07-17T08:00:00Z",
+    updatedAt: "2026-07-17T08:00:00Z",
+    lastExportedAt: null,
+    ...overrides,
+  };
+}
+
+function createSeededBridge(seed: {
+  items?: InvoiceItemDto[];
+  batches?: BatchDto[];
+}) {
+  return createBrowserCommandBridge({ seed } as never);
+}
 
 describe("browser command bridge", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/");
+    Reflect.deleteProperty(window, "__INVOICE_COMMAND_BRIDGE__");
+  });
+
   it("has an exact handler for every frontend wire command", () => {
-    expect(browserCommandNames()).toEqual(frontendCommands);
+    const apiCommandNames = (
+      apiModule as typeof apiModule & { apiCommandNames?: () => string[] }
+    ).apiCommandNames;
+    expect(apiCommandNames).toBeTypeOf("function");
+    expect(browserCommandNames()).toEqual(apiCommandNames?.());
   });
 
   it("keeps the manual review, batch assignment, and export flow stateful", async () => {
@@ -174,5 +220,267 @@ describe("browser command bridge", () => {
       items: [],
       nextCursor: null,
     });
+  });
+
+  it("paginates items, batches, and candidates with stable next cursors", async () => {
+    const bridge = createBrowserCommandBridge();
+    await bridge("import_manual_files", {
+      paths: ["one.png", "two.png", "three.png", "four.png", "five.png"],
+    });
+    for (const month of [5, 6, 7]) {
+      await bridge("create_month_batch", { year: 2026, month });
+    }
+
+    const itemPageOne = await bridge<PageDto<InvoiceItemDto>>("list_items", {
+      filter: {},
+      page: { pageSize: 2 },
+    });
+    const itemPageTwo = await bridge<PageDto<InvoiceItemDto>>("list_items", {
+      filter: {},
+      page: { pageSize: 2, cursor: itemPageOne.nextCursor },
+    });
+    expect(itemPageOne.items).toHaveLength(2);
+    expect(itemPageOne.nextCursor).not.toBeNull();
+    expect(itemPageTwo.items).toHaveLength(2);
+    expect(itemPageTwo.items.map(({ id }) => id)).not.toEqual(
+      itemPageOne.items.map(({ id }) => id),
+    );
+
+    const batchPageOne = await bridge<PageDto<BatchDto>>("list_batches", {
+      page: { pageSize: 2 },
+    });
+    const batchPageTwo = await bridge<PageDto<BatchDto>>("list_batches", {
+      page: { pageSize: 2, cursor: batchPageOne.nextCursor },
+    });
+    expect(batchPageOne.items).toHaveLength(2);
+    expect(batchPageOne.nextCursor).not.toBeNull();
+    expect(batchPageTwo.items).toHaveLength(1);
+
+    const candidatePageOne = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      { batchId: batchPageOne.items[0].id, page: { pageSize: 2 } },
+    );
+    const candidatePageTwo = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      {
+        batchId: batchPageOne.items[0].id,
+        page: { pageSize: 2, cursor: candidatePageOne.nextCursor },
+      },
+    );
+    expect(candidatePageOne.items).toHaveLength(2);
+    expect(candidatePageOne.nextCursor).not.toBeNull();
+    expect(candidatePageTwo.items).toHaveLength(2);
+  });
+
+  it("matches Rust candidate range and eligibility derivation", async () => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture()],
+      items: [
+        invoiceFixture("missing-date", {
+          invoiceDate: null,
+          status: "pending_confirmation",
+          confirmationStatus: "pending",
+        }),
+        invoiceFixture("failed", {
+          status: "ready",
+          recognitionStatus: "failed",
+        }),
+        invoiceFixture("duplicate", {
+          status: "ready",
+          recognitionStatus: "failed",
+          dedupeStatus: "suspected_duplicate",
+        }),
+      ],
+    });
+
+    const result = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      { batchId: "batch-1" },
+    );
+    expect(result.items).toEqual([
+      expect.objectContaining({
+        item: expect.objectContaining({ id: "missing-date" }),
+        outsideBatchRange: true,
+        eligible: true,
+        disabledReason: null,
+      }),
+      expect.objectContaining({
+        item: expect.objectContaining({ id: "failed" }),
+        eligible: false,
+        disabledReason: "recognition_failed",
+      }),
+      expect.objectContaining({
+        item: expect.objectContaining({ id: "duplicate" }),
+        eligible: false,
+        disabledReason: "suspected_duplicate",
+      }),
+    ]);
+  });
+
+  it.each<ItemStatus>([
+    "pending_recognition",
+    "pending_confirmation",
+    "recognition_failed",
+    "suspected_duplicate",
+  ])("refuses to export a batch containing a %s item", async (status) => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture()],
+      items: [
+        invoiceFixture(`item-${status}`, {
+          batchId: "batch-1",
+          status,
+          recognitionStatus:
+            status === "pending_recognition"
+              ? "pending"
+              : status === "recognition_failed"
+                ? "failed"
+                : "succeeded",
+          confirmationStatus: "pending",
+          dedupeStatus:
+            status === "suspected_duplicate" ? "suspected_duplicate" : "unique",
+        }),
+      ],
+    });
+
+    await expect(
+      bridge("export_batch", { batchId: "batch-1" }),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("refuses to export an empty batch", async () => {
+    const bridge = createSeededBridge({ batches: [batchFixture()] });
+    await expect(
+      bridge("export_batch", { batchId: "batch-1" }),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("returns exported batches to draft after review, assignment, or removal", async () => {
+    const exported = batchFixture("batch-1", {
+      status: "exported",
+      lastExportedAt: "2026-07-17T07:00:00Z",
+    });
+    const reviewBridge = createSeededBridge({
+      batches: [exported],
+      items: [invoiceFixture("assigned", { batchId: "batch-1" })],
+    });
+    await reviewBridge("review_item", {
+      input: {
+        id: "assigned",
+        invoiceDate: "2026-07-16",
+        suggestedPeriod: "2026-07",
+        finalCategory: "transport",
+        amountCents: 15_000,
+        city: null,
+        company: null,
+        note: null,
+        eventTag: null,
+        projectTag: null,
+      },
+    });
+    await expect(
+      reviewBridge<BatchDetailDto>("get_batch", { batchId: "batch-1" }),
+    ).resolves.toMatchObject({
+      batch: { status: "draft", lastExportedAt: "2026-07-17T07:00:00Z" },
+    });
+
+    const assignmentBridge = createSeededBridge({
+      batches: [exported],
+      items: [invoiceFixture("unassigned")],
+    });
+    await assignmentBridge("assign_items_to_batch", {
+      batchId: "batch-1",
+      itemIds: ["unassigned"],
+    });
+    await expect(
+      assignmentBridge<BatchDetailDto>("get_batch", { batchId: "batch-1" }),
+    ).resolves.toMatchObject({ batch: { status: "draft" } });
+
+    const removalBridge = createSeededBridge({
+      batches: [exported],
+      items: [invoiceFixture("assigned", { batchId: "batch-1" })],
+    });
+    await removalBridge("remove_item_from_batch", {
+      batchId: "batch-1",
+      itemId: "assigned",
+    });
+    await expect(
+      removalBridge<BatchDetailDto>("get_batch", { batchId: "batch-1" }),
+    ).resolves.toMatchObject({ batch: { status: "draft" } });
+  });
+
+  it("rejects missing IDs without partially mutating bridge state", async () => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture()],
+      items: [invoiceFixture("known")],
+    });
+    await expect(
+      bridge("assign_items_to_batch", {
+        batchId: "batch-1",
+        itemIds: ["known", "missing"],
+      }),
+    ).rejects.toMatchObject({ code: "not_found", entity: "item" });
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "known" }),
+    ).resolves.toMatchObject({ batchId: null });
+    await expect(
+      bridge("delete_mailbox_account", { accountId: "missing" }),
+    ).rejects.toMatchObject({ code: "not_found", entity: "account" });
+    await expect(
+      bridge("save_mailbox_account", {
+        input: {
+          id: "missing",
+          provider: "gmail",
+          email: "finance@example.com",
+          secret: "",
+          imapHost: null,
+          imapPort: null,
+          enabled: true,
+          syncIntervalMinutes: 15,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "not_found", entity: "account" });
+    await expect(
+      bridge("test_mailbox_account", {
+        input: {
+          id: "missing",
+          provider: "gmail",
+          email: "finance@example.com",
+          secret: "",
+          imapHost: null,
+          imapPort: null,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "not_found", entity: "account" });
+  });
+
+  it("persists bridge state across reinstall while retaining query failures and reset", async () => {
+    window.history.replaceState({}, "", "/?bridgeReset=1");
+    installBrowserCommandBridge();
+    await window.__INVOICE_COMMAND_BRIDGE__?.("import_manual_files", {
+      paths: ["durable.png"],
+    });
+    await window.__INVOICE_COMMAND_BRIDGE__?.("create_month_batch", {
+      year: 2026,
+      month: 7,
+    });
+
+    window.history.replaceState({}, "", "/?bridgeError=get_dashboard");
+    installBrowserCommandBridge();
+    await expect(
+      window.__INVOICE_COMMAND_BRIDGE__?.<PageDto<InvoiceItemDto>>("list_items", {
+        filter: {},
+      }),
+    ).resolves.toMatchObject({
+      items: [expect.objectContaining({ originalName: "durable.png" })],
+    });
+    await expect(
+      window.__INVOICE_COMMAND_BRIDGE__?.("get_dashboard"),
+    ).rejects.toMatchObject({ code: "external" });
+
+    window.history.replaceState({}, "", "/?bridgeReset=1");
+    installBrowserCommandBridge();
+    await expect(
+      window.__INVOICE_COMMAND_BRIDGE__?.("list_items", { filter: {} }),
+    ).resolves.toEqual({ items: [], nextCursor: null });
   });
 });

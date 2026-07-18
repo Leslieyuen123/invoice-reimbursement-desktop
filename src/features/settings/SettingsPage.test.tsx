@@ -34,9 +34,9 @@ const accountFixture = {
 
 const storageFixture = {
   localDataDirectory:
-    "/Users/person/Library/Application Support/com.invoice-desk.app",
+    "/Users/person/Library/Application Support/com.invoice-desk.desktop",
   exportDirectory:
-    "/Users/person/Library/Application Support/com.invoice-desk.app/storage/exports",
+    "/Users/person/Library/Application Support/com.invoice-desk.desktop/storage/exports",
   availableBytes: 128_849_018_880,
   recoveryError: null,
 };

@@ -17,6 +17,7 @@
 - [ ] `npm run test:e2e` 在 800×700、1440×900、1728×1117 全部通过
 - [ ] `npm run tauri build -- --bundles app,dmg`
 - [ ] `.app`、`.dmg` 和内置 `invoice-ocr` 都是 arm64：`file <path>`
+- [ ] `otool -l <app-binary>` 的 `LC_BUILD_VERSION minos` 为 `11.0`
 - [ ] 生产 `dist/` 不含 `VITE_BROWSER_COMMAND_BRIDGE`、`__INVOICE_COMMAND_BRIDGE__` 或 `Simulated browser command failure`
 
 ## 安装、升级和数据生命周期
@@ -25,7 +26,7 @@
 - [ ] 首启没有旧数据、测试 bridge、开发服务器地址或浏览器 console error
 - [ ] 覆盖安装上一稳定版后启动，migration 完成，原票据、批次、邮箱元数据仍在
 - [ ] 升级过程中强制中断一次，仅用专门测试副本验证下次启动可恢复
-- [ ] 卸载 `.app` 不误删 `~/Library/Application Support/com.invoice-desk.app/`、外部导出目录或钥匙串；单独记录清理数据的人工步骤
+- [ ] 卸载 `.app` 不误删 `~/Library/Application Support/com.invoice-desk.desktop/`、外部导出目录或钥匙串；单独记录清理数据的人工步骤
 - [ ] 安装包无签名/公证凭据时只标记“本地未签名 smoke”；不得标记签名或公证通过
 
 ## QQ 与 Gmail 实机协议

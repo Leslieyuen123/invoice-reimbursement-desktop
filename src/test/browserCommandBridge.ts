@@ -13,11 +13,14 @@ import type {
   ManualImportOutcomeDto,
   NewBatchInputDto,
   PageDto,
+  PageRequestDto,
   PreferencesDto,
   ReviewItemInputDto,
   SaveMailboxAccountInputDto,
   StorageStatusDto,
+  TestMailboxAccountInputDto,
 } from "../types";
+import { API_COMMANDS } from "../lib/api";
 
 type CommandArguments = Record<string, unknown>;
 export type BrowserCommandBridge = <T>(
@@ -41,10 +44,24 @@ type CommandHandler = (arguments_: CommandArguments) => unknown | Promise<unknow
 interface BrowserBridgeOptions {
   delayMs?: number;
   failCommands?: ReadonlySet<string>;
+  seed?: BrowserBridgeSeed;
+  persist?: (state: BridgeState) => void;
+}
+
+export interface BrowserBridgeSeed {
+  items?: InvoiceItemDto[];
+  batches?: BatchDto[];
+  accounts?: MailboxAccountDto[];
+  preferences?: PreferencesDto;
+  storage?: StorageStatusDto;
+  nextItemId?: number;
+  nextBatchId?: number;
+  nextAccountId?: number;
 }
 
 const now = "2026-07-17T08:00:00Z";
 const previewFixtureUrl = "/src-tauri/tests/fixtures/image-invoice.png";
+const sessionStorageKey = "invoice-reimbursement.browser-bridge.v1";
 
 function notFound(entity: string): AppError {
   return { code: "not_found", entity, message: `${entity} not found` };
@@ -66,12 +83,50 @@ function requiredObject<T>(arguments_: CommandArguments, name: string): T {
   return value as T;
 }
 
-function page<T>(items: T[]): PageDto<T> {
-  return { items, nextCursor: null };
+function paginate<T>(
+  values: T[],
+  request: unknown,
+  cursorFor: (value: T) => { sortValue: string; id: string },
+): PageDto<T> {
+  const pageRequest = (request ?? {}) as PageRequestDto;
+  const pageSize = pageRequest.pageSize ?? 50;
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 200) {
+    throw {
+      code: "validation",
+      field: "pageSize",
+      message: "page size must be between 1 and 200",
+    } satisfies AppError;
+  }
+  const ordered = [...values].sort((left, right) => {
+    const leftCursor = cursorFor(left);
+    const rightCursor = cursorFor(right);
+    return (
+      rightCursor.sortValue.localeCompare(leftCursor.sortValue) ||
+      rightCursor.id.localeCompare(leftCursor.id)
+    );
+  });
+  const bounded = pageRequest.cursor
+    ? ordered.filter((value) => {
+        const cursor = cursorFor(value);
+        return (
+          cursor.sortValue < pageRequest.cursor!.sortValue ||
+          (cursor.sortValue === pageRequest.cursor!.sortValue &&
+            cursor.id < pageRequest.cursor!.id)
+        );
+      })
+    : ordered;
+  const items = bounded.slice(0, pageSize);
+  return {
+    items,
+    nextCursor:
+      bounded.length > pageSize && items.length > 0
+        ? cursorFor(items[items.length - 1])
+        : null,
+  };
 }
 
-function initialState(): BridgeState {
-  return {
+function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
+  const defaults: BridgeState = {
     items: [],
     batches: [],
     accounts: [],
@@ -90,6 +145,23 @@ function initialState(): BridgeState {
     nextBatchId: 1,
     nextAccountId: 1,
   };
+  return {
+    ...defaults,
+    ...seed,
+    items: seed.items?.map((item) => ({ ...item })) ?? defaults.items,
+    batches: seed.batches?.map((batch) => ({ ...batch })) ?? defaults.batches,
+    accounts: seed.accounts?.map((account) => ({ ...account })) ?? defaults.accounts,
+    preferences: { ...(seed.preferences ?? defaults.preferences) },
+    storage: { ...(seed.storage ?? defaults.storage) },
+  };
+}
+
+function markBatchDraft(state: BridgeState, batchId: string | null) {
+  if (!batchId) return;
+  const batch = state.batches.find((candidate) => candidate.id === batchId);
+  if (batch?.status === "exported") {
+    Object.assign(batch, { status: "draft", updatedAt: now });
+  }
 }
 
 function categorySummary(items: InvoiceItemDto[], category: Category) {
@@ -192,19 +264,25 @@ function dashboard(state: BridgeState): DashboardDto {
 
 function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
   const handlers: Array<[string, CommandHandler]> = [
-    ["get_dashboard", () => dashboard(state)],
-    ["list_items", (arguments_) => {
+    [API_COMMANDS.getDashboard, () => dashboard(state)],
+    [API_COMMANDS.listItems, (arguments_) => {
       const filter = (arguments_.filter ?? {}) as ItemFilter;
-      return page(state.items.filter((item) => itemMatches(item, filter)).map((item) => ({ ...item })));
+      return paginate(
+        state.items
+          .filter((item) => itemMatches(item, filter))
+          .map((item) => ({ ...item })),
+        arguments_.page,
+        (item) => ({ sortValue: item.createdAt, id: item.id }),
+      );
     }],
-    ["get_item", (arguments_) => {
+    [API_COMMANDS.getItem, (arguments_) => {
       const item = state.items.find(
         (candidate) => candidate.id === requiredString(arguments_, "itemId"),
       );
       if (!item) throw notFound("item");
       return { ...item };
     }],
-    ["import_manual_files", (arguments_) => {
+    [API_COMMANDS.importManualFiles, (arguments_) => {
       const paths = arguments_.paths;
       if (!Array.isArray(paths) || !paths.every((path) => typeof path === "string")) {
         throw new Error("Browser command argument paths must be a string array");
@@ -215,10 +293,11 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
         item: { ...createItem(state, path) },
       }));
     }],
-    ["review_item", (arguments_) => {
+    [API_COMMANDS.reviewItem, (arguments_) => {
       const input = requiredObject<ReviewItemInputDto>(arguments_, "input");
       const item = state.items.find((candidate) => candidate.id === input.id);
       if (!item) throw notFound("item");
+      markBatchDraft(state, item.batchId);
       Object.assign(item, input, {
         confirmationStatus: "confirmed",
         recognitionStatus: "succeeded",
@@ -227,10 +306,11 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       });
       return { ...item };
     }],
-    ["resolve_duplicate", (arguments_) => {
+    [API_COMMANDS.resolveDuplicate, (arguments_) => {
       const itemId = requiredString(arguments_, "itemId");
       const item = state.items.find((candidate) => candidate.id === itemId);
       if (!item) throw notFound("item");
+      markBatchDraft(state, item.batchId);
       if (arguments_.keep === false) {
         state.items = state.items.filter((candidate) => candidate.id !== itemId);
         return null;
@@ -238,17 +318,24 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       Object.assign(item, { dedupeStatus: "resolved", status: "pending_confirmation", updatedAt: now });
       return { ...item };
     }],
-    ["retry_recognition", (arguments_) => {
+    [API_COMMANDS.retryRecognition, (arguments_) => {
       const item = state.items.find(
         (candidate) => candidate.id === requiredString(arguments_, "itemId"),
       );
       if (!item) throw notFound("item");
+      markBatchDraft(state, item.batchId);
       Object.assign(item, { recognitionStatus: "succeeded", status: "pending_confirmation", updatedAt: now });
       return { ...item };
     }],
-    ["list_batches", () => page(state.batches.map((batch) => ({ ...batch })))],
-    ["get_batch", (arguments_) => batchDetail(state, requiredString(arguments_, "batchId"))],
-    ["list_batch_candidates", (arguments_) => {
+    [API_COMMANDS.listBatches, (arguments_) =>
+      paginate(
+        state.batches.map((batch) => ({ ...batch })),
+        arguments_.page,
+        (batch) => ({ sortValue: batch.updatedAt, id: batch.id }),
+      )],
+    [API_COMMANDS.getBatch, (arguments_) =>
+      batchDetail(state, requiredString(arguments_, "batchId"))],
+    [API_COMMANDS.listBatchCandidates, (arguments_) => {
       const batchId = requiredString(arguments_, "batchId");
       const batch = state.batches.find((candidate) => candidate.id === batchId);
       if (!batch) throw notFound("batch");
@@ -258,52 +345,96 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
         .map<BatchCandidateDto>((item) => ({
           item: { ...item },
           outsideBatchRange:
-            item.invoiceDate !== null &&
-            (item.invoiceDate < batch.startDate || item.invoiceDate > batch.endDate),
-          eligible: !["recognition_failed", "suspected_duplicate"].includes(item.status),
+            item.invoiceDate === null ||
+            item.invoiceDate < batch.startDate ||
+            item.invoiceDate > batch.endDate,
+          eligible:
+            item.dedupeStatus !== "suspected_duplicate" &&
+            item.recognitionStatus !== "failed",
           disabledReason:
-            item.status === "recognition_failed"
-              ? "recognition_failed"
-              : item.status === "suspected_duplicate"
-                ? "suspected_duplicate"
+            item.dedupeStatus === "suspected_duplicate"
+              ? "suspected_duplicate"
+              : item.recognitionStatus === "failed"
+                ? "recognition_failed"
                 : null,
         }));
-      return page(candidates);
+      return paginate(candidates, arguments_.page, (candidate) => ({
+        sortValue: candidate.item.createdAt,
+        id: candidate.item.id,
+      }));
     }],
-    ["create_month_batch", (arguments_) => {
+    [API_COMMANDS.createMonthBatch, (arguments_) => {
       const year = Number(arguments_.year);
       const month = Number(arguments_.month);
       const startDate = `${year}-${String(month).padStart(2, "0")}-01`;
       const endDate = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
       return createBatch(state, { name: `${year} 年 ${month} 月报销`, startDate, endDate, note: null });
     }],
-    ["create_custom_batch", (arguments_) =>
+    [API_COMMANDS.createCustomBatch, (arguments_) =>
       createBatch(state, requiredObject<NewBatchInputDto>(arguments_, "input"))],
-    ["assign_items_to_batch", (arguments_) => {
+    [API_COMMANDS.assignItemsToBatch, (arguments_) => {
       const batchId = requiredString(arguments_, "batchId");
       batchDetail(state, batchId);
       const itemIds = arguments_.itemIds;
       if (!Array.isArray(itemIds) || !itemIds.every((id) => typeof id === "string")) {
         throw new Error("Browser command argument itemIds must be a string array");
       }
-      state.items.forEach((item) => {
-        if (itemIds.includes(item.id)) item.batchId = batchId;
+      const items = itemIds.map((itemId) => {
+        const item = state.items.find((candidate) => candidate.id === itemId);
+        if (!item) throw notFound("item");
+        if (
+          item.dedupeStatus === "suspected_duplicate" ||
+          item.recognitionStatus === "failed"
+        ) {
+          throw {
+            code: "conflict",
+            message: `Item ${itemId} cannot be assigned to a batch`,
+          } satisfies AppError;
+        }
+        return item;
       });
+      markBatchDraft(state, batchId);
+      for (const item of items) {
+        markBatchDraft(state, item.batchId);
+        Object.assign(item, { batchId, updatedAt: now });
+      }
       return batchDetail(state, batchId);
     }],
-    ["remove_item_from_batch", (arguments_) => {
+    [API_COMMANDS.removeItemFromBatch, (arguments_) => {
       const batchId = requiredString(arguments_, "batchId");
+      batchDetail(state, batchId);
       const item = state.items.find(
         (candidate) => candidate.id === requiredString(arguments_, "itemId"),
       );
       if (!item) throw notFound("item");
-      if (item.batchId === batchId) item.batchId = null;
+      if (item.batchId !== batchId) {
+        throw {
+          code: "conflict",
+          message: "Item does not belong to the batch",
+        } satisfies AppError;
+      }
+      markBatchDraft(state, batchId);
+      Object.assign(item, { batchId: null, updatedAt: now });
       return batchDetail(state, batchId);
     }],
-    ["export_batch", (arguments_) => {
+    [API_COMMANDS.exportBatch, (arguments_) => {
       const detail = batchDetail(state, requiredString(arguments_, "batchId"));
-      if (detail.summary.unconfirmedCount > 0) {
-        throw { code: "conflict", message: "Batch contains unconfirmed items" } satisfies AppError;
+      if (detail.items.length === 0) {
+        throw { code: "conflict", message: "Batch is empty" } satisfies AppError;
+      }
+      const blocked = detail.items.find((item) =>
+        [
+          "pending_recognition",
+          "pending_confirmation",
+          "recognition_failed",
+          "suspected_duplicate",
+        ].includes(item.status),
+      );
+      if (blocked) {
+        throw {
+          code: "conflict",
+          message: `Batch contains blocked item ${blocked.id}`,
+        } satisfies AppError;
       }
       const batch = state.batches.find((candidate) => candidate.id === detail.batch.id);
       if (!batch) throw notFound("batch");
@@ -314,12 +445,14 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
         totalAmountCents: detail.summary.totalAmountCents,
       } satisfies ExportResultDto;
     }],
-    ["list_mailbox_accounts", () => state.accounts.map((account) => ({ ...account }))],
-    ["save_mailbox_account", (arguments_) => {
+    [API_COMMANDS.listMailboxAccounts, () =>
+      state.accounts.map((account) => ({ ...account }))],
+    [API_COMMANDS.saveMailboxAccount, (arguments_) => {
       const input = requiredObject<SaveMailboxAccountInputDto>(arguments_, "input");
       const account = input.id
         ? state.accounts.find((candidate) => candidate.id === input.id)
         : undefined;
+      if (input.id && !account) throw notFound("account");
       const saved: MailboxAccountDto = {
         id: account?.id ?? `browser-account-${state.nextAccountId++}`,
         provider: input.provider,
@@ -337,20 +470,34 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       else state.accounts.push(saved);
       return { ...saved };
     }],
-    ["test_mailbox_account", () => undefined],
-    ["delete_mailbox_account", (arguments_) => {
+    [API_COMMANDS.testMailboxAccount, (arguments_) => {
+      const input = requiredObject<TestMailboxAccountInputDto>(arguments_, "input");
+      if (
+        input.id &&
+        !state.accounts.some((account) => account.id === input.id)
+      ) {
+        throw notFound("account");
+      }
+    }],
+    [API_COMMANDS.deleteMailboxAccount, (arguments_) => {
       const accountId = requiredString(arguments_, "accountId");
+      if (!state.accounts.some((account) => account.id === accountId)) {
+        throw notFound("account");
+      }
       state.accounts = state.accounts.filter((account) => account.id !== accountId);
     }],
-    ["get_preferences", () => ({ ...state.preferences })],
-    ["save_preferences", (arguments_) => {
+    [API_COMMANDS.getPreferences, () => ({ ...state.preferences })],
+    [API_COMMANDS.savePreferences, (arguments_) => {
       state.preferences = { ...requiredObject<PreferencesDto>(arguments_, "input") };
       state.storage.exportDirectory = state.preferences.exportDirectory;
       return { ...state.preferences };
     }],
-    ["get_storage_status", () => ({ ...state.storage })],
-    ["retry_export_recovery", () => ({ ...state.storage, recoveryError: null })],
-    ["sync_account_now", (arguments_) => {
+    [API_COMMANDS.getStorageStatus, () => ({ ...state.storage })],
+    [API_COMMANDS.retryExportRecovery, () => {
+      state.storage.recoveryError = null;
+      return { ...state.storage };
+    }],
+    [API_COMMANDS.syncAccountNow, (arguments_) => {
       const account = state.accounts.find(
         (candidate) => candidate.id === requiredString(arguments_, "accountId"),
       );
@@ -383,7 +530,8 @@ function createBatch(state: BridgeState, input: NewBatchInputDto): BatchDto {
 export function createBrowserCommandBridge(
   options: BrowserBridgeOptions = {},
 ): BrowserCommandBridge {
-  const handlers = makeHandlers(initialState());
+  const state = initialState(options.seed);
+  const handlers = makeHandlers(state);
   return async <T>(command: string, arguments_: CommandArguments = {}) => {
     const handler = handlers.get(command);
     if (!handler) throw new Error(`Unsupported browser command: ${command}`);
@@ -398,7 +546,9 @@ export function createBrowserCommandBridge(
         message: `Simulated browser command failure: ${command}`,
       } satisfies AppError;
     }
-    return (await handler(arguments_)) as T;
+    const result = await handler(arguments_);
+    options.persist?.(JSON.parse(JSON.stringify(state)) as BridgeState);
+    return result as T;
   };
 }
 
@@ -408,6 +558,9 @@ export function browserCommandNames() {
 
 export function installBrowserCommandBridge() {
   const search = new URLSearchParams(window.location.search);
+  if (search.get("bridgeReset") === "1") {
+    window.sessionStorage.removeItem(sessionStorageKey);
+  }
   const requestedDelay = Number(search.get("bridgeDelay") ?? 0);
   const delayMs = Number.isFinite(requestedDelay)
     ? Math.min(Math.max(requestedDelay, 0), 2_000)
@@ -415,8 +568,21 @@ export function installBrowserCommandBridge() {
   const failCommands = new Set(
     (search.get("bridgeError") ?? "").split(",").filter(Boolean),
   );
+  let seed: BrowserBridgeSeed | undefined;
+  const stored = window.sessionStorage.getItem(sessionStorageKey);
+  if (stored) {
+    try {
+      seed = JSON.parse(stored) as BrowserBridgeSeed;
+    } catch {
+      window.sessionStorage.removeItem(sessionStorageKey);
+    }
+  }
   window.__INVOICE_COMMAND_BRIDGE__ = createBrowserCommandBridge({
     delayMs,
     failCommands,
+    seed,
+    persist: (state) => {
+      window.sessionStorage.setItem(sessionStorageKey, JSON.stringify(state));
+    },
   });
 }

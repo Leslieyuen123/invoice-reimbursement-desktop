@@ -349,9 +349,7 @@ describe("InboxPage", () => {
     await user.click(await screen.findByText("出租车电子发票.pdf"));
     await user.click(screen.getByRole("button", { name: "保存并确认" }));
 
-    expect(
-      await screen.findByRole("button", { name: "后台同步结果.pdf" }),
-    ).toBeInTheDocument();
+    expect(await screen.findAllByText("后台同步结果.pdf")).not.toHaveLength(0);
     expect(screen.queryByText("本地保存响应.pdf")).not.toBeInTheDocument();
     expect(listAttempt).toBe(2);
   });
@@ -687,6 +685,45 @@ describe("InboxPage", () => {
     expect(opener).toHaveFocus();
   });
 
+  it("keeps focus inside the modal drawer and makes the background inert", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+
+    renderAppAt("/inbox");
+    const opener = await screen.findByRole("button", {
+      name: "出租车电子发票.pdf",
+    });
+    await user.click(opener);
+
+    const dialog = screen.getByRole("dialog", { name: "票据详情" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    const close = within(dialog).getByRole("button", { name: "关闭票据详情" });
+    const save = within(dialog).getByRole("button", { name: "保存并确认" });
+    expect(close).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(save).toHaveFocus();
+    await user.tab();
+    expect(close).toHaveFocus();
+
+    const background = dialog.parentElement?.children ?? [];
+    for (const element of background) {
+      if (element === dialog) continue;
+      expect(element).toHaveAttribute("inert");
+      expect(element).toHaveAttribute("aria-hidden", "true");
+    }
+    expect(document.querySelector(".app-sidebar")).toHaveAttribute("inert");
+    expect(document.querySelector(".app-topbar")).toHaveAttribute("inert");
+
+    await user.keyboard("{Escape}");
+    expect(opener).toHaveFocus();
+    expect(document.querySelector(".app-sidebar")).not.toHaveAttribute("inert");
+    expect(document.querySelector(".app-topbar")).not.toHaveAttribute("inert");
+  });
+
   it("restores focus to the latest opener after replacing the drawer", async () => {
     const user = userEvent.setup();
     const secondItem = pendingInvoiceFixture({
@@ -953,9 +990,7 @@ describe("InboxPage", () => {
       );
     });
 
-    expect(
-      await screen.findByRole("button", { name: "旧保存响应.pdf" }),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("旧保存响应.pdf")).toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
       "出租车电子发票.pdf",
     );
@@ -996,9 +1031,7 @@ describe("InboxPage", () => {
       );
     });
 
-    expect(
-      await screen.findByRole("button", { name: "旧识别响应.pdf" }),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("旧识别响应.pdf")).toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "票据详情" })).toHaveTextContent(
       "出租车电子发票.pdf",
     );
@@ -1076,6 +1109,7 @@ describe("InboxPage", () => {
       await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
     );
     await user.click(screen.getByRole("button", { name: "删除重复" }));
+    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
     await user.click(
       screen.getByRole("button", { name: "出租车电子发票-副本.pdf" }),
     );

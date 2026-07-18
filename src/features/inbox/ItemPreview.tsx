@@ -9,22 +9,42 @@ interface ItemPreviewProps {
 
 type PreviewVariant = "original" | "normalized";
 type PreviewState = "loading" | "ready" | "failed";
+type PreviewMediaType = "image" | "pdf";
 
 export type PreviewAvailabilityLoader = (
   source: string,
   signal: AbortSignal,
-) => Promise<void>;
+) => Promise<PreviewMediaType | void>;
 
-function isPreviewContentType(contentType: string | null) {
+function previewMediaTypeFromContentType(
+  contentType: string | null,
+): PreviewMediaType | null {
   const mediaType = contentType?.split(";", 1)[0].trim().toLowerCase();
-  return mediaType === "application/pdf" || mediaType?.startsWith("image/");
+  if (mediaType === "application/pdf") return "pdf";
+  if (mediaType === "image/jpeg" || mediaType === "image/png") return "image";
+  return null;
+}
+
+function previewMediaTypeFromSource(originalName: string, source: string) {
+  if (/\.(?:jpe?g|png)$/i.test(originalName.trim())) return "image";
+  if (/\.pdf$/i.test(originalName.trim())) return "pdf";
+  if (source.startsWith("data:")) {
+    return previewMediaTypeFromContentType(source.slice(5).split(/[;,]/, 1)[0]);
+  }
+  return null;
 }
 
 export const loadPreviewAvailability: PreviewAvailabilityLoader = async (
   source,
   signal,
 ) => {
-  if (source.startsWith("data:")) return;
+  if (source.startsWith("data:")) {
+    const mediaType = previewMediaTypeFromContentType(
+      source.slice(5).split(/[;,]/, 1)[0],
+    );
+    if (!mediaType) throw new Error("Preview unavailable");
+    return mediaType;
+  }
 
   const response = await fetch(source, {
     method: "GET",
@@ -32,10 +52,13 @@ export const loadPreviewAvailability: PreviewAvailabilityLoader = async (
     headers: { Range: "bytes=0-0" },
     signal,
   });
-  const available =
-    response.ok && isPreviewContentType(response.headers.get("Content-Type"));
+  const mediaType = previewMediaTypeFromContentType(
+    response.headers.get("Content-Type"),
+  );
+  const available = response.ok && mediaType !== null;
   await response.body?.cancel();
   if (!available) throw new Error("Preview unavailable");
+  return mediaType;
 };
 
 function withVariant(previewUrl: string, variant: PreviewVariant) {
@@ -59,6 +82,9 @@ export function ItemPreview({
     hasNormalized ? "normalized" : "original",
   );
   const [state, setState] = useState<PreviewState>("loading");
+  const [mediaType, setMediaType] = useState<PreviewMediaType | null>(() =>
+    previewMediaTypeFromSource(originalName, previewUrl),
+  );
   const [revision, setRevision] = useState(0);
   const source = useMemo(
     () => withVariant(previewUrl, variant),
@@ -70,8 +96,15 @@ export function ItemPreview({
     let current = true;
     setState("loading");
     void loadAvailability(source, controller.signal).then(
-      () => {
-        if (current && !controller.signal.aborted) setState("ready");
+      (detectedMediaType) => {
+        if (current && !controller.signal.aborted) {
+          setMediaType(
+            detectedMediaType ??
+              previewMediaTypeFromSource(originalName, source) ??
+              "pdf",
+          );
+          setState("ready");
+        }
       },
       () => {
         if (current && !controller.signal.aborted) setState("failed");
@@ -81,7 +114,7 @@ export function ItemPreview({
       current = false;
       controller.abort();
     };
-  }, [loadAvailability, revision, source]);
+  }, [loadAvailability, originalName, revision, source]);
 
   function chooseVariant(nextVariant: PreviewVariant) {
     setVariant(nextVariant);
@@ -140,6 +173,14 @@ export function ItemPreview({
           >
             正在加载预览
           </div>
+        ) : mediaType === "image" ? (
+          <img
+            key={`${source}-${revision}`}
+            className="item-preview-image"
+            alt="票据预览"
+            src={source}
+            onError={() => setState("failed")}
+          />
         ) : (
           <iframe
             key={`${source}-${revision}`}

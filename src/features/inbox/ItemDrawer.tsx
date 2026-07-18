@@ -97,20 +97,73 @@ export function ItemDrawer({
     "keep" | "delete" | null
   >(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
   useEffect(() => {
+    const drawer = drawerRef.current;
+    if (!drawer) return;
+    const background = new Set<HTMLElement>();
+    for (const sibling of drawer.parentElement?.children ?? []) {
+      if (sibling !== drawer && sibling instanceof HTMLElement) {
+        background.add(sibling);
+      }
+    }
+    for (const element of document.querySelectorAll<HTMLElement>(
+      ".skip-link, .app-sidebar, .app-topbar, .app-error-slot",
+    )) {
+      if (!drawer.contains(element)) background.add(element);
+    }
+    const previousBackground = [...background].map((element) => ({
+      element,
+      inert: element.hasAttribute("inert"),
+      ariaHidden: element.getAttribute("aria-hidden"),
+    }));
+    for (const { element } of previousBackground) {
+      element.setAttribute("inert", "");
+      element.setAttribute("aria-hidden", "true");
+    }
+
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      onCloseRef.current();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...drawer.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )].filter(
+        (element) =>
+          !element.hasAttribute("hidden") &&
+          element.getAttribute("aria-hidden") !== "true",
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !drawer.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !drawer.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
     };
 
     closeButtonRef.current?.focus();
     document.addEventListener("keydown", handleKeyDown);
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
+      for (const { element, inert, ariaHidden } of previousBackground) {
+        if (!inert) element.removeAttribute("inert");
+        if (ariaHidden === null) element.removeAttribute("aria-hidden");
+        else element.setAttribute("aria-hidden", ariaHidden);
+      }
     };
   }, []);
 
@@ -176,7 +229,13 @@ export function ItemDrawer({
   }
 
   return (
-    <aside className="item-drawer" role="dialog" aria-label="票据详情">
+    <aside
+      ref={drawerRef}
+      className="item-drawer"
+      role="dialog"
+      aria-modal="true"
+      aria-label="票据详情"
+    >
       <header className="item-drawer-header">
         <div>
           <span>票据详情</span>

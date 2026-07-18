@@ -46,58 +46,89 @@ function call<T>(command: string, arguments_?: CommandArguments): Promise<T> {
     : invoke<T>(command, arguments_);
 }
 
+export const API_COMMANDS = {
+  getDashboard: "get_dashboard",
+  listItems: "list_items",
+  getItem: "get_item",
+  importManualFiles: "import_manual_files",
+  reviewItem: "review_item",
+  resolveDuplicate: "resolve_duplicate",
+  retryRecognition: "retry_recognition",
+  listBatches: "list_batches",
+  getBatch: "get_batch",
+  listBatchCandidates: "list_batch_candidates",
+  createMonthBatch: "create_month_batch",
+  createCustomBatch: "create_custom_batch",
+  assignItemsToBatch: "assign_items_to_batch",
+  removeItemFromBatch: "remove_item_from_batch",
+  exportBatch: "export_batch",
+  listMailboxAccounts: "list_mailbox_accounts",
+  saveMailboxAccount: "save_mailbox_account",
+  testMailboxAccount: "test_mailbox_account",
+  deleteMailboxAccount: "delete_mailbox_account",
+  getPreferences: "get_preferences",
+  savePreferences: "save_preferences",
+  getStorageStatus: "get_storage_status",
+  retryExportRecovery: "retry_export_recovery",
+  syncAccountNow: "sync_account_now",
+} as const;
+
+export function apiCommandNames() {
+  return Object.values(API_COMMANDS).sort();
+}
+
 export const api = {
-  getDashboard: () => call<DashboardDto>("get_dashboard"),
+  getDashboard: () => call<DashboardDto>(API_COMMANDS.getDashboard),
   listItems: (filter: ItemFilter, page?: PageRequestDto) =>
-    call<PageDto<InvoiceItemDto>>("list_items", { filter, page }),
+    call<PageDto<InvoiceItemDto>>(API_COMMANDS.listItems, { filter, page }),
   getItem: (itemId: string) =>
-    call<InvoiceItemDto>("get_item", { itemId }),
+    call<InvoiceItemDto>(API_COMMANDS.getItem, { itemId }),
   importManualFiles: (paths: string[]) =>
-    call<ManualImportOutcomeDto[]>("import_manual_files", { paths }),
+    call<ManualImportOutcomeDto[]>(API_COMMANDS.importManualFiles, { paths }),
   reviewItem: (input: ReviewItemInputDto) =>
-    call<InvoiceItemDto>("review_item", { input }),
+    call<InvoiceItemDto>(API_COMMANDS.reviewItem, { input }),
   resolveDuplicate: (itemId: string, keep: boolean) =>
-    call<InvoiceItemDto | null>("resolve_duplicate", { itemId, keep }),
+    call<InvoiceItemDto | null>(API_COMMANDS.resolveDuplicate, { itemId, keep }),
   retryRecognition: (itemId: string) =>
-    call<InvoiceItemDto>("retry_recognition", { itemId }),
+    call<InvoiceItemDto>(API_COMMANDS.retryRecognition, { itemId }),
   listBatches: (page?: PageRequestDto) =>
-    call<PageDto<BatchDto>>("list_batches", { page }),
+    call<PageDto<BatchDto>>(API_COMMANDS.listBatches, { page }),
   getBatch: (batchId: string) =>
-    call<BatchDetailDto>("get_batch", { batchId }),
+    call<BatchDetailDto>(API_COMMANDS.getBatch, { batchId }),
   listBatchCandidates: (
     batchId: string,
     query?: string,
     page?: PageRequestDto,
   ) =>
-    call<PageDto<BatchCandidateDto>>("list_batch_candidates", {
+    call<PageDto<BatchCandidateDto>>(API_COMMANDS.listBatchCandidates, {
       batchId,
       query,
       page,
     }),
   createMonthBatch: (year: number, month: number) =>
-    call<BatchDto>("create_month_batch", { year, month }),
+    call<BatchDto>(API_COMMANDS.createMonthBatch, { year, month }),
   createCustomBatch: (input: NewBatchInputDto) =>
-    call<BatchDto>("create_custom_batch", { input }),
+    call<BatchDto>(API_COMMANDS.createCustomBatch, { input }),
   assignItemsToBatch: (batchId: string, itemIds: string[]) =>
-    call<BatchDetailDto>("assign_items_to_batch", { batchId, itemIds }),
+    call<BatchDetailDto>(API_COMMANDS.assignItemsToBatch, { batchId, itemIds }),
   removeItemFromBatch: (batchId: string, itemId: string) =>
-    call<BatchDetailDto>("remove_item_from_batch", { batchId, itemId }),
+    call<BatchDetailDto>(API_COMMANDS.removeItemFromBatch, { batchId, itemId }),
   exportBatch: (batchId: string) =>
-    call<ExportResultDto>("export_batch", { batchId }),
+    call<ExportResultDto>(API_COMMANDS.exportBatch, { batchId }),
   listMailboxAccounts: () =>
-    call<MailboxAccountDto[]>("list_mailbox_accounts"),
+    call<MailboxAccountDto[]>(API_COMMANDS.listMailboxAccounts),
   saveMailboxAccount: (input: SaveMailboxAccountInputDto) =>
-    call<MailboxAccountDto>("save_mailbox_account", { input }),
+    call<MailboxAccountDto>(API_COMMANDS.saveMailboxAccount, { input }),
   testMailboxAccount: (input: TestMailboxAccountInputDto) =>
-    call<void>("test_mailbox_account", { input }),
+    call<void>(API_COMMANDS.testMailboxAccount, { input }),
   deleteMailboxAccount: (accountId: string) =>
-    call<void>("delete_mailbox_account", { accountId }),
-  getPreferences: () => call<PreferencesDto>("get_preferences"),
+    call<void>(API_COMMANDS.deleteMailboxAccount, { accountId }),
+  getPreferences: () => call<PreferencesDto>(API_COMMANDS.getPreferences),
   savePreferences: (input: PreferencesInputDto) =>
-    call<PreferencesDto>("save_preferences", { input }),
-  getStorageStatus: () => call<StorageStatusDto>("get_storage_status"),
+    call<PreferencesDto>(API_COMMANDS.savePreferences, { input }),
+  getStorageStatus: () => call<StorageStatusDto>(API_COMMANDS.getStorageStatus),
   retryExportRecovery: () =>
-    call<StorageStatusDto>("retry_export_recovery"),
+    call<StorageStatusDto>(API_COMMANDS.retryExportRecovery),
   syncAccountNow: (accountId: string) =>
-    call<void>("sync_account_now", { accountId }),
+    call<void>(API_COMMANDS.syncAccountNow, { accountId }),
 };

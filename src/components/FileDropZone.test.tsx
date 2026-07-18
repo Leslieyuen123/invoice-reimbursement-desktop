@@ -31,14 +31,18 @@ describe("FileDropZone", () => {
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   });
 
-  it("uses an accessible browser file input only when the explicit bridge flag is enabled", async () => {
+  it("uses a non-focusable hidden browser input only when the explicit bridge flag is enabled", async () => {
     vi.stubEnv("VITE_BROWSER_COMMAND_BRIDGE", "1");
     const user = userEvent.setup();
     const onPaths = vi.fn();
     onDragDropEventMock.mockResolvedValue(vi.fn());
 
     render(<FileDropZone onPaths={onPaths} />);
-    const input = screen.getByLabelText("选择票据文件");
+    const input = screen.getByTestId("browser-file-input");
+    expect(input).toHaveAttribute("hidden");
+    expect(input).toHaveAttribute("aria-hidden", "true");
+    expect(input).toHaveAttribute("tabindex", "-1");
+    expect(screen.getAllByRole("button", { name: "选择文件" })).toHaveLength(1);
     const file = new File(["invoice"], "text-invoice.pdf", {
       type: "application/pdf",
     });

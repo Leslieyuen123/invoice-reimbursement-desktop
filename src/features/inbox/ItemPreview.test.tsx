@@ -111,9 +111,56 @@ describe("ItemPreview", () => {
         />,
       );
 
-      expect(await screen.findByTitle("票据预览")).toBeInTheDocument();
+      if (contentType === "application/pdf") {
+        expect(await screen.findByTitle("票据预览")).toBeInTheDocument();
+      } else {
+        expect(
+          await screen.findByRole("img", { name: "票据预览" }),
+        ).toBeInTheDocument();
+      }
     },
   );
+
+  it.each(["receipt.JPG", "receipt.jpeg", "receipt.png"])(
+    "renders image ticket %s as a contained image instead of an iframe",
+    async (originalName) => {
+      render(
+        <ItemPreview
+          originalName={originalName}
+          previewUrl="invoice-file://item/image-ticket?variant=original"
+          loadAvailability={vi.fn().mockResolvedValue(undefined)}
+        />,
+      );
+
+      const preview = await screen.findByRole("img", { name: "票据预览" });
+      expect(preview).toHaveAttribute(
+        "src",
+        "invoice-file://item/image-ticket?variant=original",
+      );
+      expect(preview).toHaveClass("item-preview-image");
+      expect(screen.queryByTitle("票据预览")).not.toBeInTheDocument();
+    },
+  );
+
+  it("uses the response MIME type when the image URL and name have no extension", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(new Uint8Array(), {
+        status: 200,
+        headers: { "Content-Type": "image/png" },
+      }),
+    );
+
+    render(
+      <ItemPreview
+        originalName="scanned-ticket"
+        previewUrl="invoice-file://item/scanned-ticket?variant=original"
+      />,
+    );
+
+    expect(
+      await screen.findByRole("img", { name: "票据预览" }),
+    ).toBeInTheDocument();
+  });
 
   it("rejects a successful textual preview response", async () => {
     fetchMock.mockResolvedValue(
