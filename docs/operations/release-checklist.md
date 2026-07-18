@@ -2,6 +2,10 @@
 
 每个候选版本都从干净 checkout 和干净 macOS 用户环境执行。记录版本、commit SHA、macOS/CPU、测试邮箱、时间范围和每项证据。真实 QQ/Gmail 凭据不得写入仓库、CI 日志、截图文件名或测试数据。
 
+## 首发应用身份
+
+2026-07-18 确认执行首发前 identity correction：产品此前从未公开发布且为零既有用户，正式首发 bundle identifier 为 `com.invoice-desk.desktop`，取代开发初始化阶段的 `com.invoice-desk.app`。本次不执行 bundle identity 数据迁移；正式数据根从第一次公开发布起固定为 `~/Library/Application Support/com.invoice-desk.desktop/`，钥匙串 service 保持 `com.invoice-desk.credentials`。
+
 ## 自动化质量门
 
 - [ ] `npm ci`

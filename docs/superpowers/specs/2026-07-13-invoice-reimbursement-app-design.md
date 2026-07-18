@@ -32,6 +32,12 @@
 9. 除自动抓取外，必须提供手动上传入口，接收零散票据文件。
 10. 最终导出结果不应只有合并 PDF，还应包含报销清单与原始文件归档。
 
+### 3.1 首发应用身份决策（2026-07-18）
+
+在首次公开发布前完成一次首发前 identity correction：正式 bundle identifier 使用 `com.invoice-desk.desktop`，不使用开发初始化阶段采用的 `com.invoice-desk.app`。用户已确认产品此前从未发布，零既有用户，也不存在需要兼容的正式用户数据目录。
+
+因此这是一项首发前身份修正，不是升级或迁移：不执行 bundle identity 数据迁移，也不让正式版自动读取开发测试目录。正式应用数据目录以 `~/Library/Application Support/com.invoice-desk.desktop/` 为准；钥匙串 service 继续独立使用 `com.invoice-desk.credentials`。
+
 ## 4. 核心设计原则
 
 ### 4.1 本地优先

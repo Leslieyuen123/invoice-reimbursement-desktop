@@ -121,6 +121,16 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
     "src",
     "/src-tauri/tests/fixtures/image-invoice.png",
   );
+  await expect.poll(
+    () =>
+      previewImage.evaluate(
+        (image: HTMLImageElement) =>
+          image.complete &&
+          image.naturalWidth > 0 &&
+          image.naturalHeight > 0,
+      ),
+    { message: "ticket preview image should finish decoding" },
+  ).toBe(true);
   const previewGeometry = await previewImage.evaluate((image: HTMLImageElement) => {
     const imageRect = image.getBoundingClientRect();
     const surfaceRect = image.parentElement!.getBoundingClientRect();

@@ -2,7 +2,7 @@
 
 本文适用于正式 macOS 版本 `com.invoice-desk.desktop`。操作前先确认 Finder 中显示的是预期用户的主目录；不要在应用运行时移动、替换或编辑数据文件。
 
-开发阶段曾使用 `com.invoice-desk.app`。旧预发布目录不是正式数据源，正式版不会自动读取或迁移该目录；如需保留预发布测试数据，应先保留只读副本，再由熟悉 SQLite migration 和文件存储布局的人员审核迁移，不能直接覆盖正式目录。钥匙串 service 仍为 `com.invoice-desk.credentials`。
+本项目在首次公开发布前完成首发前 identity correction：开发初始化阶段曾使用 `com.invoice-desk.app`，正式首发改用 `com.invoice-desk.desktop`。用户已确认此前从未发布且为零既有用户，因此不执行 bundle identity 数据迁移，正式版也不会扫描旧开发目录。开发机上的旧目录只属于可丢弃或单独归档的测试材料，不能作为正式备份恢复到新目录。钥匙串 service 仍为 `com.invoice-desk.credentials`。
 
 ## 数据位置
 

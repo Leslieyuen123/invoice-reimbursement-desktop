@@ -344,7 +344,9 @@ Expected: 两条命令均通过。
 
 Run: `npm run tauri init -- --ci --app-name "发票报销" --window-title "发票报销" --frontend-dist ../dist --dev-url http://localhost:1420 --before-dev-command "npm run dev -- --port 1420" --before-build-command "npm run build"`
 
-把生成的 `src-tauri/Cargo.toml` 包名固定为 `invoice-reimbursement`，把正式 `tauri.conf.json` identifier 固定为 `com.invoice-desk.desktop`；后续数据库目录和升级路径依赖该值。钥匙串 service 独立固定为 `com.invoice-desk.credentials`，不随 bundle identifier 改名。
+把生成的 `src-tauri/Cargo.toml` 包名固定为 `invoice-reimbursement`，把 `tauri.conf.json` 的 identifier 固定为 `com.invoice-desk.app`；后续数据库目录、钥匙串 service 和升级路径都依赖这两个值，不能改名。
+
+> 2026-07-18 首发身份决策：用户确认产品从未发布且为零既有用户。上述开发初始化 identifier 约束由首发身份决策显式取代，正式首发 identifier 为 `com.invoice-desk.desktop`；这不是已发布产品升级，不执行 bundle identity 数据迁移。钥匙串 service 仍独立固定为 `com.invoice-desk.credentials`。
 
 随后在 Rust crate 中加入并锁定 MVP 依赖：
 

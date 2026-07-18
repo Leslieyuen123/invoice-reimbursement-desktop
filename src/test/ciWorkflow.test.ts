@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import workflow from "../../.github/workflows/ci.yml?raw";
 import tauriConfig from "../../src-tauri/tauri.conf.json?raw";
+import designSpec from "../../docs/superpowers/specs/2026-07-13-invoice-reimbursement-app-design.md?raw";
+import implementationPlan from "../../docs/superpowers/plans/2026-07-13-invoice-reimbursement-app.md?raw";
 import recoveryGuide from "../../docs/operations/local-data-and-recovery.md?raw";
+import releaseChecklist from "../../docs/operations/release-checklist.md?raw";
 import playwrightConfig from "../../playwright.config.ts?raw";
 import e2eFlow from "../../tests/e2e/mvp-flow.spec.ts?raw";
 
@@ -52,11 +55,20 @@ describe("macOS application identity", () => {
     expect(config.bundle.macOS?.minimumSystemVersion).toBe("11.0");
   });
 
-  it("documents the formal data root and fails closed on an unavailable old export root", () => {
+  it("records the pre-release identity correction without inventing a migration", () => {
+    for (const document of [designSpec, releaseChecklist, recoveryGuide]) {
+      expect(document).toContain("首发前 identity correction");
+      expect(document).toContain("零既有用户");
+      expect(document).toContain("com.invoice-desk.desktop");
+    }
+    expect(implementationPlan).toContain(
+      "identifier 固定为 `com.invoice-desk.app`",
+    );
+    expect(implementationPlan).toContain("由首发身份决策显式取代");
+    expect(recoveryGuide).toContain("不执行 bundle identity 数据迁移");
     expect(recoveryGuide).toContain(
       "~/Library/Application Support/com.invoice-desk.desktop/",
     );
-    expect(recoveryGuide).toContain("旧预发布目录不是正式数据源");
     expect(recoveryGuide).toContain("不能在设置页直接改用新的导出根目录");
   });
 });
@@ -74,5 +86,12 @@ describe("browser acceptance harness", () => {
     expect(e2eFlow).toContain("attachScrollableView(");
     expect(e2eFlow).toContain('"settings"');
     expect(e2eFlow).toContain("同步与存储");
+  });
+
+  it("waits for the image element to finish decoding before measuring it", () => {
+    expect(e2eFlow).toContain("expect.poll");
+    expect(e2eFlow).toContain("image.complete");
+    expect(e2eFlow).toContain("image.naturalWidth > 0");
+    expect(e2eFlow).toContain("image.naturalHeight > 0");
   });
 });
