@@ -1,4 +1,4 @@
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
 
 use crate::db::accounts::{MailboxAccountRepository, MailboxAccountWithRetryState};
@@ -32,7 +32,12 @@ impl DashboardService {
     }
 
     pub async fn load(&self) -> Result<DashboardSnapshot, AppError> {
-        let recent_cutoff = (Utc::now() - Duration::days(7)).to_rfc3339();
+        self.load_at(Utc::now()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn load_at(&self, now: DateTime<Utc>) -> Result<DashboardSnapshot, AppError> {
+        let recent_cutoff = recent_item_cutoff(now).to_rfc3339();
         let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
             "SELECT
                 SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),
@@ -71,6 +76,10 @@ impl DashboardService {
             recent_batches,
         })
     }
+}
+
+pub fn recent_item_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
+    now - Duration::days(7)
 }
 
 fn count(value: i64) -> Result<u64, AppError> {

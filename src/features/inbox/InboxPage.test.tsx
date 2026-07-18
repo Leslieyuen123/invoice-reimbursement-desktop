@@ -185,6 +185,40 @@ describe("InboxPage", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.dashboard });
   });
 
+  it("does not reconcile an old imported item into a recent cached list", async () => {
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    const recentKey = queryKeys.items({ recent: true });
+    queryClient.setQueryData(recentKey, {
+      pages: [{ items: [], nextCursor: null }],
+      pageParams: [undefined],
+    });
+    mockCommand("list_items", new Promise(() => undefined));
+    openDialogMock.mockResolvedValue(["/Users/finance/旧票据.pdf"]);
+    mockCommand("import_manual_files", [
+      {
+        status: "imported" as const,
+        path: "/Users/finance/旧票据.pdf",
+        item: pendingInvoiceFixture({
+          id: "old-import",
+          originalName: "旧票据.pdf",
+          createdAt: "2000-01-01T00:00:00Z",
+        }),
+      },
+    ]);
+
+    renderInboxAt("/inbox?scope=recent", queryClient);
+    await user.click(screen.getByRole("button", { name: "选择文件" }));
+    await screen.findByText("已导入：旧票据.pdf");
+
+    const cached = queryClient.getQueryData<
+      InfiniteData<PageDto<InvoiceItemDto>>
+    >(recentKey);
+    expect(cached?.pages[0].items).toEqual([]);
+  });
+
   it("resets bounded pagination when a filter changes", async () => {
     const user = userEvent.setup();
     mockCommand("get_dashboard", new Promise(() => undefined));

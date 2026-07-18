@@ -181,6 +181,41 @@ async fn exports_pdf_xlsx_originals_and_manifest() {
 }
 
 #[tokio::test]
+async fn export_keeps_a_missing_invoice_date_blank_in_the_workbook() {
+    let app = TestApp::with_batch_item(ItemStatus::Ready).await;
+    let item_id = app.item_ids[0];
+    let original_bytes = b"original-without-invoice-date";
+    fs::write(
+        app.paths.originals.join(format!("{item_id}.pdf")),
+        original_bytes,
+    )
+    .unwrap();
+    fs::write(
+        app.paths.normalized.join(format!("{item_id}.pdf")),
+        inherited_media_box_pdf(100.0, 150.0),
+    )
+    .unwrap();
+    sqlx::query("UPDATE items SET invoice_date = NULL, sha256 = ? WHERE id = ?")
+        .bind(sha256_hex(original_bytes))
+        .bind(item_id.to_string())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let result = app.exports.export(app.batch_id).await.unwrap();
+    let workbook = result.directory.join("reimbursement.xlsx");
+    let sheet = read_zip_entry(&workbook, "xl/worksheets/sheet1.xml");
+    let shared_strings = read_zip_entry(&workbook, "xl/sharedStrings.xml");
+
+    assert!(
+        !sheet.contains("r=\"A2\""),
+        "invoice date cell must stay blank"
+    );
+    assert!(shared_strings.contains("2026-07"));
+    assert!(!shared_strings.contains("2026-07-13"));
+}
+
+#[tokio::test]
 async fn next_export_uses_the_saved_custom_root_without_moving_history() {
     let app = TestApp::with_exportable_batch().await;
     let custom_root = app._directory.path().join("chosen-exports");

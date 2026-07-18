@@ -272,6 +272,27 @@ describe("browser command bridge", () => {
     expect(candidatePageTwo.items).toHaveLength(2);
   });
 
+  it("keeps dashboard recent counts aligned with recent item filtering", async () => {
+    const bridge = createSeededBridge({
+      items: [
+        invoiceFixture("seven-day-boundary", {
+          createdAt: "2026-07-10T08:00:00Z",
+        }),
+        invoiceFixture("eight-days-old", {
+          createdAt: "2026-07-09T08:00:00Z",
+        }),
+      ],
+    });
+
+    await expect(bridge("get_dashboard")).resolves.toMatchObject({
+      recentlyAddedCount: 1,
+    });
+    const recent = await bridge<PageDto<InvoiceItemDto>>("list_items", {
+      filter: { recent: true },
+    });
+    expect(recent.items.map((item) => item.id)).toEqual(["seven-day-boundary"]);
+  });
+
   it("matches Rust candidate range and searched outside-date derivation", async () => {
     const bridge = createSeededBridge({
       batches: [batchFixture()],

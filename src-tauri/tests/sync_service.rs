@@ -1148,10 +1148,7 @@ async fn damaged_document_is_marked_failed_while_later_parts_continue_with_prove
     assert_eq!(failed.recognition_status, RecognitionStatus::Failed);
     assert_eq!(failed.confirmation_status, ConfirmationStatus::Pending);
     assert_eq!(succeeded.recognition_status, RecognitionStatus::Succeeded);
-    assert_eq!(
-        succeeded.invoice_date,
-        chrono::NaiveDate::from_ymd_opt(2026, 7, 14)
-    );
+    assert_eq!(succeeded.invoice_date, None);
     assert_eq!(succeeded.suggested_period.as_deref(), Some("2026-07"));
     for (item, uid, message_id) in [
         (failed, 101, "attachment-101@example.com"),

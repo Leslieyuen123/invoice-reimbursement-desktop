@@ -110,6 +110,24 @@ describe("DashboardPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("requests the recent item filter after recent dashboard navigation", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", dashboardFixture());
+    mockCommand("list_items", { items: [], nextCursor: null });
+
+    renderAppAt();
+    await user.click(await screen.findByRole("link", { name: /最近新增 7/ }));
+
+    expect(window.location.pathname).toBe("/inbox");
+    expect(window.location.search).toBe("?scope=recent");
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("list_items", {
+        filter: { recent: true },
+        page: { cursor: undefined, pageSize: 50 },
+      });
+    });
+  });
+
   it("synchronizes enabled accounts once and refreshes dashboard data", async () => {
     const user = userEvent.setup();
     let finishSynchronization: (() => void) | undefined;

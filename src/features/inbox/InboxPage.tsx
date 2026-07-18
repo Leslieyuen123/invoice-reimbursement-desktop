@@ -10,6 +10,7 @@ import { useSearchParams } from "react-router-dom";
 import { FileDropZone } from "../../components/FileDropZone";
 import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
+import { isRecentItem } from "../../lib/recent";
 import type {
   Category,
   InvoiceItemDto,
@@ -68,6 +69,7 @@ type ItemListData = InfiniteData<PageDto<InvoiceItemDto>>;
 
 function matchesItemFilter(item: InvoiceItemDto, filter: ItemFilter) {
   if (filter.status && item.status !== filter.status) return false;
+  if (filter.recent && !isRecentItem(item.createdAt)) return false;
   if (filter.suggestedPeriod && item.suggestedPeriod !== filter.suggestedPeriod) {
     return false;
   }
@@ -144,17 +146,19 @@ export function InboxPage() {
   >([]);
   const [importingPaths, setImportingPaths] = useState<string[]>([]);
   const status = statusFromSearch(searchParams.get("status"));
+  const recent = searchParams.get("scope") === "recent";
   const batchId = searchParams.get("batchId")?.trim() || undefined;
   const filter = useMemo<ItemFilter>(
     () => ({
       ...(status ? { status } : {}),
+      ...(recent ? { recent: true } : {}),
       ...(suggestedPeriod ? { suggestedPeriod } : {}),
       ...(category ? { category } : {}),
       ...(sourceType ? { sourceType } : {}),
       ...(query.trim() ? { query: query.trim() } : {}),
       ...(batchId ? { batchId } : {}),
     }),
-    [batchId, category, query, sourceType, status, suggestedPeriod],
+    [batchId, category, query, recent, sourceType, status, suggestedPeriod],
   );
   const itemsQuery = useInfiniteQuery({
     queryKey: queryKeys.items(filter),

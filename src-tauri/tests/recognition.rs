@@ -16,6 +16,7 @@ use invoice_reimbursement::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch, RecognitionStatus, SourceType,
 };
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
+use invoice_reimbursement::services::batches::BatchService;
 use invoice_reimbursement::services::recognition::{
     RecognitionService, recognize, recognize_with_warnings,
 };
@@ -84,13 +85,27 @@ fn recognizes_labeled_invoice_metadata() {
 fn incomplete_metadata_falls_back_to_received_month_and_needs_confirmation() {
     let recognized = recognize("电子票据", NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
 
-    assert_eq!(recognized.invoice_date, NaiveDate::from_ymd_opt(2026, 7, 2));
+    assert_eq!(recognized.invoice_date, None);
     assert_eq!(recognized.suggested_period, "2026-07");
     assert_eq!(recognized.category, None);
     assert_eq!(
         recognized.status(DedupeStatus::Unique),
         ItemStatus::PendingConfirmation
     );
+}
+
+#[test]
+fn complete_amount_and_category_without_invoice_date_needs_confirmation() {
+    let recognized = recognize(
+        "餐饮 食品 价税合计 ￥128.50",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(recognized.invoice_date, None);
+    assert_eq!(recognized.suggested_period, "2026-07");
+    assert_eq!(recognized.amount_cents, Some(12_850));
+    assert_eq!(recognized.category, Some(Category::Dining));
+    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
 }
 
 #[test]
@@ -399,7 +414,7 @@ async fn repository_get_by_id_returns_the_persisted_item() {
 #[tokio::test]
 async fn recognize_item_persists_automatic_fields_and_preserves_manual_fields() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
-    let repository = ItemRepository::new(pool);
+    let repository = ItemRepository::new(pool.clone());
     let mut record = sample_item(Uuid::new_v4());
     record.final_category = Some(Category::Hospitality);
     record.note = Some("manual note".to_owned());
@@ -417,17 +432,14 @@ async fn recognize_item_persists_automatic_fields_and_preserves_manual_fields() 
 
     let recognized = service.recognize_item(record.id).await.unwrap();
 
-    assert_eq!(recognized.invoice_date, NaiveDate::from_ymd_opt(2026, 7, 2));
+    assert_eq!(recognized.invoice_date, None);
     assert_eq!(recognized.suggested_period.as_deref(), Some("2026-07"));
     assert_eq!(recognized.suggested_category, Some(Category::Dining));
     assert_eq!(recognized.amount_cents, Some(12_850));
     assert_eq!(recognized.company.as_deref(), Some("星河科技有限公司"));
     assert_eq!(recognized.city.as_deref(), Some("深圳"));
     assert_eq!(recognized.recognition_status, RecognitionStatus::Succeeded);
-    assert_eq!(
-        recognized.confirmation_status,
-        ConfirmationStatus::Confirmed
-    );
+    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
     assert_eq!(recognized.final_category, Some(Category::Hospitality));
     assert_eq!(recognized.note.as_deref(), Some("manual note"));
     assert_eq!(recognized.event_tag.as_deref(), Some("annual meeting"));
@@ -435,6 +447,17 @@ async fn recognize_item_persists_automatic_fields_and_preserves_manual_fields() 
     assert_eq!(recognized.dedupe_status, DedupeStatus::Resolved);
     assert_eq!(extractor.paths(), [PathBuf::from(&record.original_path)]);
     assert_eq!(repository.get_by_id(record.id).await.unwrap(), recognized);
+
+    let batch = BatchRepository::new(pool.clone())
+        .create(NewBatch::try_new("July claims", "2026-07-01", "2026-07-31", None).unwrap())
+        .await
+        .unwrap();
+    let candidates = BatchService::new(pool)
+        .list_candidates(batch.id, Some("invoice".to_owned()), None, 50)
+        .await
+        .unwrap();
+    assert_eq!(candidates.items.len(), 1);
+    assert_eq!(candidates.items[0].invoice_date, None);
 }
 
 #[tokio::test]

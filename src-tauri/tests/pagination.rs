@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{Duration, TimeZone, Utc};
 use invoice_reimbursement::commands::batches::BatchCandidateDisabledReason;
 use invoice_reimbursement::commands::{CursorDto, PageRequestDto, batches, dashboard, items};
 use invoice_reimbursement::db;
@@ -11,6 +11,7 @@ use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::credentials::MemoryCredentialStore;
 use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::services::batches::BatchService;
+use invoice_reimbursement::services::dashboard::{DashboardService, recent_item_cutoff};
 use invoice_reimbursement::state::AppState;
 use uuid::Uuid;
 
@@ -131,6 +132,72 @@ async fn item_pages_are_bounded_and_seek_without_duplicates_or_omissions() {
     .await
     .unwrap_err();
     assert!(matches!(error, AppError::Validation { ref field, .. } if field == "pageSize"));
+}
+
+#[tokio::test]
+async fn recent_item_filter_matches_dashboard_cutoff_before_cursor_pagination() {
+    let fixture = Fixture::new().await;
+    let now = Utc.with_ymd_and_hms(2026, 7, 18, 8, 0, 0).unwrap();
+    let cutoff = recent_item_cutoff(now);
+    let eight_days_old = now - Duration::days(8);
+    sqlx::query("UPDATE items SET created_at = ?, updated_at = ?")
+        .bind(eight_days_old.to_rfc3339())
+        .bind(eight_days_old.to_rfc3339())
+        .execute(fixture.state.pool())
+        .await
+        .unwrap();
+    for (id, created_at) in [
+        (Uuid::from_u128(1), cutoff),
+        (Uuid::from_u128(2), now - Duration::days(1)),
+    ] {
+        sqlx::query("UPDATE items SET created_at = ?, updated_at = ? WHERE id = ?")
+            .bind(created_at.to_rfc3339())
+            .bind(created_at.to_rfc3339())
+            .bind(id.to_string())
+            .execute(fixture.state.pool())
+            .await
+            .unwrap();
+    }
+
+    let dashboard = DashboardService::new(fixture.state.pool().clone())
+        .load_at(now)
+        .await
+        .unwrap();
+    assert_eq!(dashboard.counts.recently_added, 2);
+
+    let first = items::list_page_at(
+        &fixture.state,
+        items::ItemFilterDto {
+            recent: true,
+            ..Default::default()
+        },
+        Some(PageRequestDto {
+            cursor: None,
+            page_size: Some(1),
+        }),
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.items[0].id, Uuid::from_u128(2).to_string());
+    assert!(first.next_cursor.is_some());
+
+    let second = items::list_page_at(
+        &fixture.state,
+        items::ItemFilterDto {
+            recent: true,
+            ..Default::default()
+        },
+        Some(PageRequestDto {
+            cursor: first.next_cursor,
+            page_size: Some(1),
+        }),
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.items[0].id, Uuid::from_u128(1).to_string());
+    assert_eq!(second.next_cursor, None);
 }
 
 #[tokio::test]

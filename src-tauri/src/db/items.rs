@@ -102,6 +102,7 @@ pub struct NewItemRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemFilter {
     pub status: Option<ItemStatus>,
+    pub created_after: Option<DateTime<Utc>>,
     pub suggested_period: Option<String>,
     pub category: Option<Category>,
     pub source_type: Option<SourceType>,
@@ -882,6 +883,11 @@ fn validate_page_size(page_size: usize) -> Result<(), AppError> {
 }
 
 fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
+    if let Some(created_after) = filter.created_after {
+        query
+            .push(" AND created_at >= ")
+            .push_bind(created_after.to_rfc3339());
+    }
     if let Some(status) = filter.status {
         match status {
             ItemStatus::SuspectedDuplicate => {

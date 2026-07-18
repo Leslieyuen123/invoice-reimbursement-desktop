@@ -123,6 +123,7 @@ export interface DashboardDto {
 
 export interface ItemFilter {
   status?: ItemStatus;
+  recent?: boolean;
   suggestedPeriod?: string;
   category?: Category;
   sourceType?: SourceType;

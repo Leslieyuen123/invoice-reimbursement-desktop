@@ -184,7 +184,7 @@ pub fn recognize_with_warnings(
     extraction_warnings: &[String],
 ) -> RecognitionOutcome {
     let (recognized_date, invalid_date) = labeled_date(text);
-    let invoice_date = recognized_date.or(Some(received_date));
+    let invoice_date = recognized_date;
     let mut warnings = extraction_warnings.to_vec();
     if invalid_date {
         warnings.push("invalid_invoice_date".to_owned());
@@ -200,9 +200,8 @@ pub fn recognize_with_warnings(
     let company = labeled_company_value(text, "购买方名称")
         .or_else(|| labeled_company_value(text, "销售方名称"));
     let city = recognized_city(text);
-    let suggested_period = invoice_date
-        .map(|date| format!("{:04}-{:02}", date.year(), date.month()))
-        .unwrap_or_else(|| format!("{:04}-{:02}", received_date.year(), received_date.month()));
+    let period_date = recognized_date.unwrap_or(received_date);
+    let suggested_period = format!("{:04}-{:02}", period_date.year(), period_date.month());
     let confirmation_status = if invoice_date.is_some()
         && amount_cents.is_some()
         && category.is_some()

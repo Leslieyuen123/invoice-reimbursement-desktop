@@ -21,6 +21,7 @@ import type {
   TestMailboxAccountInputDto,
 } from "../types";
 import { API_COMMANDS } from "../lib/api";
+import { isRecentItem } from "../lib/recent";
 
 type CommandArguments = Record<string, unknown>;
 export type BrowserCommandBridge = <T>(
@@ -217,6 +218,7 @@ function itemMatches(item: InvoiceItemDto, filter: ItemFilter) {
   const query = filter.query?.trim().toLocaleLowerCase("zh-CN");
   return (
     (!filter.status || item.status === filter.status) &&
+    (!filter.recent || isRecentItem(item.createdAt, Date.parse(now))) &&
     (!filter.suggestedPeriod || item.suggestedPeriod === filter.suggestedPeriod) &&
     (!filter.category || item.finalCategory === filter.category) &&
     (!filter.sourceType || item.sourceType === filter.sourceType) &&
@@ -263,7 +265,9 @@ function createItem(state: BridgeState, path: string): InvoiceItemDto {
 function dashboard(state: BridgeState): DashboardDto {
   return {
     mailboxAccounts: state.accounts.map((account) => ({ ...account })),
-    recentlyAddedCount: state.items.length,
+    recentlyAddedCount: state.items.filter((item) =>
+      isRecentItem(item.createdAt, Date.parse(now)),
+    ).length,
     pendingConfirmationCount: state.items.filter(
       (item) => item.status === "pending_confirmation",
     ).length,
