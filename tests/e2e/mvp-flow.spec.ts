@@ -100,6 +100,33 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
   await attachView(page, testInfo, "dashboard");
   await expectKeyboardFocusVisible(page);
 
+  await page.goto(
+    "/inbox?scope=recent&status=pending_confirmation&batchId=batch-1&foo=bar",
+  );
+  const clearRecent = page.getByRole("button", {
+    name: "清除最近 7 天筛选",
+  });
+  await expect(clearRecent).toContainText("最近 7 天");
+  await auditCurrentView(page);
+  await clearRecent.click();
+  await expect
+    .poll(() => {
+      const params = new URL(page.url()).searchParams;
+      return {
+        batchId: params.get("batchId"),
+        foo: params.get("foo"),
+        scope: params.get("scope"),
+        status: params.get("status"),
+      };
+    })
+    .toEqual({
+      batchId: "batch-1",
+      foo: "bar",
+      scope: null,
+      status: "pending_confirmation",
+    });
+  await auditCurrentView(page);
+
   await page.getByRole("link", { name: "待处理池" }).click();
   await expect(page.getByRole("heading", { name: "待处理池" })).toBeVisible();
   await auditCurrentView(page);

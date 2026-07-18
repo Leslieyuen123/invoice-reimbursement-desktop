@@ -219,6 +219,50 @@ describe("InboxPage", () => {
     expect(cached?.pages[0].items).toEqual([]);
   });
 
+  it("shows and clears only the recent scope from the inbox URL", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [], nextCursor: null });
+
+    renderAppAt(
+      "/inbox?scope=recent&status=pending_confirmation&batchId=batch-1&foo=bar",
+    );
+
+    const clearRecent = await screen.findByRole("button", {
+      name: "清除最近 7 天筛选",
+    });
+    expect(clearRecent).toHaveTextContent("最近 7 天");
+    await waitFor(() => {
+      expect(commandCalls("list_items")[0]).toMatchObject({
+        filter: {
+          recent: true,
+          status: "pending_confirmation",
+          batchId: "batch-1",
+        },
+      });
+    });
+
+    await user.click(clearRecent);
+
+    await waitFor(() => {
+      const params = new URLSearchParams(window.location.search);
+      expect(params.has("scope")).toBe(false);
+      expect(params.get("status")).toBe("pending_confirmation");
+      expect(params.get("batchId")).toBe("batch-1");
+      expect(params.get("foo")).toBe("bar");
+      expect(commandCalls("list_items")).toHaveLength(2);
+    });
+    const latestFilter = commandCalls("list_items").at(-1)?.filter as Record<
+      string,
+      unknown
+    >;
+    expect(latestFilter).toMatchObject({
+      status: "pending_confirmation",
+      batchId: "batch-1",
+    });
+    expect(latestFilter).not.toHaveProperty("recent");
+  });
+
   it("resets bounded pagination when a filter changes", async () => {
     const user = userEvent.setup();
     mockCommand("get_dashboard", new Promise(() => undefined));

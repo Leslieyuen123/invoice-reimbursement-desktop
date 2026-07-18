@@ -967,6 +967,43 @@ a {
   content: "";
 }
 
+.inbox-active-filters {
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+  padding-top: 12px;
+  overflow-x: auto;
+}
+
+.inbox-active-filter {
+  display: inline-flex;
+  height: 28px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 10px;
+  border: 1px solid rgba(141, 114, 221, 0.48);
+  border-radius: var(--control-radius);
+  background: rgba(141, 114, 221, 0.12);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.inbox-active-filter:hover {
+  border-color: rgba(141, 114, 221, 0.72);
+  background: rgba(141, 114, 221, 0.2);
+}
+
+.inbox-active-filter svg {
+  color: var(--text-secondary);
+}
+
+.inbox-active-filters + .inbox-filters {
+  padding-top: 8px;
+}
+
 .inbox-filters {
   display: grid;
   min-width: 0;

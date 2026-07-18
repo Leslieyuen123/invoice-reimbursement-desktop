@@ -3,7 +3,7 @@ import {
   useInfiniteQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { Check, RotateCcw, Search, TriangleAlert } from "lucide-react";
+import { Check, RotateCcw, Search, TriangleAlert, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
@@ -290,6 +290,12 @@ export function InboxPage() {
     setSearchParams(next);
   }
 
+  function clearRecentFilter() {
+    const next = new URLSearchParams(searchParams);
+    next.delete("scope");
+    setSearchParams(next);
+  }
+
   const importPaths = useCallback(
     async (paths: string[]) => {
       setImportingPaths((current) => [...current, ...paths]);
@@ -388,6 +394,20 @@ export function InboxPage() {
           </button>
         ))}
       </div>
+
+      {recent ? (
+        <div className="inbox-active-filters" aria-label="活动筛选">
+          <button
+            className="inbox-active-filter"
+            type="button"
+            aria-label="清除最近 7 天筛选"
+            onClick={clearRecentFilter}
+          >
+            <span>最近 7 天</span>
+            <X size={14} strokeWidth={1.8} aria-hidden="true" />
+          </button>
+        </div>
+      ) : null}
 
       <div className="inbox-filters" aria-label="票据筛选">
         <label>
