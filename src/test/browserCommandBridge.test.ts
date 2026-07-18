@@ -316,6 +316,12 @@ describe("browser command bridge", () => {
       true,
     );
 
+    const whitespaceQuery = await bridge<PageDto<BatchCandidateDto>>(
+      "list_batch_candidates",
+      { batchId: "batch-1", query: " \t\n " },
+    );
+    expect(whitespaceQuery).toEqual(inRange);
+
     const searched = await bridge<PageDto<BatchCandidateDto>>(
       "list_batch_candidates",
       { batchId: "batch-1", query: "  候选  " },
@@ -349,6 +355,21 @@ describe("browser command bridge", () => {
       outsideBatchRange: false,
       eligible: false,
       disabledReason: "suspected_duplicate",
+    });
+  });
+
+  it.each([
+    ["more than 200 Unicode characters", "票".repeat(201)],
+    ["a control character", "候选\u0000票据"],
+  ])("rejects a candidate query containing %s", async (_case, query) => {
+    const bridge = createSeededBridge({ batches: [batchFixture()] });
+
+    await expect(
+      bridge("list_batch_candidates", { batchId: "batch-1", query }),
+    ).rejects.toEqual({
+      code: "validation",
+      field: "query",
+      message: "query must contain at most 200 printable characters",
     });
   });
 

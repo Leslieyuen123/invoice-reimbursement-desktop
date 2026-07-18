@@ -83,6 +83,18 @@ function requiredObject<T>(arguments_: CommandArguments, name: string): T {
   return value as T;
 }
 
+function normalizeCandidateQuery(value: unknown) {
+  const query = typeof value === "string" ? value.trim() : "";
+  if (Array.from(query).length > 200 || /\p{Cc}/u.test(query)) {
+    throw {
+      code: "validation",
+      field: "query",
+      message: "query must contain at most 200 printable characters",
+    } satisfies AppError;
+  }
+  return query.toLocaleLowerCase("zh-CN");
+}
+
 function paginate<T>(
   values: T[],
   request: unknown,
@@ -339,10 +351,7 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       const batchId = requiredString(arguments_, "batchId");
       const batch = state.batches.find((candidate) => candidate.id === batchId);
       if (!batch) throw notFound("batch");
-      const query =
-        typeof arguments_.query === "string"
-          ? arguments_.query.trim().toLocaleLowerCase("zh-CN")
-          : "";
+      const query = normalizeCandidateQuery(arguments_.query);
       const candidates = state.items
         .filter((item) => {
           if (item.batchId !== null) return false;
