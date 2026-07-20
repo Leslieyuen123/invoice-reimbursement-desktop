@@ -89,7 +89,7 @@ impl AppState {
         let items = ItemRepository::new(pool.clone());
         let import_service = ImportService::new(items.clone(), paths.clone());
         let item_service = ItemService::new(items.clone(), paths.clone());
-        let recognition_service = RecognitionService::new(items, extractor);
+        let recognition_service = RecognitionService::with_paths(items, paths.clone(), extractor);
         let sync_service = SyncService::new(
             gateway.clone(),
             credentials.clone(),

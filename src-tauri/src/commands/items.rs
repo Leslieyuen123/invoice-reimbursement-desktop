@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -10,6 +11,7 @@ use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, SourceType,
 };
+use crate::infra::files::open_contained_regular_file;
 use crate::services::items::ItemReview;
 use crate::state::AppState;
 
@@ -263,6 +265,61 @@ pub async fn retry_recognition(state: &AppState, id: Uuid) -> Result<InvoiceItem
     state.recognition_service().retry(id).await?.try_into()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginalOpenTarget {
+    LocalPath(PathBuf),
+    ExternalUrl(String),
+}
+
+pub async fn resolve_original_open_target(
+    state: &AppState,
+    id: Uuid,
+) -> Result<OriginalOpenTarget, AppError> {
+    const MAX_URL_FILE_BYTES: u64 = 2_048;
+    let item = state.item_service().get(id).await?;
+    let path = PathBuf::from(&item.original_path);
+    let mut opened = open_contained_regular_file(&path, &state.paths().originals, "originalPath")?;
+    if item.mime_type != "text/uri-list" {
+        return Ok(OriginalOpenTarget::LocalPath(path));
+    }
+    if opened.length == 0 || opened.length > MAX_URL_FILE_BYTES {
+        return Err(AppError::validation("originalUrl", "发票链接无法打开"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.length).unwrap_or_default());
+    opened
+        .file
+        .by_ref()
+        .take(MAX_URL_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::validation("originalUrl", "发票链接无法读取"))?;
+    let value = std::str::from_utf8(&bytes)
+        .map(str::trim)
+        .map_err(|_| AppError::validation("originalUrl", "发票链接无效"))?;
+    let url =
+        url::Url::parse(value).map_err(|_| AppError::validation("originalUrl", "发票链接无效"))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(AppError::validation("originalUrl", "发票链接无效"));
+    }
+    Ok(OriginalOpenTarget::ExternalUrl(url.to_string()))
+}
+
+pub async fn open_original(state: &AppState, id: Uuid) -> Result<(), AppError> {
+    let target = resolve_original_open_target(state, id).await?;
+    let result = match target {
+        OriginalOpenTarget::LocalPath(path) => tauri_plugin_opener::open_path(path, None::<&str>),
+        OriginalOpenTarget::ExternalUrl(url) => tauri_plugin_opener::open_url(url, None::<&str>),
+    };
+    result.map_err(|_| AppError::External {
+        service: "system_opener".to_owned(),
+        retryable: false,
+        message: "无法使用系统应用打开原件".to_owned(),
+    })
+}
+
 pub fn parse_preview_uri(uri: &str) -> Result<(Uuid, PreviewVariant), AppError> {
     let url = url::Url::parse(uri).map_err(|_| invalid_preview_request())?;
     if url.scheme() != "invoice-file"
@@ -456,6 +513,14 @@ pub(crate) mod ipc {
         item_id: Uuid,
     ) -> Result<InvoiceItemDto, AppError> {
         super::get(&state, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn open_item_original(
+        state: State<'_, AppState>,
+        item_id: Uuid,
+    ) -> Result<(), AppError> {
+        super::open_original(&state, item_id).await
     }
 
     #[tauri::command(rename_all = "camelCase")]

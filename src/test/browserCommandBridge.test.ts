@@ -200,6 +200,19 @@ describe("browser command bridge", () => {
     );
   });
 
+  it("opens only originals that belong to a known item", async () => {
+    const bridge = createSeededBridge({
+      items: [invoiceFixture("known")],
+    });
+
+    await expect(
+      bridge("open_item_original", { itemId: "known" }),
+    ).resolves.toBeUndefined();
+    await expect(
+      bridge("open_item_original", { itemId: "missing" }),
+    ).rejects.toMatchObject({ code: "not_found", entity: "item" });
+  });
+
   it("injects deterministic delay and command failures for browser state audits", async () => {
     const bridge = createBrowserCommandBridge({
       delayMs: 20,

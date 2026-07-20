@@ -238,6 +238,7 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "get_dashboard",
             "list_items",
             "get_item",
+            "open_item_original",
             "import_manual_files",
             "review_item",
             "resolve_duplicate",
@@ -930,6 +931,40 @@ async fn preview_resolver_allows_only_database_owned_item_variants() {
         assert_eq!(response.headers()["access-control-allow-origin"], "*");
         assert_eq!(response.body(), b"Preview unavailable");
     }
+}
+
+#[tokio::test]
+async fn original_open_target_resolves_local_files_and_https_links_without_exposing_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let archive_id = Uuid::new_v4();
+    let archive = paths.originals.join(format!("{archive_id}.zip"));
+    std::fs::write(&archive, b"PK\x03\x04archive").unwrap();
+    insert_preview_item(&pool, archive_id, &archive, None, "application/zip").await;
+    let link_id = Uuid::new_v4();
+    let link = paths.originals.join(format!("{link_id}.url"));
+    std::fs::write(&link, b"https://invoice.example/download\n").unwrap();
+    insert_preview_item(&pool, link_id, &link, None, "text/uri-list").await;
+    let state = AppState::with_gateway(
+        pool,
+        paths,
+        Arc::new(MemoryCredentialStore::default()),
+        Arc::new(SuccessfulGateway),
+    );
+
+    assert_eq!(
+        items::resolve_original_open_target(&state, archive_id)
+            .await
+            .unwrap(),
+        items::OriginalOpenTarget::LocalPath(archive)
+    );
+    assert_eq!(
+        items::resolve_original_open_target(&state, link_id)
+            .await
+            .unwrap(),
+        items::OriginalOpenTarget::ExternalUrl("https://invoice.example/download".to_owned())
+    );
 }
 
 #[tokio::test]

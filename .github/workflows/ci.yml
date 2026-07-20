@@ -140,6 +140,10 @@ jobs:
           test "$plist_minimum_system_version" = "11.0"
           test "$main_minimum_system_version" = "11.0"
           test "$ocr_minimum_system_version" = "11.0"
+          INVOICE_OCR_BIN="$bundle_app/Contents/MacOS/invoice-ocr" \
+            cargo test --manifest-path src-tauri/Cargo.toml --test extraction \
+              packaged_sidecar_runs_through_process_gateway_with_cold_start_margin \
+              -- --ignored
           hdiutil verify "${dmg_files[0]}"
 
           mount_dir="$(mktemp -d)"
@@ -157,6 +161,10 @@ jobs:
           test -n "$mounted_app"
           test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
           test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-ocr")" = "arm64"
+          INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr" \
+            cargo test --manifest-path src-tauri/Cargo.toml --test extraction \
+              packaged_sidecar_runs_through_process_gateway_with_cold_start_margin \
+              -- --ignored
           hdiutil detach "$mount_dir" -quiet
           mounted=0
           rmdir "$mount_dir"

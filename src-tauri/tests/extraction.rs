@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -36,6 +37,16 @@ impl FakeOcr {
             pdf_text_calls: AtomicUsize::new(0),
             text: "must not OCR".to_owned(),
             pdf_text: text.into(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn returning_pdf_and_ocr(pdf_text: impl Into<String>, ocr_text: impl Into<String>) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            pdf_text_calls: AtomicUsize::new(0),
+            text: ocr_text.into(),
+            pdf_text: pdf_text.into(),
             warnings: Vec::new(),
         }
     }
@@ -117,6 +128,62 @@ fn text_pdf_is_extracted_without_calling_ocr() {
 }
 
 #[test]
+fn long_pdf_text_without_invoice_signals_falls_back_to_ocr() {
+    let ocr = Arc::new(FakeOcr::returning_pdf_and_ocr(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+        "开票日期：2026年07月16日\n价税合计 （小写）￥1014.00",
+    ));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let extracted = extractor.extract(&fixture("text-invoice.pdf")).unwrap();
+
+    assert!(extracted.text.contains("价税合计"));
+    assert_eq!(ocr.pdf_text_call_count(), 1);
+    assert_eq!(ocr.call_count(), 1);
+}
+
+#[test]
+fn empty_invoice_template_text_falls_back_to_visual_ocr() {
+    let ocr = Arc::new(FakeOcr::returning_pdf_and_ocr(
+        "电子发票（普通发票）\n发票号码：\n开票日期：\n购买方信息\n名称：\n销售方信息\n名称：\n项目名称\n金额\n税率/征收率\n税额\n合计\n价税合计（大写）\n（小写）\n备注\n开票人：\n2024/12/12 localhost:63342/template.html",
+        "电子发票（普通发票）\n发票号码：26317907120600246026\n开票日期：2026年06月14日\n*生产生活服务*通行费\n车牌号：沪ACA9778\n价税合计（小写）1.46元",
+    ));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let extracted = extractor.extract(&fixture("text-invoice.pdf")).unwrap();
+
+    assert!(extracted.text.contains("26317907120600246026"));
+    assert!(extracted.text.contains("1.46元"));
+    assert_eq!(ocr.pdf_text_call_count(), 1);
+    assert_eq!(ocr.call_count(), 1);
+}
+
+#[test]
+fn xref_stream_pdf_is_rewritten_to_classic_xref_for_export() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("xref-stream.pdf");
+    let bytes = handcrafted_xref_stream_pdf();
+    assert!(!bytes.windows(6).any(|window| window == b"\nxref\n"));
+    std::fs::write(&path, &bytes).unwrap();
+    let ocr = Arc::new(FakeOcr::returning_pdf_text(
+        "开票日期：2026年06月18日\n价税合计（小写）¥128.50",
+    ));
+    let extractor = LocalExtractor::new(ocr);
+
+    let extracted = extractor.extract(&path).unwrap();
+    let normalized = extracted.normalized_pdf.unwrap();
+
+    assert!(normalized.windows(6).any(|window| window == b"\nxref\n"));
+    assert_eq!(
+        lopdf::Document::load_mem(&normalized)
+            .unwrap()
+            .get_pages()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn image_is_ocrd_and_normalized_to_a_valid_one_page_pdf() {
     let ocr_text = "北京 出租车 价税合计 ¥128.50";
     let ocr = Arc::new(FakeOcr::returning(ocr_text));
@@ -179,6 +246,8 @@ fn scanned_pdf_propagates_ocr_warnings() {
 
 #[test]
 fn exactly_twenty_non_whitespace_pdf_characters_skip_ocr() {
+    let invoice_text = "开票日期abcdefghij价税合计¥1";
+    assert_eq!(invoice_text.chars().count(), 20);
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("threshold.pdf");
     let mut pdf = PdfDocument::new("threshold");
@@ -193,7 +262,7 @@ fn exactly_twenty_non_whitespace_pdf_characters_skip_ocr() {
                     font: BuiltinFont::Helvetica,
                 },
                 Op::WriteTextBuiltinFont {
-                    items: vec![TextItem::Text("12345678901234567890".to_owned())],
+                    items: vec![TextItem::Text(invoice_text.to_owned())],
                     font: BuiltinFont::Helvetica,
                 },
                 Op::EndTextSection,
@@ -201,12 +270,12 @@ fn exactly_twenty_non_whitespace_pdf_characters_skip_ocr() {
         )])
         .save(&PdfSaveOptions::default(), &mut Vec::new());
     std::fs::write(&path, bytes).unwrap();
-    let ocr = Arc::new(FakeOcr::returning_pdf_text("12345678901234567890"));
+    let ocr = Arc::new(FakeOcr::returning_pdf_text(invoice_text));
     let extractor = LocalExtractor::new(ocr.clone());
 
     let extracted = extractor.extract(&path).unwrap();
 
-    assert!(extracted.text.contains("12345678901234567890"));
+    assert_eq!(extracted.text, invoice_text);
     assert_eq!(ocr.call_count(), 0);
     assert_eq!(ocr.pdf_text_call_count(), 1);
 }
@@ -563,6 +632,48 @@ fn compressed_text_pdf(character_count: usize) -> Vec<u8> {
     let mut output = Vec::new();
     document.save_to(&mut output).unwrap();
     output
+}
+
+fn handcrafted_xref_stream_pdf() -> Vec<u8> {
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
+        bytes.extend_from_slice(object);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    let mut entries = Vec::new();
+    write_xref_stream_entry(&mut entries, 0, 0, u16::MAX);
+    write_xref_stream_entry(&mut entries, 1, offsets[0], 0);
+    write_xref_stream_entry(&mut entries, 1, offsets[1], 0);
+    write_xref_stream_entry(&mut entries, 1, offsets[2], 0);
+    write_xref_stream_entry(&mut entries, 1, xref_offset, 0);
+    write!(
+        &mut bytes,
+        "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 4 2] /Index [0 5] /Length {} >>\nstream\n",
+        entries.len()
+    )
+    .unwrap();
+    bytes.extend_from_slice(&entries);
+    write!(
+        &mut bytes,
+        "\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n"
+    )
+    .unwrap();
+    bytes
+}
+
+fn write_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, offset: usize, generation: u16) {
+    entries.push(entry_type);
+    entries.extend_from_slice(&(offset as u32).to_be_bytes());
+    entries.extend_from_slice(&generation.to_be_bytes());
 }
 
 #[test]

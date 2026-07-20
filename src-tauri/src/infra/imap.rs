@@ -195,7 +195,7 @@ fn fetch_blocking(
     let (uids, mut high_water) = match uid_start(cursor, uid_validity) {
         Some(start_uid) if start_uid <= highest_uid => {
             let found = session
-                .uid_search(format!("UID {start_uid}:*"))
+                .uid_search(invoice_uid_search_query(start_uid))
                 .map_err(|_| imap_error("IMAP UID search failed"))?;
             select_uid_batch(found, highest_uid, settings.max_messages)?
         }
@@ -289,6 +289,10 @@ fn fetch_blocking(
         rejected_messages,
         highest_uid: high_water,
     })
+}
+
+fn invoice_uid_search_query(start_uid: u32) -> String {
+    format!("UID {start_uid}:* SINCE 1-Jun-2026 BEFORE 1-Aug-2026")
 }
 
 fn uid_start(cursor: Option<SyncCursor>, uid_validity: u32) -> Option<u32> {
@@ -468,9 +472,17 @@ fn limit_error(message: &str) -> AppError {
 mod tests {
     use super::{
         ImapAccountConfig, MessageAdmission, MessageRejectionReason, NativeTlsImapGateway,
-        RawBudget, authentication_error, connect, imap_error, limit_error, select_uid_batch,
-        uid_start,
+        RawBudget, authentication_error, connect, imap_error, invoice_uid_search_query,
+        limit_error, select_uid_batch, uid_start,
     };
+
+    #[test]
+    fn invoice_search_is_limited_to_june_and_july_2026() {
+        assert_eq!(
+            invoice_uid_search_query(4073),
+            "UID 4073:* SINCE 1-Jun-2026 BEFORE 1-Aug-2026"
+        );
+    }
     use crate::db::accounts::{MailboxProvider, SyncCursor};
     use crate::domain::error::AppError;
 

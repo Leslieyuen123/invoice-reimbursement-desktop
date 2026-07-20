@@ -11,6 +11,7 @@ use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, derive_item_status,
 };
 use crate::infra::extraction::DocumentExtractor;
+use crate::infra::files::AppPaths;
 
 const CITY_NAMES: &[&str] = &[
     "北京",
@@ -76,12 +77,29 @@ pub struct RecognitionOutcome {
 #[derive(Clone)]
 pub struct RecognitionService {
     items: ItemRepository,
+    paths: Option<AppPaths>,
     extractor: Arc<dyn DocumentExtractor>,
 }
 
 impl RecognitionService {
     pub fn new(items: ItemRepository, extractor: Arc<dyn DocumentExtractor>) -> Self {
-        Self { items, extractor }
+        Self {
+            items,
+            paths: None,
+            extractor,
+        }
+    }
+
+    pub fn with_paths(
+        items: ItemRepository,
+        paths: AppPaths,
+        extractor: Arc<dyn DocumentExtractor>,
+    ) -> Self {
+        Self {
+            items,
+            paths: Some(paths),
+            extractor,
+        }
     }
 
     pub async fn recognize_item(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
@@ -125,25 +143,76 @@ impl RecognitionService {
                 return Err(extraction_error);
             }
         };
+        let created_normalized = match (
+            item.normalized_pdf_path.as_ref(),
+            extracted.normalized_pdf.as_deref(),
+            self.paths.as_ref(),
+        ) {
+            (None, Some(bytes), Some(paths)) => {
+                let paths = paths.clone();
+                let bytes = bytes.to_vec();
+                Some(
+                    tokio::task::spawn_blocking(move || paths.persist_normalized_pdf(id, &bytes))
+                        .await
+                        .map_err(|error| AppError::Internal {
+                            message: format!("normalized PDF storage task failed: {error}"),
+                        })??,
+                )
+            }
+            _ => None,
+        };
         let recognized =
             recognize_with_warnings(&extracted.text, received_date, &extracted.warnings);
 
-        self.persist_recognition_patch(
-            id,
-            ItemPatch {
-                invoice_date: Some(recognized.invoice_date),
-                suggested_period: Some(Some(recognized.suggested_period)),
-                suggested_category: Some(recognized.category),
-                amount_cents: Some(recognized.amount_cents),
-                city: Some(recognized.city),
-                company: Some(recognized.company),
-                recognition_status: Some(recognized.recognition_status),
-                confirmation_status: Some(recognized.confirmation_status),
-                ..ItemPatch::default()
-            },
-            preserve_manual_confirmation,
-        )
-        .await
+        let persisted = self
+            .persist_recognition_patch(
+                id,
+                ItemPatch {
+                    normalized_pdf_path: created_normalized
+                        .as_ref()
+                        .map(|path| Some(path.to_string_lossy().into_owned())),
+                    invoice_date: Some(recognized.invoice_date),
+                    suggested_period: Some(Some(recognized.suggested_period)),
+                    suggested_category: Some(recognized.category),
+                    amount_cents: Some(recognized.amount_cents),
+                    city: Some(recognized.city),
+                    company: Some(recognized.company),
+                    recognition_status: Some(recognized.recognition_status),
+                    confirmation_status: Some(recognized.confirmation_status),
+                    ..ItemPatch::default()
+                },
+                preserve_manual_confirmation,
+            )
+            .await;
+        match persisted {
+            Ok(item)
+                if created_normalized.as_ref().is_some_and(|path| {
+                    item.normalized_pdf_path.as_deref() != Some(path.to_string_lossy().as_ref())
+                }) =>
+            {
+                self.cleanup_created_normalized(created_normalized.unwrap())
+                    .await?;
+                Ok(item)
+            }
+            Ok(item) => Ok(item),
+            Err(error) => {
+                if let Some(path) = created_normalized {
+                    self.cleanup_created_normalized(path).await?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn cleanup_created_normalized(&self, path: PathBuf) -> Result<(), AppError> {
+        let Some(paths) = self.paths.clone() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || paths.delete_normalized_pdf(&path))
+            .await
+            .map_err(|error| AppError::Internal {
+                message: format!("normalized PDF cleanup task failed: {error}"),
+            })?
     }
 
     pub async fn retry(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
@@ -198,7 +267,12 @@ pub fn recognize_with_warnings(
     };
     let category = scored_category(text);
     let company = labeled_company_value(text, "购买方名称")
-        .or_else(|| labeled_company_value(text, "销售方名称"));
+        .or_else(|| company_value_from_compact_section(text, "购买方信息"))
+        .or_else(|| company_value_from_ocr_section(text, &["购买方信息", "购 买 方 信 息"]))
+        .or_else(|| labeled_company_value(text, "销售方名称"))
+        .or_else(|| company_value_from_compact_section(text, "销售方信息"))
+        .or_else(|| company_value_from_ocr_section(text, &["销售方信息", "销 售 方 信 息"]))
+        .or_else(|| trailing_company_candidate(text));
     let city = recognized_city(text);
     let period_date = recognized_date.unwrap_or(received_date);
     let suggested_period = format!("{:04}-{:02}", period_date.year(), period_date.month());
@@ -311,6 +385,93 @@ fn labeled_company_value(text: &str, label: &str) -> Option<String> {
         .find_map(|(index, _)| company_value_after_label(&text[index + label.len()..], END_LABELS))
 }
 
+fn company_value_from_ocr_section(text: &str, section_labels: &[&str]) -> Option<String> {
+    const END_LABELS: &[&str] = &[
+        "名称",
+        "统一社会信用代码",
+        "纳税人识别号",
+        "税号",
+        "地址",
+        "电话",
+        "项目名称",
+    ];
+
+    section_labels.iter().find_map(|section_label| {
+        let (_, after_section) = text.split_once(section_label)?;
+        let section = after_section
+            .split_once("项目名称")
+            .map_or(after_section, |(value, _)| value);
+        section.match_indices("名称").find_map(|(index, _)| {
+            let starts_field = section[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|character| character.is_whitespace() || character == '|');
+            let after_label = &section[index + "名称".len()..];
+            let has_separator = after_label
+                .trim_start_matches([' ', '\t'])
+                .starts_with(['：', ':']);
+            (starts_field && has_separator)
+                .then(|| company_value_after_label(after_label, END_LABELS))
+                .flatten()
+        })
+    })
+}
+
+fn company_value_from_compact_section(text: &str, section_label: &str) -> Option<String> {
+    const END_LABELS: &[&str] = &[
+        "名称",
+        "购买方信息",
+        "销售方信息",
+        "统一社会信用代码",
+        "纳税人识别号",
+        "税号",
+        "地址",
+        "电话",
+        "项目名称",
+    ];
+
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let (_, after_section) = compact.split_once(section_label)?;
+    let (_, after_name) = after_section.split_once("名称")?;
+    let value = after_name.trim_start_matches(['：', ':']);
+    let end = END_LABELS
+        .iter()
+        .filter_map(|label| value.find(label))
+        .min()
+        .unwrap_or(value.len());
+    let company = value[..end].trim_matches([
+        '：', ':', '，', ',', '。', '.', '；', ';', '（', '(', '）', ')',
+    ]);
+    (!company.is_empty() && company.ends_with("公司")).then(|| company.to_owned())
+}
+
+fn trailing_company_candidate(text: &str) -> Option<String> {
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let candidates: Vec<_> = text
+        .split_whitespace()
+        .filter_map(|token| {
+            let value = token
+                .trim_matches([
+                    '：', ':', '，', ',', '。', '.', '；', ';', '（', '(', '）', ')',
+                ])
+                .trim_start_matches("名称：")
+                .trim_start_matches("名称:");
+            (value.ends_with("公司") && value.chars().count() >= 4).then(|| value.to_owned())
+        })
+        .collect();
+    if compact.contains("购买方信息") {
+        candidates.into_iter().last()
+    } else {
+        candidates.into_iter().next()
+    }
+}
+
 fn company_label_has_field_boundary(text: &str, index: usize, label: &str) -> bool {
     let starts_field = text[..index]
         .chars()
@@ -342,7 +503,11 @@ fn labeled_date(text: &str) -> (Option<NaiveDate>, bool) {
             return (Some(date), false);
         }
         let (generic_date, _) = generic_labeled_date(text);
-        return (generic_date, true);
+        if generic_date.is_some() {
+            return (generic_date, true);
+        }
+        let fallback_date = parse_date_anywhere(after_invoice_label);
+        return (fallback_date, fallback_date.is_none());
     }
 
     generic_labeled_date(text)
@@ -386,15 +551,31 @@ fn parse_date_prefix(value: &str) -> Option<NaiveDate> {
         })
 }
 
+fn parse_date_anywhere(value: &str) -> Option<NaiveDate> {
+    value
+        .char_indices()
+        .find_map(|(index, _)| parse_date_prefix(&value[index..]))
+}
+
 fn labeled_amount(text: &str) -> Result<Option<i64>, ()> {
-    let Some(after_label) = ["价税合计（小写）", "价税合计(小写)", "价税合计", "合计"]
+    let Some(after_label) = ["价税合计（小写）", "价税合计(小写)"]
         .into_iter()
         .find_map(|label| text.split_once(label).map(|(_, value)| value))
+        .or_else(|| {
+            text.split_once("价税合计").map(|(_, value)| {
+                value
+                    .find("小写")
+                    .filter(|index| value[..*index].chars().count() <= 48)
+                    .map(|index| &value[index + "小写".len()..])
+                    .unwrap_or(value)
+            })
+        })
+        .or_else(|| text.split_once("合计").map(|(_, value)| value))
     else {
         return Ok(None);
     };
     let value = after_label
-        .trim_start_matches(['：', ':'])
+        .trim_start_matches(['：', ':', '）', ')', '（', '('])
         .trim_start()
         .trim_start_matches("RMB")
         .trim_start()
@@ -406,7 +587,32 @@ fn labeled_amount(text: &str) -> Result<Option<i64>, ()> {
             character.is_ascii_digit() || matches!(*character, '.' | ',' | '-' | '+')
         })
         .collect();
-    parse_amount_cents(&token).map(Some).ok_or(())
+    if let Some(amount) = parse_amount_cents(&token) {
+        return Ok(Some(amount));
+    }
+    if token.is_empty() {
+        return Ok(max_currency_amount(text));
+    }
+    Err(())
+}
+
+fn max_currency_amount(text: &str) -> Option<i64> {
+    text.char_indices()
+        .filter_map(|(index, marker)| {
+            matches!(marker, '¥' | '￥')
+                .then(|| &text[index + marker.len_utf8()..])
+                .and_then(parse_amount_prefix)
+        })
+        .max()
+}
+
+fn parse_amount_prefix(value: &str) -> Option<i64> {
+    let value = value.trim_start();
+    let token: String = value
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || matches!(*character, '.' | ','))
+        .collect();
+    parse_amount_cents(&token)
 }
 
 fn parse_amount_cents(token: &str) -> Option<i64> {
@@ -445,7 +651,23 @@ fn scored_category(text: &str) -> Option<Category> {
     const RULES: [(Category, &[&str]); 4] = [
         (
             Category::Transport,
-            &["出租车", "网约车", "铁路", "航空", "客运", "滴滴"],
+            &[
+                "出租车",
+                "网约车",
+                "铁路",
+                "航空",
+                "客运",
+                "滴滴",
+                "旅客运输",
+                "交通运输",
+                "行程单",
+                "打车",
+                "出行",
+                "机票",
+                "通行费",
+                "车牌号",
+                "车辆类型",
+            ],
         ),
         (Category::Dining, &["餐饮", "食品", "饭店", "餐厅"]),
         (Category::Accommodation, &["住宿", "酒店", "宾馆"]),

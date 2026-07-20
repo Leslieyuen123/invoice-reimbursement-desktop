@@ -255,6 +255,7 @@ export function ItemDrawer({
 
       <div className="item-drawer-body">
         <ItemPreview
+          itemId={item.id}
           originalName={item.originalName}
           previewUrl={item.previewUrl}
         />

@@ -712,6 +712,9 @@ async fn artifacts_contain_exact_workbook_zip_and_manifest_data() {
         &result.directory.join("reimbursement.xlsx"),
         "xl/worksheets/sheet1.xml",
     );
+    assert!(sheet.contains("<pane ySplit=\"1\""));
+    assert!(sheet.contains("<cols>"));
+    assert!(sheet.contains("<autoFilter ref=\"A1:K3\""));
     assert_numeric_cell(&sheet, "E2", "123");
     assert_numeric_cell(&sheet, "E3", "325.5");
     let styles = read_zip_entry(
@@ -719,6 +722,8 @@ async fn artifacts_contain_exact_workbook_zip_and_manifest_data() {
         "xl/styles.xml",
     );
     assert!(styles.contains("¥#,##0.00"));
+    assert!(styles.contains("FF1F2937"));
+    assert!(styles.contains("FFFFFFFF"));
 
     let originals_path = result.directory.join("originals.zip");
     let mut originals = zip::ZipArchive::new(File::open(&originals_path).unwrap()).unwrap();

@@ -301,6 +301,12 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       if (!item) throw notFound("item");
       return { ...item };
     }],
+    [API_COMMANDS.openItemOriginal, (arguments_) => {
+      const itemId = requiredString(arguments_, "itemId");
+      if (!state.items.some((candidate) => candidate.id === itemId)) {
+        throw notFound("item");
+      }
+    }],
     [API_COMMANDS.importManualFiles, (arguments_) => {
       const paths = arguments_.paths;
       if (!Array.isArray(paths) || !paths.every((path) => typeof path === "string")) {

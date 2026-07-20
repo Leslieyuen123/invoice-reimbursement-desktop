@@ -632,13 +632,21 @@ impl DocumentExtractor for LocalExtractor {
 impl LocalExtractor {
     fn extract_pdf(&self, path: &Path) -> Result<ExtractedDocument, AppError> {
         let bytes = fs::read(path).map_err(|_| document_error())?;
-        let document = lopdf::Document::load_mem(&bytes).map_err(|_| document_error())?;
+        let mut document = lopdf::Document::load_mem(&bytes).map_err(|_| document_error())?;
         if document.get_pages().len() > MAX_PDF_PAGES {
             return Err(resource_limit_error());
         }
+        document.renumber_objects();
+        document.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+        let mut normalized_pdf = Vec::new();
+        document
+            .save_to(&mut normalized_pdf)
+            .map_err(|_| document_error())?;
         drop(document);
         let extracted_text = self.ocr.extract_pdf_text(path)?;
-        let (text, warnings) = if useful_character_count(&extracted_text.text) >= 20 {
+        let (text, warnings) = if useful_character_count(&extracted_text.text) >= 20
+            && has_invoice_text_signals(&extracted_text.text)
+        {
             (extracted_text.text, extracted_text.warnings)
         } else {
             let result = self.ocr.recognize(path)?;
@@ -649,7 +657,7 @@ impl LocalExtractor {
 
         Ok(ExtractedDocument {
             text,
-            normalized_pdf: Some(bytes),
+            normalized_pdf: Some(normalized_pdf),
             warnings,
         })
     }
@@ -673,6 +681,43 @@ impl LocalExtractor {
             warnings: result.warnings,
         })
     }
+}
+
+fn has_invoice_text_signals(text: &str) -> bool {
+    text.contains("开票日期")
+        && ["价税合计", "行程费用合计", "应付金额"]
+            .iter()
+            .any(|label| text.contains(label))
+        && has_monetary_value(text)
+}
+
+fn has_monetary_value(text: &str) -> bool {
+    let characters: Vec<_> = text.chars().collect();
+    for (index, character) in characters.iter().enumerate() {
+        if matches!(character, '¥' | '￥')
+            && characters[index + 1..]
+                .iter()
+                .find(|value| !(value.is_whitespace() || matches!(value, ':' | '：')))
+                .is_some_and(|value| value.is_ascii_digit())
+        {
+            return true;
+        }
+
+        if *character == '元'
+            && characters[index.saturating_sub(24)..index]
+                .iter()
+                .any(|value| value.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+
+    text.match_indices("RMB").any(|(index, _)| {
+        text[index + 3..]
+            .chars()
+            .find(|value| !(value.is_whitespace() || matches!(value, ':' | '：')))
+            .is_some_and(|value| value.is_ascii_digit())
+    })
 }
 
 fn normalize_image(image: image::DynamicImage, width: u32, height: u32) -> Vec<u8> {

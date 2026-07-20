@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import workflow from "../../.github/workflows/ci.yml?raw";
+import entitlements from "../../src-tauri/Entitlements.plist?raw";
 import tauriConfig from "../../src-tauri/tauri.conf.json?raw";
 import designSpec from "../../docs/superpowers/specs/2026-07-13-invoice-reimbursement-app-design.md?raw";
 import implementationPlan from "../../docs/superpowers/plans/2026-07-13-invoice-reimbursement-app.md?raw";
@@ -45,6 +46,9 @@ describe("release workflow", () => {
     expect(workflow).toContain('hdiutil attach "${dmg_files[0]}"');
     expect(workflow).toContain('lipo -archs "$mounted_app/Contents/MacOS/invoice-reimbursement"');
     expect(workflow).toContain('lipo -archs "$mounted_app/Contents/MacOS/invoice-ocr"');
+    expect(workflow).toContain("packaged_sidecar_runs_through_process_gateway_with_cold_start_margin");
+    expect(workflow).toContain('INVOICE_OCR_BIN="$bundle_app/Contents/MacOS/invoice-ocr"');
+    expect(workflow).toContain('INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"');
   });
 });
 
@@ -52,11 +56,25 @@ describe("macOS application identity", () => {
   it("uses a stable non-app identifier and declares macOS 11", () => {
     const config = JSON.parse(tauriConfig) as {
       identifier: string;
-      bundle: { macOS?: { minimumSystemVersion?: string } };
+      bundle: {
+        macOS?: {
+          minimumSystemVersion?: string;
+          hardenedRuntime?: boolean;
+          signingIdentity?: string;
+          entitlements?: string;
+        };
+      };
     };
     expect(config.identifier).toBe("com.invoice-desk.desktop");
     expect(config.identifier.endsWith(".app")).toBe(false);
     expect(config.bundle.macOS?.minimumSystemVersion).toBe("11.0");
+    expect(config.bundle.macOS?.hardenedRuntime).toBe(true);
+    expect(config.bundle.macOS?.signingIdentity).toBe("-");
+    expect(config.bundle.macOS?.entitlements).toBe("Entitlements.plist");
+    expect(entitlements).toContain("com.apple.security.cs.disable-library-validation");
+    expect(entitlements).toMatch(
+      /<key>com\.apple\.security\.cs\.disable-library-validation<\/key>\s*<true\/>/,
+    );
   });
 
   it("records the pre-release identity correction without inventing a migration", () => {

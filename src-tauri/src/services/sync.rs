@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,6 +21,9 @@ const MAX_TOTAL_RAW_BYTES: usize = 200 * 1024 * 1024;
 const MAX_PARTS_PER_MESSAGE: usize = 256;
 const MAX_DOWNLOAD_LINKS_PER_MESSAGE: usize = 32;
 const MAX_DOWNLOAD_URL_LENGTH: usize = 2_048;
+const MAX_ZIP_ENTRIES: usize = 64;
+const MAX_ZIP_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncResult {
@@ -324,12 +328,20 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
             if !is_supported_file_name(&file_name) {
                 continue;
             }
-            files.push(InvoicePart {
+            let file = InvoicePart {
                 part_id: index.to_string(),
                 file_name,
                 bytes: part.contents().to_vec(),
                 message_id: message_id.clone(),
-            });
+            };
+            if file_name_has_extension(&file.file_name, "zip") {
+                match expand_zip_part(&file) {
+                    Ok(expanded) if !expanded.is_empty() => files.extend(expanded),
+                    _ => files.push(file),
+                }
+            } else {
+                files.push(file);
+            }
         }
     }
     for part_id in &message.html_body {
@@ -348,6 +360,51 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
         )?;
     }
     Ok(ParsedInvoiceParts { files, links })
+}
+
+fn expand_zip_part(part: &InvoicePart) -> Result<Vec<InvoicePart>, ()> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(&part.bytes)).map_err(|_| ())?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(());
+    }
+    let mut expanded = Vec::new();
+    let mut total_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|_| ())?;
+        if entry.is_dir() || entry.size() > MAX_ZIP_ENTRY_BYTES {
+            continue;
+        }
+        let Some(enclosed) = entry.enclosed_name() else {
+            continue;
+        };
+        let Some(file_name) = enclosed.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_recognizable_file_name(file_name) {
+            continue;
+        }
+        total_bytes = total_bytes.checked_add(entry.size()).ok_or(())?;
+        if total_bytes > MAX_ZIP_TOTAL_BYTES {
+            return Err(());
+        }
+        let capacity = usize::try_from(entry.size()).map_err(|_| ())?;
+        let mut bytes = Vec::with_capacity(capacity);
+        entry
+            .by_ref()
+            .take(MAX_ZIP_ENTRY_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| ())?;
+        if bytes.len() as u64 > MAX_ZIP_ENTRY_BYTES {
+            return Err(());
+        }
+        expanded.push(InvoicePart {
+            part_id: format!("{}.zip.{index}", part.part_id),
+            file_name: file_name.to_owned(),
+            bytes,
+            message_id: part.message_id.clone(),
+        });
+    }
+    Ok(expanded)
 }
 
 fn collect_https_links(
@@ -428,6 +485,25 @@ fn is_supported_file_name(file_name: &str) -> bool {
         })
 }
 
+fn is_recognizable_file_name(file_name: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "pdf" | "jpg" | "jpeg" | "png"
+            )
+        })
+}
+
+fn file_name_has_extension(file_name: &str, expected: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
 fn sanitize_error(message: &str, secret: &str) -> String {
     sanitize_message(message, &[secret])
 }
@@ -480,9 +556,12 @@ fn resource_limit_error(message: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use std::io::{Cursor, Write};
 
-    use super::{MAX_MESSAGES_PER_SYNC, validate_delta};
+    use chrono::Utc;
+    use zip::write::SimpleFileOptions;
+
+    use super::{InvoicePart, MAX_MESSAGES_PER_SYNC, expand_zip_part, validate_delta};
     use crate::infra::imap::{MailboxDelta, MessageRejectionReason, RawMessage, RejectedMessage};
 
     fn rejected_message(uid: u32) -> RejectedMessage {
@@ -514,6 +593,34 @@ mod tests {
         let error = validate_delta(&delta, "INBOX").unwrap_err();
 
         assert!(error.to_string().contains("too many messages"));
+    }
+
+    #[test]
+    fn zip_attachments_expand_supported_invoice_files() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("folder/invoice.pdf", SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"%PDF-invoice").unwrap();
+        archive
+            .start_file("notes/readme.txt", SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"not an invoice").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let part = InvoicePart {
+            part_id: "4".to_owned(),
+            file_name: "invoices.zip".to_owned(),
+            bytes,
+            message_id: Some("zip@example.com".to_owned()),
+        };
+
+        let expanded = expand_zip_part(&part).unwrap();
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].part_id, "4.zip.0");
+        assert_eq!(expanded[0].file_name, "invoice.pdf");
+        assert_eq!(expanded[0].bytes, b"%PDF-invoice");
+        assert_eq!(expanded[0].message_id, part.message_id);
     }
 
     #[test]

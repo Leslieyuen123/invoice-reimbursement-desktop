@@ -50,6 +50,7 @@ export const API_COMMANDS = {
   getDashboard: "get_dashboard",
   listItems: "list_items",
   getItem: "get_item",
+  openItemOriginal: "open_item_original",
   importManualFiles: "import_manual_files",
   reviewItem: "review_item",
   resolveDuplicate: "resolve_duplicate",
@@ -83,6 +84,8 @@ export const api = {
     call<PageDto<InvoiceItemDto>>(API_COMMANDS.listItems, { filter, page }),
   getItem: (itemId: string) =>
     call<InvoiceItemDto>(API_COMMANDS.getItem, { itemId }),
+  openItemOriginal: (itemId: string) =>
+    call<void>(API_COMMANDS.openItemOriginal, { itemId }),
   importManualFiles: (paths: string[]) =>
     call<ManualImportOutcomeDto[]>(API_COMMANDS.importManualFiles, { paths }),
   reviewItem: (input: ReviewItemInputDto) =>

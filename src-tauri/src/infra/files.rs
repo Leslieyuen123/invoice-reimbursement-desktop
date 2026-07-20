@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
-use std::io;
 #[cfg(test)]
 use std::io::Read;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -133,9 +133,7 @@ pub(crate) fn read_contained_regular_file_with_hooks(
     }
     before_read();
     let mut bytes = Vec::with_capacity(usize::try_from(opened.length).unwrap_or(0));
-    opened
-        .file
-        .by_ref()
+    Read::by_ref(&mut opened.file)
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| AppError::validation(field, "票据文件无法读取"))?;
@@ -244,6 +242,46 @@ impl AppPaths {
             },
             file,
         ))
+    }
+
+    pub(crate) fn persist_normalized_pdf(
+        &self,
+        id: Uuid,
+        bytes: &[u8],
+    ) -> Result<PathBuf, AppError> {
+        let staging = self.staging.join(format!("{id}.normalized.part"));
+        let destination = self.normalized.join(format!("{id}.pdf"));
+        let mut file = open_staging_file(&staging)?;
+        let write_result = (|| {
+            file.write_all(bytes)
+                .map_err(|error| internal_error("failed to write normalized PDF", error))?;
+            file.sync_all()
+                .map_err(|error| internal_error("failed to sync normalized PDF", error))
+        })();
+        drop(file);
+        if let Err(error) = write_result {
+            return match remove_file_durably(&staging) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(AppError::External {
+                    service: "filesystem_sync".to_owned(),
+                    retryable: false,
+                    message: format!(
+                        "normalized PDF staging cleanup was incomplete; manual recovery is required: original error: {error}; cleanup error: {cleanup_error}",
+                    ),
+                }),
+            };
+        }
+        promote_staged_original(&staging, &destination)?;
+        Ok(destination)
+    }
+
+    pub(crate) fn delete_normalized_pdf(&self, path: &Path) -> Result<(), AppError> {
+        if !path.starts_with(&self.normalized) {
+            return Err(AppError::Internal {
+                message: "refusing to delete a file outside normalized storage".to_owned(),
+            });
+        }
+        remove_file_durably(path)
     }
 
     pub fn delete_original(&self, path: impl AsRef<Path>) -> Result<(), AppError> {

@@ -6,7 +6,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
 use lopdf::{Document, Object, ObjectId, Stream, dictionary};
-use rust_xlsxwriter::{Format, Workbook};
+use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -600,11 +600,41 @@ fn create_workbook(
     ];
     let mut workbook = Workbook::new();
     let currency = Format::new().set_num_format("¥#,##0.00");
+    let header_format = Format::new()
+        .set_bold()
+        .set_font_color(Color::RGB(0xFFFFFF))
+        .set_background_color(Color::RGB(0x1F2937))
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border_bottom(FormatBorder::Thin);
+    let wrapped_text = Format::new().set_text_wrap().set_align(FormatAlign::Top);
     let worksheet = workbook.add_worksheet();
+    worksheet
+        .set_freeze_panes(1, 0)
+        .and_then(|worksheet| worksheet.set_row_height(0, 28))
+        .map_err(|_| internal_error("failed to configure reimbursement header"))?;
+    for (column, width) in [
+        13.0, 14.0, 20.0, 10.0, 13.0, 10.0, 28.0, 10.0, 42.0, 16.0, 16.0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        worksheet
+            .set_column_width(column as u16, width)
+            .map_err(|_| internal_error("failed to size reimbursement column"))?;
+    }
+    worksheet
+        .set_column_format(8, &wrapped_text)
+        .map_err(|_| internal_error("failed to format reimbursement notes"))?;
+    let last_row = u32::try_from(items.len())
+        .map_err(|_| internal_error("reimbursement row count overflow"))?;
+    worksheet
+        .autofilter(0, 0, last_row, 10)
+        .map_err(|_| internal_error("failed to configure reimbursement filter"))?;
     let mut text_units = 0_usize;
     for (column, header) in HEADERS.iter().enumerate() {
         worksheet
-            .write_string(0, column as u16, *header)
+            .write_string_with_format(0, column as u16, *header, &header_format)
             .map_err(|_| internal_error("failed to write reimbursement header"))?;
     }
 

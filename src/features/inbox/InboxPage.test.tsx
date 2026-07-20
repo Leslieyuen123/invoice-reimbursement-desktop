@@ -734,8 +734,17 @@ describe("InboxPage", () => {
     );
     expect(within(drawer).queryByTitle("票据预览")).not.toBeInTheDocument();
 
+    fetchMock.mockResolvedValueOnce(
+      new Response(new Uint8Array(), {
+        status: 200,
+        headers: { "Content-Type": "application/pdf" },
+      }),
+    );
+    fetchMock.mockImplementationOnce(() => new Promise(() => undefined));
     await user.click(within(drawer).getByRole("button", { name: "重新加载" }));
-    expect(await within(drawer).findByTitle("票据预览")).toBeInTheDocument();
+    expect(
+      await within(drawer).findByRole("img", { name: "票据预览" }),
+    ).toBeInTheDocument();
   });
 
   it("closes the review dialog with Escape and restores focus", async () => {

@@ -52,6 +52,7 @@ describe("ItemPreview", () => {
 
   it("ignores a stale failed check after switching preview variants", async () => {
     const user = userEvent.setup();
+    const renderPdf = vi.fn().mockResolvedValue(undefined);
     const resolvers: Array<(response: Response) => void> = [];
     fetchMock.mockImplementation(
       () =>
@@ -64,6 +65,7 @@ describe("ItemPreview", () => {
       <ItemPreview
         originalName="出租车电子发票.pdf"
         previewUrl="invoice-file://item/invoice-taxi?variant=normalized"
+        renderPdf={renderPdf}
       />,
     );
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
@@ -85,31 +87,39 @@ describe("ItemPreview", () => {
       );
     });
 
-    expect(await screen.findByTitle("票据预览")).toHaveAttribute(
-      "src",
+    expect(await screen.findByRole("img", { name: "票据预览" })).toBeInTheDocument();
+    await waitFor(() => expect(renderPdf).toHaveBeenCalledTimes(1));
+    expect(renderPdf).toHaveBeenCalledWith(
+      expect.any(HTMLDivElement),
       "invoice-file://item/invoice-taxi?variant=original",
+      expect.any(AbortSignal),
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("keeps a data URL preview usable without a network check", async () => {
+    const renderPdf = vi.fn().mockResolvedValue(undefined);
     render(
       <ItemPreview
         originalName="qa-fixture.pdf"
         previewUrl="data:application/pdf;base64,JVBERi0xLjQ="
+        renderPdf={renderPdf}
       />,
     );
 
-    expect(await screen.findByTitle("票据预览")).toHaveAttribute(
-      "src",
+    expect(await screen.findByRole("img", { name: "票据预览" })).toBeInTheDocument();
+    await waitFor(() => expect(renderPdf).toHaveBeenCalledWith(
+      expect.any(HTMLDivElement),
       "data:application/pdf;base64,JVBERi0xLjQ=",
-    );
+      expect.any(AbortSignal),
+    ));
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it.each(["application/pdf", "image/png", "image/jpeg"])(
     "accepts a successful %s preview response",
     async (contentType) => {
+      const renderPdf = vi.fn().mockResolvedValue(undefined);
       fetchMock.mockResolvedValue(
         new Response(new Uint8Array(), {
           status: 200,
@@ -121,11 +131,15 @@ describe("ItemPreview", () => {
         <ItemPreview
           originalName="preview-fixture"
           previewUrl="invoice-file://item/invoice-taxi?variant=original"
+          renderPdf={renderPdf}
         />,
       );
 
       if (contentType === "application/pdf") {
-        expect(await screen.findByTitle("票据预览")).toBeInTheDocument();
+        expect(
+          await screen.findByRole("img", { name: "票据预览" }),
+        ).toBeInTheDocument();
+        await waitFor(() => expect(renderPdf).toHaveBeenCalledTimes(1));
       } else {
         expect(
           await screen.findByRole("img", { name: "票据预览" }),
@@ -133,6 +147,33 @@ describe("ItemPreview", () => {
       }
     },
   );
+
+  it("renders PDF bytes into a canvas instead of a WebKit iframe", async () => {
+    const renderPdf = vi.fn().mockResolvedValue(undefined);
+    fetchMock.mockResolvedValue(
+      new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
+        status: 200,
+        headers: { "Content-Type": "application/pdf" },
+      }),
+    );
+
+    render(
+      <ItemPreview
+        originalName="invoice.pdf"
+        previewUrl="invoice-file://item/invoice-pdf?variant=original"
+        renderPdf={renderPdf}
+      />,
+    );
+
+    const canvas = await screen.findByRole("img", { name: "票据预览" });
+    await waitFor(() => expect(renderPdf).toHaveBeenCalledTimes(1));
+    expect(renderPdf).toHaveBeenCalledWith(
+      canvas,
+      "invoice-file://item/invoice-pdf?variant=original",
+      expect.any(AbortSignal),
+    );
+    expect(screen.queryByTitle("票据预览")).not.toBeInTheDocument();
+  });
 
   it.each(["receipt.JPG", "receipt.jpeg", "receipt.png"])(
     "renders image ticket %s as a contained image instead of an iframe",
@@ -194,5 +235,27 @@ describe("ItemPreview", () => {
       "无法显示票据预览",
     );
     expect(screen.queryByTitle("票据预览")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["download-link.url", "在浏览器中打开原件"],
+    ["invoice-bundle.zip", "用系统应用打开原件"],
+  ])("offers a usable original action for %s", async (originalName, label) => {
+    const user = userEvent.setup();
+    const openOriginal = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ItemPreview
+        itemId="item-external"
+        originalName={originalName}
+        previewUrl="invoice-file://item/item-external?variant=original"
+        openOriginal={openOriginal}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: label }));
+
+    expect(openOriginal).toHaveBeenCalledWith("item-external");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

@@ -31,7 +31,10 @@
     "icon": ["icons/icon.png"],
     "externalBin": ["binaries/invoice-ocr"],
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true,
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist"
     }
   }
 }

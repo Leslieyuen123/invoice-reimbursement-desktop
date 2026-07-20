@@ -16,6 +16,7 @@ use invoice_reimbursement::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch, RecognitionStatus, SourceType,
 };
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
+use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::services::batches::BatchService;
 use invoice_reimbursement::services::recognition::{
     RecognitionService, recognize, recognize_with_warnings,
@@ -57,6 +58,33 @@ struct GatedExtractor {
     result: Mutex<Option<ExtractedDocument>>,
 }
 
+#[tokio::test]
+async fn recognition_persists_normalized_pdf_for_export() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(Uuid::new_v4());
+    repository.insert(&record).await.unwrap();
+    let normalized_bytes = b"%PDF-1.4 normalized invoice".to_vec();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026年06月18日 餐饮 食品 价税合计 ￥128.50".to_owned(),
+        normalized_pdf: Some(normalized_bytes.clone()),
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::with_paths(repository, paths.clone(), extractor);
+
+    let recognized = service.recognize_item(record.id).await.unwrap();
+
+    let normalized_path = PathBuf::from(
+        recognized
+            .normalized_pdf_path
+            .expect("normalized path should be persisted"),
+    );
+    assert!(normalized_path.starts_with(&paths.normalized));
+    assert_eq!(std::fs::read(normalized_path).unwrap(), normalized_bytes);
+}
+
 impl DocumentExtractor for GatedExtractor {
     fn extract(&self, _path: &Path) -> Result<ExtractedDocument, AppError> {
         self.started.send(()).unwrap();
@@ -79,6 +107,26 @@ fn recognizes_labeled_invoice_metadata() {
     assert_eq!(recognized.suggested_period, "2026-06");
     assert_eq!(recognized.category, Some(Category::Dining));
     assert_eq!(recognized.amount_cents, Some(12_850));
+}
+
+#[test]
+fn flattened_pdf_text_recovers_trailing_invoice_values() {
+    let recognized = recognize(
+        "电子发票（普通发票） 发票号码：\n开票日期：\n购买方信息\n名称：\n销售方信息\n名称：\n项目名称 车牌号 车辆类型 通行日期起 通行日期止 金额 税率/征收率 税额\n价税合计（大写） （小写）\n备注\n2024/12/12 localhost:63342/template.html\n26317907120600246026 2026年06月14日 91310230MA1K0PRP1X 上海路桥发展有限公司 91310000631588023C *生产生活服务*通行费 沪ACA9778 客车 20260614 1.42 3% 0.04 ¥1.42 壹圆肆角陆分 姜娟 ¥1.46 20260614 上海大绍文化传媒有限公司 ¥0.04",
+        NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
+    );
+
+    assert_eq!(
+        recognized.invoice_date,
+        NaiveDate::from_ymd_opt(2026, 6, 14)
+    );
+    assert_eq!(recognized.amount_cents, Some(146));
+    assert_eq!(recognized.category, Some(Category::Transport));
+    assert_eq!(
+        recognized.company.as_deref(),
+        Some("上海大绍文化传媒有限公司")
+    );
+    assert!(recognized.warnings.is_empty());
 }
 
 #[test]
@@ -202,6 +250,23 @@ fn amount_accepts_rmb_marker_whitespace_and_thousands_grouping() {
 }
 
 #[test]
+fn amount_uses_multiline_lowercase_total_after_the_uppercase_total() {
+    for (text, expected) in [
+        (
+            "价税合计 (大写)\n壹仟零壹拾肆圆整\n（小写)\n￥1014.00",
+            101_400,
+        ),
+        (
+            "价税合计 (大写)\n壹佰捌拾壹圆叁角陆分\n（小写）¥181.36",
+            18_136,
+        ),
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+        assert_eq!(recognized.amount_cents, Some(expected), "{text}");
+    }
+}
+
+#[test]
 fn amount_uses_label_priority_instead_of_text_order_or_tax_amount() {
     let recognized = recognize(
         "税额 ￥9.99 合计 ￥100.00 价税合计 ￥200.00 价税合计（小写） ￥1,234.56",
@@ -241,6 +306,27 @@ fn category_scoring_supports_all_four_keyword_sets() {
 }
 
 #[test]
+fn transport_category_recognizes_current_invoice_and_itinerary_terms() {
+    for text in [
+        "旅客运输服务 *交通运输服务*客运服务费",
+        "美团打车行程单 出行费用合计",
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+        assert_eq!(recognized.category, Some(Category::Transport), "{text}");
+    }
+}
+
+#[test]
+fn toll_invoice_vehicle_fields_are_transport() {
+    let recognized = recognize(
+        "电子发票（普通发票）\n*生产生活服务*通行费\n车牌号：沪ACA9778\n车辆类型：客车",
+        NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
+    );
+
+    assert_eq!(recognized.category, Some(Category::Transport));
+}
+
+#[test]
 fn tied_category_scores_are_left_unclassified() {
     let recognized = recognize(
         "出租车 网约车 餐饮 食品",
@@ -267,6 +353,45 @@ fn company_prefers_the_buyer_name_segment_over_the_seller() {
     );
 
     assert_eq!(recognized.company.as_deref(), Some("上海星河科技有限公司"));
+}
+
+#[test]
+fn company_reads_buyer_name_from_separated_ocr_section_layout() {
+    let recognized = recognize(
+        "购买方信息\n销售方信息\n名称：上海大绍文化传媒有限公司\n名称：上海路桥发展有限公司\n统一社会信用代码/纳税人识别号：91310230MA1K0PRP1X\n统一社会信用代码/纳税人识别号：91310000631588023C\n项目名称",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(
+        recognized.company.as_deref(),
+        Some("上海大绍文化传媒有限公司")
+    );
+}
+
+#[test]
+fn company_reads_buyer_from_character_fragmented_ocr_header() {
+    let recognized = recognize(
+        "购\n买\n方\n信\n息\n名称：上海大绍文化传媒有限公司\n统一社会信用代码/纳税人识别号：91310230MA1K0PRP1X\n销\n售\n方\n信\n息\n名称：阿斯兰航空服务（上海）有限公司",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(
+        recognized.company.as_deref(),
+        Some("上海大绍文化传媒有限公司")
+    );
+}
+
+#[test]
+fn company_uses_first_candidate_when_ocr_reverses_the_section_header() {
+    let recognized = recognize(
+        "息 信 方 买 购 名称：\n息 信 方 售 销 名称：\n2026年06月15日 上海大绍文化传媒有限公司 91310230MA1K0PRP1X 上海路团科技有限公司 91310105MA1FW5NA99",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(
+        recognized.company.as_deref(),
+        Some("上海大绍文化传媒有限公司")
+    );
 }
 
 #[test]

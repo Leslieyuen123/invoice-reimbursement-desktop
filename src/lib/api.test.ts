@@ -89,6 +89,12 @@ const commandCases: Array<{
     invokeArguments: { itemId: "item-1" },
   },
   {
+    method: "openItemOriginal",
+    arguments_: ["item-1"],
+    command: "open_item_original",
+    invokeArguments: { itemId: "item-1" },
+  },
+  {
     method: "importManualFiles",
     arguments_: [["one.pdf", "two.pdf"]],
     command: "import_manual_files",
