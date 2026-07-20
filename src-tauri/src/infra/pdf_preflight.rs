@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+#[cfg(test)]
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -32,34 +34,81 @@ struct ActiveXrefEntry {
     offset: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RevisionXrefEntry {
+    object_number: usize,
+    is_active: bool,
+}
+
+struct XrefCollection {
+    visited_xrefs: HashSet<usize>,
+    active_entries: Vec<ActiveXrefEntry>,
+    total_entries: usize,
+    active_entries_total: usize,
+    max_active_entries: usize,
+    seen_object_ids: HashSet<usize>,
+}
+
+impl XrefCollection {
+    fn new(max_active_entries: usize) -> Self {
+        Self {
+            visited_xrefs: HashSet::new(),
+            active_entries: Vec::new(),
+            total_entries: 0,
+            active_entries_total: 0,
+            max_active_entries,
+            seen_object_ids: HashSet::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HEADER_PARSE_OFFSETS: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn reset_header_parse_offsets() {
+    HEADER_PARSE_OFFSETS.with(|offsets| *offsets.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+fn take_header_parse_offsets() -> Vec<usize> {
+    HEADER_PARSE_OFFSETS.with(|offsets| offsets.borrow_mut().take().unwrap_or_default())
+}
+
 pub(crate) fn validate_pdf_structure_with_limit(
     bytes: &[u8],
     max_active_entries: usize,
 ) -> Result<(), PdfPreflightError> {
     let xref_start = terminal_startxref(bytes)?;
-    let mut visited_xrefs = HashSet::new();
-    let mut active_entries = Vec::new();
-    let mut xref_entries = 0;
-    let mut active_xref_entries = 0;
-    collect_xref_offsets(
-        bytes,
-        xref_start,
-        &mut visited_xrefs,
-        &mut active_entries,
-        &mut xref_entries,
-        &mut active_xref_entries,
-        max_active_entries,
-    )?;
+    let mut collection = XrefCollection::new(max_active_entries);
+    collect_xref_offsets(bytes, xref_start, &mut collection)?;
 
-    for entry in &active_entries {
-        validate_indirect_object_header(bytes, *entry)?;
+    let mut header_cache = HashMap::new();
+    for entry in &collection.active_entries {
+        let (object_number, generation) = match header_cache.get(&entry.offset).copied() {
+            Some(header) => header,
+            None => {
+                if header_cache.len() >= MAX_XREF_ENTRIES {
+                    return Err(resource_limit());
+                }
+                let header = parse_indirect_object_header(bytes, entry.offset)?;
+                header_cache.insert(entry.offset, header);
+                header
+            }
+        };
+        if object_number != entry.object_number || generation != entry.generation {
+            return Err(invalid_pdf_structure());
+        }
     }
 
-    let mut object_offsets = active_entries
+    let mut object_offsets = collection
+        .active_entries
         .into_iter()
         .map(|entry| entry.offset)
         .collect::<Vec<_>>();
-    object_offsets.retain(|offset| !visited_xrefs.contains(offset));
+    object_offsets.retain(|offset| !collection.visited_xrefs.contains(offset));
     object_offsets.sort_unstable();
     object_offsets.dedup();
 
@@ -136,50 +185,26 @@ fn consume_eol(bytes: &[u8], cursor: &mut usize) -> Result<(), PdfPreflightError
 fn collect_xref_offsets(
     bytes: &[u8],
     xref_start: usize,
-    visited: &mut HashSet<usize>,
-    active_entries: &mut Vec<ActiveXrefEntry>,
-    xref_entries: &mut usize,
-    active_xref_entries: &mut usize,
-    max_active_entries: usize,
+    collection: &mut XrefCollection,
 ) -> Result<(), PdfPreflightError> {
     if xref_start >= bytes.len()
-        || visited.len() >= MAX_XREF_REVISIONS
-        || !visited.insert(xref_start)
+        || collection.visited_xrefs.len() >= MAX_XREF_REVISIONS
+        || !collection.visited_xrefs.insert(xref_start)
     {
         return Err(invalid_pdf_structure());
     }
     let mut lexer = RawLexer::at(bytes, xref_start);
     let first = lexer.next_token()?;
     let previous_xref = match first {
-        RawToken::Word(b"xref") => collect_classic_xref_section(
-            &mut lexer,
-            xref_start,
-            active_entries,
-            xref_entries,
-            active_xref_entries,
-            max_active_entries,
-        )?,
-        RawToken::Word(_) => collect_uncompressed_xref_stream(
-            bytes,
-            xref_start,
-            active_entries,
-            xref_entries,
-            active_xref_entries,
-            max_active_entries,
-        )?,
+        RawToken::Word(b"xref") => {
+            collect_classic_xref_section(&mut lexer, xref_start, collection)?
+        }
+        RawToken::Word(_) => collect_uncompressed_xref_stream(bytes, xref_start, collection)?,
         _ => return Err(invalid_pdf_structure()),
     };
 
     if let Some(previous_xref) = previous_xref {
-        collect_xref_offsets(
-            bytes,
-            previous_xref,
-            visited,
-            active_entries,
-            xref_entries,
-            active_xref_entries,
-            max_active_entries,
-        )?;
+        collect_xref_offsets(bytes, previous_xref, collection)?;
     }
     Ok(())
 }
@@ -187,11 +212,9 @@ fn collect_xref_offsets(
 fn collect_classic_xref_section(
     lexer: &mut RawLexer<'_>,
     xref_start: usize,
-    active_entries: &mut Vec<ActiveXrefEntry>,
-    xref_entries: &mut usize,
-    active_xref_entries: &mut usize,
-    max_active_entries: usize,
+    collection: &mut XrefCollection,
 ) -> Result<Option<usize>, PdfPreflightError> {
+    let mut revision_entries = Vec::new();
     let previous_xref = loop {
         let token = lexer.next_token()?;
         match token {
@@ -201,7 +224,7 @@ fn collect_classic_xref_section(
             RawToken::Word(first) => {
                 let first_object = parse_usize(first)?;
                 let count = parse_usize_word(lexer.next_token()?)?;
-                record_xref_entries(xref_entries, count)?;
+                record_xref_entries(&mut collection.total_entries, count)?;
                 for index in 0..count {
                     let object_number = first_object
                         .checked_add(index)
@@ -213,14 +236,20 @@ fn collect_classic_xref_section(
                     }
                     match lexer.next_token()? {
                         RawToken::Word(b"n") => {
-                            record_active_xref_entry(active_xref_entries, max_active_entries)?;
-                            active_entries.push(ActiveXrefEntry {
+                            collection.active_entries.push(ActiveXrefEntry {
                                 object_number,
                                 generation,
                                 offset,
                             });
+                            revision_entries.push(RevisionXrefEntry {
+                                object_number,
+                                is_active: true,
+                            });
                         }
-                        RawToken::Word(b"f") => {}
+                        RawToken::Word(b"f") => revision_entries.push(RevisionXrefEntry {
+                            object_number,
+                            is_active: false,
+                        }),
                         _ => return Err(invalid_pdf_structure()),
                     }
                 }
@@ -228,6 +257,12 @@ fn collect_classic_xref_section(
             _ => return Err(invalid_pdf_structure()),
         }
     };
+    record_effective_active_entries(
+        revision_entries,
+        &mut collection.seen_object_ids,
+        &mut collection.active_entries_total,
+        collection.max_active_entries,
+    )?;
     Ok(previous_xref)
 }
 
@@ -244,10 +279,7 @@ struct XrefStreamDictionary {
 fn collect_uncompressed_xref_stream(
     bytes: &[u8],
     xref_start: usize,
-    active_entries: &mut Vec<ActiveXrefEntry>,
-    xref_entries: &mut usize,
-    active_xref_entries: &mut usize,
-    max_active_entries: usize,
+    collection: &mut XrefCollection,
 ) -> Result<Option<usize>, PdfPreflightError> {
     let prefix_end = xref_start
         .checked_add(MAX_XREF_STREAM_DICTIONARY_BYTES)
@@ -275,7 +307,7 @@ fn collect_uncompressed_xref_stream(
     }
     let index = dictionary.index.unwrap_or_else(|| vec![0, size]);
     let entry_count = validate_xref_index(&index, size)?;
-    record_xref_entries(xref_entries, entry_count)?;
+    record_xref_entries(&mut collection.total_entries, entry_count)?;
 
     let entry_width = widths
         .into_iter()
@@ -299,6 +331,7 @@ fn collect_uncompressed_xref_stream(
 
     let mut cursor = content_start;
     let mut found_self = false;
+    let mut revision_entries = Vec::new();
     for range in index.chunks_exact(2) {
         let first_object = range[0];
         let count = range[1];
@@ -319,7 +352,10 @@ fn collect_uncompressed_xref_stream(
             let offset = read_big_endian(&entry[type_end..offset_end])?;
             let generation = read_big_endian(&entry[offset_end..])?;
             match entry_type {
-                0 => {}
+                0 => revision_entries.push(RevisionXrefEntry {
+                    object_number: object_id,
+                    is_active: false,
+                }),
                 1 => {
                     let offset = usize::try_from(offset).map_err(|_| invalid_pdf_structure())?;
                     let generation = usize::try_from(generation)
@@ -329,11 +365,14 @@ fn collect_uncompressed_xref_stream(
                     if offset >= bytes.len() {
                         return Err(invalid_pdf_structure());
                     }
-                    record_active_xref_entry(active_xref_entries, max_active_entries)?;
-                    active_entries.push(ActiveXrefEntry {
+                    collection.active_entries.push(ActiveXrefEntry {
                         object_number: object_id,
                         generation,
                         offset,
+                    });
+                    revision_entries.push(RevisionXrefEntry {
+                        object_number: object_id,
+                        is_active: true,
                     });
                     if object_id == object_number {
                         found_self = offset == xref_start;
@@ -347,6 +386,12 @@ fn collect_uncompressed_xref_stream(
     if cursor != content_end || !found_self {
         return Err(invalid_pdf_structure());
     }
+    record_effective_active_entries(
+        revision_entries,
+        &mut collection.seen_object_ids,
+        &mut collection.active_entries_total,
+        collection.max_active_entries,
+    )?;
     Ok(dictionary.previous_xref)
 }
 
@@ -455,29 +500,41 @@ fn record_xref_entries(total: &mut usize, count: usize) -> Result<(), PdfPreflig
     Ok(())
 }
 
-fn record_active_xref_entry(total: &mut usize, limit: usize) -> Result<(), PdfPreflightError> {
-    *total = total
-        .checked_add(1)
-        .filter(|total| *total <= limit)
-        .ok_or_else(resource_limit)?;
+fn record_effective_active_entries(
+    revision_entries: Vec<RevisionXrefEntry>,
+    seen_object_ids: &mut HashSet<usize>,
+    active_total: &mut usize,
+    active_limit: usize,
+) -> Result<(), PdfPreflightError> {
+    for entry in revision_entries.into_iter().rev() {
+        if seen_object_ids.insert(entry.object_number) && entry.is_active {
+            *active_total = active_total
+                .checked_add(1)
+                .filter(|total| *total <= active_limit)
+                .ok_or_else(resource_limit)?;
+        }
+    }
     Ok(())
 }
 
-fn validate_indirect_object_header(
+fn parse_indirect_object_header(
     bytes: &[u8],
-    entry: ActiveXrefEntry,
-) -> Result<(), PdfPreflightError> {
-    if entry.offset >= bytes.len() {
+    offset: usize,
+) -> Result<(usize, usize), PdfPreflightError> {
+    #[cfg(test)]
+    HEADER_PARSE_OFFSETS.with(|offsets| {
+        if let Some(offsets) = offsets.borrow_mut().as_mut() {
+            offsets.push(offset);
+        }
+    });
+    if offset >= bytes.len() {
         return Err(invalid_pdf_structure());
     }
-    let mut lexer = RawLexer::at(bytes, entry.offset);
+    let mut lexer = RawLexer::at(bytes, offset);
     let object_number = parse_structural_usize(lexer.next_structural_token()?)?;
     let generation = parse_structural_usize(lexer.next_structural_token()?)?;
     expect_structural_word(&mut lexer, b"obj")?;
-    if object_number != entry.object_number || generation != entry.generation {
-        return Err(invalid_pdf_structure());
-    }
-    Ok(())
+    Ok((object_number, generation))
 }
 
 fn stream_content_start(bytes: &[u8], position: usize) -> Result<usize, PdfPreflightError> {
@@ -910,7 +967,7 @@ mod tests {
 
     use super::{
         MAX_XREF_ENTRIES, PdfPreflightError, RawLexer, RawToken, reject_unsafe_object_dictionary,
-        validate_pdf_structure_with_limit,
+        reset_header_parse_offsets, take_header_parse_offsets, validate_pdf_structure_with_limit,
     };
 
     fn validate_pdf_structure(bytes: &[u8]) -> Result<(), PdfPreflightError> {
@@ -979,6 +1036,47 @@ mod tests {
         let bytes = classic_pdf_with_free_xref_entries(20_001);
 
         validate_pdf_structure_with_limit(&bytes, 3).unwrap();
+    }
+
+    #[test]
+    fn repeated_entries_parse_each_unique_header_offset_once() {
+        let (bytes, shared_offset) = classic_pdf_with_repeated_commented_entry(2_000, 64 * 1024);
+        reset_header_parse_offsets();
+
+        validate_pdf_structure_with_limit(&bytes, MAX_XREF_ENTRIES).unwrap();
+
+        let parsed_offsets = take_header_parse_offsets();
+        assert_eq!(
+            parsed_offsets
+                .iter()
+                .filter(|offset| **offset == shared_offset)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn newest_normal_entry_shadows_older_active_entry_for_the_budget() {
+        let bytes = incremental_pdf_with_latest_entry(b"n", true);
+
+        validate_pdf_structure_with_limit(&bytes, 3).unwrap();
+    }
+
+    #[test]
+    fn newest_free_entry_tombstones_older_active_entry_for_the_budget() {
+        let bytes = incremental_pdf_with_latest_entry(b"f", false);
+
+        validate_pdf_structure_with_limit(&bytes, 2).unwrap();
+    }
+
+    #[test]
+    fn historical_unique_objects_still_consume_the_active_entry_budget() {
+        let bytes = incremental_pdf_with_unique_object();
+
+        assert_eq!(
+            validate_pdf_structure_with_limit(&bytes, 3),
+            Err(PdfPreflightError::ResourceLimit)
+        );
     }
 
     #[test]
@@ -1174,6 +1272,85 @@ mod tests {
             &mut bytes,
             "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
             free_count + 4,
+        )
+        .unwrap();
+        bytes
+    }
+
+    fn classic_pdf_with_repeated_commented_entry(
+        repeated_entries: usize,
+        comment_bytes: usize,
+    ) -> (Vec<u8>, usize) {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let shared_offset = bytes.len();
+        bytes.push(b'%');
+        bytes.extend(std::iter::repeat_n(b'x', comment_bytes));
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let page_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>\nendobj\n",
+        );
+
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in [shared_offset, pages_offset, page_offset] {
+            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+        }
+        for _ in 0..repeated_entries {
+            writeln!(&mut bytes, "1 1\n{shared_offset:010} 00000 n ").unwrap();
+        }
+        write!(
+            &mut bytes,
+            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .unwrap();
+        (bytes, shared_offset)
+    }
+
+    fn incremental_pdf_with_latest_entry(status: &[u8], write_updated_object: bool) -> Vec<u8> {
+        let mut bytes = classic_pdf_with_free_xref_entries(0);
+        let previous_xref = bytes
+            .windows(b"xref".len())
+            .position(|window| window == b"xref")
+            .unwrap();
+        let entry_offset = if write_updated_object {
+            let offset = bytes.len();
+            bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            offset
+        } else {
+            0
+        };
+        let latest_xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n1 1\n");
+        writeln!(
+            &mut bytes,
+            "{entry_offset:010} 00000 {} ",
+            std::str::from_utf8(status).unwrap()
+        )
+        .unwrap();
+        write!(
+            &mut bytes,
+            "trailer\n<< /Size 4 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{latest_xref}\n%%EOF\n"
+        )
+        .unwrap();
+        bytes
+    }
+
+    fn incremental_pdf_with_unique_object() -> Vec<u8> {
+        let mut bytes = classic_pdf_with_free_xref_entries(0);
+        let previous_xref = bytes
+            .windows(b"xref".len())
+            .position(|window| window == b"xref")
+            .unwrap();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"4 0 obj\nnull\nendobj\n");
+        let latest_xref = bytes.len();
+        write!(
+            &mut bytes,
+            "xref\n4 1\n{object_offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{latest_xref}\n%%EOF\n"
         )
         .unwrap();
         bytes

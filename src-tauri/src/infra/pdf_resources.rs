@@ -2,12 +2,29 @@ use std::io::Read;
 
 use flate2::read::ZlibDecoder;
 use lopdf::{Document, Object, Stream};
+use thiserror::Error;
 
 use crate::domain::error::AppError;
 
 pub(crate) const DEFAULT_PDF_PAGES_PER_ITEM: usize = 100;
 pub(crate) const DEFAULT_PDF_OBJECTS_PER_ITEM: usize = 20_000;
 pub(crate) const DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM: u64 = 100 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum PdfResourceError {
+    #[error("{0}")]
+    Invalid(&'static str),
+    #[error("{0}")]
+    Unsupported(&'static str),
+    #[error("{0}")]
+    ResourceLimit(&'static str),
+}
+
+impl PdfResourceError {
+    pub(crate) fn into_validation_error(self) -> AppError {
+        AppError::validation("normalizedPdf", self.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PdfResourceLimits {
@@ -65,38 +82,29 @@ pub(crate) fn validate_pdf_resources(
     document: &Document,
     usage: &mut PdfResourceUsage,
     limits: PdfResourceLimits,
-) -> Result<(), AppError> {
+) -> Result<(), PdfResourceError> {
     let pages = document.get_pages().len();
     if pages > limits.max_pages_per_item {
-        return Err(validation_error(
-            "normalizedPdf",
-            "单张票据 PDF 页数超过导出限制",
-        ));
+        return Err(resource_limit("单张票据 PDF 页数超过导出限制"));
     }
     let total_pages = usage
         .pages
         .checked_add(pages)
-        .ok_or_else(|| validation_error("normalizedPdf", "PDF 页数超过导出限制"))?;
+        .ok_or_else(|| resource_limit("PDF 页数超过导出限制"))?;
     if total_pages > limits.max_pages_total {
-        return Err(validation_error("normalizedPdf", "PDF 总页数超过导出限制"));
+        return Err(resource_limit("PDF 总页数超过导出限制"));
     }
 
     let objects = document.objects.len();
     if objects > limits.max_objects_per_item {
-        return Err(validation_error(
-            "normalizedPdf",
-            "单张票据 PDF 对象数超过导出限制",
-        ));
+        return Err(resource_limit("单张票据 PDF 对象数超过导出限制"));
     }
     let total_objects = usage
         .objects
         .checked_add(objects)
-        .ok_or_else(|| validation_error("normalizedPdf", "PDF 对象数超过导出限制"))?;
+        .ok_or_else(|| resource_limit("PDF 对象数超过导出限制"))?;
     if total_objects > limits.max_objects_total {
-        return Err(validation_error(
-            "normalizedPdf",
-            "PDF 总对象数超过导出限制",
-        ));
+        return Err(resource_limit("PDF 总对象数超过导出限制"));
     }
 
     let mut decoded_stream_bytes = 0_u64;
@@ -115,23 +123,17 @@ pub(crate) fn validate_pdf_resources(
         let decoded_len = bounded_stream_size(stream, item_remaining.min(package_remaining))?;
         decoded_stream_bytes = decoded_stream_bytes
             .checked_add(decoded_len)
-            .ok_or_else(|| validation_error("normalizedPdf", "PDF 数据流超过导出限制"))?;
+            .ok_or_else(|| resource_limit("PDF 数据流超过导出限制"))?;
         if decoded_stream_bytes > limits.max_decoded_stream_bytes_per_item {
-            return Err(validation_error(
-                "normalizedPdf",
-                "单张票据 PDF 解码数据超过导出限制",
-            ));
+            return Err(resource_limit("单张票据 PDF 解码数据超过导出限制"));
         }
     }
     let total_decoded_stream_bytes = usage
         .decoded_stream_bytes
         .checked_add(decoded_stream_bytes)
-        .ok_or_else(|| validation_error("normalizedPdf", "PDF 数据流超过导出限制"))?;
+        .ok_or_else(|| resource_limit("PDF 数据流超过导出限制"))?;
     if total_decoded_stream_bytes > limits.max_decoded_stream_bytes_total {
-        return Err(validation_error(
-            "normalizedPdf",
-            "PDF 解码数据总量超过导出限制",
-        ));
+        return Err(resource_limit("PDF 解码数据总量超过导出限制"));
     }
 
     usage.pages = total_pages;
@@ -144,14 +146,14 @@ fn remaining_decoded_stream_budget(
     limit: u64,
     committed: u64,
     current: u64,
-) -> Result<u64, AppError> {
+) -> Result<u64, PdfResourceError> {
     let used = committed
         .checked_add(current)
-        .ok_or_else(|| validation_error("normalizedPdf", "PDF 数据流超过导出限制"))?;
+        .ok_or_else(|| resource_limit("PDF 数据流超过导出限制"))?;
     Ok(limit.saturating_sub(used))
 }
 
-fn bounded_stream_size(stream: &Stream, limit: u64) -> Result<u64, AppError> {
+fn bounded_stream_size(stream: &Stream, limit: u64) -> Result<u64, PdfResourceError> {
     let filters = match stream.filters() {
         Ok(filters) => filters,
         Err(_) if stream.dict.get(b"Filter").is_err() => {
@@ -174,7 +176,7 @@ fn bounded_stream_size(stream: &Stream, limit: u64) -> Result<u64, AppError> {
     }
 }
 
-fn bounded_flate_size(content: &[u8], limit: u64) -> Result<u64, AppError> {
+fn bounded_flate_size(content: &[u8], limit: u64) -> Result<u64, PdfResourceError> {
     let decoder = ZlibDecoder::new(content);
     let mut bounded = decoder.take(limit.saturating_add(1));
     let mut buffer = [0_u8; 64 * 1024];
@@ -182,37 +184,35 @@ fn bounded_flate_size(content: &[u8], limit: u64) -> Result<u64, AppError> {
     loop {
         let read = bounded
             .read(&mut buffer)
-            .map_err(|_| validation_error("normalizedPdf", "PDF 数据流无法解码"))?;
+            .map_err(|_| invalid_pdf("PDF 数据流无法解码"))?;
         if read == 0 {
             return Ok(total);
         }
         total = total.saturating_add(read as u64);
         if total > limit {
-            return Err(validation_error(
-                "normalizedPdf",
-                "单张票据 PDF 解码数据超过导出限制",
-            ));
+            return Err(resource_limit("单张票据 PDF 解码数据超过导出限制"));
         }
     }
 }
 
-fn bounded_opaque_size(size: usize, limit: u64) -> Result<u64, AppError> {
+fn bounded_opaque_size(size: usize, limit: u64) -> Result<u64, PdfResourceError> {
     let size = size as u64;
     if size > limit {
-        return Err(validation_error(
-            "normalizedPdf",
-            "单张票据 PDF 解码数据超过导出限制",
-        ));
+        return Err(resource_limit("单张票据 PDF 解码数据超过导出限制"));
     }
     Ok(size)
 }
 
-fn unsupported_stream_filter() -> AppError {
-    validation_error("normalizedPdf", "PDF 数据流过滤器不受安全导出支持")
+fn unsupported_stream_filter() -> PdfResourceError {
+    PdfResourceError::Unsupported("PDF 数据流过滤器不受安全导出支持")
 }
 
-fn validation_error(field: &str, message: &str) -> AppError {
-    AppError::validation(field, message)
+fn invalid_pdf(message: &'static str) -> PdfResourceError {
+    PdfResourceError::Invalid(message)
+}
+
+fn resource_limit(message: &'static str) -> PdfResourceError {
+    PdfResourceError::ResourceLimit(message)
 }
 
 #[cfg(test)]
@@ -220,7 +220,7 @@ mod tests {
     use lopdf::{Document, Object, Stream, dictionary};
 
     use super::{
-        PdfResourceLimits, PdfResourceUsage, remaining_decoded_stream_budget,
+        PdfResourceError, PdfResourceLimits, PdfResourceUsage, remaining_decoded_stream_budget,
         validate_pdf_resources,
     };
 
@@ -231,9 +231,7 @@ mod tests {
 
         let error = validate_pdf_resources(&document, &mut usage, pdf_limits(1)).unwrap_err();
 
-        assert!(
-            matches!(error, crate::domain::error::AppError::Validation { field, .. } if field == "normalizedPdf")
-        );
+        assert!(matches!(error, PdfResourceError::ResourceLimit(_)));
     }
 
     #[test]
@@ -246,9 +244,7 @@ mod tests {
 
         let error = validate_pdf_resources(&document, &mut usage, limits).unwrap_err();
 
-        assert!(
-            matches!(error, crate::domain::error::AppError::Validation { field, .. } if field == "normalizedPdf")
-        );
+        assert!(matches!(error, PdfResourceError::ResourceLimit(_)));
     }
 
     #[test]
@@ -261,18 +257,42 @@ mod tests {
 
         let error = validate_pdf_resources(&document, &mut usage, limits).unwrap_err();
 
-        assert!(
-            matches!(error, crate::domain::error::AppError::Validation { field, .. } if field == "normalizedPdf")
-        );
+        assert!(matches!(error, PdfResourceError::ResourceLimit(_)));
     }
 
     #[test]
     fn pdf_decoded_stream_budget_overflow_is_rejected() {
         let error = remaining_decoded_stream_budget(u64::MAX, u64::MAX, 1).unwrap_err();
 
-        assert!(
-            matches!(error, crate::domain::error::AppError::Validation { field, .. } if field == "normalizedPdf")
-        );
+        assert!(matches!(error, PdfResourceError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn corrupt_flate_stream_is_invalid_not_a_resource_limit() {
+        let mut document = pdf_with_pages(1);
+        document.add_object(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            b"not a zlib stream".to_vec(),
+        ));
+        let error =
+            validate_pdf_resources(&document, &mut PdfResourceUsage::default(), pdf_limits(10))
+                .unwrap_err();
+
+        assert!(matches!(error, PdfResourceError::Invalid(_)));
+    }
+
+    #[test]
+    fn allocative_stream_filter_is_unsupported_not_invalid() {
+        let mut document = pdf_with_pages(1);
+        document.add_object(Stream::new(
+            dictionary! { "Filter" => "LZWDecode" },
+            b"encoded".to_vec(),
+        ));
+        let error =
+            validate_pdf_resources(&document, &mut PdfResourceUsage::default(), pdf_limits(10))
+                .unwrap_err();
+
+        assert!(matches!(error, PdfResourceError::Unsupported(_)));
     }
 
     fn pdf_limits(max_pages_per_item: usize) -> PdfResourceLimits {

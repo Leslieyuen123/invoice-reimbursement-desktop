@@ -540,6 +540,24 @@ fn highly_compressed_pdf_stream_is_rejected_before_text_extraction_or_ocr() {
 }
 
 #[test]
+fn corrupt_flate_stream_is_a_document_error_before_text_extraction_or_ocr() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("corrupt-flate-stream.pdf");
+    std::fs::write(&path, corrupt_flate_pdf()).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("corrupt Flate stream should fail");
+
+    assert_external(&error, "document_extractor");
+    assert_eq!(error.to_string(), "Unable to read document.");
+    assert_eq!(ocr.pdf_text_call_count(), 0);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
 fn images_over_the_dimension_budget_are_rejected_before_ocr() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("too-wide.png");
@@ -792,12 +810,13 @@ fn classic_pdf_with_duplicate_active_xref_entries(active_count: usize) -> Vec<u8
     }
 
     let xref_offset = bytes.len();
-    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    writeln!(&mut bytes, "xref\n0 {}", active_count + 1).unwrap();
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
     for offset in &offsets {
         writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
     }
     for _ in 3..active_count {
-        writeln!(&mut bytes, "1 1\n{:010} 00000 n ", offsets[0]).unwrap();
+        writeln!(&mut bytes, "{:010} 00000 n ", offsets[0]).unwrap();
     }
     write!(
         &mut bytes,
@@ -806,6 +825,20 @@ fn classic_pdf_with_duplicate_active_xref_entries(active_count: usize) -> Vec<u8
     )
     .unwrap();
     bytes
+}
+
+fn corrupt_flate_pdf() -> Vec<u8> {
+    let bytes = PdfDocument::new("corrupt Flate stream")
+        .with_pages(vec![PdfPage::new(Mm(10.0), Mm(10.0), Vec::new())])
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    let mut document = lopdf::Document::load_mem(&bytes).unwrap();
+    document.add_object(lopdf::Stream::new(
+        lopdf::dictionary! { "Filter" => "FlateDecode" },
+        b"not a zlib stream".to_vec(),
+    ));
+    let mut output = Vec::new();
+    document.save_to(&mut output).unwrap();
+    output
 }
 
 fn handcrafted_xref_stream_pdf() -> Vec<u8> {

@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::infra::pdf_preflight::{PdfPreflightError, validate_pdf_structure_with_limit};
 use crate::infra::pdf_resources::{
     DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM, DEFAULT_PDF_OBJECTS_PER_ITEM,
-    DEFAULT_PDF_PAGES_PER_ITEM, PdfResourceLimits, PdfResourceUsage, validate_pdf_resources,
+    DEFAULT_PDF_PAGES_PER_ITEM, PdfResourceError, PdfResourceLimits, PdfResourceUsage,
+    validate_pdf_resources,
 };
 
 const NORMALIZED_IMAGE_DPI: f32 = 96.0;
@@ -652,7 +653,12 @@ impl LocalExtractor {
             DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM,
         );
         validate_pdf_resources(&document, &mut PdfResourceUsage::default(), resource_limits)
-            .map_err(|_| resource_limit_error())?;
+            .map_err(|error| match error {
+                PdfResourceError::Invalid(_) => document_error(),
+                PdfResourceError::Unsupported(_) | PdfResourceError::ResourceLimit(_) => {
+                    resource_limit_error()
+                }
+            })?;
         document.renumber_objects();
         document.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
         let normalized_pdf =

@@ -1253,12 +1253,13 @@ fn classic_pdf_with_duplicate_active_xref_entries(active_count: usize) -> Vec<u8
     }
 
     let xref_offset = bytes.len();
-    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    writeln!(&mut bytes, "xref\n0 {}", active_count + 1).unwrap();
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
     for offset in &offsets {
         writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
     }
     for _ in 3..active_count {
-        writeln!(&mut bytes, "1 1\n{:010} 00000 n ", offsets[0]).unwrap();
+        writeln!(&mut bytes, "{:010} 00000 n ", offsets[0]).unwrap();
     }
     write!(
         &mut bytes,

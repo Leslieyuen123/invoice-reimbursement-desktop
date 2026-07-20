@@ -19,7 +19,8 @@ use crate::infra::files::sync_directory;
 use crate::infra::pdf_preflight::{PdfPreflightError, validate_pdf_structure_with_limit};
 use crate::infra::pdf_resources::{
     DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM, DEFAULT_PDF_OBJECTS_PER_ITEM,
-    DEFAULT_PDF_PAGES_PER_ITEM, PdfResourceLimits, PdfResourceUsage, validate_pdf_resources,
+    DEFAULT_PDF_PAGES_PER_ITEM, PdfResourceError, PdfResourceLimits, PdfResourceUsage,
+    validate_pdf_resources,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -333,7 +334,8 @@ pub(crate) fn prepare_merged_pdf(
         if document.get_pages().is_empty() {
             return Err(validation_error("normalizedPdf", "归一化 PDF 不包含页面"));
         }
-        validate_pdf_resources(&document, &mut usage, pdf_limits)?;
+        validate_pdf_resources(&document, &mut usage, pdf_limits)
+            .map_err(PdfResourceError::into_validation_error)?;
         flatten_page_attributes(&mut document)?;
 
         document.renumber_objects_with(output.max_id + 1);
