@@ -335,9 +335,10 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
                 message_id: message_id.clone(),
             };
             if file_name_has_extension(&file.file_name, "zip") {
-                match expand_zip_part(&file) {
-                    Ok(expanded) if !expanded.is_empty() => files.extend(expanded),
-                    _ => files.push(file),
+                let expanded = expand_zip_part(&file);
+                files.push(file);
+                if let Ok(expanded) = expanded {
+                    files.extend(expanded);
                 }
             } else {
                 files.push(file);
@@ -561,7 +562,9 @@ mod tests {
     use chrono::Utc;
     use zip::write::SimpleFileOptions;
 
-    use super::{InvoicePart, MAX_MESSAGES_PER_SYNC, expand_zip_part, validate_delta};
+    use super::{
+        InvoicePart, MAX_MESSAGES_PER_SYNC, expand_zip_part, parse_invoice_parts, validate_delta,
+    };
     use crate::infra::imap::{MailboxDelta, MessageRejectionReason, RawMessage, RejectedMessage};
 
     fn rejected_message(uid: u32) -> RejectedMessage {
@@ -621,6 +624,69 @@ mod tests {
         assert_eq!(expanded[0].file_name, "invoice.pdf");
         assert_eq!(expanded[0].bytes, b"%PDF-invoice");
         assert_eq!(expanded[0].message_id, part.message_id);
+    }
+
+    #[test]
+    fn parsed_zip_attachment_preserves_original_and_appends_expanded_files() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("folder/invoice.pdf", SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"%PDF-invoice").unwrap();
+        let zip_bytes = archive.finish().unwrap().into_inner();
+        let boundary = "invoice-parts-boundary";
+        let mut message = format!(
+            "From: billing@example.com\r\n\
+             To: finance@example.com\r\n\
+             Message-ID: <zip@example.com>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\
+             \r\n\
+             --{boundary}\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             Invoice attached.\r\n\
+             --{boundary}\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             \r\n\
+             <p>Invoice attached.</p>\r\n\
+             --{boundary}\r\n\
+             Content-Type: application/octet-stream\r\n\
+             \r\n\
+             metadata\r\n\
+             --{boundary}\r\n\
+             Content-Type: application/zip; name=\"invoices.zip\"\r\n\
+             Content-Disposition: attachment; filename=\"invoices.zip\"\r\n\
+             Content-Transfer-Encoding: binary\r\n\
+             \r\n"
+        )
+        .into_bytes();
+        message.extend_from_slice(&zip_bytes);
+        message.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let raw = RawMessage {
+            uid: 4,
+            mailbox: "INBOX".to_owned(),
+            raw: message,
+            received_at: Utc::now(),
+        };
+
+        let parsed = parse_invoice_parts(&raw).unwrap();
+
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.files[0].part_id, "4");
+        assert_eq!(parsed.files[0].file_name, "invoices.zip");
+        assert_eq!(parsed.files[0].bytes, zip_bytes);
+        assert_eq!(
+            parsed.files[0].message_id.as_deref(),
+            Some("zip@example.com")
+        );
+        assert_eq!(parsed.files[1].part_id, "4.zip.0");
+        assert_eq!(parsed.files[1].file_name, "invoice.pdf");
+        assert_eq!(parsed.files[1].bytes, b"%PDF-invoice");
+        assert_eq!(
+            parsed.files[1].message_id.as_deref(),
+            Some("zip@example.com")
+        );
     }
 
     #[test]
