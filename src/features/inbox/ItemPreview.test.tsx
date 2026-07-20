@@ -5,7 +5,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ItemPreview } from "./ItemPreview";
+import { ItemPreview, planPdfPages } from "./ItemPreview";
 
 const fetchMock = vi.fn<typeof fetch>();
 const appShellCss = readFileSync(
@@ -26,6 +26,82 @@ describe("ItemPreview", () => {
     expect(appShellCss).toMatch(
       /\.item-preview-surface\s*\{[^}]*contain:\s*size layout paint;/s,
     );
+  });
+
+  it("rejects 100 A4 pages when their cumulative physical pixels exceed the budget", () => {
+    const pages = Array.from({ length: 100 }, () => ({
+      width: 595,
+      height: 842,
+    }));
+
+    expect(() => planPdfPages(pages, 1_000, 2)).toThrowError(
+      "Preview unavailable",
+    );
+  });
+
+  it.each([
+    ["an extremely long MediaBox", { width: 100, height: 100_000 }, 1_000],
+    ["an oversized square MediaBox", { width: 5_000, height: 5_000 }, 5_000],
+  ])("rejects %s before allocating a canvas", (_label, page, availableWidth) => {
+    expect(() => planPdfPages([page], availableWidth, 2)).toThrowError(
+      "Preview unavailable",
+    );
+  });
+
+  it("returns the exact canvas and CSS dimensions for a legal two-page PDF", () => {
+    expect(
+      planPdfPages(
+        [
+          { width: 600, height: 800 },
+          { width: 300, height: 600 },
+        ],
+        600,
+        2,
+      ),
+    ).toEqual([
+      {
+        canvasWidth: 1_200,
+        canvasHeight: 1_600,
+        cssWidth: 600,
+        cssHeight: 800,
+        renderScale: 2,
+      },
+      {
+        canvasWidth: 1_200,
+        canvasHeight: 2_400,
+        cssWidth: 600,
+        cssHeight: 1_200,
+        renderScale: 4,
+      },
+    ]);
+  });
+
+  it.each([
+    ["an empty document", [], 600, 2],
+    [
+      "more than 100 pages",
+      Array.from({ length: 101 }, () => ({ width: 600, height: 800 })),
+      600,
+      1,
+    ],
+    [
+      "a non-finite page width",
+      [{ width: Number.POSITIVE_INFINITY, height: 800 }],
+      600,
+      1,
+    ],
+    ["a non-positive page height", [{ width: 600, height: 0 }], 600, 1],
+    [
+      "a non-finite available width",
+      [{ width: 600, height: 800 }],
+      Number.NaN,
+      1,
+    ],
+    ["a non-positive pixel ratio", [{ width: 600, height: 800 }], 600, 0],
+  ])("rejects %s", (_label, pages, availableWidth, devicePixelRatio) => {
+    expect(() =>
+      planPdfPages(pages, availableWidth, devicePixelRatio),
+    ).toThrowError("Preview unavailable");
   });
 
   it("aborts an unfinished preview check when it unmounts", async () => {
@@ -257,5 +333,89 @@ describe("ItemPreview", () => {
 
     expect(openOriginal).toHaveBeenCalledWith("item-external");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("offers the original when PDF rendering fails", async () => {
+    const user = userEvent.setup();
+    const openOriginal = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ItemPreview
+        itemId="item-pdf"
+        originalName="invoice.pdf"
+        previewUrl="invoice-file://item/item-pdf?variant=original"
+        loadAvailability={vi.fn().mockResolvedValue("pdf")}
+        renderPdf={vi.fn().mockRejectedValue(new Error("render failed"))}
+        openOriginal={openOriginal}
+      />,
+    );
+
+    const openButton = await screen.findByRole("button", {
+      name: "用系统应用打开原件",
+    });
+    await user.click(openButton);
+
+    expect(openOriginal).toHaveBeenCalledWith("item-pdf");
+  });
+
+  it("surfaces a generic opener error and re-enables retry", async () => {
+    const user = userEvent.setup();
+    const openOriginal = vi
+      .fn()
+      .mockRejectedValue(new Error("backend path /private/invoices/secret.pdf"));
+
+    render(
+      <ItemPreview
+        itemId="item-external"
+        originalName="invoice-bundle.zip"
+        previewUrl="invoice-file://item/item-external?variant=original"
+        openOriginal={openOriginal}
+      />,
+    );
+
+    const openButton = await screen.findByRole("button", {
+      name: "用系统应用打开原件",
+    });
+    await user.click(openButton);
+
+    const error = await screen.findByRole("alert");
+    expect(error).toHaveTextContent("无法打开原件，请稍后重试。");
+    expect(error).not.toHaveTextContent("/private/invoices/secret.pdf");
+    expect(openButton).toBeEnabled();
+
+    openOriginal.mockResolvedValueOnce(undefined);
+    await user.click(openButton);
+
+    await waitFor(() =>
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
+    );
+    expect(openOriginal).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a stale opener error when the preview source changes", async () => {
+    const user = userEvent.setup();
+    const openOriginal = vi.fn().mockRejectedValue(new Error("open failed"));
+
+    render(
+      <ItemPreview
+        itemId="item-external"
+        originalName="invoice-bundle.zip"
+        previewUrl="invoice-file://item/item-external?variant=normalized"
+        openOriginal={openOriginal}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole("button", { name: "用系统应用打开原件" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "无法打开原件，请稍后重试。",
+    );
+
+    await user.click(screen.getByRole("button", { name: "原件" }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
+    );
   });
 });

@@ -10,7 +10,7 @@ interface ItemPreviewProps {
   previewUrl: string;
   loadAvailability?: PreviewAvailabilityLoader;
   renderPdf?: PdfRenderer;
-  openOriginal?: (itemId: string) => Promise<void>;
+  openOriginal?: OriginalOpener;
 }
 
 type PreviewVariant = "original" | "normalized";
@@ -27,6 +27,106 @@ export type PdfRenderer = (
   source: string,
   signal: AbortSignal,
 ) => Promise<void>;
+
+type OriginalOpener = (itemId: string) => Promise<void>;
+
+export interface PdfPageGeometry {
+  width: number;
+  height: number;
+}
+
+export interface PdfPagePlan {
+  canvasWidth: number;
+  canvasHeight: number;
+  cssWidth: number;
+  cssHeight: number;
+  renderScale: number;
+}
+
+const MAX_PDF_PAGES = 100;
+const MAX_CANVAS_DIMENSION = 8_192;
+const MAX_PAGE_PIXELS = 16_000_000;
+const MAX_TOTAL_PIXELS = 32_000_000;
+const MAX_DEVICE_PIXEL_RATIO = 2;
+
+function previewUnavailable(): never {
+  throw new Error("Preview unavailable");
+}
+
+export function planPdfPages(
+  pages: readonly PdfPageGeometry[],
+  availableWidth: number,
+  devicePixelRatio: number,
+): PdfPagePlan[] {
+  if (
+    pages.length === 0 ||
+    pages.length > MAX_PDF_PAGES ||
+    !Number.isFinite(availableWidth) ||
+    availableWidth <= 0 ||
+    !Number.isFinite(devicePixelRatio) ||
+    devicePixelRatio <= 0
+  ) {
+    previewUnavailable();
+  }
+
+  const pixelRatio = Math.min(devicePixelRatio, MAX_DEVICE_PIXEL_RATIO);
+  let totalPixels = 0;
+
+  return pages.map(({ width, height }) => {
+    if (
+      !Number.isFinite(width) ||
+      width <= 0 ||
+      !Number.isFinite(height) ||
+      height <= 0
+    ) {
+      previewUnavailable();
+    }
+
+    const cssScale = Math.min(availableWidth / width, 2);
+    const renderScale = cssScale * pixelRatio;
+    const canvasWidth = Math.ceil(width * renderScale);
+    const canvasHeight = Math.ceil(height * renderScale);
+    const cssWidth = Math.ceil(canvasWidth / pixelRatio);
+    const cssHeight = Math.ceil(canvasHeight / pixelRatio);
+
+    if (
+      !Number.isFinite(renderScale) ||
+      renderScale <= 0 ||
+      !Number.isSafeInteger(canvasWidth) ||
+      canvasWidth <= 0 ||
+      canvasWidth > MAX_CANVAS_DIMENSION ||
+      !Number.isSafeInteger(canvasHeight) ||
+      canvasHeight <= 0 ||
+      canvasHeight > MAX_CANVAS_DIMENSION ||
+      !Number.isSafeInteger(cssWidth) ||
+      cssWidth <= 0 ||
+      !Number.isSafeInteger(cssHeight) ||
+      cssHeight <= 0
+    ) {
+      previewUnavailable();
+    }
+
+    const pagePixels = canvasWidth * canvasHeight;
+    const nextTotalPixels = totalPixels + pagePixels;
+    if (
+      !Number.isSafeInteger(pagePixels) ||
+      pagePixels > MAX_PAGE_PIXELS ||
+      !Number.isSafeInteger(nextTotalPixels) ||
+      nextTotalPixels > MAX_TOTAL_PIXELS
+    ) {
+      previewUnavailable();
+    }
+    totalPixels = nextTotalPixels;
+
+    return {
+      canvasWidth,
+      canvasHeight,
+      cssWidth,
+      cssHeight,
+      renderScale,
+    };
+  });
+}
 
 let pdfModulePromise:
   | Promise<typeof import("pdfjs-dist/legacy/build/pdf.mjs")>
@@ -49,33 +149,59 @@ export const renderPdfPages: PdfRenderer = async (surface, source, signal) => {
   const pdfjs = await loadPdfModule();
   const loadingTask = pdfjs.getDocument({ data: bytes });
   const abort = () => void loadingTask.destroy();
+  const pages: Array<
+    Awaited<ReturnType<Awaited<typeof loadingTask.promise>["getPage"]>>
+  > = [];
   signal.addEventListener("abort", abort, { once: true });
   try {
     const pdfDocument = await loadingTask.promise;
     const availableWidth = Math.max(surface.clientWidth - 32, 320);
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    if (
+      !Number.isSafeInteger(pdfDocument.numPages) ||
+      pdfDocument.numPages <= 0 ||
+      pdfDocument.numPages > MAX_PDF_PAGES
+    ) {
+      previewUnavailable();
+    }
+
+    const geometries: PdfPageGeometry[] = [];
     for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
       const page = await pdfDocument.getPage(pageNumber);
+      pages.push(page);
       const unscaled = page.getViewport({ scale: 1 });
-      const cssScale = Math.min(availableWidth / unscaled.width, 2);
-      const viewport = page.getViewport({ scale: cssScale * pixelRatio });
+      geometries.push({ width: unscaled.width, height: unscaled.height });
+    }
+
+    const plans = planPdfPages(
+      geometries,
+      availableWidth,
+      window.devicePixelRatio,
+    );
+    for (let index = 0; index < pages.length; index += 1) {
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      const page = pages[index];
+      const plan = plans[index];
+      const viewport = page.getViewport({ scale: plan.renderScale });
       const canvas = window.document.createElement("canvas");
       const context = canvas.getContext("2d");
       if (!context) throw new Error("Preview unavailable");
       canvas.className = "item-preview-pdf-page";
-      canvas.width = Math.ceil(viewport.width);
-      canvas.height = Math.ceil(viewport.height);
-      canvas.style.width = `${Math.ceil(viewport.width / pixelRatio)}px`;
-      canvas.style.height = `${Math.ceil(viewport.height / pixelRatio)}px`;
-      canvas.setAttribute("aria-label", `第 ${pageNumber} 页`);
+      canvas.width = plan.canvasWidth;
+      canvas.height = plan.canvasHeight;
+      canvas.style.width = `${plan.cssWidth}px`;
+      canvas.style.height = `${plan.cssHeight}px`;
+      canvas.setAttribute("aria-label", `第 ${index + 1} 页`);
       surface.append(canvas);
       await page.render({ canvas, canvasContext: context, viewport }).promise;
-      page.cleanup();
     }
   } finally {
     signal.removeEventListener("abort", abort);
-    await loadingTask.destroy();
+    try {
+      for (const page of pages) page.cleanup();
+    } finally {
+      await loadingTask.destroy();
+    }
   }
 };
 
@@ -136,6 +262,57 @@ function withVariant(previewUrl: string, variant: PreviewVariant) {
   }
 }
 
+interface OpenOriginalActionProps {
+  itemId?: string;
+  isExternalUrl: boolean;
+  openOriginal: OriginalOpener;
+}
+
+function OpenOriginalAction({
+  itemId,
+  isExternalUrl,
+  openOriginal,
+}: OpenOriginalActionProps) {
+  const [opening, setOpening] = useState(false);
+  const [openError, setOpenError] = useState(false);
+
+  async function handleOpenOriginal() {
+    if (!itemId || opening) return;
+    setOpenError(false);
+    setOpening(true);
+    try {
+      await openOriginal(itemId);
+    } catch {
+      setOpenError(true);
+    } finally {
+      setOpening(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        className="button button-secondary"
+        type="button"
+        disabled={!itemId || opening}
+        onClick={() => void handleOpenOriginal()}
+      >
+        {isExternalUrl ? (
+          <ExternalLink size={15} strokeWidth={1.7} aria-hidden="true" />
+        ) : (
+          <FileArchive size={15} strokeWidth={1.7} aria-hidden="true" />
+        )}
+        {isExternalUrl ? "在浏览器中打开原件" : "用系统应用打开原件"}
+      </button>
+      {openError ? (
+        <span className="preview-open-error" role="alert">
+          无法打开原件，请稍后重试。
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 export function ItemPreview({
   itemId,
   originalName,
@@ -154,7 +331,6 @@ export function ItemPreview({
   );
   const [revision, setRevision] = useState(0);
   const [pdfReady, setPdfReady] = useState(false);
-  const [openingOriginal, setOpeningOriginal] = useState(false);
   const pdfSurface = useRef<HTMLDivElement>(null);
   const source = useMemo(
     () => withVariant(previewUrl, variant),
@@ -193,16 +369,6 @@ export function ItemPreview({
   }, [loadAvailability, originalName, revision, source]);
 
   const isExternalUrl = /\.url$/i.test(originalName.trim());
-
-  async function handleOpenOriginal() {
-    if (!itemId || openingOriginal) return;
-    setOpeningOriginal(true);
-    try {
-      await openOriginal(itemId);
-    } finally {
-      setOpeningOriginal(false);
-    }
-  }
 
   useEffect(() => {
     if (state !== "ready" || mediaType !== "pdf" || !pdfSurface.current) return;
@@ -274,6 +440,14 @@ export function ItemPreview({
               <RefreshCw size={15} strokeWidth={1.7} aria-hidden="true" />
               重新加载
             </button>
+            {itemId ? (
+              <OpenOriginalAction
+                key={source}
+                itemId={itemId}
+                isExternalUrl={isExternalUrl}
+                openOriginal={openOriginal}
+              />
+            ) : null}
           </div>
         ) : state === "loading" ? (
           <div
@@ -296,19 +470,12 @@ export function ItemPreview({
                 ? "此发票由邮件中的安全链接提供。"
                 : "此格式需使用 Mac 上已安装的应用查看。"}
             </span>
-            <button
-              className="button button-secondary"
-              type="button"
-              disabled={!itemId || openingOriginal}
-              onClick={() => void handleOpenOriginal()}
-            >
-              {isExternalUrl ? (
-                <ExternalLink size={15} strokeWidth={1.7} aria-hidden="true" />
-              ) : (
-                <FileArchive size={15} strokeWidth={1.7} aria-hidden="true" />
-              )}
-              {isExternalUrl ? "在浏览器中打开原件" : "用系统应用打开原件"}
-            </button>
+            <OpenOriginalAction
+              key={source}
+              itemId={itemId}
+              isExternalUrl={isExternalUrl}
+              openOriginal={openOriginal}
+            />
           </div>
         ) : mediaType === "image" ? (
           <img

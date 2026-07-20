@@ -1415,6 +1415,7 @@ a {
   flex: 0 0 auto;
   background: white;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.28);
+  content-visibility: auto;
 }
 
 .item-preview-image {
@@ -1475,6 +1476,11 @@ a {
 
 .preview-error .button {
   margin-top: 6px;
+}
+
+.preview-open-error {
+  color: var(--danger);
+  font-size: 12px;
 }
 
 .item-editor {
