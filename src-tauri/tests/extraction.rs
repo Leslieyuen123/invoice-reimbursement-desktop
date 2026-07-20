@@ -739,12 +739,14 @@ fn process_gateway_keeps_its_session_after_a_resource_error() {
 
 #[test]
 fn process_gateway_restarts_after_a_timeout() {
-    let gateway = ProcessOcrGateway::with_timeout(ocr_helper(), Duration::from_millis(500));
+    let gateway = ProcessOcrGateway::new(ocr_helper());
 
     gateway
-        .recognize(Path::new("timeout.pdf"))
+        .recognize_with_timeout(Path::new("timeout.pdf"), Duration::from_millis(500))
         .expect_err("hung response should time out");
-    let recovered = gateway.recognize(Path::new("success invoice.pdf")).unwrap();
+    let recovered = gateway
+        .recognize_with_timeout(Path::new("success invoice.pdf"), Duration::from_secs(5))
+        .unwrap();
 
     assert_eq!(recovered.text, "北京 出租车 价税合计 ¥128.50");
 }
