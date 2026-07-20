@@ -388,35 +388,33 @@ fn parse_invoice_parts_with_zip_budget(
 fn preflight_zip_entries(bytes: &[u8]) -> Result<usize, ()> {
     const EOCD_BYTES: usize = 22;
     const MAX_COMMENT_BYTES: usize = u16::MAX as usize;
-    const ZIP64_LOCATOR_BYTES: usize = 20;
 
     let search_start = bytes
         .len()
         .saturating_sub(EOCD_BYTES.saturating_add(MAX_COMMENT_BYTES));
-    let eocd_offset = bytes[search_start..]
-        .windows(4)
-        .enumerate()
-        .rev()
-        .find_map(|(relative_offset, signature)| {
-            if signature != b"PK\x05\x06" {
-                return None;
-            }
-            let offset = search_start.checked_add(relative_offset)?;
-            let record = bytes.get(offset..offset.checked_add(EOCD_BYTES)?)?;
-            let comment_bytes = u16::from_le_bytes([record[20], record[21]]) as usize;
-            (offset.checked_add(EOCD_BYTES)?.checked_add(comment_bytes)? == bytes.len())
-                .then_some(offset)
-        })
-        .ok_or(())?;
-    if eocd_offset >= ZIP64_LOCATOR_BYTES
-        && bytes.get(eocd_offset - ZIP64_LOCATOR_BYTES..eocd_offset - 16)
-            == Some(b"PK\x06\x07".as_slice())
-    {
-        return Err(());
+    let mut eocd_offset = None;
+    for (offset, signature) in bytes.windows(4).enumerate() {
+        if signature == b"PK\x06\x06" || signature == b"PK\x06\x07" {
+            return Err(());
+        }
+        if signature == b"PK\x05\x06" && eocd_offset.replace(offset).is_some() {
+            return Err(());
+        }
     }
+    let eocd_offset = eocd_offset
+        .filter(|offset| *offset >= search_start)
+        .ok_or(())?;
     let record = bytes
         .get(eocd_offset..eocd_offset.checked_add(EOCD_BYTES).ok_or(())?)
         .ok_or(())?;
+    let comment_bytes = u16::from_le_bytes([record[20], record[21]]) as usize;
+    if eocd_offset
+        .checked_add(EOCD_BYTES)
+        .and_then(|end| end.checked_add(comment_bytes))
+        != Some(bytes.len())
+    {
+        return Err(());
+    }
     let disk = u16::from_le_bytes([record[4], record[5]]);
     let central_directory_disk = u16::from_le_bytes([record[6], record[7]]);
     let entries_on_disk = u16::from_le_bytes([record[8], record[9]]);
@@ -743,6 +741,14 @@ mod tests {
         bytes[eocd + 10..eocd + 12].copy_from_slice(&count.to_le_bytes());
     }
 
+    fn append_fake_eocd(bytes: &mut Vec<u8>, count: u16) {
+        let mut eocd = [0_u8; 22];
+        eocd[..4].copy_from_slice(b"PK\x05\x06");
+        eocd[8..10].copy_from_slice(&count.to_le_bytes());
+        eocd[10..12].copy_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&eocd);
+    }
+
     #[test]
     fn rejected_messages_count_toward_the_delta_limit() {
         let rejected_messages = (1..=MAX_MESSAGES_PER_SYNC as u32)
@@ -979,6 +985,45 @@ mod tests {
         assert_eq!(budget.remaining_entries, 1);
         assert!(expand_zip_part(&second, &mut budget).is_err());
         assert_eq!(budget.remaining_entries, 0);
+    }
+
+    #[test]
+    fn ambiguous_classic_eocd_is_rejected_before_budget_reservation() {
+        let mut ambiguous_zip = zip_with_pdf_entries("invoice", 1, b"pdf");
+        append_fake_eocd(&mut ambiguous_zip, 1);
+
+        assert!(preflight_zip_entries(&ambiguous_zip).is_err());
+        let part = InvoicePart {
+            part_id: "1".to_owned(),
+            file_name: "ambiguous.zip".to_owned(),
+            bytes: ambiguous_zip.clone(),
+            message_id: None,
+        };
+        let mut budget = ZipExpansionBudget::default();
+        assert!(expand_zip_part(&part, &mut budget).is_err());
+        assert_eq!(budget.remaining_entries, 64);
+        let raw = raw_message_with_zip_attachments(&[("ambiguous.zip", &ambiguous_zip)]);
+
+        let parsed = parse_invoice_parts(&raw).unwrap();
+
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].file_name, "ambiguous.zip");
+        assert_eq!(parsed.files[0].bytes, ambiguous_zip);
+    }
+
+    #[test]
+    fn zip64_signatures_are_rejected_at_any_archive_offset() {
+        let zip64_eocd = zip_with_pdf_entries("beforePK\x06\x06after", 1, b"pdf");
+        let zip64_locator = zip_with_pdf_entries("beforePK\x06\x07after", 1, b"pdf");
+        assert!(zip64_eocd.windows(4).any(|window| window == b"PK\x06\x06"));
+        assert!(
+            zip64_locator
+                .windows(4)
+                .any(|window| window == b"PK\x06\x07")
+        );
+
+        assert!(preflight_zip_entries(&zip64_eocd).is_err());
+        assert!(preflight_zip_entries(&zip64_locator).is_err());
     }
 
     #[test]
