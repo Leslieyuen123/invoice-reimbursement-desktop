@@ -419,6 +419,16 @@ fn company_is_not_guessed_from_unlabeled_buyer_and_seller_sections() {
 }
 
 #[test]
+fn company_requires_a_verified_flattened_record_tail_before_template_fallback() {
+    let recognized = recognize(
+        "电子发票（普通发票） 发票号码：\n开票日期：\n购买方信息\n名称：\n销售方信息\n名称：\n项目名称 服务费\n购买方 上海星河科技有限公司\n销售方 北京远方服务有限公司\n价税合计（小写） ￥128.50\n备注\n无结构化尾部",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(recognized.company, None);
+}
+
+#[test]
 fn company_falls_back_to_the_seller_name_segment() {
     let recognized = recognize(
         "销售方名称：北京远方服务有限公司\n销售方税号：123",

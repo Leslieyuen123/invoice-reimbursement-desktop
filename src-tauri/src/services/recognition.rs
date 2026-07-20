@@ -449,31 +449,35 @@ fn company_value_from_compact_section(text: &str, section_label: &str) -> Option
 }
 
 fn trailing_company_candidate(text: &str) -> Option<String> {
+    if let Some(record) = flattened_invoice_record(text) {
+        return company_candidates(record.tail)
+            .next_back()
+            .map(str::to_owned);
+    }
+
     let compact: String = text
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    let candidates: Vec<_> = text
-        .split_whitespace()
-        .filter_map(|token| {
-            let value = token
-                .trim_matches([
-                    '：', ':', '，', ',', '。', '.', '；', ';', '（', '(', '）', ')',
-                ])
-                .trim_start_matches("名称：")
-                .trim_start_matches("名称:");
-            (value.ends_with("公司") && value.chars().count() >= 4).then(|| value.to_owned())
-        })
-        .collect();
-    if is_known_flattened_invoice_template(text) {
-        candidates.into_iter().last()
-    } else if compact.contains("息信方买购名称：息信方售销名称：")
+    if compact.contains("息信方买购名称：息信方售销名称：")
         || compact.contains("息信方买购名称:息信方售销名称:")
     {
-        candidates.into_iter().next()
+        company_candidates(text).next().map(str::to_owned)
     } else {
         None
     }
+}
+
+fn company_candidates(text: &str) -> impl DoubleEndedIterator<Item = &str> {
+    text.split_whitespace().filter_map(|token| {
+        let value = token
+            .trim_matches([
+                '：', ':', '，', ',', '。', '.', '；', ';', '（', '(', '）', ')',
+            ])
+            .trim_start_matches("名称：")
+            .trim_start_matches("名称:");
+        (value.ends_with("公司") && value.chars().count() >= 4).then_some(value)
+    })
 }
 
 fn company_label_has_field_boundary(text: &str, index: usize, label: &str) -> bool {
@@ -555,6 +559,16 @@ fn parse_date_prefix(value: &str) -> Option<NaiveDate> {
 }
 
 fn flattened_invoice_date(text: &str) -> Option<NaiveDate> {
+    let record = flattened_invoice_record(text)?;
+    parse_date_prefix(&record.tail[record.date_offset..])
+}
+
+struct FlattenedInvoiceRecord<'a> {
+    tail: &'a str,
+    date_offset: usize,
+}
+
+fn flattened_invoice_record(text: &str) -> Option<FlattenedInvoiceRecord<'_>> {
     if !is_known_flattened_invoice_template(text) {
         return None;
     }
@@ -563,13 +577,18 @@ fn flattened_invoice_date(text: &str) -> Option<NaiveDate> {
     tail.char_indices()
         .take_while(|(index, _)| *index <= 256)
         .find_map(|(index, _)| {
-            let date = parse_date_prefix(&tail[index..])?;
-            let invoice_number = tail[..index].split_whitespace().next_back()?;
+            parse_date_prefix(&tail[index..])?;
+            let before_date = &tail[..index];
+            let invoice_number = before_date.split_whitespace().next_back()?;
             let valid_invoice_number = (8..=24).contains(&invoice_number.len())
                 && invoice_number
                     .chars()
                     .all(|character| character.is_ascii_digit());
-            valid_invoice_number.then_some(date)
+            let invoice_number_start = before_date.rfind(invoice_number)?;
+            valid_invoice_number.then_some(FlattenedInvoiceRecord {
+                tail: &tail[invoice_number_start..],
+                date_offset: index - invoice_number_start,
+            })
         })
 }
 
