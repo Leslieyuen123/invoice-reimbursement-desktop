@@ -385,19 +385,86 @@ fn parse_invoice_parts_with_zip_budget(
     Ok(ParsedInvoiceParts { files, links })
 }
 
+fn preflight_zip_entries(bytes: &[u8]) -> Result<usize, ()> {
+    const EOCD_BYTES: usize = 22;
+    const MAX_COMMENT_BYTES: usize = u16::MAX as usize;
+    const ZIP64_LOCATOR_BYTES: usize = 20;
+
+    let search_start = bytes
+        .len()
+        .saturating_sub(EOCD_BYTES.saturating_add(MAX_COMMENT_BYTES));
+    let eocd_offset = bytes[search_start..]
+        .windows(4)
+        .enumerate()
+        .rev()
+        .find_map(|(relative_offset, signature)| {
+            if signature != b"PK\x05\x06" {
+                return None;
+            }
+            let offset = search_start.checked_add(relative_offset)?;
+            let record = bytes.get(offset..offset.checked_add(EOCD_BYTES)?)?;
+            let comment_bytes = u16::from_le_bytes([record[20], record[21]]) as usize;
+            (offset.checked_add(EOCD_BYTES)?.checked_add(comment_bytes)? == bytes.len())
+                .then_some(offset)
+        })
+        .ok_or(())?;
+    if eocd_offset >= ZIP64_LOCATOR_BYTES
+        && bytes.get(eocd_offset - ZIP64_LOCATOR_BYTES..eocd_offset - 16)
+            == Some(b"PK\x06\x07".as_slice())
+    {
+        return Err(());
+    }
+    let record = bytes
+        .get(eocd_offset..eocd_offset.checked_add(EOCD_BYTES).ok_or(())?)
+        .ok_or(())?;
+    let disk = u16::from_le_bytes([record[4], record[5]]);
+    let central_directory_disk = u16::from_le_bytes([record[6], record[7]]);
+    let entries_on_disk = u16::from_le_bytes([record[8], record[9]]);
+    let total_entries = u16::from_le_bytes([record[10], record[11]]);
+    let central_directory_bytes =
+        u32::from_le_bytes([record[12], record[13], record[14], record[15]]);
+    let central_directory_offset =
+        u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+    if disk != 0
+        || central_directory_disk != 0
+        || entries_on_disk != total_entries
+        || entries_on_disk == u16::MAX
+        || total_entries == u16::MAX
+        || central_directory_bytes == u32::MAX
+        || central_directory_offset == u32::MAX
+    {
+        return Err(());
+    }
+    let central_directory_end = usize::try_from(central_directory_offset)
+        .map_err(|_| ())?
+        .checked_add(usize::try_from(central_directory_bytes).map_err(|_| ())?)
+        .ok_or(())?;
+    if central_directory_end > eocd_offset {
+        return Err(());
+    }
+    Ok(usize::from(total_entries))
+}
+
 fn expand_zip_part(
     part: &InvoicePart,
     budget: &mut ZipExpansionBudget,
 ) -> Result<Vec<InvoicePart>, ()> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(&part.bytes)).map_err(|_| ())?;
-    if archive.len() > MAX_ZIP_ENTRIES {
+    let declared_entries = preflight_zip_entries(&part.bytes)?;
+    if declared_entries > MAX_ZIP_ENTRIES {
         return Err(());
     }
-    let Some(remaining_entries) = budget.remaining_entries.checked_sub(archive.len()) else {
+    let Some(remaining_entries) = budget.remaining_entries.checked_sub(declared_entries) else {
         budget.remaining_entries = 0;
         return Err(());
     };
     budget.remaining_entries = remaining_entries;
+    if declared_entries == 0 {
+        return Ok(Vec::new());
+    }
+    let mut archive = zip::ZipArchive::new(Cursor::new(&part.bytes)).map_err(|_| ())?;
+    if archive.len() != declared_entries {
+        return Err(());
+    }
     let mut expanded = Vec::new();
     let mut total_bytes = 0_u64;
     for index in 0..archive.len() {
@@ -601,7 +668,8 @@ mod tests {
 
     use super::{
         InvoicePart, MAX_MESSAGES_PER_SYNC, ZipExpansionBudget, expand_zip_part,
-        parse_invoice_parts, parse_invoice_parts_with_zip_budget, validate_delta,
+        parse_invoice_parts, parse_invoice_parts_with_zip_budget, preflight_zip_entries,
+        validate_delta,
     };
     use crate::infra::imap::{MailboxDelta, MessageRejectionReason, RawMessage, RejectedMessage};
 
@@ -660,6 +728,19 @@ mod tests {
             raw: message,
             received_at: Utc::now(),
         }
+    }
+
+    fn eocd_offset(bytes: &[u8]) -> usize {
+        bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .unwrap()
+    }
+
+    fn set_eocd_entry_count(bytes: &mut [u8], count: u16) {
+        let eocd = eocd_offset(bytes);
+        bytes[eocd + 8..eocd + 10].copy_from_slice(&count.to_le_bytes());
+        bytes[eocd + 10..eocd + 12].copy_from_slice(&count.to_le_bytes());
     }
 
     #[test]
@@ -839,6 +920,65 @@ mod tests {
         assert_eq!(originals, vec!["first.zip", "second.zip"]);
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].file_name, "first-0.pdf");
+    }
+
+    #[test]
+    fn zip64_entry_metadata_is_rejected_while_originals_are_preserved() {
+        let mut sentinel_zip = zip_with_pdf_entries("sentinel", 1, b"pdf");
+        set_eocd_entry_count(&mut sentinel_zip, u16::MAX);
+        let mut locator_zip = zip_with_pdf_entries("locator", 1, b"pdf");
+        let eocd = eocd_offset(&locator_zip);
+        let mut locator = [0_u8; 20];
+        locator[..4].copy_from_slice(b"PK\x06\x07");
+        locator_zip.splice(eocd..eocd, locator);
+
+        assert!(preflight_zip_entries(&sentinel_zip).is_err());
+        assert!(preflight_zip_entries(&locator_zip).is_err());
+        let raw = raw_message_with_zip_attachments(&[
+            ("sentinel.zip", &sentinel_zip),
+            ("locator.zip", &locator_zip),
+        ]);
+
+        let parsed = parse_invoice_parts(&raw).unwrap();
+
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.files[0].file_name, "sentinel.zip");
+        assert_eq!(parsed.files[0].bytes, sentinel_zip);
+        assert_eq!(parsed.files[1].file_name, "locator.zip");
+        assert_eq!(parsed.files[1].bytes, locator_zip);
+    }
+
+    #[test]
+    fn zip_entry_budget_is_reserved_before_archive_parser_runs() {
+        let first_zip = zip_with_pdf_entries("first", 1, b"pdf");
+        let mut second_zip = zip_with_pdf_entries("second", 1, b"pdf");
+        set_eocd_entry_count(&mut second_zip, 2);
+        let central_directory = second_zip
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        second_zip[central_directory] = b'X';
+        let first = InvoicePart {
+            part_id: "1".to_owned(),
+            file_name: "first.zip".to_owned(),
+            bytes: first_zip,
+            message_id: None,
+        };
+        let second = InvoicePart {
+            part_id: "2".to_owned(),
+            file_name: "second.zip".to_owned(),
+            bytes: second_zip,
+            message_id: None,
+        };
+        let mut budget = ZipExpansionBudget {
+            remaining_entries: 2,
+            remaining_bytes: 10,
+        };
+
+        assert!(expand_zip_part(&first, &mut budget).is_ok());
+        assert_eq!(budget.remaining_entries, 1);
+        assert!(expand_zip_part(&second, &mut budget).is_err());
+        assert_eq!(budget.remaining_entries, 0);
     }
 
     #[test]
