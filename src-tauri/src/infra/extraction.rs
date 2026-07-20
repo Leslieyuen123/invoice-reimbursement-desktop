@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -15,9 +15,11 @@ use printpdf::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::infra::exporters::{DEFAULT_EXPORT_LIMITS, validate_pdf_item_resources};
+use crate::infra::pdf_preflight::validate_pdf_structure;
+
 const NORMALIZED_IMAGE_DPI: f32 = 96.0;
-// Keep these document budgets aligned with sidecars/ocr/main.py.
-const MAX_PDF_PAGES: usize = 100;
+const MAX_NORMALIZED_PDF_BYTES: usize = 50 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 20_000;
 const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 const MAX_NORMALIZED_PAGE_POINTS: f32 = 14_400.0;
@@ -632,16 +634,19 @@ impl DocumentExtractor for LocalExtractor {
 impl LocalExtractor {
     fn extract_pdf(&self, path: &Path) -> Result<ExtractedDocument, AppError> {
         let bytes = fs::read(path).map_err(|_| document_error())?;
+        validate_pdf_structure(&bytes).map_err(|_| resource_limit_error())?;
         let mut document = lopdf::Document::load_mem(&bytes).map_err(|_| document_error())?;
-        if document.get_pages().len() > MAX_PDF_PAGES {
-            return Err(resource_limit_error());
-        }
+        validate_pdf_item_resources(&document, DEFAULT_EXPORT_LIMITS)
+            .map_err(|_| resource_limit_error())?;
         document.renumber_objects();
         document.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
-        let mut normalized_pdf = Vec::new();
-        document
-            .save_to(&mut normalized_pdf)
-            .map_err(|_| document_error())?;
+        let normalized_pdf =
+            write_pdf_with_limit(&mut document, Vec::new(), MAX_NORMALIZED_PDF_BYTES).map_err(
+                |error| match error {
+                    PdfNormalizationWriteError::ResourceLimit => resource_limit_error(),
+                    PdfNormalizationWriteError::Io => document_error(),
+                },
+            )?;
         drop(document);
         let extracted_text = self.ocr.extract_pdf_text(path)?;
         let (text, warnings) = if useful_character_count(&extracted_text.text) >= 20
@@ -681,6 +686,64 @@ impl LocalExtractor {
             warnings: result.warnings,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfNormalizationWriteError {
+    ResourceLimit,
+    Io,
+}
+
+struct BoundedWriter<W> {
+    inner: W,
+    remaining: usize,
+    limit_exceeded: bool,
+}
+
+impl<W> BoundedWriter<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit_exceeded: false,
+        }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.remaining {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("normalized PDF output limit exceeded"));
+        }
+        let written = self.inner.write(buffer)?;
+        self.remaining = self.remaining.saturating_sub(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_pdf_with_limit<W: Write>(
+    document: &mut lopdf::Document,
+    target: W,
+    limit: usize,
+) -> Result<W, PdfNormalizationWriteError> {
+    let mut writer = BoundedWriter::new(target, limit);
+    if document.save_to(&mut writer).is_err() {
+        return if writer.limit_exceeded {
+            Err(PdfNormalizationWriteError::ResourceLimit)
+        } else {
+            Err(PdfNormalizationWriteError::Io)
+        };
+    }
+    Ok(writer.into_inner())
 }
 
 fn has_invoice_text_signals(text: &str) -> bool {
@@ -790,5 +853,50 @@ fn resource_limit_error() -> AppError {
         service: "document_extractor".to_owned(),
         retryable: false,
         message: "Document exceeds extraction resource limits.".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+
+    use lopdf::{Document, Object, StringFormat};
+
+    use super::{PdfNormalizationWriteError, write_pdf_with_limit};
+
+    #[test]
+    fn normalized_pdf_writer_rejects_output_over_an_injected_small_limit() {
+        let mut document = Document::with_version("1.5");
+        document.add_object(Object::String(vec![b'x'; 256], StringFormat::Literal));
+
+        let error = write_pdf_with_limit(&mut document, Vec::new(), 64)
+            .expect_err("normalized PDF should exceed the injected limit");
+
+        assert_eq!(error, PdfNormalizationWriteError::ResourceLimit);
+    }
+
+    #[test]
+    fn normalized_pdf_writer_distinguishes_io_errors_from_the_output_limit() {
+        #[derive(Debug)]
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected failure",
+                ))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut document = Document::with_version("1.5");
+        let error = write_pdf_with_limit(&mut document, FailingWriter, usize::MAX)
+            .expect_err("injected writer failure should propagate");
+
+        assert_eq!(error, PdfNormalizationWriteError::Io);
     }
 }

@@ -473,6 +473,24 @@ fn validate_pdf_resources(
     Ok(())
 }
 
+pub(crate) fn validate_pdf_item_resources(
+    document: &Document,
+    limits: ExportLimits,
+) -> Result<(), AppError> {
+    validate_pdf_resources(
+        document,
+        &mut PdfResourceUsage::default(),
+        PdfResourceLimits {
+            max_pages_per_item: limits.max_pdf_pages_per_item,
+            max_pages_total: limits.max_pdf_pages_per_item,
+            max_objects_per_item: limits.max_pdf_objects_per_item,
+            max_objects_total: limits.max_pdf_objects_per_item,
+            max_decoded_stream_bytes_per_item: limits.max_pdf_decoded_stream_bytes_per_item,
+            max_decoded_stream_bytes_total: limits.max_pdf_decoded_stream_bytes_per_item,
+        },
+    )
+}
+
 fn remaining_decoded_stream_budget(
     limit: u64,
     committed: u64,

@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::extraction::{
     DocumentExtractor, LocalExtractor, OcrGateway, OcrResult, ProcessOcrGateway,
@@ -461,6 +463,60 @@ fn pdfs_over_one_hundred_pages_are_rejected_before_text_extraction_or_ocr() {
 
     assert_resource_error(&error);
     assert_eq!(ocr.call_count(), 0);
+    assert_eq!(ocr.pdf_text_call_count(), 0);
+}
+
+#[test]
+fn escaped_object_stream_is_rejected_before_text_extraction_or_ocr() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("escaped-object-stream.pdf");
+    std::fs::write(&path, classic_pdf_with_escaped_object_stream()).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("escaped object stream should be rejected");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.pdf_text_call_count(), 0);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn pdfs_over_twenty_thousand_objects_are_rejected_before_text_extraction_or_ocr() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("too-many-objects.pdf");
+    std::fs::write(&path, pdf_with_object_count(20_001)).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("object budget should reject PDF");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.pdf_text_call_count(), 0);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn highly_compressed_pdf_stream_is_rejected_before_text_extraction_or_ocr() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("high-ratio-stream.pdf");
+    let bytes = high_ratio_flate_pdf(100 * 1024 * 1024 + 1);
+    assert!(bytes.len() < 200_000, "fixture did not compress");
+    std::fs::write(&path, bytes).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("decoded stream budget should reject PDF");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.pdf_text_call_count(), 0);
+    assert_eq!(ocr.call_count(), 0);
 }
 
 #[test]
@@ -629,6 +685,71 @@ fn compressed_text_pdf(character_count: usize) -> Vec<u8> {
             .compress()
             .unwrap();
     }
+    let mut output = Vec::new();
+    document.save_to(&mut output).unwrap();
+    output
+}
+
+fn classic_pdf_with_escaped_object_stream() -> Vec<u8> {
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
+        b"<< /Type /Obj#53tm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
+        bytes.extend_from_slice(object);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        &mut bytes,
+        "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    )
+    .unwrap();
+    bytes
+}
+
+fn pdf_with_object_count(object_count: usize) -> Vec<u8> {
+    let bytes = PdfDocument::new("object budget")
+        .with_pages(vec![PdfPage::new(Mm(10.0), Mm(10.0), Vec::new())])
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    let mut document = lopdf::Document::load_mem(&bytes).unwrap();
+    while document.objects.len() < object_count {
+        document.add_object(lopdf::Object::Null);
+    }
+    let mut output = Vec::new();
+    document.save_to(&mut output).unwrap();
+    output
+}
+
+fn high_ratio_flate_pdf(decoded_size: usize) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    let zeros = [0_u8; 64 * 1024];
+    let mut remaining = decoded_size;
+    while remaining != 0 {
+        let chunk = remaining.min(zeros.len());
+        encoder.write_all(&zeros[..chunk]).unwrap();
+        remaining -= chunk;
+    }
+    let compressed = encoder.finish().unwrap();
+
+    let bytes = PdfDocument::new("decoded stream budget")
+        .with_pages(vec![PdfPage::new(Mm(10.0), Mm(10.0), Vec::new())])
+        .save(&PdfSaveOptions::default(), &mut Vec::new());
+    let mut document = lopdf::Document::load_mem(&bytes).unwrap();
+    document.add_object(lopdf::Stream::new(
+        lopdf::dictionary! { "Filter" => "FlateDecode" },
+        compressed,
+    ));
     let mut output = Vec::new();
     document.save_to(&mut output).unwrap();
     output
