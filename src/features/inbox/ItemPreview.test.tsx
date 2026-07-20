@@ -5,7 +5,29 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ItemPreview, planPdfPages } from "./ItemPreview";
+import {
+  createPdfRenderer,
+  ItemPreview,
+  planPdfPages,
+} from "./ItemPreview";
+
+type TestPdfRenderer = (
+  surface: HTMLDivElement,
+  source: string,
+  signal: AbortSignal,
+) => Promise<void>;
+
+interface TestPdfModule {
+  getDocument: (...args: unknown[]) => unknown;
+}
+
+function createTestPdfRenderer(
+  loadModule: () => Promise<TestPdfModule>,
+): TestPdfRenderer {
+  return createPdfRenderer(
+    loadModule as unknown as Parameters<typeof createPdfRenderer>[0],
+  );
+}
 
 const fetchMock = vi.fn<typeof fetch>();
 const appShellCss = readFileSync(
@@ -20,7 +42,10 @@ describe("ItemPreview", () => {
     vi.stubGlobal("fetch", fetchMock);
   });
 
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
 
   it("contains preview layout and paint inside its allocated surface", () => {
     expect(appShellCss).toMatch(
@@ -104,6 +129,106 @@ describe("ItemPreview", () => {
     ).toThrowError("Preview unavailable");
   });
 
+  it("cleans each rendered page before rendering the next page", async () => {
+    fetchMock.mockResolvedValue(new Response(new Uint8Array([0x25, 0x50])));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+      {} as CanvasRenderingContext2D,
+    );
+    const firstCleanup = vi.fn(() => true);
+    const firstPage = {
+      cleanup: firstCleanup,
+      getViewport: vi.fn(({ scale }: { scale: number }) => ({
+        width: 100 * scale,
+        height: 100 * scale,
+      })),
+      render: vi.fn(() => ({ promise: Promise.resolve() })),
+    };
+    const secondPage = {
+      cleanup: vi.fn(() => true),
+      getViewport: vi.fn(({ scale }: { scale: number }) => ({
+        width: 100 * scale,
+        height: 100 * scale,
+      })),
+      render: vi.fn(() => {
+        expect(firstCleanup).toHaveBeenCalledTimes(1);
+        return { promise: Promise.resolve() };
+      }),
+    };
+    const pages = [firstPage, secondPage];
+    const destroy = vi.fn().mockResolvedValue(undefined);
+    const getDocument = vi.fn(() => ({
+      destroy,
+      promise: Promise.resolve({
+        numPages: pages.length,
+        getPage: vi.fn(async (pageNumber: number) => pages[pageNumber - 1]),
+      }),
+    }));
+    const renderer = createTestPdfRenderer(
+      vi.fn().mockResolvedValue({ getDocument }),
+    );
+
+    await renderer(
+      document.createElement("div"),
+      "invoice-file://item/two-pages",
+      new AbortController().signal,
+    );
+
+    expect(firstCleanup).toHaveBeenCalledTimes(1);
+    expect(secondPage.cleanup).toHaveBeenCalledTimes(1);
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not create a PDF loading task when aborted during module loading", async () => {
+    fetchMock.mockResolvedValue(new Response(new Uint8Array([0x25, 0x50])));
+    const getDocument = vi.fn();
+    let resolveModule!: (module: TestPdfModule) => void;
+    const loadModule = vi.fn(
+      () =>
+        new Promise<TestPdfModule>((resolve) => {
+          resolveModule = resolve;
+        }),
+    );
+    const renderer = createTestPdfRenderer(loadModule);
+    const controller = new AbortController();
+    const renderPromise = renderer(
+      document.createElement("div"),
+      "invoice-file://item/aborted-module",
+      controller.signal,
+    );
+    const rejection = expect(renderPromise).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await waitFor(() => expect(loadModule).toHaveBeenCalledTimes(1));
+
+    controller.abort();
+    resolveModule({ getDocument });
+
+    await rejection;
+    expect(getDocument).not.toHaveBeenCalled();
+  });
+
+  it("destroys a loading task when aborted before its listener is bound", async () => {
+    fetchMock.mockResolvedValue(new Response(new Uint8Array([0x25, 0x50])));
+    const controller = new AbortController();
+    const destroy = vi.fn().mockResolvedValue(undefined);
+    const getDocument = vi.fn(() => {
+      controller.abort();
+      return { destroy, promise: new Promise(() => undefined) };
+    });
+    const renderer = createTestPdfRenderer(
+      vi.fn().mockResolvedValue({ getDocument }),
+    );
+
+    await expect(
+      renderer(
+        document.createElement("div"),
+        "invoice-file://item/aborted-task",
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
   it("aborts an unfinished preview check when it unmounts", async () => {
     let requestSignal: AbortSignal | undefined;
     fetchMock.mockImplementation(
@@ -171,6 +296,43 @@ describe("ItemPreview", () => {
       expect.any(AbortSignal),
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("waits for the new source availability before rendering its PDF", async () => {
+    const user = userEvent.setup();
+    const renderPdf = vi.fn().mockResolvedValue(undefined);
+    const availabilityResolvers: Array<(mediaType: "pdf") => void> = [];
+    const loadAvailability = vi.fn(
+      () =>
+        new Promise<"pdf">((resolve) => {
+          availabilityResolvers.push(resolve);
+        }),
+    );
+
+    render(
+      <ItemPreview
+        originalName="invoice.pdf"
+        previewUrl="invoice-file://item/invoice?variant=normalized"
+        loadAvailability={loadAvailability}
+        renderPdf={renderPdf}
+      />,
+    );
+    await waitFor(() => expect(loadAvailability).toHaveBeenCalledTimes(1));
+    await act(async () => availabilityResolvers[0]("pdf"));
+    await waitFor(() => expect(renderPdf).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "原件" }));
+    await waitFor(() => expect(loadAvailability).toHaveBeenCalledTimes(2));
+
+    expect(renderPdf).toHaveBeenCalledTimes(1);
+
+    await act(async () => availabilityResolvers[1]("pdf"));
+    await waitFor(() => expect(renderPdf).toHaveBeenCalledTimes(2));
+    expect(renderPdf).toHaveBeenLastCalledWith(
+      expect.any(HTMLDivElement),
+      "invoice-file://item/invoice?variant=original",
+      expect.any(AbortSignal),
+    );
   });
 
   it("keeps a data URL preview usable without a network check", async () => {
@@ -356,6 +518,30 @@ describe("ItemPreview", () => {
     await user.click(openButton);
 
     expect(openOriginal).toHaveBeenCalledWith("item-pdf");
+  });
+
+  it("uses the failed PDF live region for an opener error without nesting alerts", async () => {
+    const user = userEvent.setup();
+    const openOriginal = vi.fn().mockRejectedValue(new Error("open failed"));
+
+    render(
+      <ItemPreview
+        itemId="item-pdf"
+        originalName="invoice.pdf"
+        previewUrl="invoice-file://item/item-pdf?variant=original"
+        loadAvailability={vi.fn().mockResolvedValue("pdf")}
+        renderPdf={vi.fn().mockRejectedValue(new Error("render failed"))}
+        openOriginal={openOriginal}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole("button", { name: "用系统应用打开原件" }),
+    );
+
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toHaveTextContent("无法打开原件，请稍后重试。");
   });
 
   it("surfaces a generic opener error and re-enables retry", async () => {

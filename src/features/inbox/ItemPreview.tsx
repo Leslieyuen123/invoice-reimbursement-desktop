@@ -17,6 +17,13 @@ type PreviewVariant = "original" | "normalized";
 type PreviewState = "loading" | "ready" | "failed";
 type PreviewMediaType = "image" | "pdf" | "external";
 
+interface PreviewAvailability {
+  source: string;
+  revision: number;
+  state: PreviewState;
+  mediaType: PreviewMediaType | null;
+}
+
 export type PreviewAvailabilityLoader = (
   source: string,
   signal: AbortSignal,
@@ -140,70 +147,99 @@ async function loadPdfModule() {
   return pdfModulePromise;
 }
 
-export const renderPdfPages: PdfRenderer = async (surface, source, signal) => {
-  const response = await fetch(source, { cache: "no-store", signal });
-  if (!response.ok) throw new Error("Preview unavailable");
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+export function createPdfRenderer(
+  loadModule: typeof loadPdfModule = loadPdfModule,
+): PdfRenderer {
+  return async (surface, source, signal) => {
+    const response = await fetch(source, { cache: "no-store", signal });
+    if (!response.ok) throw new Error("Preview unavailable");
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-  const pdfjs = await loadPdfModule();
-  const loadingTask = pdfjs.getDocument({ data: bytes });
-  const abort = () => void loadingTask.destroy();
-  const pages: Array<
-    Awaited<ReturnType<Awaited<typeof loadingTask.promise>["getPage"]>>
-  > = [];
-  signal.addEventListener("abort", abort, { once: true });
-  try {
-    const pdfDocument = await loadingTask.promise;
-    const availableWidth = Math.max(surface.clientWidth - 32, 320);
-    if (
-      !Number.isSafeInteger(pdfDocument.numPages) ||
-      pdfDocument.numPages <= 0 ||
-      pdfDocument.numPages > MAX_PDF_PAGES
-    ) {
-      previewUnavailable();
+    const pdfjs = await loadModule();
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+    const loadingTask = pdfjs.getDocument({ data: bytes });
+    const destroyAbortedTask = async (): Promise<never> => {
+      await loadingTask.destroy().catch(() => undefined);
+      throw new DOMException("Aborted", "AbortError");
+    };
+    if (signal.aborted) return destroyAbortedTask();
+
+    const abort = () => {
+      void loadingTask.destroy().catch(() => undefined);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      signal.removeEventListener("abort", abort);
+      return destroyAbortedTask();
     }
 
-    const geometries: PdfPageGeometry[] = [];
-    for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber += 1) {
-      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-      const page = await pdfDocument.getPage(pageNumber);
-      pages.push(page);
-      const unscaled = page.getViewport({ scale: 1 });
-      geometries.push({ width: unscaled.width, height: unscaled.height });
-    }
-
-    const plans = planPdfPages(
-      geometries,
-      availableWidth,
-      window.devicePixelRatio,
-    );
-    for (let index = 0; index < pages.length; index += 1) {
-      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-      const page = pages[index];
-      const plan = plans[index];
-      const viewport = page.getViewport({ scale: plan.renderScale });
-      const canvas = window.document.createElement("canvas");
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("Preview unavailable");
-      canvas.className = "item-preview-pdf-page";
-      canvas.width = plan.canvasWidth;
-      canvas.height = plan.canvasHeight;
-      canvas.style.width = `${plan.cssWidth}px`;
-      canvas.style.height = `${plan.cssHeight}px`;
-      canvas.setAttribute("aria-label", `第 ${index + 1} 页`);
-      surface.append(canvas);
-      await page.render({ canvas, canvasContext: context, viewport }).promise;
-    }
-  } finally {
-    signal.removeEventListener("abort", abort);
+    type PdfPage = Awaited<
+      ReturnType<Awaited<typeof loadingTask.promise>["getPage"]>
+    >;
+    const pendingCleanup = new Set<PdfPage>();
+    const pages: PdfPage[] = [];
     try {
-      for (const page of pages) page.cleanup();
+      const pdfDocument = await loadingTask.promise;
+      const availableWidth = Math.max(surface.clientWidth - 32, 320);
+      if (
+        !Number.isSafeInteger(pdfDocument.numPages) ||
+        pdfDocument.numPages <= 0 ||
+        pdfDocument.numPages > MAX_PDF_PAGES
+      ) {
+        previewUnavailable();
+      }
+
+      const geometries: PdfPageGeometry[] = [];
+      for (
+        let pageNumber = 1;
+        pageNumber <= pdfDocument.numPages;
+        pageNumber += 1
+      ) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const page = await pdfDocument.getPage(pageNumber);
+        pages.push(page);
+        pendingCleanup.add(page);
+        const unscaled = page.getViewport({ scale: 1 });
+        geometries.push({ width: unscaled.width, height: unscaled.height });
+      }
+
+      const plans = planPdfPages(
+        geometries,
+        availableWidth,
+        window.devicePixelRatio,
+      );
+      for (let index = 0; index < pages.length; index += 1) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        const page = pages[index];
+        const plan = plans[index];
+        const viewport = page.getViewport({ scale: plan.renderScale });
+        const canvas = window.document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Preview unavailable");
+        canvas.className = "item-preview-pdf-page";
+        canvas.width = plan.canvasWidth;
+        canvas.height = plan.canvasHeight;
+        canvas.style.width = `${plan.cssWidth}px`;
+        canvas.style.height = `${plan.cssHeight}px`;
+        canvas.setAttribute("aria-label", `第 ${index + 1} 页`);
+        surface.append(canvas);
+        await page.render({ canvas, canvasContext: context, viewport }).promise;
+        if (page.cleanup()) pendingCleanup.delete(page);
+      }
     } finally {
-      await loadingTask.destroy();
+      signal.removeEventListener("abort", abort);
+      try {
+        for (const page of pendingCleanup) page.cleanup();
+      } finally {
+        await loadingTask.destroy();
+      }
     }
-  }
-};
+  };
+}
+
+export const renderPdfPages = createPdfRenderer();
 
 function previewMediaTypeFromContentType(
   contentType: string | null,
@@ -266,12 +302,14 @@ interface OpenOriginalActionProps {
   itemId?: string;
   isExternalUrl: boolean;
   openOriginal: OriginalOpener;
+  announceError?: boolean;
 }
 
 function OpenOriginalAction({
   itemId,
   isExternalUrl,
   openOriginal,
+  announceError = true,
 }: OpenOriginalActionProps) {
   const [opening, setOpening] = useState(false);
   const [openError, setOpenError] = useState(false);
@@ -305,7 +343,10 @@ function OpenOriginalAction({
         {isExternalUrl ? "在浏览器中打开原件" : "用系统应用打开原件"}
       </button>
       {openError ? (
-        <span className="preview-open-error" role="alert">
+        <span
+          className="preview-open-error"
+          role={announceError ? "alert" : undefined}
+        >
           无法打开原件，请稍后重试。
         </span>
       ) : null}
@@ -325,10 +366,6 @@ export function ItemPreview({
   const [variant, setVariant] = useState<PreviewVariant>(
     hasNormalized ? "normalized" : "original",
   );
-  const [state, setState] = useState<PreviewState>("loading");
-  const [mediaType, setMediaType] = useState<PreviewMediaType | null>(() =>
-    previewMediaTypeFromSource(originalName, previewUrl),
-  );
   const [revision, setRevision] = useState(0);
   const [pdfReady, setPdfReady] = useState(false);
   const pdfSurface = useRef<HTMLDivElement>(null);
@@ -336,30 +373,61 @@ export function ItemPreview({
     () => withVariant(previewUrl, variant),
     [previewUrl, variant],
   );
+  const [availability, setAvailability] = useState<PreviewAvailability>(() => ({
+    source,
+    revision,
+    state: "loading",
+    mediaType: previewMediaTypeFromSource(originalName, source),
+  }));
+  const currentAvailability =
+    availability.source === source && availability.revision === revision
+      ? availability
+      : null;
+  const state = currentAvailability?.state ?? "loading";
+  const mediaType = currentAvailability?.mediaType ?? null;
 
   useEffect(() => {
     const inferredMediaType = previewMediaTypeFromSource(originalName, source);
     if (inferredMediaType === "external") {
-      setMediaType("external");
-      setState("ready");
+      setAvailability({
+        source,
+        revision,
+        state: "ready",
+        mediaType: "external",
+      });
       return;
     }
     const controller = new AbortController();
     let current = true;
-    setState("loading");
+    setAvailability({
+      source,
+      revision,
+      state: "loading",
+      mediaType: inferredMediaType,
+    });
     void loadAvailability(source, controller.signal).then(
       (detectedMediaType) => {
         if (current && !controller.signal.aborted) {
-          setMediaType(
-            detectedMediaType ??
+          setAvailability({
+            source,
+            revision,
+            state: "ready",
+            mediaType:
+              detectedMediaType ??
               previewMediaTypeFromSource(originalName, source) ??
               "pdf",
-          );
-          setState("ready");
+          });
         }
       },
       () => {
-        if (current && !controller.signal.aborted) setState("failed");
+        if (current && !controller.signal.aborted) {
+          setAvailability({
+            source,
+            revision,
+            state: "failed",
+            mediaType: inferredMediaType,
+          });
+        }
       },
     );
     return () => {
@@ -382,7 +450,14 @@ export function ItemPreview({
         if (current && !controller.signal.aborted) setPdfReady(true);
       },
       () => {
-        if (current && !controller.signal.aborted) setState("failed");
+        if (current && !controller.signal.aborted) {
+          setAvailability({
+            source,
+            revision,
+            state: "failed",
+            mediaType: "pdf",
+          });
+        }
       },
     );
     return () => {
@@ -446,6 +521,7 @@ export function ItemPreview({
                 itemId={itemId}
                 isExternalUrl={isExternalUrl}
                 openOriginal={openOriginal}
+                announceError={false}
               />
             ) : null}
           </div>
@@ -483,7 +559,14 @@ export function ItemPreview({
             className="item-preview-image"
             alt="票据预览"
             src={source}
-            onError={() => setState("failed")}
+            onError={() =>
+              setAvailability({
+                source,
+                revision,
+                state: "failed",
+                mediaType: "image",
+              })
+            }
           />
         ) : (
           <div className="item-preview-pdf-shell">
