@@ -126,7 +126,21 @@ fn flattened_pdf_text_recovers_trailing_invoice_values() {
         recognized.company.as_deref(),
         Some("上海大绍文化传媒有限公司")
     );
-    assert!(recognized.warnings.is_empty());
+    assert_eq!(recognized.warnings, ["invalid_invoice_date"]);
+    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
+}
+
+#[test]
+fn empty_invoice_date_does_not_consume_a_later_travel_date() {
+    let recognized = recognize(
+        "开票日期：\n通行日期：2026-06-14\n餐饮 食品 价税合计 ￥128.50",
+        NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
+    );
+
+    assert_eq!(recognized.invoice_date, None);
+    assert_eq!(recognized.suggested_period, "2026-07");
+    assert_eq!(recognized.warnings, ["invalid_invoice_date"]);
+    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
 }
 
 #[test]
@@ -392,6 +406,16 @@ fn company_uses_first_candidate_when_ocr_reverses_the_section_header() {
         recognized.company.as_deref(),
         Some("上海大绍文化传媒有限公司")
     );
+}
+
+#[test]
+fn company_is_not_guessed_from_unlabeled_buyer_and_seller_sections() {
+    let recognized = recognize(
+        "购买方信息\n上海星河科技有限公司\n纳税人识别号：91310000\n销售方信息\n北京远方服务有限公司\n纳税人识别号：91110000",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(recognized.company, None);
 }
 
 #[test]
@@ -838,6 +862,71 @@ async fn concurrent_manual_update_is_preserved_while_extraction_is_running() {
         recognized.confirmation_status,
         ConfirmationStatus::Confirmed
     );
+}
+
+#[tokio::test]
+async fn concurrent_confirmation_keeps_generated_normalized_pdf_and_manual_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(Uuid::new_v4());
+    repository.insert(&record).await.unwrap();
+    let item_id = record.id;
+    let normalized_bytes = b"%PDF-1.4 normalized during concurrent review".to_vec();
+    let (started_tx, started_rx) = sync_channel(1);
+    let (proceed_tx, proceed_rx) = sync_channel(1);
+    let extractor = Arc::new(GatedExtractor {
+        started: started_tx,
+        proceed: Mutex::new(proceed_rx),
+        result: Mutex::new(Some(ExtractedDocument {
+            text: "开票日期：2026-06-18 餐饮 食品 价税合计 ￥128.50".to_owned(),
+            normalized_pdf: Some(normalized_bytes.clone()),
+            warnings: Vec::new(),
+        })),
+    });
+    let service = RecognitionService::with_paths(repository.clone(), paths.clone(), extractor);
+    let recognition = tokio::spawn(async move { service.recognize_item(item_id).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let manual_date = NaiveDate::from_ymd_opt(2026, 5, 9).unwrap();
+    repository
+        .update_fields(
+            item_id,
+            ItemPatch {
+                invoice_date: Some(Some(manual_date)),
+                suggested_period: Some(Some("2026-05".to_owned())),
+                final_category: Some(Some(Category::Hospitality)),
+                amount_cents: Some(Some(9_999)),
+                company: Some(Some("人工确认公司".to_owned())),
+                confirmation_status: Some(ConfirmationStatus::Confirmed),
+                note: Some(Some("识别期间已确认".to_owned())),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    proceed_tx.send(()).unwrap();
+    let recognized = recognition.await.unwrap().unwrap();
+
+    let expected_path = paths.normalized.join(format!("{item_id}.pdf"));
+    assert_eq!(
+        recognized.normalized_pdf_path.as_deref(),
+        Some(expected_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(std::fs::read(expected_path).unwrap(), normalized_bytes);
+    assert_eq!(recognized.invoice_date, Some(manual_date));
+    assert_eq!(recognized.suggested_period.as_deref(), Some("2026-05"));
+    assert_eq!(recognized.final_category, Some(Category::Hospitality));
+    assert_eq!(recognized.amount_cents, Some(9_999));
+    assert_eq!(recognized.company.as_deref(), Some("人工确认公司"));
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+    assert_eq!(recognized.note.as_deref(), Some("识别期间已确认"));
 }
 
 fn sample_item(id: Uuid) -> NewItemRecord {

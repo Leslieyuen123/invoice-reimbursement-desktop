@@ -465,10 +465,14 @@ fn trailing_company_candidate(text: &str) -> Option<String> {
             (value.ends_with("公司") && value.chars().count() >= 4).then(|| value.to_owned())
         })
         .collect();
-    if compact.contains("购买方信息") {
+    if is_known_flattened_invoice_template(text) {
         candidates.into_iter().last()
-    } else {
+    } else if compact.contains("息信方买购名称：息信方售销名称：")
+        || compact.contains("息信方买购名称:息信方售销名称:")
+    {
         candidates.into_iter().next()
+    } else {
+        None
     }
 }
 
@@ -506,8 +510,7 @@ fn labeled_date(text: &str) -> (Option<NaiveDate>, bool) {
         if generic_date.is_some() {
             return (generic_date, true);
         }
-        let fallback_date = parse_date_anywhere(after_invoice_label);
-        return (fallback_date, fallback_date.is_none());
+        return (flattened_invoice_date(text), true);
     }
 
     generic_labeled_date(text)
@@ -551,10 +554,47 @@ fn parse_date_prefix(value: &str) -> Option<NaiveDate> {
         })
 }
 
-fn parse_date_anywhere(value: &str) -> Option<NaiveDate> {
-    value
-        .char_indices()
-        .find_map(|(index, _)| parse_date_prefix(&value[index..]))
+fn flattened_invoice_date(text: &str) -> Option<NaiveDate> {
+    if !is_known_flattened_invoice_template(text) {
+        return None;
+    }
+
+    let (_, tail) = text.split_once("备注")?;
+    tail.char_indices()
+        .take_while(|(index, _)| *index <= 256)
+        .find_map(|(index, _)| {
+            let date = parse_date_prefix(&tail[index..])?;
+            let invoice_number = tail[..index].split_whitespace().next_back()?;
+            let valid_invoice_number = (8..=24).contains(&invoice_number.len())
+                && invoice_number
+                    .chars()
+                    .all(|character| character.is_ascii_digit());
+            valid_invoice_number.then_some(date)
+        })
+}
+
+fn is_known_flattened_invoice_template(text: &str) -> bool {
+    const TEMPLATE_SIGNALS: &[&str] = &[
+        "电子发票",
+        "发票号码",
+        "购买方信息",
+        "销售方信息",
+        "项目名称",
+        "价税合计",
+        "备注",
+    ];
+    let has_empty_invoice_date = text
+        .lines()
+        .map(str::trim)
+        .any(|line| matches!(line, "开票日期：" | "开票日期:"));
+    let empty_company_names = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| matches!(*line, "名称：" | "名称:"))
+        .count();
+    has_empty_invoice_date
+        && empty_company_names >= 2
+        && TEMPLATE_SIGNALS.iter().all(|signal| text.contains(signal))
 }
 
 fn labeled_amount(text: &str) -> Result<Option<i64>, ()> {

@@ -567,6 +567,41 @@ impl ItemRepository {
             && item.confirmation_status == ConfirmationStatus::Confirmed
             && item.final_category.is_some()
         {
+            if item.normalized_pdf_path.is_none()
+                && let Some(normalized_pdf_path) = patch
+                    .normalized_pdf_path
+                    .as_ref()
+                    .and_then(|value| value.as_ref())
+            {
+                let updated_at = Utc::now();
+                let update = sqlx::query(
+                    "UPDATE items SET normalized_pdf_path = ?, updated_at = ? \
+                     WHERE id = ? AND normalized_pdf_path IS NULL",
+                )
+                .bind(normalized_pdf_path)
+                .bind(updated_at.to_rfc3339())
+                .bind(id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| internal_error("failed to update normalized PDF path", error))?;
+                if update.rows_affected() != 0 {
+                    reset_affected_batches(
+                        &mut transaction,
+                        item.batch_id,
+                        item.batch_id,
+                        updated_at,
+                    )
+                    .await?;
+                }
+                let refreshed_row = sqlx::query_as::<_, DbItemRow>(&select)
+                    .bind(id.to_string())
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        internal_error("failed to refresh guarded item update", error)
+                    })?;
+                item = InvoiceItem::try_from(refreshed_row)?;
+            }
             transaction
                 .commit()
                 .await
