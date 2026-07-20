@@ -521,6 +521,28 @@ fn pdfs_over_twenty_thousand_active_xref_entries_are_rejected_before_parsing_or_
 }
 
 #[test]
+fn newest_free_entry_cannot_lower_the_loader_compatible_preflight_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("newest-free-with-old-normal.pdf");
+    let bytes = incremental_pdf_with_newest_free_and_old_normals(20_001, 4);
+    let loaded = lopdf::Document::load_mem(&bytes).unwrap();
+    assert_eq!(loaded.objects.len(), 20_001);
+    assert!(loaded.objects.contains_key(&(4, 0)));
+    drop(loaded);
+    std::fs::write(&path, bytes).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("loader-compatible active xref budget should reject PDF");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.pdf_text_call_count(), 0);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
 fn highly_compressed_pdf_stream_is_rejected_before_text_extraction_or_ocr() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("high-ratio-stream.pdf");
@@ -821,6 +843,51 @@ fn classic_pdf_with_duplicate_active_xref_entries(active_count: usize) -> Vec<u8
     write!(
         &mut bytes,
         "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+        active_count + 1,
+    )
+    .unwrap();
+    bytes
+}
+
+fn incremental_pdf_with_newest_free_and_old_normals(
+    active_count: usize,
+    freed_object: usize,
+) -> Vec<u8> {
+    assert!(active_count >= 3);
+    assert!((1..=active_count).contains(&freed_object));
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(active_count);
+    for object_number in 1..=active_count {
+        offsets.push(bytes.len());
+        writeln!(&mut bytes, "{object_number} 0 obj").unwrap();
+        match object_number {
+            1 => bytes.extend_from_slice(b"<< /Type /Catalog /Pages 2 0 R >>"),
+            2 => bytes.extend_from_slice(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            3 => {
+                bytes.extend_from_slice(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>")
+            }
+            _ => bytes.extend_from_slice(b"null"),
+        }
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let previous_xref = bytes.len();
+    writeln!(&mut bytes, "xref\n0 {}", active_count + 1).unwrap();
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        &mut bytes,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{previous_xref}\n%%EOF\n",
+        active_count + 1,
+    )
+    .unwrap();
+
+    let latest_xref = bytes.len();
+    write!(
+        &mut bytes,
+        "xref\n{freed_object} 1\n0000000000 00000 f \ntrailer\n<< /Size {} /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{latest_xref}\n%%EOF\n",
         active_count + 1,
     )
     .unwrap();

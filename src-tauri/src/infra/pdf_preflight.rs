@@ -506,8 +506,10 @@ fn record_effective_active_entries(
     active_total: &mut usize,
     active_limit: usize,
 ) -> Result<(), PdfPreflightError> {
+    // Match lopdf 0.36's loader: its xref parsers omit free entries, then its reader merges
+    // normal entries newest-first without replacing an object ID that is already present.
     for entry in revision_entries.into_iter().rev() {
-        if seen_object_ids.insert(entry.object_number) && entry.is_active {
+        if entry.is_active && seen_object_ids.insert(entry.object_number) {
             *active_total = active_total
                 .checked_add(1)
                 .filter(|total| *total <= active_limit)
@@ -1063,10 +1065,16 @@ mod tests {
     }
 
     #[test]
-    fn newest_free_entry_tombstones_older_active_entry_for_the_budget() {
+    fn newest_free_entry_does_not_hide_older_normal_from_loader_budget() {
         let bytes = incremental_pdf_with_latest_entry(b"f", false);
+        let loaded = Document::load_mem(&bytes).unwrap();
 
-        validate_pdf_structure_with_limit(&bytes, 2).unwrap();
+        assert!(loaded.objects.contains_key(&(1, 0)));
+
+        assert_eq!(
+            validate_pdf_structure_with_limit(&bytes, 2),
+            Err(PdfPreflightError::ResourceLimit)
+        );
     }
 
     #[test]
