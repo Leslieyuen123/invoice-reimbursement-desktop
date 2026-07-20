@@ -13,7 +13,8 @@ use invoice_reimbursement::db::batches::BatchRepository;
 use invoice_reimbursement::db::items::{ItemPatch, ItemRepository, NewItemRecord};
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::domain::model::{
-    Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch, RecognitionStatus, SourceType,
+    BatchStatus, Category, ConfirmationStatus, DedupeStatus, ItemStatus, NewBatch,
+    RecognitionStatus, SourceType,
 };
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use invoice_reimbursement::infra::files::AppPaths;
@@ -56,6 +57,18 @@ struct GatedExtractor {
     started: SyncSender<()>,
     proceed: Mutex<Receiver<()>>,
     result: Mutex<Option<ExtractedDocument>>,
+}
+
+async fn mark_batch_exported(pool: &sqlx::SqlitePool, batch_id: Uuid) {
+    sqlx::query(
+        "UPDATE batches SET status = 'exported', last_exported_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind("2026-07-14T08:00:00Z")
+    .bind("2026-07-14T08:00:00Z")
+    .bind(batch_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -122,10 +135,25 @@ fn flattened_pdf_text_recovers_trailing_invoice_values() {
     );
     assert_eq!(recognized.amount_cents, Some(146));
     assert_eq!(recognized.category, Some(Category::Transport));
-    assert_eq!(
-        recognized.company.as_deref(),
-        Some("上海大绍文化传媒有限公司")
+    assert_eq!(recognized.company, None);
+    assert_eq!(recognized.warnings, ["invalid_invoice_date"]);
+    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
+}
+
+#[test]
+fn flattened_date_search_window_counts_unicode_characters() {
+    let remarks_prefix = "说".repeat(100);
+    let text = format!(
+        "电子发票（普通发票） 发票号码：\n开票日期：\n购买方信息\n名称：\n销售方信息\n名称：\n项目名称\n价税合计\n备注\n{remarks_prefix}\n26317907120600246026 2026年06月14日"
     );
+
+    let recognized = recognize(&text, NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+
+    assert_eq!(
+        recognized.invoice_date,
+        NaiveDate::from_ymd_opt(2026, 6, 14)
+    );
+    assert_eq!(recognized.suggested_period, "2026-06");
     assert_eq!(recognized.warnings, ["invalid_invoice_date"]);
     assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
 }
@@ -396,16 +424,13 @@ fn company_reads_buyer_from_character_fragmented_ocr_header() {
 }
 
 #[test]
-fn company_uses_first_candidate_when_ocr_reverses_the_section_header() {
+fn company_is_not_guessed_from_a_reversed_ocr_section_header() {
     let recognized = recognize(
-        "息 信 方 买 购 名称：\n息 信 方 售 销 名称：\n2026年06月15日 上海大绍文化传媒有限公司 91310230MA1K0PRP1X 上海路团科技有限公司 91310105MA1FW5NA99",
+        "页眉示例有限公司\n息 信 方 买 购 名称：\n息 信 方 售 销 名称：\n2026年06月15日 上海大绍文化传媒有限公司 91310230MA1K0PRP1X 上海路团科技有限公司 91310105MA1FW5NA99\n备注其他有限公司",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
     );
 
-    assert_eq!(
-        recognized.company.as_deref(),
-        Some("上海大绍文化传媒有限公司")
-    );
+    assert_eq!(recognized.company, None);
 }
 
 #[test]
@@ -875,12 +900,18 @@ async fn concurrent_manual_update_is_preserved_while_extraction_is_running() {
 }
 
 #[tokio::test]
-async fn concurrent_confirmation_keeps_generated_normalized_pdf_and_manual_fields() {
+async fn concurrent_review_keeps_normalized_pdf_and_drafts_the_exported_batch() {
     let directory = tempfile::tempdir().unwrap();
     let paths = AppPaths::create(directory.path().join("storage")).unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();
-    let repository = ItemRepository::new(pool);
-    let record = sample_item(Uuid::new_v4());
+    let repository = ItemRepository::new(pool.clone());
+    let batch_repository = BatchRepository::new(pool.clone());
+    let batch = batch_repository
+        .create(NewBatch::try_new("Reviewed May claims", "2026-05-01", "2026-05-31", None).unwrap())
+        .await
+        .unwrap();
+    let mut record = sample_item(Uuid::new_v4());
+    record.batch_id = Some(batch.id);
     repository.insert(&record).await.unwrap();
     let item_id = record.id;
     let normalized_bytes = b"%PDF-1.4 normalized during concurrent review".to_vec();
@@ -902,7 +933,7 @@ async fn concurrent_confirmation_keeps_generated_normalized_pdf_and_manual_field
         .unwrap();
 
     let manual_date = NaiveDate::from_ymd_opt(2026, 5, 9).unwrap();
-    repository
+    let reviewed = repository
         .update_fields(
             item_id,
             ItemPatch {
@@ -910,14 +941,24 @@ async fn concurrent_confirmation_keeps_generated_normalized_pdf_and_manual_field
                 suggested_period: Some(Some("2026-05".to_owned())),
                 final_category: Some(Some(Category::Hospitality)),
                 amount_cents: Some(Some(9_999)),
+                city: Some(Some("上海".to_owned())),
                 company: Some(Some("人工确认公司".to_owned())),
+                recognition_status: Some(RecognitionStatus::Succeeded),
                 confirmation_status: Some(ConfirmationStatus::Confirmed),
                 note: Some(Some("识别期间已确认".to_owned())),
+                event_tag: Some(Some("客户会议".to_owned())),
+                project_tag: Some(Some("P-2026-05".to_owned())),
                 ..ItemPatch::default()
             },
         )
         .await
         .unwrap();
+    assert_eq!(reviewed.status(), ItemStatus::Ready);
+    mark_batch_exported(&pool, batch.id).await;
+    assert_eq!(
+        batch_repository.get(batch.id).await.unwrap().status,
+        BatchStatus::Exported
+    );
     proceed_tx.send(()).unwrap();
     let recognized = recognition.await.unwrap().unwrap();
 
@@ -931,12 +972,118 @@ async fn concurrent_confirmation_keeps_generated_normalized_pdf_and_manual_field
     assert_eq!(recognized.suggested_period.as_deref(), Some("2026-05"));
     assert_eq!(recognized.final_category, Some(Category::Hospitality));
     assert_eq!(recognized.amount_cents, Some(9_999));
+    assert_eq!(recognized.city.as_deref(), Some("上海"));
     assert_eq!(recognized.company.as_deref(), Some("人工确认公司"));
+    assert_eq!(recognized.recognition_status, RecognitionStatus::Succeeded);
     assert_eq!(
         recognized.confirmation_status,
         ConfirmationStatus::Confirmed
     );
     assert_eq!(recognized.note.as_deref(), Some("识别期间已确认"));
+    assert_eq!(recognized.event_tag.as_deref(), Some("客户会议"));
+    assert_eq!(recognized.project_tag.as_deref(), Some("P-2026-05"));
+    assert_eq!(recognized.batch_id, Some(batch.id));
+    assert_eq!(recognized.status(), ItemStatus::Ready);
+    let persisted_batch = batch_repository.get(batch.id).await.unwrap();
+    assert_eq!(persisted_batch.status, BatchStatus::Draft);
+    assert!(persisted_batch.last_exported_at.is_some());
+}
+
+#[tokio::test]
+async fn guarded_normalization_failure_rolls_back_path_and_cleans_generated_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool.clone());
+    let batch_repository = BatchRepository::new(pool.clone());
+    let batch = batch_repository
+        .create(NewBatch::try_new("Reviewed May claims", "2026-05-01", "2026-05-31", None).unwrap())
+        .await
+        .unwrap();
+    let mut record = sample_item(Uuid::new_v4());
+    record.batch_id = Some(batch.id);
+    repository.insert(&record).await.unwrap();
+    let item_id = record.id;
+    let normalized_bytes = b"%PDF-1.4 rollback normalized invoice".to_vec();
+    let (started_tx, started_rx) = sync_channel(1);
+    let (proceed_tx, proceed_rx) = sync_channel(1);
+    let extractor = Arc::new(GatedExtractor {
+        started: started_tx,
+        proceed: Mutex::new(proceed_rx),
+        result: Mutex::new(Some(ExtractedDocument {
+            text: "开票日期：2026-06-18 餐饮 食品 价税合计 ￥128.50".to_owned(),
+            normalized_pdf: Some(normalized_bytes),
+            warnings: Vec::new(),
+        })),
+    });
+    let service = RecognitionService::with_paths(repository.clone(), paths.clone(), extractor);
+    let recognition = tokio::spawn(async move { service.recognize_item(item_id).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let manual_date = NaiveDate::from_ymd_opt(2026, 5, 9).unwrap();
+    let reviewed = repository
+        .update_fields(
+            item_id,
+            ItemPatch {
+                invoice_date: Some(Some(manual_date)),
+                suggested_period: Some(Some("2026-05".to_owned())),
+                final_category: Some(Some(Category::Hospitality)),
+                amount_cents: Some(Some(9_999)),
+                city: Some(Some("上海".to_owned())),
+                company: Some(Some("人工确认公司".to_owned())),
+                recognition_status: Some(RecognitionStatus::Succeeded),
+                confirmation_status: Some(ConfirmationStatus::Confirmed),
+                note: Some(Some("识别期间已确认".to_owned())),
+                event_tag: Some(Some("客户会议".to_owned())),
+                project_tag: Some(Some("P-2026-05".to_owned())),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reviewed.status(), ItemStatus::Ready);
+    mark_batch_exported(&pool, batch.id).await;
+    sqlx::query(&format!(
+        "CREATE TRIGGER reject_guarded_batch_reset BEFORE UPDATE ON batches \
+         WHEN OLD.id = '{}' AND NEW.status = 'draft' \
+         BEGIN SELECT RAISE(ABORT, 'reject guarded batch reset'); END",
+        batch.id
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    proceed_tx.send(()).unwrap();
+
+    let error = recognition.await.unwrap().unwrap_err();
+
+    assert!(
+        matches!(error, AppError::Internal { ref message } if message.contains("reject guarded batch reset")),
+        "unexpected error: {error:?}"
+    );
+    let expected_path = paths.normalized.join(format!("{item_id}.pdf"));
+    let expected_staging = paths.staging.join(format!("{item_id}.normalized.part"));
+    assert!(!expected_path.exists());
+    assert!(!expected_staging.exists());
+    let persisted = repository.get_by_id(item_id).await.unwrap();
+    assert_eq!(persisted.normalized_pdf_path, None);
+    assert_eq!(persisted.invoice_date, Some(manual_date));
+    assert_eq!(persisted.suggested_period.as_deref(), Some("2026-05"));
+    assert_eq!(persisted.final_category, Some(Category::Hospitality));
+    assert_eq!(persisted.amount_cents, Some(9_999));
+    assert_eq!(persisted.city.as_deref(), Some("上海"));
+    assert_eq!(persisted.company.as_deref(), Some("人工确认公司"));
+    assert_eq!(persisted.recognition_status, RecognitionStatus::Succeeded);
+    assert_eq!(persisted.confirmation_status, ConfirmationStatus::Confirmed);
+    assert_eq!(persisted.note.as_deref(), Some("识别期间已确认"));
+    assert_eq!(persisted.event_tag.as_deref(), Some("客户会议"));
+    assert_eq!(persisted.project_tag.as_deref(), Some("P-2026-05"));
+    assert_eq!(persisted.batch_id, Some(batch.id));
+    assert_eq!(persisted.status(), ItemStatus::Ready);
+    let persisted_batch = batch_repository.get(batch.id).await.unwrap();
+    assert_eq!(persisted_batch.status, BatchStatus::Exported);
+    assert!(persisted_batch.last_exported_at.is_some());
 }
 
 fn sample_item(id: Uuid) -> NewItemRecord {
