@@ -25,6 +25,21 @@ const MAX_ZIP_ENTRIES: usize = 64;
 const MAX_ZIP_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_ZIP_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy)]
+struct ZipExpansionBudget {
+    remaining_entries: usize,
+    remaining_bytes: u64,
+}
+
+impl Default for ZipExpansionBudget {
+    fn default() -> Self {
+        Self {
+            remaining_entries: MAX_ZIP_ENTRIES,
+            remaining_bytes: MAX_ZIP_TOTAL_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncResult {
     pub imported_count: u32,
@@ -299,6 +314,13 @@ fn validate_message_identity(
 }
 
 fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError> {
+    parse_invoice_parts_with_zip_budget(raw, ZipExpansionBudget::default())
+}
+
+fn parse_invoice_parts_with_zip_budget(
+    raw: &RawMessage,
+    mut zip_budget: ZipExpansionBudget,
+) -> Result<ParsedInvoiceParts, AppError> {
     let message = MessageParser::default()
         .parse(&raw.raw)
         .ok_or_else(|| external_error("mailbox message could not be parsed"))?;
@@ -335,7 +357,7 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
                 message_id: message_id.clone(),
             };
             if file_name_has_extension(&file.file_name, "zip") {
-                let expanded = expand_zip_part(&file);
+                let expanded = expand_zip_part(&file, &mut zip_budget);
                 files.push(file);
                 if let Ok(expanded) = expanded {
                     files.extend(expanded);
@@ -363,11 +385,19 @@ fn parse_invoice_parts(raw: &RawMessage) -> Result<ParsedInvoiceParts, AppError>
     Ok(ParsedInvoiceParts { files, links })
 }
 
-fn expand_zip_part(part: &InvoicePart) -> Result<Vec<InvoicePart>, ()> {
+fn expand_zip_part(
+    part: &InvoicePart,
+    budget: &mut ZipExpansionBudget,
+) -> Result<Vec<InvoicePart>, ()> {
     let mut archive = zip::ZipArchive::new(Cursor::new(&part.bytes)).map_err(|_| ())?;
     if archive.len() > MAX_ZIP_ENTRIES {
         return Err(());
     }
+    let Some(remaining_entries) = budget.remaining_entries.checked_sub(archive.len()) else {
+        budget.remaining_entries = 0;
+        return Err(());
+    };
+    budget.remaining_entries = remaining_entries;
     let mut expanded = Vec::new();
     let mut total_bytes = 0_u64;
     for index in 0..archive.len() {
@@ -384,18 +414,25 @@ fn expand_zip_part(part: &InvoicePart) -> Result<Vec<InvoicePart>, ()> {
         if !is_recognizable_file_name(file_name) {
             continue;
         }
-        total_bytes = total_bytes.checked_add(entry.size()).ok_or(())?;
+        let entry_size = entry.size();
+        total_bytes = total_bytes.checked_add(entry_size).ok_or(())?;
         if total_bytes > MAX_ZIP_TOTAL_BYTES {
             return Err(());
         }
-        let capacity = usize::try_from(entry.size()).map_err(|_| ())?;
+        let Some(remaining_bytes) = budget.remaining_bytes.checked_sub(entry_size) else {
+            budget.remaining_bytes = 0;
+            return Err(());
+        };
+        budget.remaining_bytes = remaining_bytes;
+        let capacity = usize::try_from(entry_size).map_err(|_| ())?;
         let mut bytes = Vec::with_capacity(capacity);
         entry
             .by_ref()
-            .take(MAX_ZIP_ENTRY_BYTES.saturating_add(1))
+            .take(entry_size)
             .read_to_end(&mut bytes)
             .map_err(|_| ())?;
-        if bytes.len() as u64 > MAX_ZIP_ENTRY_BYTES {
+        let mut extra = [0_u8; 1];
+        if bytes.len() as u64 != entry_size || entry.read(&mut extra).map_err(|_| ())? != 0 {
             return Err(());
         }
         expanded.push(InvoicePart {
@@ -563,7 +600,8 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::{
-        InvoicePart, MAX_MESSAGES_PER_SYNC, expand_zip_part, parse_invoice_parts, validate_delta,
+        InvoicePart, MAX_MESSAGES_PER_SYNC, ZipExpansionBudget, expand_zip_part,
+        parse_invoice_parts, parse_invoice_parts_with_zip_budget, validate_delta,
     };
     use crate::infra::imap::{MailboxDelta, MessageRejectionReason, RawMessage, RejectedMessage};
 
@@ -573,6 +611,54 @@ mod tests {
             mailbox: "INBOX".to_owned(),
             received_at: Utc::now(),
             reason: MessageRejectionReason::MessageTooLarge,
+        }
+    }
+
+    fn zip_with_pdf_entries(prefix: &str, count: usize, contents: &[u8]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..count {
+            archive
+                .start_file(
+                    format!("{prefix}-{index}.pdf"),
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive.write_all(contents).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn raw_message_with_zip_attachments(attachments: &[(&str, &[u8])]) -> RawMessage {
+        let boundary = "aggregate-zip-budget-boundary";
+        let mut message = format!(
+            "From: billing@example.com\r\n\
+             To: finance@example.com\r\n\
+             Message-ID: <aggregate-zip@example.com>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\
+             \r\n"
+        )
+        .into_bytes();
+        for (file_name, bytes) in attachments {
+            message.extend_from_slice(
+                format!(
+                    "--{boundary}\r\n\
+                     Content-Type: application/zip; name=\"{file_name}\"\r\n\
+                     Content-Disposition: attachment; filename=\"{file_name}\"\r\n\
+                     Content-Transfer-Encoding: binary\r\n\
+                     \r\n"
+                )
+                .as_bytes(),
+            );
+            message.extend_from_slice(bytes);
+            message.extend_from_slice(b"\r\n");
+        }
+        message.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        RawMessage {
+            uid: 9,
+            mailbox: "INBOX".to_owned(),
+            raw: message,
+            received_at: Utc::now(),
         }
     }
 
@@ -617,7 +703,8 @@ mod tests {
             message_id: Some("zip@example.com".to_owned()),
         };
 
-        let expanded = expand_zip_part(&part).unwrap();
+        let mut budget = ZipExpansionBudget::default();
+        let expanded = expand_zip_part(&part, &mut budget).unwrap();
 
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].part_id, "4.zip.0");
@@ -687,6 +774,71 @@ mod tests {
             parsed.files[1].message_id.as_deref(),
             Some("zip@example.com")
         );
+    }
+
+    #[test]
+    fn zip_entry_budget_is_shared_across_message_attachments() {
+        let first_zip = zip_with_pdf_entries("first", 33, b"a");
+        let second_zip = zip_with_pdf_entries("second", 33, b"b");
+        let raw = raw_message_with_zip_attachments(&[
+            ("first.zip", &first_zip),
+            ("second.zip", &second_zip),
+        ]);
+
+        let parsed = parse_invoice_parts(&raw).unwrap();
+        let originals = parsed
+            .files
+            .iter()
+            .filter(|file| file.file_name.ends_with(".zip"))
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>();
+        let expanded = parsed
+            .files
+            .iter()
+            .filter(|file| file.file_name.ends_with(".pdf"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(originals, vec!["first.zip", "second.zip"]);
+        assert_eq!(expanded.len(), 33);
+        assert!(
+            expanded
+                .iter()
+                .all(|file| file.file_name.starts_with("first-"))
+        );
+    }
+
+    #[test]
+    fn zip_byte_budget_is_shared_across_message_attachments() {
+        let first_zip = zip_with_pdf_entries("first", 1, b"aa");
+        let second_zip = zip_with_pdf_entries("second", 1, b"bb");
+        let raw = raw_message_with_zip_attachments(&[
+            ("first.zip", &first_zip),
+            ("second.zip", &second_zip),
+        ]);
+
+        let parsed = parse_invoice_parts_with_zip_budget(
+            &raw,
+            ZipExpansionBudget {
+                remaining_entries: 2,
+                remaining_bytes: 3,
+            },
+        )
+        .unwrap();
+        let originals = parsed
+            .files
+            .iter()
+            .filter(|file| file.file_name.ends_with(".zip"))
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>();
+        let expanded = parsed
+            .files
+            .iter()
+            .filter(|file| file.file_name.ends_with(".pdf"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(originals, vec!["first.zip", "second.zip"]);
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].file_name, "first-0.pdf");
     }
 
     #[test]
