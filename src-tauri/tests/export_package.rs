@@ -932,6 +932,24 @@ async fn escaped_object_stream_is_rejected_before_staging() {
 }
 
 #[tokio::test]
+async fn excessive_active_xref_entries_are_rejected_before_staging() {
+    let app = TestApp::with_exportable_batch().await;
+    let normalized = normalized_path(&app.pool, app.item_ids[0]).await;
+    let bytes = classic_pdf_with_duplicate_active_xref_entries(20_001);
+    assert!(bytes.len() < 512 * 1024, "fixture should remain compact");
+    fs::write(normalized, bytes).unwrap();
+
+    let error = app.exports.export(app.batch_id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation { field, message }
+            if field == "normalizedPdf" && message.contains("对象数")
+    ));
+    assert_storage_empty(&app.paths);
+}
+
+#[tokio::test]
 async fn highly_compressed_stream_is_bounded_before_staging() {
     let app = TestApp::with_exportable_batch().await;
     let normalized = normalized_path(&app.pool, app.item_ids[0]).await;
@@ -1213,6 +1231,39 @@ fn classic_pdf_with_escaped_object_stream() -> Vec<u8> {
     write!(
         &mut bytes,
         "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+    )
+    .unwrap();
+    bytes
+}
+
+fn classic_pdf_with_duplicate_active_xref_entries(active_count: usize) -> Vec<u8> {
+    assert!(active_count >= 3);
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
+        bytes.extend_from_slice(object);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in &offsets {
+        writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+    }
+    for _ in 3..active_count {
+        writeln!(&mut bytes, "1 1\n{:010} 00000 n ", offsets[0]).unwrap();
+    }
+    write!(
+        &mut bytes,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+        active_count + 1,
     )
     .unwrap();
     bytes

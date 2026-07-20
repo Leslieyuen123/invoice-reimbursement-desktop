@@ -15,8 +15,11 @@ use printpdf::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::infra::exporters::{DEFAULT_EXPORT_LIMITS, validate_pdf_item_resources};
-use crate::infra::pdf_preflight::validate_pdf_structure;
+use crate::infra::pdf_preflight::{PdfPreflightError, validate_pdf_structure_with_limit};
+use crate::infra::pdf_resources::{
+    DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM, DEFAULT_PDF_OBJECTS_PER_ITEM,
+    DEFAULT_PDF_PAGES_PER_ITEM, PdfResourceLimits, PdfResourceUsage, validate_pdf_resources,
+};
 
 const NORMALIZED_IMAGE_DPI: f32 = 96.0;
 const MAX_NORMALIZED_PDF_BYTES: usize = 50 * 1024 * 1024;
@@ -634,9 +637,21 @@ impl DocumentExtractor for LocalExtractor {
 impl LocalExtractor {
     fn extract_pdf(&self, path: &Path) -> Result<ExtractedDocument, AppError> {
         let bytes = fs::read(path).map_err(|_| document_error())?;
-        validate_pdf_structure(&bytes).map_err(|_| resource_limit_error())?;
+        validate_pdf_structure_with_limit(&bytes, DEFAULT_PDF_OBJECTS_PER_ITEM).map_err(
+            |error| match error {
+                PdfPreflightError::Invalid => document_error(),
+                PdfPreflightError::Unsupported | PdfPreflightError::ResourceLimit => {
+                    resource_limit_error()
+                }
+            },
+        )?;
         let mut document = lopdf::Document::load_mem(&bytes).map_err(|_| document_error())?;
-        validate_pdf_item_resources(&document, DEFAULT_EXPORT_LIMITS)
+        let resource_limits = PdfResourceLimits::single_item(
+            DEFAULT_PDF_PAGES_PER_ITEM,
+            DEFAULT_PDF_OBJECTS_PER_ITEM,
+            DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM,
+        );
+        validate_pdf_resources(&document, &mut PdfResourceUsage::default(), resource_limits)
             .map_err(|_| resource_limit_error())?;
         document.renumber_objects();
         document.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;

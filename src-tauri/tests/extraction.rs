@@ -381,6 +381,7 @@ fn corrupt_pdf_is_rejected_without_ocr_or_path_disclosure() {
         .expect_err("corrupt PDF should fail");
 
     assert_external(&error, "document_extractor");
+    assert_eq!(error.to_string(), "Unable to read document.");
     assert!(!error.to_string().contains("private-secret"));
     assert!(!error.to_string().contains("broken.pdf"));
     assert_eq!(ocr.call_count(), 0);
@@ -494,6 +495,25 @@ fn pdfs_over_twenty_thousand_objects_are_rejected_before_text_extraction_or_ocr(
     let error = extractor
         .extract(&path)
         .expect_err("object budget should reject PDF");
+
+    assert_resource_error(&error);
+    assert_eq!(ocr.pdf_text_call_count(), 0);
+    assert_eq!(ocr.call_count(), 0);
+}
+
+#[test]
+fn pdfs_over_twenty_thousand_active_xref_entries_are_rejected_before_parsing_or_ocr() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("too-many-active-xref-entries.pdf");
+    let bytes = classic_pdf_with_duplicate_active_xref_entries(20_001);
+    assert!(bytes.len() < 512 * 1024, "fixture should remain compact");
+    std::fs::write(&path, bytes).unwrap();
+    let ocr = Arc::new(FakeOcr::returning("must not run"));
+    let extractor = LocalExtractor::new(ocr.clone());
+
+    let error = extractor
+        .extract(&path)
+        .expect_err("active xref entry budget should reject PDF");
 
     assert_resource_error(&error);
     assert_eq!(ocr.pdf_text_call_count(), 0);
@@ -753,6 +773,39 @@ fn high_ratio_flate_pdf(decoded_size: usize) -> Vec<u8> {
     let mut output = Vec::new();
     document.save_to(&mut output).unwrap();
     output
+}
+
+fn classic_pdf_with_duplicate_active_xref_entries(active_count: usize) -> Vec<u8> {
+    assert!(active_count >= 3);
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
+        bytes.extend_from_slice(object);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in &offsets {
+        writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
+    }
+    for _ in 3..active_count {
+        writeln!(&mut bytes, "1 1\n{:010} 00000 n ", offsets[0]).unwrap();
+    }
+    write!(
+        &mut bytes,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+        active_count + 1,
+    )
+    .unwrap();
+    bytes
 }
 
 fn handcrafted_xref_stream_pdf() -> Vec<u8> {

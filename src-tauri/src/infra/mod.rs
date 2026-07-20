@@ -4,3 +4,4 @@ pub mod extraction;
 pub mod files;
 pub mod imap;
 pub(crate) mod pdf_preflight;
+pub(crate) mod pdf_resources;
