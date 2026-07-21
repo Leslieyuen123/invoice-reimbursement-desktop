@@ -127,24 +127,29 @@ jobs:
           verify_app_signature() (
             set -euo pipefail
             local app_path="$1"
-            local main_executable="$app_path/Contents/MacOS/invoice-reimbursement"
+            local executable_path
             local signature_details
             local entitlements_plist
             local disable_library_validation
 
             codesign --verify --deep --strict "$app_path"
-            signature_details="$(codesign -dv --verbose=4 "$main_executable" 2>&1)"
-            grep -qx 'Signature=adhoc' <<<"$signature_details"
-            grep -Eq '^CodeDirectory .*flags=.*runtime' <<<"$signature_details"
-
             entitlements_plist="$(mktemp)"
             trap 'rm -f "$entitlements_plist"' EXIT
-            codesign -d --entitlements - --xml "$main_executable" >"$entitlements_plist"
-            disable_library_validation="$(
-              /usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation' \
-                "$entitlements_plist"
-            )"
-            test "$disable_library_validation" = "true"
+
+            for executable_path in \
+              "$app_path/Contents/MacOS/invoice-reimbursement" \
+              "$app_path/Contents/MacOS/invoice-ocr"
+            do
+              signature_details="$(codesign -dv --verbose=4 "$executable_path" 2>&1)"
+              grep -qx 'Signature=adhoc' <<<"$signature_details"
+              grep -Eq '^CodeDirectory .*flags=.*runtime' <<<"$signature_details"
+              codesign -d --entitlements - --xml "$executable_path" >"$entitlements_plist"
+              disable_library_validation="$(
+                /usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation' \
+                  "$entitlements_plist"
+              )"
+              test "$disable_library_validation" = "true"
+            done
           )
 
           test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement")" = "arm64"

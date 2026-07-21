@@ -39,8 +39,20 @@ describe("release workflow", () => {
   });
 
   it("checks the mounted DMG app deployment target before its OCR test", () => {
-    expect(workflow).toContain(
-      'mounted_plist_minimum_system_version="$(\n            /usr/libexec/PlistBuddy -c \'Print :LSMinimumSystemVersion\' \\\n              "$mounted_app/Contents/Info.plist"',
+    const mountedPlistCheckStart = workflow.indexOf(
+      'mounted_plist_minimum_system_version="$(',
+    );
+    const mountedPlistCheckEnd = workflow.indexOf(
+      'mounted_main_minimum_system_version="$(',
+      mountedPlistCheckStart,
+    );
+    const mountedPlistCheck = workflow.slice(
+      mountedPlistCheckStart,
+      mountedPlistCheckEnd,
+    );
+    expect(mountedPlistCheck).toContain("Print :LSMinimumSystemVersion");
+    expect(mountedPlistCheck).toContain(
+      '"$mounted_app/Contents/Info.plist"',
     );
     expect(workflow).toContain(
       'otool -l "$mounted_app/Contents/MacOS/invoice-reimbursement"',
@@ -58,16 +70,13 @@ describe("release workflow", () => {
       'test "$mounted_ocr_minimum_system_version" = "11.0"',
     );
 
-    const mountedTargetCheck = workflow.indexOf(
-      'mounted_plist_minimum_system_version="$(',
-    );
-    expect(mountedTargetCheck).toBeGreaterThan(
+    expect(mountedPlistCheckStart).toBeGreaterThan(
       workflow.indexOf('hdiutil attach "${dmg_files[0]}"'),
     );
     const mountedOcrTest = workflow.indexOf(
       'INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"',
     );
-    expect(mountedTargetCheck).toBeLessThan(mountedOcrTest);
+    expect(mountedPlistCheckStart).toBeLessThan(mountedOcrTest);
     expect(
       workflow.indexOf(
         'test "$mounted_ocr_minimum_system_version" = "11.0"',
@@ -76,11 +85,29 @@ describe("release workflow", () => {
   });
 
   it("keeps the DMG cleanup trap around mounted payload verification", () => {
+    const attach = workflow.indexOf('hdiutil attach "${dmg_files[0]}"');
+    const mountedVerification = workflow.indexOf(
+      'verify_app_signature "$mounted_app"',
+      attach,
+    );
+    const mountedOcrTest = workflow.indexOf(
+      'INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"',
+      mountedVerification,
+    );
+    const explicitDetach = workflow.indexOf(
+      'hdiutil detach "$mount_dir" -quiet',
+      mountedOcrTest,
+    );
+    const clearCleanupTrap = workflow.indexOf("trap - EXIT", explicitDetach);
+
     expect(workflow).toContain("trap cleanup EXIT");
     expect(workflow).toContain(
       'hdiutil detach "$mount_dir" -quiet || true',
     );
-    expect(workflow).toContain("trap - EXIT");
+    expect(mountedVerification).toBeGreaterThan(attach);
+    expect(mountedOcrTest).toBeGreaterThan(mountedVerification);
+    expect(explicitDetach).toBeGreaterThan(mountedOcrTest);
+    expect(clearCleanupTrap).toBeGreaterThan(explicitDetach);
   });
 
   it("verifies the standalone app and mounted DMG payload before upload", () => {
@@ -129,26 +156,48 @@ describe("release workflow", () => {
   });
 
   it("verifies ad-hoc hardened-runtime signing for standalone and mounted apps", () => {
-    expect(workflow.match(/verify_app_signature\(\) \(/g)).toHaveLength(1);
-    expect(
-      workflow.match(/codesign --verify --deep --strict "\$app_path"/g),
-    ).toHaveLength(1);
-    expect(workflow).toContain(
-      'signature_details="$(codesign -dv --verbose=4 "$main_executable" 2>&1)"',
+    const verifyAppSignatureStart = workflow.indexOf(
+      "verify_app_signature() (",
     );
-    expect(workflow).toContain(
+    const verifyAppSignatureEnd = workflow.indexOf(
+      "\n          )",
+      verifyAppSignatureStart,
+    );
+    const verifyAppSignature = workflow.slice(
+      verifyAppSignatureStart,
+      verifyAppSignatureEnd,
+    );
+
+    expect(verifyAppSignatureStart).toBeGreaterThan(-1);
+    expect(verifyAppSignatureEnd).toBeGreaterThan(verifyAppSignatureStart);
+    expect(
+      verifyAppSignature.match(
+        /codesign --verify --deep --strict "\$app_path"/g,
+      ),
+    ).toHaveLength(1);
+    expect(verifyAppSignature).toContain("for executable_path in \\");
+    expect(verifyAppSignature).toContain(
+      '"$app_path/Contents/MacOS/invoice-reimbursement" \\',
+    );
+    expect(verifyAppSignature).toContain(
+      '"$app_path/Contents/MacOS/invoice-ocr"',
+    );
+    expect(verifyAppSignature).toContain(
+      'signature_details="$(codesign -dv --verbose=4 "$executable_path" 2>&1)"',
+    );
+    expect(verifyAppSignature).toContain(
       "grep -qx 'Signature=adhoc' <<<\"$signature_details\"",
     );
-    expect(workflow).toContain(
+    expect(verifyAppSignature).toContain(
       "grep -Eq '^CodeDirectory .*flags=.*runtime' <<<\"$signature_details\"",
     );
-    expect(workflow).toContain(
-      'codesign -d --entitlements - --xml "$main_executable" >"$entitlements_plist"',
+    expect(verifyAppSignature).toContain(
+      'codesign -d --entitlements - --xml "$executable_path" >"$entitlements_plist"',
     );
-    expect(workflow).toContain(
+    expect(verifyAppSignature).toContain(
       "/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation'",
     );
-    expect(workflow).toContain(
+    expect(verifyAppSignature).toContain(
       'test "$disable_library_validation" = "true"',
     );
     expect(workflow).toContain('verify_app_signature "$bundle_app"');
