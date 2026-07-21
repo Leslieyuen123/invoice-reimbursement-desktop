@@ -30,6 +30,29 @@ function extractVerifyAppSignature(source: string): string {
   return lines.slice(0, closingLineIndex + 2).join("\n");
 }
 
+function extractExecutableInspectionLoopBody(helper: string): string {
+  const lines = helper.split(/\r?\n/);
+  const loopOpeningIndex = lines.findIndex(
+    (line) => line.trim() === "for executable_path in \\",
+  );
+  if (loopOpeningIndex === -1) {
+    throw new Error("verify_app_signature helper has no executable loop");
+  }
+
+  const loopIndent = lines[loopOpeningIndex].match(/^[ \t]*/)?.[0] ?? "";
+  const doIndex = lines.findIndex(
+    (line, index) => index > loopOpeningIndex && line === `${loopIndent}do`,
+  );
+  const doneIndex = lines.findIndex(
+    (line, index) => index > doIndex && line === `${loopIndent}done`,
+  );
+  if (doIndex === -1 || doneIndex === -1) {
+    throw new Error("executable loop has no same-indent do/done boundary");
+  }
+
+  return lines.slice(doIndex + 1, doneIndex).join("\n");
+}
+
 describe("release workflow", () => {
   it("fails closed unless both macOS jobs run on Apple Silicon", () => {
     expect(workflow.match(/runs-on: macos-15/g)).toHaveLength(2);
@@ -131,6 +154,23 @@ describe("release workflow", () => {
   });
 
   it("verifies the standalone app and mounted DMG payload before upload", () => {
+    const build = workflow.indexOf(
+      "run: npm run tauri build -- --bundles app,dmg",
+    );
+    const standaloneVerification = workflow.indexOf(
+      'verify_app_signature "$bundle_app"',
+      build,
+    );
+    const attach = workflow.indexOf(
+      'hdiutil attach "${dmg_files[0]}"',
+      standaloneVerification,
+    );
+    const mountedVerification = workflow.indexOf(
+      'verify_app_signature "$mounted_app"',
+      attach,
+    );
+    const uploadArtifact = workflow.indexOf("uses: actions/upload-artifact@");
+
     expect(workflow).toContain("name: Verify Apple Silicon bundles");
     expect(workflow).toContain('lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement"');
     expect(workflow).toContain('lipo -archs "$bundle_app/Contents/MacOS/invoice-ocr"');
@@ -141,6 +181,13 @@ describe("release workflow", () => {
     expect(workflow).toContain("packaged_sidecar_runs_through_process_gateway_with_cold_start_margin");
     expect(workflow).toContain('INVOICE_OCR_BIN="$bundle_app/Contents/MacOS/invoice-ocr"');
     expect(workflow).toContain('INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"');
+    expect(build).toBeGreaterThan(-1);
+    expect(standaloneVerification).toBeGreaterThan(build);
+    expect(attach).toBeGreaterThan(standaloneVerification);
+    expect(mountedVerification).toBeGreaterThan(attach);
+    expect(uploadArtifact).toBeGreaterThan(mountedVerification);
+    expect(standaloneVerification).toBeLessThan(uploadArtifact);
+    expect(mountedVerification).toBeLessThan(uploadArtifact);
   });
 
   it("asserts the mounted app path is absolute before its OCR test", () => {
@@ -178,6 +225,9 @@ describe("release workflow", () => {
   it("isolates the signing helper independently of YAML source indentation", () => {
     const reindentedWorkflow = workflow.replace(/^/gm, "  ");
     const verifyAppSignature = extractVerifyAppSignature(reindentedWorkflow);
+    const inspectionLoopBody = extractExecutableInspectionLoopBody(
+      verifyAppSignature,
+    );
 
     expect(verifyAppSignature).toContain(
       '"$app_path/Contents/MacOS/invoice-ocr"',
@@ -185,10 +235,16 @@ describe("release workflow", () => {
     expect(verifyAppSignature).not.toContain(
       'test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement")"',
     );
+    expect(inspectionLoopBody).toContain(
+      'codesign -dv --verbose=4 "$executable_path"',
+    );
   });
 
   it("verifies ad-hoc hardened-runtime signing for standalone and mounted apps", () => {
     const verifyAppSignature = extractVerifyAppSignature(workflow);
+    const inspectionLoopBody = extractExecutableInspectionLoopBody(
+      verifyAppSignature,
+    );
 
     expect(
       verifyAppSignature.match(
@@ -202,22 +258,22 @@ describe("release workflow", () => {
     expect(verifyAppSignature).toContain(
       '"$app_path/Contents/MacOS/invoice-ocr"',
     );
-    expect(verifyAppSignature).toContain(
+    expect(inspectionLoopBody).toContain(
       'signature_details="$(codesign -dv --verbose=4 "$executable_path" 2>&1)"',
     );
-    expect(verifyAppSignature).toContain(
+    expect(inspectionLoopBody).toContain(
       "grep -qx 'Signature=adhoc' <<<\"$signature_details\"",
     );
-    expect(verifyAppSignature).toContain(
+    expect(inspectionLoopBody).toContain(
       "grep -Eq '^CodeDirectory .*flags=.*runtime' <<<\"$signature_details\"",
     );
-    expect(verifyAppSignature).toContain(
+    expect(inspectionLoopBody).toContain(
       'codesign -d --entitlements - --xml "$executable_path" >"$entitlements_plist"',
     );
-    expect(verifyAppSignature).toContain(
+    expect(inspectionLoopBody).toContain(
       "/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation'",
     );
-    expect(verifyAppSignature).toContain(
+    expect(inspectionLoopBody).toContain(
       'test "$disable_library_validation" = "true"',
     );
     expect(workflow).toContain('verify_app_signature "$bundle_app"');
