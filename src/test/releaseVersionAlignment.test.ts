@@ -1,3 +1,7 @@
+import { readFile } from "node:fs/promises";
+import { join, sep } from "node:path";
+
+import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { describe, expect, it } from "vitest";
 
 import quickStart from "../../docs/user-guide/invoice-reimbursement-quick-start.md?raw";
@@ -11,6 +15,9 @@ import tauriConfigSource from "../../src-tauri/tauri.conf.json?raw";
 
 const EXPECTED_VERSION = "0.1.1";
 const EXPECTED_DMG = "invoice-reimbursement-0.1.1-macos-arm64.dmg";
+const REPO_ROOT = process.cwd();
+const STANDARD_FONT_DATA_URL =
+  join(REPO_ROOT, "node_modules/pdfjs-dist/standard_fonts") + sep;
 
 function cargoPackageVersion(source: string, packageName: string): string {
   const packageBlock = source
@@ -23,7 +30,77 @@ function cargoPackageVersion(source: string, packageName: string): string {
   return version;
 }
 
+function cargoManifestPackageVersion(source: string): string {
+  const lines = source.split(/\r?\n/);
+  const packageStart = lines.findIndex((line) => line.trim() === "[package]");
+  if (packageStart < 0) {
+    throw new Error("missing Cargo.toml [package] section");
+  }
+
+  const followingSection = lines
+    .slice(packageStart + 1)
+    .findIndex((line) => /^\s*\[[^\]]+\]\s*$/.test(line));
+  const packageEnd =
+    followingSection < 0 ? lines.length : packageStart + 1 + followingSection;
+  const packageSection = lines.slice(packageStart + 1, packageEnd).join("\n");
+  const name = packageSection.match(/^\s*name\s*=\s*"([^"]+)"\s*(?:#.*)?$/m)?.[1];
+  const version = packageSection.match(
+    /^\s*version\s*=\s*"([^"]+)"\s*(?:#.*)?$/m,
+  )?.[1];
+  if (name !== "invoice-reimbursement" || !version) {
+    throw new Error("missing invoice-reimbursement Cargo.toml package version");
+  }
+
+  return version;
+}
+
+async function pdfText(relativePath: string): Promise<string> {
+  const loadingTask = getDocument({
+    data: new Uint8Array(await readFile(join(REPO_ROOT, relativePath))),
+    standardFontDataUrl: STANDARD_FONT_DATA_URL,
+  });
+
+  try {
+    const document = await loadingTask.promise;
+    try {
+      const pages: string[] = [];
+      for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+        const page = await document.getPage(pageNumber);
+        try {
+          const content = await page.getTextContent();
+          pages.push(
+            content.items
+              .flatMap((item) => ("str" in item ? [item.str] : []))
+              .join(" "),
+          );
+        } finally {
+          page.cleanup();
+        }
+      }
+      return pages.join("\n");
+    } finally {
+      await document.cleanup();
+      await document.destroy();
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
 describe("release version alignment", () => {
+  it("reads the Cargo package version when another field separates it from the name", () => {
+    const manifest = `[package]
+name = "invoice-reimbursement"
+description = "Desktop invoice workflow"
+version = "${EXPECTED_VERSION}"
+edition = "2024"
+
+[lib]
+name = "invoice_reimbursement"`;
+
+    expect(cargoManifestPackageVersion(manifest)).toBe(EXPECTED_VERSION);
+  });
+
   it("keeps every release-facing source at v0.1.1", () => {
     const packageJson = JSON.parse(packageSource) as { version: string };
     const packageLock = JSON.parse(packageLockSource) as {
@@ -31,9 +108,7 @@ describe("release version alignment", () => {
       packages: { "": { version: string } };
     };
     const tauriConfig = JSON.parse(tauriConfigSource) as { version: string };
-    const cargoVersion = cargoManifest.match(
-      /^name = "invoice-reimbursement"\nversion = "([^"]+)"$/m,
-    )?.[1];
+    const cargoVersion = cargoManifestPackageVersion(cargoManifest);
 
     expect.soft(packageJson.version).toBe(EXPECTED_VERSION);
     expect.soft(packageLock.version).toBe(EXPECTED_VERSION);
@@ -62,5 +137,32 @@ describe("release version alignment", () => {
     expect.soft(pdfBuilder).toContain('f"v{APP_VERSION}"');
     expect.soft(pdfBuilder).not.toContain("v0.1.0");
     expect.soft(pdfBuilder).not.toContain("0.1.0");
+  });
+
+  it("keeps both committed user-guide PDFs aligned with the release", async () => {
+    const guides = [
+      {
+        path: "output/pdf/invoice-reimbursement-user-manual-zh-cn.pdf",
+        identity: "发票报销完整用户手册",
+        distinctContent: ["9. 导出报销材料", "附录 C：导出文件对照表"],
+      },
+      {
+        path: "output/pdf/invoice-reimbursement-quick-start-zh-cn.pdf",
+        identity: "发票报销快速入门",
+        distinctContent: ["3. 批次与导出", "更多说明请查看"],
+      },
+    ];
+
+    for (const guide of guides) {
+      const text = (await pdfText(guide.path)).replace(/\s+/gu, "");
+      expect.soft(text).toContain(guide.identity.replace(/\s+/gu, ""));
+      expect.soft(text).toContain(`v${EXPECTED_VERSION}`);
+      expect.soft(text).not.toContain("v0.1.0");
+      expect.soft(text).toContain("立即同步");
+      expect.soft(text).toContain("保存并确认");
+      for (const expected of guide.distinctContent) {
+        expect.soft(text).toContain(expected.replace(/\s+/gu, ""));
+      }
+    }
   });
 });
