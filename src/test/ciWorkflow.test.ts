@@ -50,6 +50,33 @@ describe("release workflow", () => {
     expect(workflow).toContain('INVOICE_OCR_BIN="$bundle_app/Contents/MacOS/invoice-ocr"');
     expect(workflow).toContain('INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"');
   });
+
+  it("verifies ad-hoc hardened-runtime signing for standalone and mounted apps", () => {
+    expect(workflow.match(/verify_app_signature\(\) \(/g)).toHaveLength(1);
+    expect(
+      workflow.match(/codesign --verify --deep --strict "\$app_path"/g),
+    ).toHaveLength(1);
+    expect(workflow).toContain(
+      'signature_details="$(codesign -dv --verbose=4 "$main_executable" 2>&1)"',
+    );
+    expect(workflow).toContain(
+      "grep -qx 'Signature=adhoc' <<<\"$signature_details\"",
+    );
+    expect(workflow).toContain(
+      "grep -Eq '^CodeDirectory .*flags=.*runtime' <<<\"$signature_details\"",
+    );
+    expect(workflow).toContain(
+      'codesign -d --entitlements - --xml "$main_executable" >"$entitlements_plist"',
+    );
+    expect(workflow).toContain(
+      "/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation'",
+    );
+    expect(workflow).toContain(
+      'test "$disable_library_validation" = "true"',
+    );
+    expect(workflow).toContain('verify_app_signature "$bundle_app"');
+    expect(workflow).toContain('verify_app_signature "$mounted_app"');
+  });
 });
 
 describe("macOS application identity", () => {

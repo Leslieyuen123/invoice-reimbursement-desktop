@@ -123,8 +123,33 @@ jobs:
           test -d "$bundle_app"
           test "${#dmg_files[@]}" -eq 1
           test -f "${dmg_files[0]}"
+
+          verify_app_signature() (
+            set -euo pipefail
+            local app_path="$1"
+            local main_executable="$app_path/Contents/MacOS/invoice-reimbursement"
+            local signature_details
+            local entitlements_plist
+            local disable_library_validation
+
+            codesign --verify --deep --strict "$app_path"
+            signature_details="$(codesign -dv --verbose=4 "$main_executable" 2>&1)"
+            grep -qx 'Signature=adhoc' <<<"$signature_details"
+            grep -Eq '^CodeDirectory .*flags=.*runtime' <<<"$signature_details"
+
+            entitlements_plist="$(mktemp)"
+            trap 'rm -f "$entitlements_plist"' EXIT
+            codesign -d --entitlements - --xml "$main_executable" >"$entitlements_plist"
+            disable_library_validation="$(
+              /usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation' \
+                "$entitlements_plist"
+            )"
+            test "$disable_library_validation" = "true"
+          )
+
           test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
           test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-ocr")" = "arm64"
+          verify_app_signature "$bundle_app"
           plist_minimum_system_version="$(
             /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
               "$bundle_app/Contents/Info.plist"
@@ -161,6 +186,7 @@ jobs:
           test -n "$mounted_app"
           test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
           test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-ocr")" = "arm64"
+          verify_app_signature "$mounted_app"
           INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr" \
             cargo test --manifest-path src-tauri/Cargo.toml --test extraction \
               packaged_sidecar_runs_through_process_gateway_with_cold_start_margin \
