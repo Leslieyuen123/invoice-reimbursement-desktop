@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use crate::domain::error::{AppError, sanitize_app_error};
 
+#[cfg(not(test))]
 const CREDENTIAL_READ_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const CREDENTIAL_READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 pub trait CredentialStore: Send + Sync {
     fn get(&self, account_id: &str) -> Result<Option<String>, AppError>;
@@ -191,7 +194,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{AppError, CredentialStore, get_credential_with_timeout};
+    use super::{AppError, CredentialStore, get_credential};
 
     struct SlowCredentialStore;
 
@@ -212,13 +215,9 @@ mod tests {
 
     #[tokio::test]
     async fn credential_read_timeout_returns_unlock_guidance() {
-        let error = get_credential_with_timeout(
-            Arc::new(SlowCredentialStore),
-            "account-id".to_owned(),
-            Duration::from_millis(20),
-        )
-        .await
-        .unwrap_err();
+        let error = get_credential(Arc::new(SlowCredentialStore), "account-id".to_owned())
+            .await
+            .unwrap_err();
 
         assert_eq!(
             error,
