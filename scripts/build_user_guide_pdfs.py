@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 from pathlib import Path
 from typing import Literal
@@ -35,6 +36,10 @@ from reportlab.platypus.tableofcontents import TableOfContents
 
 
 Kind = Literal["full", "quick"]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+APP_VERSION = json.loads(
+    (REPO_ROOT / "package.json").read_text(encoding="utf-8")
+)["version"]
 FONT_PATH = Path("/System/Library/Fonts/STHeiti Light.ttc")
 FONT_NAME = "GuideHeiti"
 PAPER = colors.HexColor("#FFFFFF")
@@ -293,7 +298,7 @@ class GuideDocTemplate(BaseDocTemplate):
                 PAGE_WIDTH - RIGHT_MARGIN,
                 PAGE_HEIGHT - 12.5 * mm,
             )
-        canvas.drawString(LEFT_MARGIN, 8.5 * mm, "发票报销 v0.1.0")
+        canvas.drawString(LEFT_MARGIN, 8.5 * mm, f"发票报销 v{APP_VERSION}")
         canvas.drawRightString(
             PAGE_WIDTH - RIGHT_MARGIN,
             8.5 * mm,
@@ -360,6 +365,8 @@ def image_flowables(
     else:
         if path.name == "mailbox-setup.png":
             max_height = 40 * mm
+        elif path.name == "item-status-flow.png":
+            max_height = 62 * mm
         else:
             max_height = 145 * mm if aspect < 1 else 100 * mm
     width = max_width
@@ -370,7 +377,7 @@ def image_flowables(
     image = Image(str(path), width=width, height=height)
     image.hAlign = "CENTER"
     caption = Paragraph(inline_markup(alt), style_map["caption"])
-    return [Spacer(1, 4), image, caption]
+    return [KeepTogether([Spacer(1, 4), image, caption])]
 
 
 def markdown_table(
@@ -597,10 +604,10 @@ def cover_story(
         )
     metadata = Table(
         [
-            [Paragraph("适用版本", style_map["table_header"]), Paragraph("v0.1.0", style_map["table"])],
+            [Paragraph("适用版本", style_map["table_header"]), Paragraph(f"v{APP_VERSION}", style_map["table"])],
             [Paragraph("适用设备", style_map["table_header"]), Paragraph("Apple Silicon Mac", style_map["table"])],
             [Paragraph("最低系统", style_map["table_header"]), Paragraph("macOS 11", style_map["table"])],
-            [Paragraph("文档日期", style_map["table_header"]), Paragraph("2026-07-20", style_map["table"])],
+            [Paragraph("文档日期", style_map["table_header"]), Paragraph("2026-07-21", style_map["table"])],
         ],
         colWidths=[36 * mm, 72 * mm],
         hAlign="LEFT",
