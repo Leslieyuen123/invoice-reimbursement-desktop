@@ -38,6 +38,51 @@ describe("release workflow", () => {
     expect(workflow).toContain('test "$ocr_minimum_system_version" = "11.0"');
   });
 
+  it("checks the mounted DMG app deployment target before its OCR test", () => {
+    expect(workflow).toContain(
+      'mounted_plist_minimum_system_version="$(\n            /usr/libexec/PlistBuddy -c \'Print :LSMinimumSystemVersion\' \\\n              "$mounted_app/Contents/Info.plist"',
+    );
+    expect(workflow).toContain(
+      'otool -l "$mounted_app/Contents/MacOS/invoice-reimbursement"',
+    );
+    expect(workflow).toContain(
+      'otool -l "$mounted_app/Contents/MacOS/invoice-ocr"',
+    );
+    expect(workflow).toContain(
+      'test "$mounted_plist_minimum_system_version" = "11.0"',
+    );
+    expect(workflow).toContain(
+      'test "$mounted_main_minimum_system_version" = "11.0"',
+    );
+    expect(workflow).toContain(
+      'test "$mounted_ocr_minimum_system_version" = "11.0"',
+    );
+
+    const mountedTargetCheck = workflow.indexOf(
+      'mounted_plist_minimum_system_version="$(',
+    );
+    expect(mountedTargetCheck).toBeGreaterThan(
+      workflow.indexOf('hdiutil attach "${dmg_files[0]}"'),
+    );
+    const mountedOcrTest = workflow.indexOf(
+      'INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"',
+    );
+    expect(mountedTargetCheck).toBeLessThan(mountedOcrTest);
+    expect(
+      workflow.indexOf(
+        'test "$mounted_ocr_minimum_system_version" = "11.0"',
+      ),
+    ).toBeLessThan(mountedOcrTest);
+  });
+
+  it("keeps the DMG cleanup trap around mounted payload verification", () => {
+    expect(workflow).toContain("trap cleanup EXIT");
+    expect(workflow).toContain(
+      'hdiutil detach "$mount_dir" -quiet || true',
+    );
+    expect(workflow).toContain("trap - EXIT");
+  });
+
   it("verifies the standalone app and mounted DMG payload before upload", () => {
     expect(workflow).toContain("name: Verify Apple Silicon bundles");
     expect(workflow).toContain('lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement"');
@@ -49,6 +94,38 @@ describe("release workflow", () => {
     expect(workflow).toContain("packaged_sidecar_runs_through_process_gateway_with_cold_start_margin");
     expect(workflow).toContain('INVOICE_OCR_BIN="$bundle_app/Contents/MacOS/invoice-ocr"');
     expect(workflow).toContain('INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"');
+  });
+
+  it("asserts the mounted app path is absolute before its OCR test", () => {
+    const absolutePathCheck = workflow.indexOf('[[ "$mounted_app" = /* ]]');
+    expect(absolutePathCheck).toBeGreaterThan(
+      workflow.indexOf(
+        'mounted_app="$(find "$mount_dir" -maxdepth 1 -type d -name \'*.app\' -print -quit)"',
+      ),
+    );
+    expect(absolutePathCheck).toBeLessThan(
+      workflow.indexOf(
+        'INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr"',
+      ),
+    );
+  });
+
+  it("anchors packaged artifact paths before invoking Cargo integration tests", () => {
+    expect(workflow).toContain(
+      'bundle_app="$PWD/src-tauri/target/release/bundle/macos/发票报销.app"',
+    );
+    expect(workflow).toContain(
+      'dmg_files=("$PWD"/src-tauri/target/release/bundle/dmg/*_aarch64.dmg)',
+    );
+  });
+
+  it("keeps bundle creation gated and limited to app and DMG artifacts", () => {
+    expect(workflow).toContain(
+      "  bundle:\n    name: unsigned macOS bundle\n    needs: gates",
+    );
+    expect(workflow).toContain(
+      "run: npm run tauri build -- --bundles app,dmg",
+    );
   });
 
   it("verifies ad-hoc hardened-runtime signing for standalone and mounted apps", () => {
@@ -76,6 +153,13 @@ describe("release workflow", () => {
     );
     expect(workflow).toContain('verify_app_signature "$bundle_app"');
     expect(workflow).toContain('verify_app_signature "$mounted_app"');
+    for (const forbiddenMarker of [
+      "Developer ID",
+      "notarytool",
+      "secrets.",
+    ]) {
+      expect(workflow).not.toContain(forbiddenMarker);
+    }
   });
 });
 

@@ -118,8 +118,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bundle_app="src-tauri/target/release/bundle/macos/发票报销.app"
-          dmg_files=(src-tauri/target/release/bundle/dmg/*_aarch64.dmg)
+          bundle_app="$PWD/src-tauri/target/release/bundle/macos/发票报销.app"
+          dmg_files=("$PWD"/src-tauri/target/release/bundle/dmg/*_aarch64.dmg)
           test -d "$bundle_app"
           test "${#dmg_files[@]}" -eq 1
           test -f "${dmg_files[0]}"
@@ -184,9 +184,25 @@ jobs:
           mounted=1
           mounted_app="$(find "$mount_dir" -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$mounted_app"
+          [[ "$mounted_app" = /* ]]
           test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-reimbursement")" = "arm64"
           test "$(lipo -archs "$mounted_app/Contents/MacOS/invoice-ocr")" = "arm64"
           verify_app_signature "$mounted_app"
+          mounted_plist_minimum_system_version="$(
+            /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+              "$mounted_app/Contents/Info.plist"
+          )"
+          mounted_main_minimum_system_version="$(
+            otool -l "$mounted_app/Contents/MacOS/invoice-reimbursement" |
+              awk '$1 == "minos" { print $2; exit }'
+          )"
+          mounted_ocr_minimum_system_version="$(
+            otool -l "$mounted_app/Contents/MacOS/invoice-ocr" |
+              awk '$1 == "minos" { print $2; exit }'
+          )"
+          test "$mounted_plist_minimum_system_version" = "11.0"
+          test "$mounted_main_minimum_system_version" = "11.0"
+          test "$mounted_ocr_minimum_system_version" = "11.0"
           INVOICE_OCR_BIN="$mounted_app/Contents/MacOS/invoice-ocr" \
             cargo test --manifest-path src-tauri/Cargo.toml --test extraction \
               packaged_sidecar_runs_through_process_gateway_with_cold_start_margin \
