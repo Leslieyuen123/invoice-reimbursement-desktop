@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use crate::domain::error::{AppError, sanitize_app_error};
+
+const CREDENTIAL_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub trait CredentialStore: Send + Sync {
     fn get(&self, account_id: &str) -> Result<Option<String>, AppError>;
@@ -14,8 +17,18 @@ pub async fn get_credential(
     store: Arc<dyn CredentialStore>,
     account_id: String,
 ) -> Result<Option<String>, AppError> {
-    let result = tokio::task::spawn_blocking(move || store.get(&account_id))
+    get_credential_with_timeout(store, account_id, CREDENTIAL_READ_TIMEOUT).await
+}
+
+async fn get_credential_with_timeout(
+    store: Arc<dyn CredentialStore>,
+    account_id: String,
+    timeout: Duration,
+) -> Result<Option<String>, AppError> {
+    let task = tokio::task::spawn_blocking(move || store.get(&account_id));
+    let result = tokio::time::timeout(timeout, task)
         .await
+        .map_err(|_| credential_read_timeout_error())?
         .map_err(|_| credential_task_error("read"))?;
     result.map_err(|error| sanitize_app_error(error, &[]))
 }
@@ -162,5 +175,58 @@ fn lock_error() -> AppError {
 fn credential_task_error(operation: &str) -> AppError {
     AppError::Internal {
         message: format!("credential {operation} task failed"),
+    }
+}
+
+fn credential_read_timeout_error() -> AppError {
+    AppError::External {
+        service: "mailbox_credential".to_owned(),
+        retryable: false,
+        message: "读取邮箱凭据超时，请解锁 Mac 后重试".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{AppError, CredentialStore, get_credential_with_timeout};
+
+    struct SlowCredentialStore;
+
+    impl CredentialStore for SlowCredentialStore {
+        fn get(&self, _account_id: &str) -> Result<Option<String>, AppError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(Some("test-only-secret".to_owned()))
+        }
+
+        fn set(&self, _account_id: &str, _secret: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        fn delete(&self, _account_id: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_read_timeout_returns_unlock_guidance() {
+        let error = get_credential_with_timeout(
+            Arc::new(SlowCredentialStore),
+            "account-id".to_owned(),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            AppError::External {
+                service: "mailbox_credential".to_owned(),
+                retryable: false,
+                message: "读取邮箱凭据超时，请解锁 Mac 后重试".to_owned(),
+            }
+        );
     }
 }
