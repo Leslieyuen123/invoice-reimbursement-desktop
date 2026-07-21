@@ -47,11 +47,20 @@ describe("release version alignment", () => {
     for (const guide of [quickStart, userManual]) {
       expect.soft(guide).toContain(`v${EXPECTED_VERSION}`);
       expect.soft(guide).toContain(EXPECTED_DMG);
+      expect.soft(guide).not.toContain("v0.1.0");
+      expect.soft(guide).not.toContain("发票报销_0.1.0_aarch64.dmg");
+      expect
+        .soft(guide)
+        .not.toContain(
+          "221da96e640426824a3d6673d9e90080302f0edd4fce45fb856d5e74a8e111b3",
+        );
     }
 
     expect.soft(pdfBuilder).toContain("APP_VERSION = json.loads(");
     expect.soft(pdfBuilder).toContain('REPO_ROOT / "package.json"');
     expect.soft(pdfBuilder).toContain('f"发票报销 v{APP_VERSION}"');
     expect.soft(pdfBuilder).toContain('f"v{APP_VERSION}"');
+    expect.soft(pdfBuilder).not.toContain("v0.1.0");
+    expect.soft(pdfBuilder).not.toContain("0.1.0");
   });
 });
