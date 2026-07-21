@@ -10,6 +10,26 @@ import releaseChecklist from "../../docs/operations/release-checklist.md?raw";
 import playwrightConfig from "../../playwright.config.ts?raw";
 import e2eFlow from "../../tests/e2e/mvp-flow.spec.ts?raw";
 
+function extractVerifyAppSignature(source: string): string {
+  const openings = Array.from(
+    source.matchAll(/^([ \t]*)verify_app_signature\(\) \($/gm),
+  );
+  if (openings.length !== 1) {
+    throw new Error(`expected one verify_app_signature helper, found ${openings.length}`);
+  }
+
+  const opening = openings[0];
+  const lines = source.slice(opening.index).split(/\r?\n/);
+  const closingLineIndex = lines
+    .slice(1)
+    .findIndex((line) => line === `${opening[1]})`);
+  if (closingLineIndex === -1) {
+    throw new Error("verify_app_signature helper has no same-indent closing line");
+  }
+
+  return lines.slice(0, closingLineIndex + 2).join("\n");
+}
+
 describe("release workflow", () => {
   it("fails closed unless both macOS jobs run on Apple Silicon", () => {
     expect(workflow.match(/runs-on: macos-15/g)).toHaveLength(2);
@@ -155,21 +175,21 @@ describe("release workflow", () => {
     );
   });
 
-  it("verifies ad-hoc hardened-runtime signing for standalone and mounted apps", () => {
-    const verifyAppSignatureStart = workflow.indexOf(
-      "verify_app_signature() (",
-    );
-    const verifyAppSignatureEnd = workflow.indexOf(
-      "\n          )",
-      verifyAppSignatureStart,
-    );
-    const verifyAppSignature = workflow.slice(
-      verifyAppSignatureStart,
-      verifyAppSignatureEnd,
-    );
+  it("isolates the signing helper independently of YAML source indentation", () => {
+    const reindentedWorkflow = workflow.replace(/^/gm, "  ");
+    const verifyAppSignature = extractVerifyAppSignature(reindentedWorkflow);
 
-    expect(verifyAppSignatureStart).toBeGreaterThan(-1);
-    expect(verifyAppSignatureEnd).toBeGreaterThan(verifyAppSignatureStart);
+    expect(verifyAppSignature).toContain(
+      '"$app_path/Contents/MacOS/invoice-ocr"',
+    );
+    expect(verifyAppSignature).not.toContain(
+      'test "$(lipo -archs "$bundle_app/Contents/MacOS/invoice-reimbursement")"',
+    );
+  });
+
+  it("verifies ad-hoc hardened-runtime signing for standalone and mounted apps", () => {
+    const verifyAppSignature = extractVerifyAppSignature(workflow);
+
     expect(
       verifyAppSignature.match(
         /codesign --verify --deep --strict "\$app_path"/g,
