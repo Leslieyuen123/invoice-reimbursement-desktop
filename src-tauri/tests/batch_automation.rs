@@ -23,6 +23,7 @@ use invoice_reimbursement::infra::imap::{
 };
 use invoice_reimbursement::services::batches::{BatchService, NewBatchInput};
 use invoice_reimbursement::state::AppState;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 #[derive(Default)]
@@ -372,6 +373,100 @@ async fn one_account_failure_does_not_block_successful_accounts_or_export() {
     assert_eq!(result.assigned_count, 1);
     assert_eq!(result.exception_count, 0);
     assert!(result.export.is_some());
+}
+
+#[tokio::test]
+async fn later_page_failure_keeps_completed_range_progress_for_exception_classification() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    gateway.queue(
+        "a@example.com",
+        vec![
+            Ok(MailboxDelta {
+                uid_validity: 1,
+                messages: vec![raw_message(
+                    1,
+                    include_bytes!("fixtures/mail/attachment.eml"),
+                )],
+                rejected_messages: Vec::new(),
+                highest_uid: 1,
+            }),
+            Err(AppError::External {
+                service: "imap".to_owned(),
+                retryable: true,
+                message: "second page failed with secret-a@example.com".to_owned(),
+            }),
+        ],
+    );
+    let harness = Harness::new(
+        gateway,
+        Arc::new(SequenceExtractor::new(&[INCOMPLETE_TEXT])),
+    )
+    .await;
+    let failed_account = harness.add_account("a@example.com", true).await;
+    let batch = harness.may_batch().await;
+    let safe_id = uuid::Uuid::new_v4();
+    let mut safe_item = ready_item(&harness.paths, safe_id);
+    let original_bytes = b"managed original";
+    safe_item.sha256 = format!("{:x}", Sha256::digest(original_bytes));
+    fs::write(&safe_item.original_path, original_bytes).unwrap();
+    fs::write(
+        safe_item.normalized_pdf_path.as_deref().unwrap(),
+        include_bytes!("fixtures/text-invoice.pdf"),
+    )
+    .unwrap();
+    ItemRepository::new(harness.pool.clone())
+        .insert(&safe_item)
+        .await
+        .unwrap();
+
+    let result = harness
+        .state
+        .batch_automation_service()
+        .run(batch.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.failed_accounts.len(), 1);
+    assert_eq!(result.failed_accounts[0].account_id, failed_account.id);
+    assert!(
+        !result.failed_accounts[0]
+            .message
+            .contains("secret-a@example.com")
+    );
+    assert_eq!(result.imported_count, 1);
+    assert_eq!(result.assigned_count, 1);
+    assert_eq!(result.exception_count, 1);
+    assert_eq!(result.export.unwrap().item_count, 1);
+    let sync_run = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, error_message FROM sync_runs WHERE account_id = ?",
+    )
+    .bind(failed_account.id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(sync_run.0, "failed");
+    assert!(!sync_run.1.unwrap().contains("secret-a@example.com"));
+    let items = ItemRepository::new(harness.pool)
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.id == safe_id)
+            .unwrap()
+            .batch_id,
+        Some(batch.id)
+    );
+    assert!(
+        items
+            .iter()
+            .find(|item| item.id != safe_id)
+            .unwrap()
+            .batch_id
+            .is_none()
+    );
 }
 
 #[tokio::test]

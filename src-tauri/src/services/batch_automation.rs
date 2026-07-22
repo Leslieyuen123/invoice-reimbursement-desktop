@@ -135,26 +135,29 @@ impl BatchAutomationService {
         let mut imported_count = 0_u32;
         let mut touched_item_ids = HashSet::new();
         for account in accounts {
-            let result = match self.account_operations.try_lock(account.id) {
-                Ok(_operation) => {
-                    self.sync
-                        .run_range(account.id, batch.start_date, batch.end_date)
-                        .await
-                }
-                Err(error) => Err(error),
+            let (result, error) = match self.account_operations.try_lock(account.id) {
+                Ok(_operation) => match self
+                    .sync
+                    .run_range_with_progress(account.id, batch.start_date, batch.end_date)
+                    .await
+                {
+                    Ok(result) => (Some(result), None),
+                    Err(failure) => (Some(failure.completed), Some(failure.error)),
+                },
+                Err(error) => (None, Some(error)),
             };
-            match result {
-                Ok(result) => {
-                    imported_count = imported_count
-                        .checked_add(result.imported_count)
-                        .ok_or_else(count_overflow)?;
-                    touched_item_ids.extend(result.touched_item_ids);
-                }
-                Err(error) => failed_accounts.push(AccountAutomationFailure {
+            if let Some(result) = result {
+                imported_count = imported_count
+                    .checked_add(result.imported_count)
+                    .ok_or_else(count_overflow)?;
+                touched_item_ids.extend(result.touched_item_ids);
+            }
+            if let Some(error) = error {
+                failed_accounts.push(AccountAutomationFailure {
                     account_id: account.id,
                     email: account.email,
                     message: sanitize_message(&error.to_string(), &[]),
-                }),
+                });
             }
         }
 

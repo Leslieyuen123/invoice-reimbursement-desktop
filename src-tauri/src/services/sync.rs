@@ -48,6 +48,24 @@ pub struct SyncResult {
     pub(crate) touched_item_ids: Vec<Uuid>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RangeSyncFailure {
+    pub(crate) error: AppError,
+    pub(crate) completed: SyncResult,
+}
+
+impl RangeSyncFailure {
+    fn empty(error: AppError) -> Self {
+        Self {
+            error,
+            completed: SyncResult {
+                imported_count: 0,
+                touched_item_ids: Vec::new(),
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SyncService {
     gateway: Arc<dyn ImapGateway>,
@@ -143,23 +161,47 @@ impl SyncService {
         start_date: NaiveDate,
         end_date: NaiveDate,
     ) -> Result<SyncResult, AppError> {
+        self.run_range_with_progress(account_id, start_date, end_date)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) async fn run_range_with_progress(
+        &self,
+        account_id: Uuid,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<SyncResult, RangeSyncFailure> {
         if start_date > end_date {
-            return Err(AppError::validation(
+            return Err(RangeSyncFailure::empty(AppError::validation(
                 "dateRange",
                 "IMAP start date must not be after end date",
-            ));
+            )));
         }
-        let end_exclusive = end_date.succ_opt().ok_or_else(|| {
-            AppError::validation("dateRange", "IMAP end date is outside the supported range")
-        })?;
-        let range = ImapDateRange::new(start_date, end_exclusive)?;
-        let run = self.accounts.begin_sync_run(account_id).await?;
+        let end_exclusive = end_date
+            .succ_opt()
+            .ok_or_else(|| {
+                AppError::validation("dateRange", "IMAP end date is outside the supported range")
+            })
+            .map_err(RangeSyncFailure::empty)?;
+        let range =
+            ImapDateRange::new(start_date, end_exclusive).map_err(RangeSyncFailure::empty)?;
+        let run = self
+            .accounts
+            .begin_sync_run(account_id)
+            .await
+            .map_err(RangeSyncFailure::empty)?;
         let account = match self.accounts.get(account_id).await {
             Ok(account) => account,
             Err(error) => {
                 let sanitized = sanitize_error(&error.to_string(), "");
-                self.accounts.finish_sync_failure(&run, &sanitized).await?;
-                return Err(sanitized_external_error(&error, sanitized));
+                self.accounts
+                    .finish_sync_failure(&run, &sanitized)
+                    .await
+                    .map_err(RangeSyncFailure::empty)?;
+                return Err(RangeSyncFailure::empty(sanitized_external_error(
+                    &error, sanitized,
+                )));
             }
         };
         let secret = match get_credential(self.credentials.clone(), account_id.to_string()).await {
@@ -168,14 +210,16 @@ impl SyncService {
                 let error = authentication_error("mailbox credential is unavailable");
                 self.accounts
                     .finish_sync_failure(&run, &error.to_string())
-                    .await?;
-                return Err(error);
+                    .await
+                    .map_err(RangeSyncFailure::empty)?;
+                return Err(RangeSyncFailure::empty(error));
             }
             Err(error) => {
                 self.accounts
                     .finish_sync_failure(&run, &error.to_string())
-                    .await?;
-                return Err(error);
+                    .await
+                    .map_err(RangeSyncFailure::empty)?;
+                return Err(RangeSyncFailure::empty(error));
             }
         };
         let config = ImapAccountConfig::from_account(&account);
@@ -190,15 +234,35 @@ impl SyncService {
                     .await
                 {
                     let sanitized = sanitize_error(&error.to_string(), &secret);
-                    self.accounts.finish_sync_failure(&run, &sanitized).await?;
-                    return Err(sanitized_external_error(&error, sanitized));
+                    if let Err(record_error) =
+                        self.accounts.finish_sync_failure(&run, &sanitized).await
+                    {
+                        return Err(RangeSyncFailure {
+                            error: record_error,
+                            completed: result,
+                        });
+                    }
+                    return Err(RangeSyncFailure {
+                        error: sanitized_external_error(&error, sanitized),
+                        completed: result,
+                    });
                 }
                 Ok(result)
             }
-            Err(error) => {
+            Err(failure) => {
+                let RangeSyncFailure { error, completed } = failure;
                 let sanitized = sanitize_error(&error.to_string(), &secret);
-                self.accounts.finish_sync_failure(&run, &sanitized).await?;
-                Err(sanitized_external_error(&error, sanitized))
+                if let Err(record_error) = self.accounts.finish_sync_failure(&run, &sanitized).await
+                {
+                    return Err(RangeSyncFailure {
+                        error: record_error,
+                        completed,
+                    });
+                }
+                Err(RangeSyncFailure {
+                    error: sanitized_external_error(&error, sanitized),
+                    completed,
+                })
             }
         }
     }
@@ -229,7 +293,7 @@ impl SyncService {
         config: &ImapAccountConfig,
         secret: &str,
         range: ImapDateRange,
-    ) -> Result<SyncResult, AppError> {
+    ) -> Result<SyncResult, RangeSyncFailure> {
         let mut cursor = None;
         let mut seen_cursors = HashSet::new();
         let mut page_count = 0_usize;
@@ -238,14 +302,23 @@ impl SyncService {
         let mut touched_item_id_set = HashSet::new();
         loop {
             if page_count >= MAX_RANGE_SYNC_PAGES {
-                return Err(external_error("IMAP range scan exceeded page limit"));
+                return Err(range_sync_failure(
+                    external_error("IMAP range scan exceeded page limit"),
+                    imported_count,
+                    touched_item_ids,
+                ));
             }
             page_count += 1;
             let delta = self
                 .gateway
                 .fetch_range(config, secret, cursor, range)
-                .await?;
-            validate_delta(&delta, &config.mailbox)?;
+                .await
+                .map_err(|error| {
+                    range_sync_failure(error, imported_count, touched_item_ids.clone())
+                })?;
+            validate_delta(&delta, &config.mailbox).map_err(|error| {
+                range_sync_failure(error, imported_count, touched_item_ids.clone())
+            })?;
             let next_cursor = SyncCursor {
                 uid_validity: delta.uid_validity,
                 last_uid: delta.highest_uid,
@@ -259,14 +332,27 @@ impl SyncService {
                             && next_cursor.last_uid < cursor.last_uid
                     }))
             {
-                return Err(external_error(
-                    "IMAP range scan did not make forward progress",
+                return Err(range_sync_failure(
+                    external_error("IMAP range scan did not make forward progress"),
+                    imported_count,
+                    touched_item_ids,
                 ));
             }
-            let result = self.process_delta(account_id, &delta, true).await?;
+            let result = self
+                .process_delta(account_id, &delta, true)
+                .await
+                .map_err(|error| {
+                    range_sync_failure(error, imported_count, touched_item_ids.clone())
+                })?;
             imported_count = imported_count
                 .checked_add(result.imported_count)
-                .ok_or_else(sync_import_count_overflow)?;
+                .ok_or_else(|| {
+                    range_sync_failure(
+                        sync_import_count_overflow(),
+                        imported_count,
+                        touched_item_ids.clone(),
+                    )
+                })?;
             for id in result.touched_item_ids {
                 if touched_item_id_set.insert(id) {
                     touched_item_ids.push(id);
@@ -367,6 +453,20 @@ impl SyncService {
             imported_count,
             touched_item_ids,
         })
+    }
+}
+
+fn range_sync_failure(
+    error: AppError,
+    imported_count: u32,
+    touched_item_ids: Vec<Uuid>,
+) -> RangeSyncFailure {
+    RangeSyncFailure {
+        error,
+        completed: SyncResult {
+            imported_count,
+            touched_item_ids,
+        },
     }
 }
 
