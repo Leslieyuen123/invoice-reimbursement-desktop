@@ -293,6 +293,74 @@ impl BatchService {
         self.get(batch_id).await
     }
 
+    #[doc(hidden)]
+    pub async fn assign_unassigned_items(
+        &self,
+        batch_id: Uuid,
+        item_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, AppError> {
+        let mut seen = HashSet::with_capacity(item_ids.len());
+        let item_ids = item_ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect::<Vec<_>>();
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| database_error("failed to begin automation assignment", error))?;
+
+        let result = async {
+            let batch_exists =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM batches WHERE id = ?")
+                    .bind(batch_id.to_string())
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        database_error("failed to validate automation batch", error)
+                    })?
+                    != 0;
+            if !batch_exists {
+                return Err(batch_not_found(batch_id));
+            }
+
+            let updated_at = Utc::now().to_rfc3339();
+            let mut assigned_ids = Vec::new();
+            for item_id in item_ids {
+                let result = sqlx::query(
+                    "UPDATE items SET batch_id = ?, updated_at = ? \
+                     WHERE id = ? AND batch_id IS NULL \
+                       AND recognition_status = 'succeeded' \
+                       AND confirmation_status = 'confirmed' \
+                       AND dedupe_status != 'suspected_duplicate'",
+                )
+                .bind(batch_id.to_string())
+                .bind(&updated_at)
+                .bind(item_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| database_error("failed to assign automation item", error))?;
+                if result.rows_affected() == 1 {
+                    assigned_ids.push(item_id);
+                }
+            }
+            if !assigned_ids.is_empty() {
+                sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
+                    .bind(&updated_at)
+                    .bind(batch_id.to_string())
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| database_error("failed to refresh automation batch", error))?;
+                validate_summary_total(&mut transaction, batch_id).await?;
+            }
+            Ok(assigned_ids)
+        }
+        .await;
+
+        finish_automation_assignment(transaction, result).await
+    }
+
     pub async fn remove_item(
         &self,
         batch_id: Uuid,
@@ -480,6 +548,25 @@ async fn finish_unit_transaction(
             Ok(()) => Err(error),
             Err(_) => Err(AppError::Internal {
                 message: "batch transaction failed and rollback also failed".to_owned(),
+            }),
+        },
+    }
+}
+
+async fn finish_automation_assignment(
+    transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
+    result: Result<Vec<Uuid>, AppError>,
+) -> Result<Vec<Uuid>, AppError> {
+    match result {
+        Ok(assigned_ids) => transaction
+            .commit()
+            .await
+            .map(|()| assigned_ids)
+            .map_err(|error| database_error("failed to commit automation assignment", error)),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(_) => Err(AppError::Internal {
+                message: "automation assignment failed and rollback also failed".to_owned(),
             }),
         },
     }

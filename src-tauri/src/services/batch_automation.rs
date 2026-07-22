@@ -9,13 +9,14 @@ use uuid::Uuid;
 
 use crate::db::accounts::MailboxAccountRepository;
 use crate::db::items::{InvoiceItem, ItemRepository};
+use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::{AppError, sanitize_message};
 use crate::domain::model::{DedupeStatus, ItemStatus};
 use crate::infra::files::{AppPaths, open_contained_regular_file};
 use crate::services::batches::BatchService;
 use crate::services::export::{ExportResult, ExportService};
 use crate::services::operations::AccountOperationCoordinator;
-use crate::services::sync::SyncService;
+use crate::services::sync::{SyncProgress, SyncService};
 
 const CANDIDATE_PAGE_SIZE: usize = 200;
 const MAX_BATCH_RANGE_DAYS: i64 = 366;
@@ -132,8 +133,7 @@ impl BatchAutomationService {
         }
         let scanned_account_count = u32::try_from(accounts.len()).map_err(|_| count_overflow())?;
         let mut failed_accounts = Vec::new();
-        let mut imported_count = 0_u32;
-        let mut touched_item_ids = HashSet::new();
+        let mut completed = SyncProgress::default();
         for account in accounts {
             let (result, error) = match self.account_operations.try_lock(account.id) {
                 Ok(_operation) => match self
@@ -147,10 +147,7 @@ impl BatchAutomationService {
                 Err(error) => (None, Some(error)),
             };
             if let Some(result) = result {
-                imported_count = imported_count
-                    .checked_add(result.imported_count)
-                    .ok_or_else(count_overflow)?;
-                touched_item_ids.extend(result.touched_item_ids);
+                completed.merge(result)?;
             }
             if let Some(error) = error {
                 failed_accounts.push(AccountAutomationFailure {
@@ -185,7 +182,8 @@ impl BatchAutomationService {
             cursor = Some(next_cursor);
         }
 
-        let touched_item_ids = touched_item_ids.into_iter().collect::<Vec<_>>();
+        let imported_count = completed.imported_count;
+        let touched_item_ids = completed.touched_item_ids.into_iter().collect::<Vec<_>>();
         for item in ItemRepository::new(self.pool.clone())
             .list_by_ids(&touched_item_ids)
             .await?
@@ -195,10 +193,28 @@ impl BatchAutomationService {
             }
         }
 
-        let assigned_count = u32::try_from(safe_ids.len()).map_err(|_| count_overflow())?;
-        if !safe_ids.is_empty() {
-            self.batches.assign_items(batch_id, &safe_ids).await?;
+        let assigned_ids = if safe_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.batches
+                .assign_unassigned_items(batch_id, &safe_ids)
+                .await?
+        };
+        let assigned_id_set = assigned_ids.iter().copied().collect::<HashSet<_>>();
+        let skipped_safe_ids = safe_ids
+            .iter()
+            .copied()
+            .filter(|id| !assigned_id_set.contains(id))
+            .collect::<Vec<_>>();
+        for item in ItemRepository::new(self.pool.clone())
+            .list_by_ids(&skipped_safe_ids)
+            .await?
+        {
+            if item.batch_id != Some(batch_id) {
+                exception_ids.insert(item.id);
+            }
         }
+        let assigned_count = u32::try_from(assigned_ids.len()).map_err(|_| count_overflow())?;
         let exception_count = u32::try_from(exception_ids.len()).map_err(|_| count_overflow())?;
         let resulting_batch = self.batches.get(batch_id).await?;
         let export = if resulting_batch.summary.item_count == 0 {
@@ -230,7 +246,10 @@ fn is_safe_candidate(
             .is_some_and(|date| date >= start_date && date <= end_date)
         && item.dedupe_status != DedupeStatus::SuspectedDuplicate
         && item.final_category.is_some()
-        && item.amount_cents.is_some()
+        && item
+            .amount_cents
+            .is_some_and(|amount| validate_amount_cents(amount, "amountCents").is_ok())
+        && item.currency == "CNY"
         && item.suggested_period.is_some()
         && invoice_files_are_safe(paths, item)
 }

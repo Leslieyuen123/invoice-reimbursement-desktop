@@ -18,6 +18,7 @@ use crate::services::recognition::RecognitionService;
 
 const MAX_MESSAGES_PER_SYNC: usize = 1_000;
 const MAX_RANGE_SYNC_PAGES: usize = 64;
+const MAX_TOUCHED_ITEM_IDS: usize = MAX_MESSAGES_PER_SYNC * MAX_RANGE_SYNC_PAGES;
 const MAX_RAW_MESSAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_TOTAL_RAW_BYTES: usize = 200 * 1024 * 1024;
 const MAX_PARTS_PER_MESSAGE: usize = 256;
@@ -42,26 +43,90 @@ impl Default for ZipExpansionBudget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncResult {
     pub imported_count: u32,
-    pub(crate) touched_item_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SyncProgress {
+    pub(crate) imported_count: u32,
+    pub(crate) touched_item_ids: HashSet<Uuid>,
+}
+
+impl SyncProgress {
+    fn into_result(self) -> SyncResult {
+        SyncResult {
+            imported_count: self.imported_count,
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) -> Result<(), AppError> {
+        self.merge_with_limit(other, MAX_TOUCHED_ITEM_IDS)
+    }
+
+    fn merge_with_limit(&mut self, other: Self, limit: usize) -> Result<(), AppError> {
+        let imported_count = self
+            .imported_count
+            .checked_add(other.imported_count)
+            .ok_or_else(sync_import_count_overflow)?;
+        if self.touched_item_ids.len() > limit {
+            return Err(touched_item_limit_error());
+        }
+        let remaining = limit - self.touched_item_ids.len();
+        let new_unique_count = other
+            .touched_item_ids
+            .iter()
+            .filter(|id| !self.touched_item_ids.contains(id))
+            .take(remaining.saturating_add(1))
+            .count();
+        if new_unique_count > remaining {
+            return Err(touched_item_limit_error());
+        }
+
+        self.imported_count = imported_count;
+        self.touched_item_ids.extend(other.touched_item_ids);
+        Ok(())
+    }
+
+    fn record_item(&mut self, item_id: Uuid, imported: bool) -> Result<(), AppError> {
+        self.record_item_with_limit(item_id, imported, MAX_TOUCHED_ITEM_IDS)
+    }
+
+    fn record_item_with_limit(
+        &mut self,
+        item_id: Uuid,
+        imported: bool,
+        limit: usize,
+    ) -> Result<(), AppError> {
+        let imported_count = if imported {
+            self.imported_count
+                .checked_add(1)
+                .ok_or_else(sync_import_count_overflow)?
+        } else {
+            self.imported_count
+        };
+        if !self.touched_item_ids.contains(&item_id) && self.touched_item_ids.len() >= limit {
+            return Err(touched_item_limit_error());
+        }
+
+        self.imported_count = imported_count;
+        self.touched_item_ids.insert(item_id);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct RangeSyncFailure {
+pub(crate) struct SyncProgressFailure {
     pub(crate) error: AppError,
-    pub(crate) completed: SyncResult,
+    pub(crate) completed: SyncProgress,
 }
 
-impl RangeSyncFailure {
+impl SyncProgressFailure {
     fn empty(error: AppError) -> Self {
         Self {
             error,
-            completed: SyncResult {
-                imported_count: 0,
-                touched_item_ids: Vec::new(),
-            },
+            completed: SyncProgress::default(),
         }
     }
 }
@@ -163,6 +228,7 @@ impl SyncService {
     ) -> Result<SyncResult, AppError> {
         self.run_range_with_progress(account_id, start_date, end_date)
             .await
+            .map(SyncProgress::into_result)
             .map_err(|failure| failure.error)
     }
 
@@ -171,9 +237,9 @@ impl SyncService {
         account_id: Uuid,
         start_date: NaiveDate,
         end_date: NaiveDate,
-    ) -> Result<SyncResult, RangeSyncFailure> {
+    ) -> Result<SyncProgress, SyncProgressFailure> {
         if start_date > end_date {
-            return Err(RangeSyncFailure::empty(AppError::validation(
+            return Err(SyncProgressFailure::empty(AppError::validation(
                 "dateRange",
                 "IMAP start date must not be after end date",
             )));
@@ -183,14 +249,14 @@ impl SyncService {
             .ok_or_else(|| {
                 AppError::validation("dateRange", "IMAP end date is outside the supported range")
             })
-            .map_err(RangeSyncFailure::empty)?;
+            .map_err(SyncProgressFailure::empty)?;
         let range =
-            ImapDateRange::new(start_date, end_exclusive).map_err(RangeSyncFailure::empty)?;
+            ImapDateRange::new(start_date, end_exclusive).map_err(SyncProgressFailure::empty)?;
         let run = self
             .accounts
             .begin_sync_run(account_id)
             .await
-            .map_err(RangeSyncFailure::empty)?;
+            .map_err(SyncProgressFailure::empty)?;
         let account = match self.accounts.get(account_id).await {
             Ok(account) => account,
             Err(error) => {
@@ -198,8 +264,8 @@ impl SyncService {
                 self.accounts
                     .finish_sync_failure(&run, &sanitized)
                     .await
-                    .map_err(RangeSyncFailure::empty)?;
-                return Err(RangeSyncFailure::empty(sanitized_external_error(
+                    .map_err(SyncProgressFailure::empty)?;
+                return Err(SyncProgressFailure::empty(sanitized_external_error(
                     &error, sanitized,
                 )));
             }
@@ -211,15 +277,15 @@ impl SyncService {
                 self.accounts
                     .finish_sync_failure(&run, &error.to_string())
                     .await
-                    .map_err(RangeSyncFailure::empty)?;
-                return Err(RangeSyncFailure::empty(error));
+                    .map_err(SyncProgressFailure::empty)?;
+                return Err(SyncProgressFailure::empty(error));
             }
             Err(error) => {
                 self.accounts
                     .finish_sync_failure(&run, &error.to_string())
                     .await
-                    .map_err(RangeSyncFailure::empty)?;
-                return Err(RangeSyncFailure::empty(error));
+                    .map_err(SyncProgressFailure::empty)?;
+                return Err(SyncProgressFailure::empty(error));
             }
         };
         let config = ImapAccountConfig::from_account(&account);
@@ -237,12 +303,12 @@ impl SyncService {
                     if let Err(record_error) =
                         self.accounts.finish_sync_failure(&run, &sanitized).await
                     {
-                        return Err(RangeSyncFailure {
+                        return Err(SyncProgressFailure {
                             error: record_error,
                             completed: result,
                         });
                     }
-                    return Err(RangeSyncFailure {
+                    return Err(SyncProgressFailure {
                         error: sanitized_external_error(&error, sanitized),
                         completed: result,
                     });
@@ -250,16 +316,16 @@ impl SyncService {
                 Ok(result)
             }
             Err(failure) => {
-                let RangeSyncFailure { error, completed } = failure;
+                let SyncProgressFailure { error, completed } = failure;
                 let sanitized = sanitize_error(&error.to_string(), &secret);
                 if let Err(record_error) = self.accounts.finish_sync_failure(&run, &sanitized).await
                 {
-                    return Err(RangeSyncFailure {
+                    return Err(SyncProgressFailure {
                         error: record_error,
                         completed,
                     });
                 }
-                Err(RangeSyncFailure {
+                Err(SyncProgressFailure {
                     error: sanitized_external_error(&error, sanitized),
                     completed,
                 })
@@ -277,7 +343,11 @@ impl SyncService {
         let delta = self.gateway.fetch_since(config, secret, cursor).await?;
         validate_delta(&delta, &config.mailbox)?;
         let rescan = cursor.is_some_and(|cursor| cursor.uid_validity != delta.uid_validity);
-        let result = self.process_delta(account_id, &delta, rescan).await?;
+        let result = self
+            .process_delta(account_id, &delta, rescan)
+            .await
+            .map_err(|failure| failure.error)?
+            .into_result();
         Ok((
             result,
             SyncCursor {
@@ -293,19 +363,16 @@ impl SyncService {
         config: &ImapAccountConfig,
         secret: &str,
         range: ImapDateRange,
-    ) -> Result<SyncResult, RangeSyncFailure> {
+    ) -> Result<SyncProgress, SyncProgressFailure> {
         let mut cursor = None;
         let mut seen_cursors = HashSet::new();
         let mut page_count = 0_usize;
-        let mut imported_count = 0_u32;
-        let mut touched_item_ids = Vec::new();
-        let mut touched_item_id_set = HashSet::new();
+        let mut completed = SyncProgress::default();
         loop {
             if page_count >= MAX_RANGE_SYNC_PAGES {
-                return Err(range_sync_failure(
+                return Err(sync_progress_failure(
                     external_error("IMAP range scan exceeded page limit"),
-                    imported_count,
-                    touched_item_ids,
+                    completed,
                 ));
             }
             page_count += 1;
@@ -313,12 +380,9 @@ impl SyncService {
                 .gateway
                 .fetch_range(config, secret, cursor, range)
                 .await
-                .map_err(|error| {
-                    range_sync_failure(error, imported_count, touched_item_ids.clone())
-                })?;
-            validate_delta(&delta, &config.mailbox).map_err(|error| {
-                range_sync_failure(error, imported_count, touched_item_ids.clone())
-            })?;
+                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+            validate_delta(&delta, &config.mailbox)
+                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
             let next_cursor = SyncCursor {
                 uid_validity: delta.uid_validity,
                 last_uid: delta.highest_uid,
@@ -332,37 +396,30 @@ impl SyncService {
                             && next_cursor.last_uid < cursor.last_uid
                     }))
             {
-                return Err(range_sync_failure(
+                return Err(sync_progress_failure(
                     external_error("IMAP range scan did not make forward progress"),
-                    imported_count,
-                    touched_item_ids,
+                    completed,
                 ));
             }
-            let result = self
-                .process_delta(account_id, &delta, true)
-                .await
-                .map_err(|error| {
-                    range_sync_failure(error, imported_count, touched_item_ids.clone())
-                })?;
-            imported_count = imported_count
-                .checked_add(result.imported_count)
-                .ok_or_else(|| {
-                    range_sync_failure(
-                        sync_import_count_overflow(),
-                        imported_count,
-                        touched_item_ids.clone(),
-                    )
-                })?;
-            for id in result.touched_item_ids {
-                if touched_item_id_set.insert(id) {
-                    touched_item_ids.push(id);
+            match self.process_delta(account_id, &delta, true).await {
+                Ok(page) => {
+                    if let Err(error) = completed.merge(page) {
+                        return Err(sync_progress_failure(error, completed));
+                    }
+                }
+                Err(failure) => {
+                    let SyncProgressFailure {
+                        error,
+                        completed: page,
+                    } = failure;
+                    if let Err(merge_error) = completed.merge(page) {
+                        return Err(sync_progress_failure(merge_error, completed));
+                    }
+                    return Err(sync_progress_failure(error, completed));
                 }
             }
             if finished {
-                return Ok(SyncResult {
-                    imported_count,
-                    touched_item_ids,
-                });
+                return Ok(completed);
             }
             seen_cursors.insert(cursor_key);
             cursor = Some(next_cursor);
@@ -374,24 +431,20 @@ impl SyncService {
         account_id: Uuid,
         delta: &MailboxDelta,
         rescan: bool,
-    ) -> Result<SyncResult, AppError> {
-        let mut imported_count = 0_u32;
-        let mut touched_item_ids = Vec::new();
-        let mut touched_item_id_set = HashSet::new();
+    ) -> Result<SyncProgress, SyncProgressFailure> {
+        let mut completed = SyncProgress::default();
         for rejected in &delta.rejected_messages {
             let outcome = self
                 .import
                 .import_email_rejection(account_id, delta.uid_validity, rejected, rescan)
-                .await?;
-            track_import_outcome(
-                outcome,
-                &mut imported_count,
-                &mut touched_item_ids,
-                &mut touched_item_id_set,
-            )?;
+                .await
+                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+            track_import_outcome(outcome, &mut completed)
+                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
         }
         for raw_message in &delta.messages {
-            let parsed = parse_invoice_parts(raw_message)?;
+            let parsed = parse_invoice_parts(raw_message)
+                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
             for part in parsed.files {
                 let outcome = self
                     .import
@@ -409,19 +462,16 @@ impl SyncService {
                             rescan,
                         },
                     )
-                    .await?;
-                let item = track_import_outcome(
-                    outcome,
-                    &mut imported_count,
-                    &mut touched_item_ids,
-                    &mut touched_item_id_set,
-                )?;
+                    .await
+                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+                let item = track_import_outcome(outcome, &mut completed)
+                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
                 if item.recognition_status == RecognitionStatus::Pending
                     && item.confirmation_status == ConfirmationStatus::Pending
                     && let Err(error) = self.recognition.recognize_item(item.id).await
                     && !is_document_recognition_failure(&error)
                 {
-                    return Err(error);
+                    return Err(sync_progress_failure(error, completed));
                 }
             }
             for link in parsed.links {
@@ -440,60 +490,44 @@ impl SyncService {
                             rescan,
                         },
                     )
-                    .await?;
-                track_import_outcome(
-                    outcome,
-                    &mut imported_count,
-                    &mut touched_item_ids,
-                    &mut touched_item_id_set,
-                )?;
+                    .await
+                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+                track_import_outcome(outcome, &mut completed)
+                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
             }
         }
-        Ok(SyncResult {
-            imported_count,
-            touched_item_ids,
-        })
+        Ok(completed)
     }
 }
 
-fn range_sync_failure(
-    error: AppError,
-    imported_count: u32,
-    touched_item_ids: Vec<Uuid>,
-) -> RangeSyncFailure {
-    RangeSyncFailure {
-        error,
-        completed: SyncResult {
-            imported_count,
-            touched_item_ids,
-        },
-    }
+fn sync_progress_failure(error: AppError, completed: SyncProgress) -> SyncProgressFailure {
+    SyncProgressFailure { error, completed }
 }
 
 fn track_import_outcome(
     outcome: ImportOutcome,
-    imported_count: &mut u32,
-    touched_item_ids: &mut Vec<Uuid>,
-    touched_item_id_set: &mut HashSet<Uuid>,
+    completed: &mut SyncProgress,
 ) -> Result<crate::db::items::InvoiceItem, AppError> {
-    let item = match outcome {
-        ImportOutcome::New(item) => {
-            *imported_count = imported_count
-                .checked_add(1)
-                .ok_or_else(sync_import_count_overflow)?;
-            item
-        }
-        ImportOutcome::Existing(item) => item,
+    let (item, imported) = match outcome {
+        ImportOutcome::New(item) => (item, true),
+        ImportOutcome::Existing(item) => (item, false),
     };
-    if touched_item_id_set.insert(item.id) {
-        touched_item_ids.push(item.id);
-    }
+    completed.record_item(item.id, imported)?;
     Ok(item)
 }
 
 fn sync_import_count_overflow() -> AppError {
     AppError::Internal {
         message: "sync import count overflow".to_owned(),
+    }
+}
+
+fn touched_item_limit_error() -> AppError {
+    AppError::External {
+        service: "imap".to_owned(),
+        retryable: true,
+        message: "IMAP sync touched-item limit exceeded; retry with a narrower date range"
+            .to_owned(),
     }
 }
 
@@ -923,13 +957,15 @@ mod tests {
     use std::io::{Cursor, Write};
 
     use chrono::Utc;
+    use uuid::Uuid;
     use zip::write::SimpleFileOptions;
 
     use super::{
-        InvoicePart, MAX_MESSAGES_PER_SYNC, ZipExpansionBudget, expand_zip_part,
+        InvoicePart, MAX_MESSAGES_PER_SYNC, SyncProgress, ZipExpansionBudget, expand_zip_part,
         parse_invoice_parts, parse_invoice_parts_with_zip_budget, preflight_zip_entries,
         validate_delta,
     };
+    use crate::domain::error::AppError;
     use crate::infra::imap::{MailboxDelta, MessageRejectionReason, RawMessage, RejectedMessage};
 
     fn rejected_message(uid: u32) -> RejectedMessage {
@@ -1030,6 +1066,58 @@ mod tests {
         let error = validate_delta(&delta, "INBOX").unwrap_err();
 
         assert!(error.to_string().contains("too many messages"));
+    }
+
+    #[test]
+    fn touched_item_limit_preserves_progress_completed_before_overflow() {
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let mut completed = SyncProgress {
+            imported_count: 1,
+            touched_item_ids: [first_id].into_iter().collect(),
+        };
+        let before_overflow = completed.clone();
+        let next = SyncProgress {
+            imported_count: 1,
+            touched_item_ids: [second_id].into_iter().collect(),
+        };
+
+        let error = completed.merge_with_limit(next, 1).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::External {
+                ref service,
+                retryable: true,
+                ref message,
+            } if service == "imap" && message.contains("narrower date range")
+        ));
+        assert_eq!(completed, before_overflow);
+    }
+
+    #[test]
+    fn touched_item_limit_preserves_page_progress_before_record_overflow() {
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let mut completed = SyncProgress {
+            imported_count: 1,
+            touched_item_ids: [first_id].into_iter().collect(),
+        };
+        let before_overflow = completed.clone();
+
+        let error = completed
+            .record_item_with_limit(second_id, true, 1)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::External {
+                ref service,
+                retryable: true,
+                ref message,
+            } if service == "imap" && message.contains("narrower date range")
+        ));
+        assert_eq!(completed, before_overflow);
     }
 
     #[test]

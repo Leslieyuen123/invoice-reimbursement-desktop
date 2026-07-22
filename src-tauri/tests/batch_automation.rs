@@ -11,6 +11,7 @@ use invoice_reimbursement::db::accounts::{
     MailboxAccount, MailboxAccountRepository, MailboxProvider, NewMailboxAccount, SyncCursor,
 };
 use invoice_reimbursement::db::items::{ItemFilter, ItemRepository, NewItemRecord};
+use invoice_reimbursement::domain::amount::MAX_SAFE_AMOUNT_CENTS;
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType,
@@ -330,6 +331,127 @@ async fn missing_or_unmanaged_invoice_files_remain_exceptions_without_blocking_t
 }
 
 #[tokio::test]
+async fn only_cny_candidates_with_valid_amounts_are_assigned_and_exported() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    gateway.queue("a@example.com", completed_scan(Vec::new()));
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[]))).await;
+    harness.add_account("a@example.com", true).await;
+    let batch = harness.may_batch().await;
+    let repository = ItemRepository::new(harness.pool.clone());
+    let valid_id = uuid::Uuid::new_v4();
+    let foreign_currency_id = uuid::Uuid::new_v4();
+    let negative_id = uuid::Uuid::new_v4();
+    let excessive_id = uuid::Uuid::new_v4();
+
+    for (id, currency) in [
+        (valid_id, "CNY"),
+        (foreign_currency_id, "USD"),
+        (negative_id, "CNY"),
+        (excessive_id, "CNY"),
+    ] {
+        let mut item = ready_item(&harness.paths, id);
+        item.currency = currency.to_owned();
+        let original_bytes = format!("managed original {id}");
+        item.sha256 = format!("{:x}", Sha256::digest(original_bytes.as_bytes()));
+        fs::write(&item.original_path, original_bytes).unwrap();
+        fs::write(
+            item.normalized_pdf_path.as_deref().unwrap(),
+            include_bytes!("fixtures/text-invoice.pdf"),
+        )
+        .unwrap();
+        repository.insert(&item).await.unwrap();
+    }
+
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE items SET amount_cents = -1 WHERE id = ?")
+        .bind(negative_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE items SET amount_cents = ? WHERE id = ?")
+        .bind(MAX_SAFE_AMOUNT_CENTS + 1)
+        .bind(excessive_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+    let result = harness
+        .state
+        .batch_automation_service()
+        .run(batch.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.assigned_count, 1);
+    assert_eq!(result.exception_count, 3);
+    assert_eq!(result.export.unwrap().item_count, 1);
+    let items = repository
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.id == valid_id)
+            .unwrap()
+            .batch_id,
+        Some(batch.id)
+    );
+    for id in [foreign_currency_id, negative_id, excessive_id] {
+        assert!(
+            items
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap()
+                .batch_id
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn candidate_pagination_classifies_rows_after_the_first_two_hundred() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    gateway.queue("a@example.com", completed_scan(Vec::new()));
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[]))).await;
+    harness.add_account("a@example.com", true).await;
+    let batch = harness.may_batch().await;
+    let repository = ItemRepository::new(harness.pool.clone());
+    for _ in 0..201 {
+        repository
+            .insert(&ready_item(&harness.paths, uuid::Uuid::new_v4()))
+            .await
+            .unwrap();
+    }
+
+    let result = harness
+        .state
+        .batch_automation_service()
+        .run(batch.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.assigned_count, 0);
+    assert_eq!(result.exception_count, 201);
+    assert!(result.export.is_none());
+    assert!(
+        BatchService::new(harness.pool)
+            .get(batch.id)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn one_account_failure_does_not_block_successful_accounts_or_export() {
     let gateway = Arc::new(FakeRangeGateway::default());
     gateway.queue(
@@ -467,6 +589,55 @@ async fn later_page_failure_keeps_completed_range_progress_for_exception_classif
             .batch_id
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn later_message_failure_keeps_completed_progress_from_the_same_page() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    gateway.queue(
+        "a@example.com",
+        vec![Ok(MailboxDelta {
+            uid_validity: 1,
+            messages: vec![
+                raw_message(1, include_bytes!("fixtures/mail/attachment.eml")),
+                raw_message(2, b""),
+            ],
+            rejected_messages: Vec::new(),
+            highest_uid: 2,
+        })],
+    );
+    let harness = Harness::new(
+        gateway,
+        Arc::new(SequenceExtractor::new(&[INCOMPLETE_TEXT])),
+    )
+    .await;
+    let failed_account = harness.add_account("a@example.com", true).await;
+    let batch = harness.may_batch().await;
+
+    let result = harness
+        .state
+        .batch_automation_service()
+        .run(batch.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.failed_accounts.len(), 1);
+    assert_eq!(result.failed_accounts[0].account_id, failed_account.id);
+    assert!(
+        result.failed_accounts[0]
+            .message
+            .contains("could not be parsed")
+    );
+    assert_eq!(result.imported_count, 1);
+    assert_eq!(result.assigned_count, 0);
+    assert_eq!(result.exception_count, 1);
+    assert!(result.export.is_none());
+    let items = ItemRepository::new(harness.pool)
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].batch_id.is_none());
 }
 
 #[tokio::test]
