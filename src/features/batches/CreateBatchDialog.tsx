@@ -55,6 +55,7 @@ export function CreateBatchDialog() {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [note, setNote] = useState("");
+  const [automate, setAutomate] = useState(true);
   useEffect(() => {
     viewActive.current = true;
     return () => {
@@ -76,7 +77,10 @@ export function CreateBatchDialog() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.batchLists });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
       if (viewActive.current) {
-        navigate(`/batches/${batch.id}`, { replace: true });
+        navigate(`/batches/${batch.id}`, {
+          replace: true,
+          ...(automate ? { state: { runAutomation: true } } : {}),
+        });
       }
     },
   });
@@ -190,6 +194,20 @@ export function CreateBatchDialog() {
           </div>
         ) : null}
 
+        <label className="batch-automation-option">
+          <input
+            type="checkbox"
+            aria-label="创建后自动处理并导出"
+            checked={automate}
+            disabled={createMutation.isPending}
+            onChange={(event) => setAutomate(event.target.checked)}
+          />
+          <span>
+            <strong>创建后自动处理并导出</strong>
+            <small>同步邮箱、纳入安全票据并生成报销包</small>
+          </span>
+        </label>
+
         <div className="batch-form-actions">
           <button
             type="button"
@@ -204,7 +222,11 @@ export function CreateBatchDialog() {
             disabled={createMutation.isPending}
           >
             <CalendarRange size={16} strokeWidth={1.7} aria-hidden="true" />
-            {createMutation.isPending ? "正在创建" : "创建批次"}
+            {createMutation.isPending
+              ? "正在创建"
+              : automate
+                ? "创建并自动处理"
+                : "创建批次"}
           </button>
         </div>
       </form>

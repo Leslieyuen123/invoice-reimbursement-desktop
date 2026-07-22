@@ -1,23 +1,27 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { join } from "@tauri-apps/api/path";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   CircleAlert,
+  CircleCheck,
   FileArchive,
   FolderOpen,
+  LoaderCircle,
   PackagePlus,
   RefreshCw,
+  Sparkles,
   SlidersHorizontal,
   Trash2,
 } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { formatAmountCents } from "../../lib/amount";
 import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
 import type {
   AppError,
+  BatchAutomationResultDto,
   BatchDetailDto,
   Category,
   CursorDto,
@@ -60,6 +64,12 @@ const statusLabels: Record<ItemStatus, string> = {
   ready: "可纳入批次",
 };
 
+type AutomationFeedback =
+  | { status: "idle" }
+  | { status: "pending" }
+  | { status: "success"; result: BatchAutomationResultDto }
+  | { status: "error"; message: string };
+
 function categoryLabel(category: Category | null) {
   return category ? categoryLabels[category] : "待分类";
 }
@@ -76,10 +86,34 @@ function errorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
+function automationErrorMessage(error: unknown) {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    ["validation", "not_found", "conflict", "external", "internal"].includes(
+      String(error.code),
+    ) &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    return (error as AppError).message;
+  }
+  return "自动处理失败，请稍后重试";
+}
+
 export function BatchDetailPage() {
   const { batchId = "" } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const routeSession = useRef(0);
+  const viewActive = useRef(false);
+  const activeBatchId = useRef(batchId);
+  const consumedAutomationLocations = useRef(new Set<string>());
+  const runAutomationRef = useRef<(operationBatchId: string) => void>(() => undefined);
+  const [automationFeedback, setAutomationFeedback] =
+    useState<AutomationFeedback>({ status: "idle" });
   const [recommendPending, setRecommendPending] = useState(false);
   const [recommendError, setRecommendError] = useState<string | null>(null);
   const [exportPending, setExportPending] = useState(false);
@@ -102,6 +136,10 @@ export function BatchDetailPage() {
   } | null>(null);
   const [removePending, setRemovePending] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
+  const automationMutation = useMutation({
+    mutationFn: (operationBatchId: string) =>
+      api.runBatchAutomation(operationBatchId),
+  });
   const batchQuery = useQuery({
     queryKey: queryKeys.batch(batchId),
     queryFn: () => api.getBatch(batchId),
@@ -115,7 +153,10 @@ export function BatchDetailPage() {
   });
 
   useEffect(() => {
+    viewActive.current = true;
+    activeBatchId.current = batchId;
     routeSession.current += 1;
+    setAutomationFeedback({ status: "idle" });
     setRecommendPending(false);
     setRecommendError(null);
     setExportPending(false);
@@ -128,6 +169,8 @@ export function BatchDetailPage() {
     setRemovePending(false);
     setRemoveError(null);
     return () => {
+      viewActive.current = false;
+      activeBatchId.current = "";
       routeSession.current += 1;
     };
   }, [batchId]);
@@ -168,6 +211,55 @@ export function BatchDetailPage() {
       (revision = 0) => revision + 1,
     );
   }
+
+  async function runAutomation(operationBatchId: string) {
+    const session = routeSession.current;
+    setAutomationFeedback({ status: "pending" });
+    try {
+      const result = await automationMutation.mutateAsync(operationBatchId);
+      reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
+      if (
+        viewActive.current &&
+        activeBatchId.current === operationBatchId &&
+        session === routeSession.current
+      ) {
+        setAutomationFeedback({ status: "success", result });
+      }
+    } catch (error) {
+      if (
+        viewActive.current &&
+        activeBatchId.current === operationBatchId &&
+        session === routeSession.current
+      ) {
+        setAutomationFeedback({
+          status: "error",
+          message: automationErrorMessage(error),
+        });
+      }
+    }
+  }
+
+  runAutomationRef.current = (operationBatchId: string) => {
+    void runAutomation(operationBatchId);
+  };
+
+  useEffect(() => {
+    const routeState = location.state as { runAutomation?: unknown } | null;
+    if (routeState?.runAutomation !== true) return;
+    if (consumedAutomationLocations.current.has(location.key)) return;
+    consumedAutomationLocations.current.add(location.key);
+    const operationBatchId = batchId;
+    navigate(location.pathname, { replace: true, state: null });
+    queueMicrotask(() => {
+      if (
+        viewActive.current &&
+        activeBatchId.current === operationBatchId
+      ) {
+        runAutomationRef.current(operationBatchId);
+      }
+    });
+  }, [batchId, location.key, location.pathname, location.state, navigate]);
 
   async function assignRecommendations() {
     const session = routeSession.current;
@@ -424,6 +516,86 @@ export function BatchDetailPage() {
       {recommendError ? (
         <div className="batch-inline-error" role="alert">{recommendError}</div>
       ) : null}
+
+      <section
+        className={`batch-automation-strip is-${automationFeedback.status}`}
+        aria-labelledby="batch-automation-title"
+      >
+        {automationFeedback.status === "idle" ? (
+          <div className="batch-automation-copy">
+            <div className="batch-automation-title">
+              <Sparkles size={17} strokeWidth={1.7} aria-hidden="true" />
+              <h2 id="batch-automation-title">自动处理</h2>
+            </div>
+            <p>同步该日期范围的邮箱票据，纳入安全项并生成报销包。</p>
+          </div>
+        ) : automationFeedback.status === "pending" ? (
+          <div
+            className="batch-automation-copy"
+            role="status"
+            aria-label="正在自动处理批次"
+          >
+            <div className="batch-automation-title">
+              <LoaderCircle
+                className="batch-automation-spinner"
+                size={17}
+                strokeWidth={1.7}
+                aria-hidden="true"
+              />
+              <h2 id="batch-automation-title">正在自动处理</h2>
+            </div>
+            <p>正在同步邮箱、整理票据并准备导出。</p>
+          </div>
+        ) : automationFeedback.status === "success" ? (
+          <div className="batch-automation-copy">
+            <div className="batch-automation-title">
+              <CircleCheck size={17} strokeWidth={1.7} aria-hidden="true" />
+              <h2 id="batch-automation-title">自动处理完成</h2>
+            </div>
+            <ul className="batch-automation-counts">
+              <li>{automationFeedback.result.importedCount} 张新导入</li>
+              <li>{automationFeedback.result.assignedCount} 张已自动纳入</li>
+              <li>{automationFeedback.result.exceptionCount} 个异常项</li>
+              <li>{automationFeedback.result.failedAccounts.length} 个邮箱失败</li>
+            </ul>
+            {automationFeedback.result.export ? (
+              <p className="batch-automation-directory">
+                <span>导出目录</span>
+                <code>{automationFeedback.result.export.directory}</code>
+              </p>
+            ) : (
+              <p className="batch-automation-empty">
+                没有可导出的票据，本次未生成报销包
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="batch-automation-copy" role="alert">
+            <div className="batch-automation-title">
+              <CircleAlert size={17} strokeWidth={1.7} aria-hidden="true" />
+              <h2 id="batch-automation-title">自动处理未完成</h2>
+            </div>
+            <p>{automationFeedback.message}</p>
+          </div>
+        )}
+        <div className="batch-automation-action">
+          <button
+            type="button"
+            className="button button-secondary"
+            disabled={automationFeedback.status === "pending"}
+            onClick={() => void runAutomation(batchId)}
+          >
+            <Sparkles size={15} strokeWidth={1.7} aria-hidden="true" />
+            {automationFeedback.status === "pending"
+              ? "正在自动处理"
+              : automationFeedback.status === "error"
+                ? "重试自动处理"
+                : automationFeedback.status === "success"
+                  ? "再次自动处理"
+                  : "一键自动处理"}
+          </button>
+        </div>
+      </section>
 
       <div className="batch-summary-strip">
         <div>

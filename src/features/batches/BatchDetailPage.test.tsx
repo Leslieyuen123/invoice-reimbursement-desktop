@@ -17,6 +17,7 @@ import {
   resetMockApi,
 } from "../../test/mockApi";
 import type {
+  BatchAutomationResultDto,
   BatchCandidateDto,
   BatchDetailDto,
   BatchDto,
@@ -106,6 +107,24 @@ function candidateFixture(
     outsideBatchRange: false,
     eligible: true,
     disabledReason: null,
+    ...overrides,
+  };
+}
+
+function automationFixture(
+  overrides: Partial<BatchAutomationResultDto> = {},
+): BatchAutomationResultDto {
+  return {
+    scannedAccountCount: 1,
+    failedAccounts: [],
+    importedCount: 1,
+    assignedCount: 1,
+    exceptionCount: 0,
+    export: {
+      directory: "/Users/finance/2026-5",
+      itemCount: 1,
+      totalAmountCents: 12_850,
+    },
     ...overrides,
   };
 }
@@ -208,12 +227,264 @@ describe("Batch workspace", () => {
     await user.type(screen.getByLabelText("批次名称"), "6-8 月整理批次");
     await user.type(screen.getByLabelText("开始日期"), "2026-06-01");
     await user.type(screen.getByLabelText("结束日期"), "2026-08-31");
+    await user.click(
+      screen.getByRole("checkbox", { name: "创建后自动处理并导出" }),
+    );
     await user.click(screen.getByRole("button", { name: "创建批次" }));
     expect(commandCalls("create_custom_batch")[0].endDate).toBe("2026-08-31");
     await screen.findByRole("button", { name: "加入推荐票据" });
     await user.click(screen.getByRole("button", { name: "加入推荐票据" }));
     await user.click(screen.getByRole("button", { name: "导出报销包" }));
     expect(await screen.findByText(/merged\.pdf/)).toBeInTheDocument();
+  });
+
+  it("automatically processes and exports a newly created monthly batch", async () => {
+    const user = userEvent.setup();
+    const created = batchFixture({
+      id: "batch-may",
+      name: "2026 年 5 月报销",
+      startDate: "2026-05-01",
+      endDate: "2026-05-31",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("create_month_batch", created);
+    mockCommand("get_batch", { ...detailFixture(), batch: created });
+    mockCommand("run_batch_automation", automationFixture());
+
+    renderAppAt("/batches/new");
+
+    expect(
+      screen.getByRole("checkbox", { name: "创建后自动处理并导出" }),
+    ).toBeChecked();
+    await user.clear(screen.getByLabelText("年份"));
+    await user.type(screen.getByLabelText("年份"), "2026");
+    await user.selectOptions(screen.getByLabelText("月份"), "5");
+    await user.click(screen.getByRole("button", { name: "创建并自动处理" }));
+
+    expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
+    expect(commandCalls("create_month_batch")).toEqual([
+      { year: 2026, month: 5 },
+    ]);
+    expect(commandCalls("run_batch_automation")).toEqual([
+      { batchId: "batch-may" },
+    ]);
+    expect(screen.getByText("1 张已自动纳入")).toBeInTheDocument();
+  });
+
+  it("creates without automation when the create toggle is off", async () => {
+    const user = userEvent.setup();
+    const created = batchFixture({ id: "batch-manual" });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("create_month_batch", created);
+    mockCommand("get_batch", { ...detailFixture(), batch: created });
+    mockCommand("run_batch_automation", automationFixture());
+
+    renderAppAt("/batches/new");
+    await user.click(
+      screen.getByRole("checkbox", { name: "创建后自动处理并导出" }),
+    );
+    await user.click(screen.getByRole("button", { name: "创建批次" }));
+
+    expect(
+      await screen.findByRole("button", { name: "一键自动处理" }),
+    ).toBeEnabled();
+    expect(commandCalls("create_month_batch")).toHaveLength(1);
+    expect(commandCalls("run_batch_automation")).toHaveLength(0);
+  });
+
+  it("shows stable pending feedback and a complete automation summary", async () => {
+    const user = userEvent.setup();
+    const automation = deferred<BatchAutomationResultDto>();
+    mockDetail(detailFixture());
+    mockCommand("run_batch_automation", automation.promise);
+
+    renderAppAt("/batches/batch-summer");
+
+    const start = await screen.findByRole("button", { name: "一键自动处理" });
+    expect(start).toBeEnabled();
+    await user.click(start);
+    expect(
+      screen.getByRole("status", { name: "正在自动处理批次" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "正在自动处理" }),
+    ).toBeDisabled();
+
+    await act(async () => {
+      automation.resolve(
+        automationFixture({
+          exceptionCount: 2,
+          failedAccounts: [
+            {
+              accountId: "account-failed",
+              email: "failed@example.com",
+              message: "邮箱连接超时",
+            },
+          ],
+          export: {
+            directory: "/Users/finance/a/very/long/export/path/2026-05",
+            itemCount: 1,
+            totalAmountCents: 12_850,
+          },
+        }),
+      );
+    });
+
+    expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
+    expect(screen.getByText("1 张新导入")).toBeInTheDocument();
+    expect(screen.getByText("1 张已自动纳入")).toBeInTheDocument();
+    expect(screen.getByText("2 个异常项")).toBeInTheDocument();
+    expect(screen.getByText("1 个邮箱失败")).toBeInTheDocument();
+    expect(
+      screen.getByText("/Users/finance/a/very/long/export/path/2026-05"),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(commandCalls("get_batch").length).toBeGreaterThan(1));
+  });
+
+  it("keeps the batch mounted and succeeds when automation is retried", async () => {
+    const user = userEvent.setup();
+    let attempt = 0;
+    mockDetail(detailFixture());
+    mockCommand("run_batch_automation", () => {
+      attempt += 1;
+      return attempt === 1
+        ? Promise.reject({
+            code: "external",
+            service: "mailbox",
+            retryable: true,
+            message: "邮箱同步暂时失败",
+          })
+        : automationFixture({ export: null });
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "邮箱同步暂时失败",
+    );
+    expect(
+      screen.getByRole("heading", { name: "6-8 月整理批次" }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试自动处理" }));
+
+    expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
+    expect(screen.getByText("没有可导出的票据，本次未生成报销包")).toBeInTheDocument();
+    expect(commandCalls("run_batch_automation")).toHaveLength(2);
+  });
+
+  it("does not recreate a batch when its automatic start fails", async () => {
+    const user = userEvent.setup();
+    const created = batchFixture({ id: "batch-auto-failed" });
+    let automationAttempt = 0;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("create_month_batch", created);
+    mockCommand("get_batch", { ...detailFixture(), batch: created });
+    mockCommand("run_batch_automation", () => {
+      automationAttempt += 1;
+      return automationAttempt === 1
+        ? Promise.reject({ code: "conflict", message: "自动处理已在运行" })
+        : automationFixture();
+    });
+
+    renderAppAt("/batches/new");
+    await user.click(screen.getByRole("button", { name: "创建并自动处理" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("自动处理已在运行");
+    expect(
+      screen.getByRole("heading", { name: "6-8 月整理批次" }),
+    ).toBeInTheDocument();
+    expect(commandCalls("create_month_batch")).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "重试自动处理" }));
+    expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
+    expect(commandCalls("create_month_batch")).toHaveLength(1);
+    expect(commandCalls("run_batch_automation")).toHaveLength(2);
+  });
+
+  it("consumes automatic route state once under StrictMode", async () => {
+    const user = userEvent.setup();
+    const automation = deferred<BatchAutomationResultDto>();
+    const created = batchFixture({ id: "batch-strict" });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("create_month_batch", created);
+    mockCommand("get_batch", { ...detailFixture(), batch: created });
+    mockCommand("run_batch_automation", automation.promise);
+
+    const view = renderStrictAppAt("/batches/new");
+    await user.click(screen.getByRole("button", { name: "创建并自动处理" }));
+    await waitFor(() => expect(commandCalls("run_batch_automation")).toHaveLength(1));
+    expect(window.history.state.usr).toBeNull();
+
+    view.rerender(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+    expect(commandCalls("run_batch_automation")).toHaveLength(1);
+    await act(async () => automation.resolve(automationFixture()));
+    expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
+  });
+
+  it("ignores a late automation result after switching batch routes", async () => {
+    const user = userEvent.setup();
+    const first = deferred<BatchAutomationResultDto>();
+    const second = deferred<BatchAutomationResultDto>();
+    const otherDetail = {
+      ...detailFixture(),
+      batch: batchFixture({ id: "batch-other", name: "其他批次" }),
+    };
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", (arguments_) =>
+      (arguments_ as { batchId: string }).batchId === "batch-other"
+        ? otherDetail
+        : detailFixture(),
+    );
+    mockCommand("run_batch_automation", (arguments_) =>
+      (arguments_ as { batchId: string }).batchId === "batch-other"
+        ? second.promise
+        : first.promise,
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+    await act(async () => {
+      window.history.pushState({}, "", "/batches/batch-other");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(await screen.findByRole("heading", { name: "其他批次" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "一键自动处理" }));
+
+    await act(async () => first.resolve(automationFixture({ importedCount: 77 })));
+    expect(
+      screen.getByRole("status", { name: "正在自动处理批次" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("77 张新导入")).not.toBeInTheDocument();
+    await act(async () => second.resolve(automationFixture({ importedCount: 2 })));
+    expect(await screen.findByText("2 张新导入")).toBeInTheDocument();
+  });
+
+  it("ignores a late automation result after the detail page unmounts", async () => {
+    const user = userEvent.setup();
+    const automation = deferred<BatchAutomationResultDto>();
+    const other = batchFixture({ id: "batch-other", name: "其他批次" });
+    mockDetail(detailFixture());
+    mockCommand("run_batch_automation", automation.promise);
+    mockCommand("list_batches", { items: [other], nextCursor: null });
+    mockCommand("get_batch", (arguments_) =>
+      (arguments_ as { batchId: string }).batchId === "batch-other"
+        ? { ...detailFixture(), batch: other }
+        : detailFixture(),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+    await user.click(screen.getByText("报销批次", { selector: ".batch-back-link" }));
+    await user.click(await screen.findByRole("link", { name: /其他批次/ }));
+    await act(async () => automation.resolve(automationFixture({ importedCount: 88 })));
+
+    expect(screen.getByRole("heading", { name: "其他批次" })).toBeInTheDocument();
+    expect(screen.queryByText("88 张新导入")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "一键自动处理" })).toBeEnabled();
   });
 
   it("continues recommendations after a disabled-only candidate page", async () => {
@@ -292,6 +563,9 @@ describe("Batch workspace", () => {
     expect(screen.getByRole("radio", { name: "按月" })).toBeChecked();
     expect(screen.getByLabelText("年份")).toHaveValue(now.getFullYear());
     expect(screen.getByLabelText("月份")).toHaveValue(String(now.getMonth() + 1));
+    await user.click(
+      screen.getByRole("checkbox", { name: "创建后自动处理并导出" }),
+    );
     await user.click(screen.getByRole("button", { name: "创建批次" }));
 
     await waitFor(() => {
@@ -314,6 +588,9 @@ describe("Batch workspace", () => {
     }));
 
     renderAppAt("/batches/new");
+    await user.click(
+      screen.getByRole("checkbox", { name: "创建后自动处理并导出" }),
+    );
     await user.click(screen.getByRole("button", { name: "创建批次" }));
     await user.click(screen.getByRole("button", { name: "取消" }));
     expect(await screen.findByRole("heading", { name: "报销批次" })).toBeInTheDocument();
