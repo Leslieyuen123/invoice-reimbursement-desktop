@@ -592,7 +592,7 @@ async fn later_page_failure_keeps_completed_range_progress_for_exception_classif
 }
 
 #[tokio::test]
-async fn later_message_failure_keeps_completed_progress_from_the_same_page() {
+async fn later_message_failure_returns_error_and_keeps_completed_progress() {
     let gateway = Arc::new(FakeRangeGateway::default());
     gateway.queue(
         "a@example.com",
@@ -614,30 +614,45 @@ async fn later_message_failure_keeps_completed_progress_from_the_same_page() {
     let failed_account = harness.add_account("a@example.com", true).await;
     let batch = harness.may_batch().await;
 
-    let result = harness
+    let error = harness
         .state
         .batch_automation_service()
         .run(batch.id)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.failed_accounts.len(), 1);
-    assert_eq!(result.failed_accounts[0].account_id, failed_account.id);
-    assert!(
-        result.failed_accounts[0]
-            .message
-            .contains("could not be parsed")
+    assert_eq!(
+        error,
+        AppError::External {
+            service: "mailbox".to_owned(),
+            retryable: true,
+            message: "所有已启用邮箱同步失败，请检查网络和邮箱授权后重试".to_owned(),
+        }
     );
-    assert_eq!(result.imported_count, 1);
-    assert_eq!(result.assigned_count, 0);
-    assert_eq!(result.exception_count, 1);
-    assert!(result.export.is_none());
-    let items = ItemRepository::new(harness.pool)
+    let sync_run = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, error_message FROM sync_runs WHERE account_id = ?",
+    )
+    .bind(failed_account.id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(sync_run.0, "failed");
+    assert!(sync_run.1.unwrap().contains("could not be parsed"));
+    let items = ItemRepository::new(harness.pool.clone())
         .list_bounded_for_tests(ItemFilter::default())
         .await
         .unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].batch_id.is_none());
+    assert_eq!(items[0].confirmation_status, ConfirmationStatus::Pending);
+    assert!(
+        BatchService::new(harness.pool)
+            .get(batch.id)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -762,7 +777,7 @@ async fn all_failed_accounts_with_no_items_return_failures_without_export() {
         vec![Err(AppError::External {
             service: "imap".to_owned(),
             retryable: true,
-            message: "range scan failed".to_owned(),
+            message: "range scan failed with secret-a@example.com\n\u{0000}control".to_owned(),
         })],
     );
     let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[]))).await;
@@ -777,20 +792,42 @@ async fn all_failed_accounts_with_no_items_return_failures_without_export() {
         .await
         .unwrap();
 
-    let result = harness
+    let error = harness
         .state
         .batch_automation_service()
         .run(batch.id)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.scanned_account_count, 1);
-    assert_eq!(result.failed_accounts.len(), 1);
-    assert_eq!(result.failed_accounts[0].account_id, account.id);
-    assert_eq!(result.imported_count, 0);
-    assert_eq!(result.assigned_count, 0);
-    assert_eq!(result.exception_count, 0);
-    assert!(result.export.is_none());
+    assert_eq!(
+        error,
+        AppError::External {
+            service: "mailbox".to_owned(),
+            retryable: true,
+            message: "所有已启用邮箱同步失败，请检查网络和邮箱授权后重试".to_owned(),
+        }
+    );
+    assert!(!error.to_string().contains("secret-a@example.com"));
+    assert!(!error.to_string().chars().any(char::is_control));
+    let sync_run = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, error_message FROM sync_runs WHERE account_id = ?",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(sync_run.0, "failed");
+    let recorded_message = sync_run.1.unwrap();
+    assert!(!recorded_message.contains("secret-a@example.com"));
+    assert!(!recorded_message.chars().any(char::is_control));
+    assert!(
+        BatchService::new(harness.pool)
+            .get(batch.id)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }
 
 #[tokio::test]

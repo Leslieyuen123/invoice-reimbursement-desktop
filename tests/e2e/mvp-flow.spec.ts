@@ -374,7 +374,10 @@ test("automated May batch failure remains retryable", async ({ page }, testInfo)
     page.getByRole("status", { name: "正在自动处理批次" }),
   ).toBeVisible();
   const failure = page.getByRole("alert").filter({ hasText: "自动处理未完成" });
-  await expect(failure).toContainText("Simulated browser command failure");
+  await expect(failure).toContainText(
+    "所有已启用邮箱同步失败，请检查网络和邮箱授权后重试",
+  );
+  await expect(page.getByText("自动处理完成")).not.toBeVisible();
   await auditCurrentView(page);
   await attachView(page, testInfo, "automated-may-batch-failure");
 

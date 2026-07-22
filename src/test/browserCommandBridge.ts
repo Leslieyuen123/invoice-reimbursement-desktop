@@ -730,6 +730,14 @@ export function createBrowserCommandBridge(
       options.failCommands?.has(command) ||
       remainingFailOnceCommands.delete(command)
     ) {
+      if (command === API_COMMANDS.runBatchAutomation) {
+        throw {
+          code: "external",
+          service: "mailbox",
+          retryable: true,
+          message: "所有已启用邮箱同步失败，请检查网络和邮箱授权后重试",
+        } satisfies AppError;
+      }
       throw {
         code: "external",
         service: "browser_bridge",

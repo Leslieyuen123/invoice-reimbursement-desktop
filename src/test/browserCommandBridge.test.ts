@@ -280,7 +280,9 @@ describe("browser command bridge", () => {
       bridge("run_batch_automation", { batchId: "batch-may" }),
     ).rejects.toMatchObject({
       code: "external",
+      service: "mailbox",
       retryable: true,
+      message: "所有已启用邮箱同步失败，请检查网络和邮箱授权后重试",
     });
     await expect(
       bridge<BatchAutomationResultDto>("run_batch_automation", {

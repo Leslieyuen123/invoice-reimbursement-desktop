@@ -18,6 +18,7 @@ use crate::services::sync::{SyncProgress, SyncService, TouchedItemBudget};
 
 const CANDIDATE_PAGE_SIZE: usize = 200;
 const MAX_BATCH_RANGE_DAYS: i64 = 366;
+const ALL_MAILBOXES_FAILED_MESSAGE: &str = "所有已启用邮箱同步失败，请检查网络和邮箱授权后重试";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountAutomationFailure {
@@ -161,6 +162,7 @@ impl BatchAutomationService {
                 message: "no enabled mailbox accounts are configured".to_owned(),
             });
         }
+        let account_count = accounts.len();
         let scanned_account_count = u32::try_from(accounts.len()).map_err(|_| count_overflow())?;
         let mut failed_accounts = Vec::new();
         let mut completed = SyncProgress::default();
@@ -259,6 +261,13 @@ impl BatchAutomationService {
         let assigned_count = u32::try_from(assigned_ids.len()).map_err(|_| count_overflow())?;
         let exception_count = u32::try_from(exception_ids.len()).map_err(|_| count_overflow())?;
         let resulting_batch = self.batches.get(batch_id).await?;
+        if failed_accounts.len() == account_count && resulting_batch.summary.item_count == 0 {
+            return Err(AppError::External {
+                service: "mailbox".to_owned(),
+                retryable: true,
+                message: ALL_MAILBOXES_FAILED_MESSAGE.to_owned(),
+            });
+        }
         let export = if resulting_batch.summary.item_count == 0 {
             None
         } else {
