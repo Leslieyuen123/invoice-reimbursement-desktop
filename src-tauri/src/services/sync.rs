@@ -17,6 +17,7 @@ use crate::services::import::{EmailImportSource, ImportOutcome, ImportService};
 use crate::services::recognition::RecognitionService;
 
 const MAX_MESSAGES_PER_SYNC: usize = 1_000;
+const MAX_RANGE_SYNC_PAGES: usize = 64;
 const MAX_RAW_MESSAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_TOTAL_RAW_BYTES: usize = 200 * 1024 * 1024;
 const MAX_PARTS_PER_MESSAGE: usize = 256;
@@ -229,26 +230,44 @@ impl SyncService {
         range: ImapDateRange,
     ) -> Result<SyncResult, AppError> {
         let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut page_count = 0_usize;
         let mut imported_count = 0_u32;
         loop {
+            if page_count >= MAX_RANGE_SYNC_PAGES {
+                return Err(external_error("IMAP range scan exceeded page limit"));
+            }
+            page_count += 1;
             let delta = self
                 .gateway
                 .fetch_range(config, secret, cursor, range)
                 .await?;
             validate_delta(&delta, &config.mailbox)?;
-            let rescan =
-                cursor.is_some_and(|cursor: SyncCursor| cursor.uid_validity != delta.uid_validity);
-            let result = self.process_delta(account_id, &delta, rescan).await?;
-            imported_count = imported_count
-                .checked_add(result.imported_count)
-                .ok_or_else(sync_import_count_overflow)?;
             let next_cursor = SyncCursor {
                 uid_validity: delta.uid_validity,
                 last_uid: delta.highest_uid,
             };
-            if cursor == Some(next_cursor) {
+            let finished = cursor == Some(next_cursor);
+            let cursor_key = (next_cursor.uid_validity, next_cursor.last_uid);
+            if !finished
+                && (seen_cursors.contains(&cursor_key)
+                    || cursor.is_some_and(|cursor: SyncCursor| {
+                        cursor.uid_validity == next_cursor.uid_validity
+                            && next_cursor.last_uid < cursor.last_uid
+                    }))
+            {
+                return Err(external_error(
+                    "IMAP range scan did not make forward progress",
+                ));
+            }
+            let result = self.process_delta(account_id, &delta, true).await?;
+            imported_count = imported_count
+                .checked_add(result.imported_count)
+                .ok_or_else(sync_import_count_overflow)?;
+            if finished {
                 return Ok(SyncResult { imported_count });
             }
+            seen_cursors.insert(cursor_key);
             cursor = Some(next_cursor);
         }
     }

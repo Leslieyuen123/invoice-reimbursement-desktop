@@ -72,6 +72,16 @@ struct RangeGateway {
     requests: Mutex<Vec<(Option<SyncCursor>, ImapDateRange)>>,
 }
 
+struct RangeTestContext {
+    _directory: tempfile::TempDir,
+    pool: sqlx::SqlitePool,
+    accounts: MailboxAccountRepository,
+    items: ItemRepository,
+    account_id: Uuid,
+    credentials: Arc<MemoryCredentialStore>,
+    paths: AppPaths,
+}
+
 struct ConcurrentGateway {
     delta: MailboxDelta,
     barrier: tokio::sync::Barrier,
@@ -179,6 +189,48 @@ impl RangeGateway {
 
     fn requests(&self) -> Vec<(Option<SyncCursor>, ImapDateRange)> {
         self.requests.lock().unwrap().clone()
+    }
+}
+
+impl RangeTestContext {
+    async fn new(email: &str, secret: &str) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let accounts = MailboxAccountRepository::new(pool.clone());
+        let items = ItemRepository::new(pool.clone());
+        let account = accounts
+            .insert(NewMailboxAccount {
+                provider: MailboxProvider::Gmail,
+                email: email.to_owned(),
+                imap_host: "imap.gmail.com".to_owned(),
+                imap_port: 993,
+                enabled: true,
+                sync_interval_minutes: 15,
+            })
+            .await
+            .unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.set(&account.id.to_string(), secret).unwrap();
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        Self {
+            _directory: directory,
+            pool,
+            accounts,
+            items,
+            account_id: account.id,
+            credentials,
+            paths,
+        }
+    }
+
+    fn service(&self, gateway: Arc<dyn ImapGateway>) -> SyncService {
+        SyncService::new(
+            gateway,
+            self.credentials.clone(),
+            self.accounts.clone(),
+            ImportService::new(self.items.clone(), self.paths.clone()),
+            RecognitionService::new(self.items.clone(), Arc::new(FakeExtractor)),
+        )
     }
 }
 
@@ -371,6 +423,223 @@ async fn range_sync_pages_history_without_reading_or_overwriting_daily_cursor() 
         .unwrap(),
         ("succeeded".to_owned(), 1)
     );
+}
+
+#[tokio::test]
+async fn range_sync_rescans_every_page_without_duplicating_an_older_epoch_part() {
+    let context = RangeTestContext::new("range-rescan@example.com", "password").await;
+    let import = ImportService::new(context.items.clone(), context.paths.clone());
+    let preloaded = import
+        .import_email_bytes(
+            "invoice-101.pdf",
+            b"%PDF-1.7\n1 0 obj\n<</Type/Catalog>>\nendobj\n%%EOF\n",
+            EmailImportSource {
+                account_id: context.account_id,
+                mailbox: "INBOX".to_owned(),
+                uid_validity: 10,
+                uid: 101,
+                message_id: Some("attachment-101@example.com".to_owned()),
+                part_id: "2".to_owned(),
+                received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                rescan: false,
+            },
+        )
+        .await
+        .unwrap();
+    let ImportOutcome::New(preloaded) = preloaded else {
+        panic!("older epoch fixture must be newly imported")
+    };
+    let gateway = Arc::new(RangeGateway::new(vec![
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 11,
+            highest_uid: 7,
+            messages: vec![raw_message(
+                7,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 11,
+            highest_uid: 8,
+            messages: vec![raw_message(
+                8,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 11,
+            highest_uid: 8,
+            messages: vec![],
+        }),
+    ]));
+
+    let result = context
+        .service(gateway.clone())
+        .run_range(
+            context.account_id,
+            NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.imported_count, 0);
+    let stored = context
+        .items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, preloaded.id);
+    assert_eq!(stored[0].source_uid_validity, Some(10));
+    assert_eq!(gateway.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn range_sync_rejects_a_non_consecutive_cursor_repeat() {
+    let context = RangeTestContext::new("range-cycle@example.com", "password").await;
+    let cursor_a = SyncCursor {
+        uid_validity: 12,
+        last_uid: 10,
+    };
+    let cursor_b = SyncCursor {
+        uid_validity: 12,
+        last_uid: 20,
+    };
+    let gateway = Arc::new(RangeGateway::new(
+        [cursor_a, cursor_b, cursor_a, cursor_a]
+            .into_iter()
+            .map(|cursor| {
+                Ok(MailboxDelta {
+                    rejected_messages: vec![],
+                    uid_validity: cursor.uid_validity,
+                    highest_uid: cursor.last_uid,
+                    messages: vec![],
+                })
+            })
+            .collect(),
+    ));
+
+    let error = context
+        .service(gateway.clone())
+        .run_range(
+            context.account_id,
+            NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        AppError::External {
+            service: "imap".to_owned(),
+            retryable: true,
+            message: "IMAP range scan did not make forward progress".to_owned(),
+        }
+    );
+    assert_eq!(gateway.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn range_sync_stops_before_fetching_page_sixty_five() {
+    let context = RangeTestContext::new("range-limit@example.com", "password").await;
+    let mut deltas = (1..=64)
+        .map(|highest_uid| {
+            Ok(MailboxDelta {
+                rejected_messages: vec![],
+                uid_validity: 13,
+                highest_uid,
+                messages: vec![],
+            })
+        })
+        .collect::<Vec<_>>();
+    deltas.push(Ok(MailboxDelta {
+        rejected_messages: vec![],
+        uid_validity: 13,
+        highest_uid: 64,
+        messages: vec![],
+    }));
+    let gateway = Arc::new(RangeGateway::new(deltas));
+
+    let error = context
+        .service(gateway.clone())
+        .run_range(
+            context.account_id,
+            NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        AppError::External {
+            service: "imap".to_owned(),
+            retryable: true,
+            message: "IMAP range scan exceeded page limit".to_owned(),
+        }
+    );
+    assert_eq!(gateway.requests().len(), 64);
+}
+
+#[tokio::test]
+async fn range_sync_failure_is_sanitized_and_does_not_touch_the_daily_cursor() {
+    let secret = "private-range-auth-code";
+    let context = RangeTestContext::new("range-auth@example.com", secret).await;
+    let daily_cursor = SyncCursor {
+        uid_validity: 9,
+        last_uid: 900,
+    };
+    context
+        .accounts
+        .upsert_cursor(context.account_id, "INBOX", daily_cursor)
+        .await
+        .unwrap();
+    let gateway = Arc::new(RangeGateway::new(vec![Err(AppError::External {
+        service: "imap_authentication".to_owned(),
+        retryable: false,
+        message: format!("login rejected credential {secret}\nserver detail"),
+    })]));
+
+    let error = context
+        .service(gateway.clone())
+        .run_range(
+            context.account_id,
+            NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 31).unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(!error.to_string().contains(secret));
+    assert!(error.to_string().contains("[redacted]"));
+    assert_eq!(gateway.requests().len(), 1);
+    assert_eq!(
+        context
+            .accounts
+            .get_cursor(context.account_id, "INBOX")
+            .await
+            .unwrap(),
+        Some(daily_cursor)
+    );
+    let account = context.accounts.get(context.account_id).await.unwrap();
+    let account_error = account.last_error.as_deref().unwrap();
+    assert!(!account_error.contains(secret));
+    assert!(account_error.contains("[redacted]"));
+    let run = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, error_message FROM sync_runs WHERE account_id = ?",
+    )
+    .bind(context.account_id.to_string())
+    .fetch_one(&context.pool)
+    .await
+    .unwrap();
+    assert_eq!(run.0, "failed");
+    assert!(!run.1.as_deref().unwrap().contains(secret));
+    assert!(run.1.as_deref().unwrap().contains("[redacted]"));
 }
 
 #[tokio::test]
