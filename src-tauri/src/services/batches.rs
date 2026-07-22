@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::db::batches::{Batch, BatchPage, BatchPageCursor, BatchRepository, BatchSummary};
 use crate::db::items::{InvoiceItem, ItemPageCursor, ItemRepository};
-use crate::domain::amount::checked_add_amount_cents;
+use crate::domain::amount::{MAX_SAFE_AMOUNT_CENTS, checked_add_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, NewBatch, RecognitionStatus,
@@ -293,12 +293,12 @@ impl BatchService {
         self.get(batch_id).await
     }
 
-    #[doc(hidden)]
-    pub async fn assign_unassigned_items(
+    pub(crate) async fn assign_unassigned_items(
         &self,
-        batch_id: Uuid,
+        batch: &Batch,
         item_ids: &[Uuid],
     ) -> Result<Vec<Uuid>, AppError> {
+        let batch_id = batch.id;
         let mut seen = HashSet::with_capacity(item_ids.len());
         let item_ids = item_ids
             .iter()
@@ -333,11 +333,23 @@ impl BatchService {
                      WHERE id = ? AND batch_id IS NULL \
                        AND recognition_status = 'succeeded' \
                        AND confirmation_status = 'confirmed' \
-                       AND dedupe_status != 'suspected_duplicate'",
+                       AND dedupe_status != 'suspected_duplicate' \
+                       AND invoice_date >= ? AND invoice_date <= ? \
+                       AND amount_cents IS NOT NULL \
+                       AND amount_cents >= 0 AND amount_cents <= ? \
+                       AND currency = 'CNY' \
+                       AND final_category IS NOT NULL \
+                       AND suggested_period IS NOT NULL \
+                       AND TRIM(original_path) != '' \
+                       AND normalized_pdf_path IS NOT NULL \
+                       AND TRIM(normalized_pdf_path) != ''",
                 )
                 .bind(batch_id.to_string())
                 .bind(&updated_at)
                 .bind(item_id.to_string())
+                .bind(batch.start_date.to_string())
+                .bind(batch.end_date.to_string())
+                .bind(MAX_SAFE_AMOUNT_CENTS)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| database_error("failed to assign automation item", error))?;

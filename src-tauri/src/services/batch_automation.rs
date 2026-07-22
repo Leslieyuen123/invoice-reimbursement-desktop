@@ -16,7 +16,7 @@ use crate::infra::files::{AppPaths, open_contained_regular_file};
 use crate::services::batches::BatchService;
 use crate::services::export::{ExportResult, ExportService};
 use crate::services::operations::AccountOperationCoordinator;
-use crate::services::sync::{SyncProgress, SyncService};
+use crate::services::sync::{SyncProgress, SyncService, TouchedItemBudget};
 
 const CANDIDATE_PAGE_SIZE: usize = 200;
 const MAX_BATCH_RANGE_DAYS: i64 = 366;
@@ -80,6 +80,15 @@ pub struct BatchAutomationService {
     account_operations: AccountOperationCoordinator,
     coordinator: BatchAutomationCoordinator,
     paths: AppPaths,
+    #[cfg(test)]
+    assignment_pause: Option<Arc<AssignmentPause>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AssignmentPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl BatchAutomationService {
@@ -100,10 +109,33 @@ impl BatchAutomationService {
             account_operations,
             coordinator,
             paths,
+            #[cfg(test)]
+            assignment_pause: None,
         }
     }
 
     pub async fn run(&self, batch_id: Uuid) -> Result<BatchAutomationResult, AppError> {
+        let mut budget = TouchedItemBudget::default();
+        self.run_with_touched_item_budget(batch_id, &mut budget)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn run_with_touched_item_limit(
+        &self,
+        batch_id: Uuid,
+        limit: usize,
+    ) -> Result<BatchAutomationResult, AppError> {
+        let mut budget = TouchedItemBudget::new(limit);
+        self.run_with_touched_item_budget(batch_id, &mut budget)
+            .await
+    }
+
+    async fn run_with_touched_item_budget(
+        &self,
+        batch_id: Uuid,
+        budget: &mut TouchedItemBudget,
+    ) -> Result<BatchAutomationResult, AppError> {
         let _active = self.coordinator.acquire(batch_id)?;
         let detail = self.batches.get(batch_id).await?;
         let batch = detail.batch;
@@ -135,10 +167,16 @@ impl BatchAutomationService {
         let mut failed_accounts = Vec::new();
         let mut completed = SyncProgress::default();
         for account in accounts {
+            budget.ensure_available()?;
             let (result, error) = match self.account_operations.try_lock(account.id) {
                 Ok(_operation) => match self
                     .sync
-                    .run_range_with_progress(account.id, batch.start_date, batch.end_date)
+                    .run_range_with_progress_and_budget(
+                        account.id,
+                        batch.start_date,
+                        batch.end_date,
+                        budget,
+                    )
                     .await
                 {
                     Ok(result) => (Some(result), None),
@@ -193,11 +231,17 @@ impl BatchAutomationService {
             }
         }
 
+        #[cfg(test)]
+        if let Some(pause) = &self.assignment_pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+
         let assigned_ids = if safe_ids.is_empty() {
             Vec::new()
         } else {
             self.batches
-                .assign_unassigned_items(batch_id, &safe_ids)
+                .assign_unassigned_items(&batch, &safe_ids)
                 .await?
         };
         let assigned_id_set = assigned_ids.iter().copied().collect::<HashSet<_>>();
@@ -267,3 +311,6 @@ fn count_overflow() -> AppError {
         message: "batch automation count overflow".to_owned(),
     }
 }
+
+#[cfg(test)]
+mod automation_tests;

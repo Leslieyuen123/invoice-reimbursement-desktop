@@ -14,7 +14,7 @@ use invoice_reimbursement::services::recognition::RecognitionService;
 use sqlx::SqlitePool;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{Barrier, oneshot};
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn date(year: i32, month: u32, day: u32) -> NaiveDate {
@@ -1192,79 +1192,4 @@ async fn concurrent_assignments_cannot_give_one_item_to_two_batches() {
     assert!(first_after.updated_at > first_before.updated_at);
     assert!(second_after.updated_at > second_before.updated_at);
     assert_eq!(first_after.updated_at, second_after.updated_at);
-}
-
-#[tokio::test]
-async fn stale_automation_assignment_does_not_move_a_manual_winner() {
-    let directory = tempfile::tempdir().expect("temporary directory should create");
-    let database_path = directory.path().join("automation-race.sqlite3");
-    let pool = db::connect(&format!("sqlite://{}", database_path.display()))
-        .await
-        .expect("file database should connect");
-    let service = BatchService::new(pool.clone());
-    let target = service
-        .create_month(2026, 2)
-        .await
-        .expect("automation batch should create");
-    let manual_winner = service
-        .create_month(2026, 3)
-        .await
-        .expect("manual batch should create");
-    let item = sample_item(84, Some("2026-02"));
-    ItemRepository::new(pool.clone())
-        .insert(&item)
-        .await
-        .expect("item should insert");
-    let stale_ids = service
-        .list_candidates(target.id, None, None, 200)
-        .await
-        .expect("automation candidates should load")
-        .items
-        .into_iter()
-        .map(|item| item.id)
-        .collect::<Vec<_>>();
-    assert_eq!(stale_ids, [item.id]);
-
-    let barrier = Arc::new(Barrier::new(2));
-    let (manual_committed, wait_for_manual) = oneshot::channel();
-    let manual_service = service.clone();
-    let manual_barrier = barrier.clone();
-    let manual_batch_id = manual_winner.id;
-    let item_id = item.id;
-    let manual = tokio::spawn(async move {
-        manual_barrier.wait().await;
-        let result = manual_service
-            .assign_items(manual_batch_id, &[item_id])
-            .await;
-        manual_committed.send(()).unwrap();
-        result
-    });
-    let automation_service = service.clone();
-    let target_id = target.id;
-    let automation = tokio::spawn(async move {
-        barrier.wait().await;
-        wait_for_manual.await.unwrap();
-        automation_service
-            .assign_unassigned_items(target_id, &stale_ids)
-            .await
-    });
-
-    manual
-        .await
-        .expect("manual assignment should join")
-        .expect("manual assignment should succeed");
-    let assigned_ids = automation
-        .await
-        .expect("automation assignment should join")
-        .expect("automation assignment should succeed");
-
-    assert!(assigned_ids.is_empty());
-    assert_eq!(
-        ItemRepository::new(pool)
-            .get_by_id(item.id)
-            .await
-            .expect("item should reload")
-            .batch_id,
-        Some(manual_winner.id)
-    );
 }
