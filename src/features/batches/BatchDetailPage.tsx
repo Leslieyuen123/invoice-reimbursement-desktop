@@ -41,6 +41,8 @@ const exportFiles = [
 
 const RECOMMEND_PAGE_SIZE = 200;
 const MAX_RECOMMEND_PAGES = 5;
+const MAX_AUTOMATION_ERROR_MESSAGE_LENGTH = 240;
+const AUTOMATION_ERROR_FALLBACK = "自动处理失败，请稍后重试";
 
 const categories = [
   ["交通", "transport"],
@@ -67,7 +69,11 @@ const statusLabels: Record<ItemStatus, string> = {
 type AutomationFeedback =
   | { status: "idle" }
   | { status: "pending" }
-  | { status: "success"; result: BatchAutomationResultDto }
+  | {
+      status: "success";
+      result: BatchAutomationResultDto;
+      contentRevision: number;
+    }
   | { status: "error"; message: string };
 
 function categoryLabel(category: Category | null) {
@@ -86,20 +92,46 @@ function errorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
-function automationErrorMessage(error: unknown) {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    ["validation", "not_found", "conflict", "external", "internal"].includes(
-      String(error.code),
-    ) &&
-    "message" in error &&
-    typeof error.message === "string"
-  ) {
-    return (error as AppError).message;
+function isAppError(error: unknown): error is AppError {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as Record<string, unknown>;
+  if (typeof candidate.message !== "string") return false;
+
+  switch (candidate.code) {
+    case "validation":
+      return typeof candidate.field === "string";
+    case "not_found":
+      return typeof candidate.entity === "string";
+    case "conflict":
+    case "internal":
+      return true;
+    case "external":
+      return (
+        typeof candidate.service === "string" &&
+        typeof candidate.retryable === "boolean"
+      );
+    default:
+      return false;
   }
-  return "自动处理失败，请稍后重试";
+}
+
+function sanitizeAutomationErrorMessage(message: string) {
+  const withoutControls = Array.from(message, (character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)
+      ? " "
+      : character;
+  }).join("");
+  const normalized = withoutControls.replace(/\s+/gu, " ").trim();
+  return Array.from(normalized)
+    .slice(0, MAX_AUTOMATION_ERROR_MESSAGE_LENGTH)
+    .join("")
+    .trimEnd();
+}
+
+function automationErrorMessage(error: unknown) {
+  if (!isAppError(error)) return AUTOMATION_ERROR_FALLBACK;
+  return sanitizeAutomationErrorMessage(error.message) || AUTOMATION_ERROR_FALLBACK;
 }
 
 export function BatchDetailPage() {
@@ -180,6 +212,12 @@ export function BatchDetailPage() {
     setExportResult(null);
     setExportError(null);
     setRevealError(null);
+    setAutomationFeedback((feedback) =>
+      feedback.status === "success" &&
+      feedback.contentRevision !== batchContentRevision
+        ? { status: "idle" }
+        : feedback,
+    );
   }, [batchContentRevision]);
 
   useEffect(() => {
@@ -219,12 +257,13 @@ export function BatchDetailPage() {
       const result = await automationMutation.mutateAsync(operationBatchId);
       reconcileBatchDetail(operationBatchId);
       advanceBatchContentRevision(operationBatchId);
+      const contentRevision = getBatchContentRevision(operationBatchId);
       if (
         viewActive.current &&
         activeBatchId.current === operationBatchId &&
         session === routeSession.current
       ) {
-        setAutomationFeedback({ status: "success", result });
+        setAutomationFeedback({ status: "success", result, contentRevision });
       }
     } catch (error) {
       if (
@@ -547,7 +586,12 @@ export function BatchDetailPage() {
             <p>正在同步邮箱、整理票据并准备导出。</p>
           </div>
         ) : automationFeedback.status === "success" ? (
-          <div className="batch-automation-copy">
+          <div
+            className="batch-automation-copy"
+            role="status"
+            aria-live="polite"
+            aria-label="批次自动处理完成"
+          >
             <div className="batch-automation-title">
               <CircleCheck size={17} strokeWidth={1.7} aria-hidden="true" />
               <h2 id="batch-automation-title">自动处理完成</h2>

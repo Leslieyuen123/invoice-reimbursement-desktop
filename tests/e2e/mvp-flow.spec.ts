@@ -246,6 +246,11 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
 
   await page.getByRole("link", { name: "报销批次" }).click();
   await page.getByRole("link", { name: "新建批次" }).click();
+  const automateAfterCreation = page.getByRole("checkbox", {
+    name: "创建后自动处理并导出",
+  });
+  await expect(automateAfterCreation).toBeChecked();
+  await automateAfterCreation.uncheck();
   await page.getByRole("button", { name: "创建批次" }).click();
   await expect(page.getByRole("heading", { name: /报销/ })).toBeVisible();
   await page.getByRole("button", { name: "调整票据" }).click();
@@ -289,6 +294,53 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
       .filter((duration) => duration > 20),
   );
   expect(longAnimations).toEqual([]);
+});
+
+test("automated May batch completes from the default create action", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/settings?bridgeReset=1&bridgeDelay=150");
+  await expect(page.getByRole("heading", { name: "运行设置" })).toBeVisible();
+
+  const newAccount = page.getByRole("form", { name: "新邮箱账号" });
+  await newAccount.getByLabel("邮箱地址").fill("automation@example.com");
+  await newAccount.locator('input[type="password"]').fill("e2e-app-password");
+  await expect(
+    newAccount.getByRole("switch", { name: "启用此账号" }),
+  ).toBeChecked();
+  await newAccount.getByRole("button", { name: "测试连接" }).click();
+  await expect(newAccount.getByText("连接成功")).toBeVisible();
+  await newAccount.getByRole("button", { name: "保存账号" }).click();
+  await expect(
+    page.getByRole("form", { name: "automation@example.com" }),
+  ).toBeVisible();
+
+  await page.getByRole("link", { name: "报销批次" }).click();
+  await page.getByRole("link", { name: "新建批次" }).click();
+  const automateAfterCreation = page.getByRole("checkbox", {
+    name: "创建后自动处理并导出",
+  });
+  await expect(automateAfterCreation).toBeChecked();
+  await page.getByLabel("年份").fill("2026");
+  await page.getByLabel("月份").selectOption("5");
+  await page.getByRole("button", { name: "创建并自动处理" }).click();
+
+  await expect(
+    page.getByRole("status", { name: "正在自动处理批次" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("status", { name: "批次自动处理完成" }),
+  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "2026 年 5 月报销" })).toBeVisible();
+  await expect(page.getByText("0 张新导入")).toBeVisible();
+  await expect(page.getByText("0 张已自动纳入")).toBeVisible();
+  await expect(page.getByText("0 个异常项")).toBeVisible();
+  await expect(page.getByText("0 个邮箱失败")).toBeVisible();
+  await expect(
+    page.getByText("没有可导出的票据，本次未生成报销包"),
+  ).toBeVisible();
+  await auditCurrentView(page);
+  await attachView(page, testInfo, "automated-may-batch");
 });
 
 test("loading, empty, and error states remain operable", async ({ page }) => {

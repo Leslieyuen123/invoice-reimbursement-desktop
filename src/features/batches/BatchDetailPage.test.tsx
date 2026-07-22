@@ -330,7 +330,10 @@ describe("Batch workspace", () => {
       );
     });
 
-    expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
+    const completionStatus = await screen.findByRole("status", {
+      name: "批次自动处理完成",
+    });
+    expect(completionStatus).toHaveAttribute("aria-live", "polite");
     expect(screen.getByText("1 张新导入")).toBeInTheDocument();
     expect(screen.getByText("1 张已自动纳入")).toBeInTheDocument();
     expect(screen.getByText("2 个异常项")).toBeInTheDocument();
@@ -339,6 +342,40 @@ describe("Batch workspace", () => {
       screen.getByText("/Users/finance/a/very/long/export/path/2026-05"),
     ).toBeInTheDocument();
     await waitFor(() => expect(commandCalls("get_batch").length).toBeGreaterThan(1));
+  });
+
+  it("clears automation success when manual assignment changes batch content", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(itemFixture());
+    mockDetail(detailFixture(), [candidate]);
+    mockCommand(
+      "run_batch_automation",
+      automationFixture({
+        importedCount: 4,
+        assignedCount: 3,
+        export: {
+          directory: "/Users/finance/stale-automation-export",
+          itemCount: 3,
+          totalAmountCents: 12_850,
+        },
+      }),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+    expect(await screen.findByText("4 张新导入")).toBeInTheDocument();
+    expect(screen.getByText("/Users/finance/stale-automation-export")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "加入推荐票据" }));
+
+    expect(
+      await screen.findByRole("button", { name: "一键自动处理" }),
+    ).toBeEnabled();
+    expect(screen.queryByText("自动处理完成")).not.toBeInTheDocument();
+    expect(screen.queryByText("4 张新导入")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("/Users/finance/stale-automation-export"),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps the batch mounted and succeeds when automation is retried", async () => {
@@ -371,6 +408,52 @@ describe("Batch workspace", () => {
     expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
     expect(screen.getByText("没有可导出的票据，本次未生成报销包")).toBeInTheDocument();
     expect(commandCalls("run_batch_automation")).toHaveLength(2);
+  });
+
+  it("uses the fallback for a malformed automation error", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture());
+    mockCommand("run_batch_automation", () =>
+      Promise.reject({
+        code: "external",
+        message: "泄漏\n\u0000详情",
+      }),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("自动处理失败，请稍后重试");
+    expect(alert).not.toHaveTextContent("泄漏");
+  });
+
+  it("sanitizes and caps a valid automation error message", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture());
+    mockCommand("run_batch_automation", () =>
+      Promise.reject({
+        code: "external",
+        service: "mailbox",
+        retryable: true,
+        message: `邮箱\u0000同步\n\u0085失败 ${"详".repeat(300)} 机密尾部`,
+      }),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+
+    const message = (await screen.findByRole("alert")).querySelector("p");
+    expect(message).not.toBeNull();
+    expect(message?.textContent).toHaveLength(240);
+    expect(message).toHaveTextContent(`邮箱 同步 失败 ${"详".repeat(231)}`);
+    expect(message).not.toHaveTextContent("机密尾部");
+    expect(
+      Array.from(message?.textContent ?? "").some((character) => {
+        const codePoint = character.codePointAt(0) ?? 0;
+        return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+      }),
+    ).toBe(false);
   });
 
   it("does not recreate a batch when its automatic start fails", async () => {
