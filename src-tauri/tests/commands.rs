@@ -16,6 +16,10 @@ use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::infra::imap::{
     ImapAccountConfig, ImapDateRange, ImapGateway, MailboxDelta,
 };
+use invoice_reimbursement::services::batch_automation::{
+    AccountAutomationFailure, BatchAutomationResult,
+};
+use invoice_reimbursement::services::export::ExportResult;
 use invoice_reimbursement::state::AppState;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -273,6 +277,7 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "assign_items_to_batch",
             "remove_item_from_batch",
             "export_batch",
+            "run_batch_automation",
             "list_mailbox_accounts",
             "save_mailbox_account",
             "test_mailbox_account",
@@ -284,6 +289,119 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "sync_account_now",
         ]
     );
+}
+
+#[test]
+fn batch_automation_dto_maps_the_backend_result_without_rewriting_failure_messages() {
+    let account_id = Uuid::new_v4();
+    let result = BatchAutomationResult {
+        scanned_account_count: 1,
+        failed_accounts: vec![AccountAutomationFailure {
+            account_id,
+            email: "account@example.invalid".to_owned(),
+            message: "backend-safe failure".to_owned(),
+        }],
+        imported_count: 2,
+        assigned_count: 3,
+        exception_count: 4,
+        export: Some(ExportResult {
+            directory: "test-export".into(),
+            item_count: 5,
+            total_amount_cents: 12_850,
+        }),
+    };
+
+    let dto = batches::BatchAutomationResultDto::try_from(result).unwrap();
+
+    assert_eq!(dto.scanned_account_count, 1);
+    assert_eq!(dto.failed_accounts.len(), 1);
+    assert_eq!(dto.failed_accounts[0].account_id, account_id.to_string());
+    assert_eq!(dto.failed_accounts[0].email, "account@example.invalid");
+    assert_eq!(dto.failed_accounts[0].message, "backend-safe failure");
+    assert_eq!(dto.imported_count, 2);
+    assert_eq!(dto.assigned_count, 3);
+    assert_eq!(dto.exception_count, 4);
+    assert_eq!(dto.export.unwrap().item_count, 5);
+}
+
+#[test]
+fn batch_automation_dto_serializes_only_safe_camel_case_fields() {
+    let dto = batches::BatchAutomationResultDto {
+        scanned_account_count: 1,
+        failed_accounts: vec![batches::AccountAutomationFailureDto {
+            account_id: "account-id".to_owned(),
+            email: "account@example.invalid".to_owned(),
+            message: "backend-safe failure".to_owned(),
+        }],
+        imported_count: 2,
+        assigned_count: 3,
+        exception_count: 4,
+        export: None,
+    };
+
+    assert_eq!(
+        serde_json::to_value(dto).unwrap(),
+        serde_json::json!({
+            "scannedAccountCount": 1,
+            "failedAccounts": [{
+                "accountId": "account-id",
+                "email": "account@example.invalid",
+                "message": "backend-safe failure",
+            }],
+            "importedCount": 2,
+            "assignedCount": 3,
+            "exceptionCount": 4,
+            "export": null,
+        })
+    );
+}
+
+#[tokio::test]
+async fn batch_automation_adapter_delegates_to_the_state_service() {
+    let app = TestApp::with_dashboard_fixture().await;
+    sqlx::query("DELETE FROM items")
+        .execute(app.state.pool())
+        .await
+        .unwrap();
+    let account_id = sqlx::query_scalar::<_, String>("SELECT id FROM mailbox_accounts LIMIT 1")
+        .fetch_one(app.state.pool())
+        .await
+        .unwrap();
+    app.state
+        .credentials()
+        .set(&account_id, "test-value")
+        .unwrap();
+    let batch_id = sqlx::query_scalar::<_, String>("SELECT id FROM batches LIMIT 1")
+        .fetch_one(app.state.pool())
+        .await
+        .unwrap();
+
+    let dto = batches::run_automation(&app.state, Uuid::parse_str(&batch_id).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(dto.scanned_account_count, 1);
+    assert!(dto.failed_accounts.is_empty());
+    assert_eq!(dto.imported_count, 0);
+    assert_eq!(dto.assigned_count, 0);
+    assert_eq!(dto.exception_count, 0);
+    assert!(dto.export.is_none());
+}
+
+#[tokio::test]
+async fn batch_automation_adapter_is_rejected_after_tracked_operations_close() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let shutdown = app.state.begin_application_shutdown(None);
+
+    let error = batches::run_automation(&app.state, Uuid::new_v4())
+        .await
+        .expect_err("batch automation must enter the tracked-operation gate");
+
+    assert!(
+        matches!(error, AppError::Conflict { ref message } if message.contains("shutting down"))
+    );
+    let report = shutdown.wait(std::time::Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
 }
 
 #[tokio::test]

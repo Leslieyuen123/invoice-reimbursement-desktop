@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   BatchCandidateDto,
+  BatchAutomationResultDto,
   BatchDetailDto,
   BatchDto,
   DashboardDto,
@@ -63,6 +64,7 @@ export const API_COMMANDS = {
   assignItemsToBatch: "assign_items_to_batch",
   removeItemFromBatch: "remove_item_from_batch",
   exportBatch: "export_batch",
+  runBatchAutomation: "run_batch_automation",
   listMailboxAccounts: "list_mailbox_accounts",
   saveMailboxAccount: "save_mailbox_account",
   testMailboxAccount: "test_mailbox_account",
@@ -118,6 +120,8 @@ export const api = {
     call<BatchDetailDto>(API_COMMANDS.removeItemFromBatch, { batchId, itemId }),
   exportBatch: (batchId: string) =>
     call<ExportResultDto>(API_COMMANDS.exportBatch, { batchId }),
+  runBatchAutomation: (batchId: string) =>
+    call<BatchAutomationResultDto>(API_COMMANDS.runBatchAutomation, { batchId }),
   listMailboxAccounts: () =>
     call<MailboxAccountDto[]>(API_COMMANDS.listMailboxAccounts),
   saveMailboxAccount: (input: SaveMailboxAccountInputDto) =>

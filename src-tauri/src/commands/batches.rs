@@ -2,11 +2,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::commands::export::ExportResultDto;
 use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
 use crate::db::batches::{Batch, BatchPageCursor, BatchSummary};
 use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::AppError;
 use crate::domain::model::{BatchStatus, DedupeStatus, RecognitionStatus};
+use crate::services::batch_automation::{AccountAutomationFailure, BatchAutomationResult};
 use crate::services::batches::{
     BatchDetail, BatchDetailSummary, BatchService, CategorySummary, NewBatchInput,
 };
@@ -187,6 +189,54 @@ pub struct BatchCandidateDto {
     pub disabled_reason: Option<BatchCandidateDisabledReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountAutomationFailureDto {
+    pub account_id: String,
+    pub email: String,
+    pub message: String,
+}
+
+impl From<AccountAutomationFailure> for AccountAutomationFailureDto {
+    fn from(failure: AccountAutomationFailure) -> Self {
+        Self {
+            account_id: failure.account_id.to_string(),
+            email: failure.email,
+            message: failure.message,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAutomationResultDto {
+    pub scanned_account_count: u32,
+    pub failed_accounts: Vec<AccountAutomationFailureDto>,
+    pub imported_count: u32,
+    pub assigned_count: u32,
+    pub exception_count: u32,
+    pub export: Option<ExportResultDto>,
+}
+
+impl TryFrom<BatchAutomationResult> for BatchAutomationResultDto {
+    type Error = AppError;
+
+    fn try_from(result: BatchAutomationResult) -> Result<Self, Self::Error> {
+        Ok(Self {
+            scanned_account_count: result.scanned_account_count,
+            failed_accounts: result
+                .failed_accounts
+                .into_iter()
+                .map(AccountAutomationFailureDto::from)
+                .collect(),
+            imported_count: result.imported_count,
+            assigned_count: result.assigned_count,
+            exception_count: result.exception_count,
+            export: result.export.map(ExportResultDto::try_from).transpose()?,
+        })
+    }
+}
+
 pub async fn list(state: &AppState) -> Result<Vec<BatchDto>, AppError> {
     Ok(list_page(state, None).await?.items)
 }
@@ -327,11 +377,24 @@ pub async fn remove(
         .try_into()
 }
 
+pub async fn run_automation(
+    state: &AppState,
+    batch_id: Uuid,
+) -> Result<BatchAutomationResultDto, AppError> {
+    let service = state.batch_automation_service();
+    state
+        .run_tracked_operation(async move { service.run(batch_id).await })
+        .await?
+        .try_into()
+}
+
 pub(crate) mod ipc {
     use tauri::State;
     use uuid::Uuid;
 
-    use super::{BatchCandidateDto, BatchDetailDto, BatchDto, NewBatchInputDto};
+    use super::{
+        BatchAutomationResultDto, BatchCandidateDto, BatchDetailDto, BatchDto, NewBatchInputDto,
+    };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
     use crate::state::AppState;
@@ -395,5 +458,13 @@ pub(crate) mod ipc {
         item_id: Uuid,
     ) -> Result<BatchDetailDto, AppError> {
         super::remove(&state, batch_id, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn run_batch_automation(
+        state: State<'_, AppState>,
+        batch_id: Uuid,
+    ) -> Result<BatchAutomationResultDto, AppError> {
+        super::run_automation(&state, batch_id).await
     }
 }

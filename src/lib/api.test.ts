@@ -181,6 +181,12 @@ const commandCases: Array<{
     invokeArguments: { batchId: "batch-1" },
   },
   {
+    method: "runBatchAutomation",
+    arguments_: ["batch-1"],
+    command: "run_batch_automation",
+    invokeArguments: { batchId: "batch-1" },
+  },
+  {
     method: "listMailboxAccounts",
     arguments_: [],
     command: "list_mailbox_accounts",

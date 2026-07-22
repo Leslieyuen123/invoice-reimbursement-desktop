@@ -207,6 +207,21 @@ export interface ExportResultDto {
   totalAmountCents: AmountCents;
 }
 
+export interface AccountAutomationFailureDto {
+  accountId: string;
+  email: string;
+  message: string;
+}
+
+export interface BatchAutomationResultDto {
+  scannedAccountCount: number;
+  failedAccounts: AccountAutomationFailureDto[];
+  importedCount: number;
+  assignedCount: number;
+  exceptionCount: number;
+  export: ExportResultDto | null;
+}
+
 export interface SaveMailboxAccountInputDto {
   id: string | null;
   provider: MailboxProvider;
