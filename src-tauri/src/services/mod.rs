@@ -1,4 +1,5 @@
 pub mod account_saves;
+pub mod batch_automation;
 pub mod batches;
 pub mod dashboard;
 pub mod export;

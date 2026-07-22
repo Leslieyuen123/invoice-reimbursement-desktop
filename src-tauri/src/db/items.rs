@@ -508,6 +508,49 @@ impl ItemRepository {
         Ok(ItemPage { items, next_cursor })
     }
 
+    pub(crate) async fn list_unassigned_email_ids_fetched_between(
+        &self,
+        account_ids: &[Uuid],
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<Vec<Uuid>, AppError> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = start_date
+            .and_hms_opt(0, 0, 0)
+            .expect("a valid date has a midnight")
+            .and_utc();
+        let end_exclusive = end_date
+            .succ_opt()
+            .ok_or_else(|| AppError::validation("dateRange", "end date is outside range"))?
+            .and_hms_opt(0, 0, 0)
+            .expect("a valid date has a midnight")
+            .and_utc();
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id FROM items WHERE source_type = 'email' AND batch_id IS NULL \
+             AND fetched_at >= ",
+        );
+        query
+            .push_bind(start.to_rfc3339())
+            .push(" AND fetched_at < ")
+            .push_bind(end_exclusive.to_rfc3339())
+            .push(" AND source_account_id IN (");
+        {
+            let mut separated = query.separated(", ");
+            for account_id in account_ids {
+                separated.push_bind(account_id.to_string());
+            }
+        }
+        query.push(") ORDER BY fetched_at DESC, id DESC");
+        let ids = query
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to list email automation exceptions", error))?;
+        ids.into_iter().map(|id| parse_uuid(&id, "id")).collect()
+    }
+
     pub(crate) async fn list_by_batch_with_connection(
         connection: &mut SqliteConnection,
         batch_id: Uuid,

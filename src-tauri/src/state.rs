@@ -14,6 +14,8 @@ use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
 use crate::services::account_saves::{
     AccountSagaShutdown, AccountSaveCoordinator, AccountSaveReconciliationReport,
 };
+use crate::services::batch_automation::{BatchAutomationCoordinator, BatchAutomationService};
+use crate::services::batches::BatchService;
 use crate::services::dashboard::DashboardService;
 use crate::services::export::{ExportCoordinator, ExportService};
 use crate::services::import::ImportService;
@@ -35,9 +37,11 @@ pub struct AppState {
     import_service: ImportService,
     item_service: ItemService,
     recognition_service: RecognitionService,
+    sync_service: SyncService,
     account_operations: AccountOperationCoordinator,
     account_saves: AccountSaveCoordinator,
     export_coordinator: ExportCoordinator,
+    batch_automation_coordinator: BatchAutomationCoordinator,
     preview_coordinator: PreviewCoordinator,
     background_sync_gate: BackgroundSyncGate,
     export_preference_gate: ExportPreferenceGate,
@@ -99,7 +103,7 @@ impl AppState {
         );
         let application_scheduler = Scheduler::with_operations_and_gate(
             pool.clone(),
-            Arc::new(sync_service),
+            Arc::new(sync_service.clone()),
             account_operations.clone(),
             account_saves.clone(),
             background_sync_gate.clone(),
@@ -112,9 +116,11 @@ impl AppState {
             import_service,
             item_service,
             recognition_service,
+            sync_service,
             account_operations,
             account_saves,
             export_coordinator: ExportCoordinator::default(),
+            batch_automation_coordinator: BatchAutomationCoordinator::default(),
             preview_coordinator: PreviewCoordinator::default(),
             background_sync_gate,
             export_preference_gate,
@@ -154,6 +160,17 @@ impl AppState {
             self.paths.clone(),
             self.export_coordinator.clone(),
             self.export_preference_gate.clone(),
+        )
+    }
+
+    pub fn batch_automation_service(&self) -> BatchAutomationService {
+        BatchAutomationService::new(
+            self.pool.clone(),
+            self.sync_service.clone(),
+            BatchService::new(self.pool.clone()),
+            self.export_service(),
+            self.account_operations.clone(),
+            self.batch_automation_coordinator.clone(),
         )
     }
 
