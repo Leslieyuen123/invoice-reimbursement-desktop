@@ -13,7 +13,9 @@ use invoice_reimbursement::domain::model::{Category, ItemStatus};
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use invoice_reimbursement::infra::files::AppPaths;
-use invoice_reimbursement::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta};
+use invoice_reimbursement::infra::imap::{
+    ImapAccountConfig, ImapDateRange, ImapGateway, MailboxDelta,
+};
 use invoice_reimbursement::state::AppState;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -138,6 +140,16 @@ impl ImapGateway for SuccessfulGateway {
             highest_uid: 0,
         })
     }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
+    }
 }
 
 #[derive(Default)]
@@ -170,6 +182,16 @@ impl ImapGateway for BlockingGateway {
             rejected_messages: Vec::new(),
             highest_uid: 0,
         })
+    }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
     }
 }
 

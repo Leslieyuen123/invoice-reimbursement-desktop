@@ -16,8 +16,8 @@ use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentia
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::infra::imap::{
-    ImapAccountConfig, ImapGateway, MailboxDelta, MessageRejectionReason, NativeTlsImapGateway,
-    RawMessage, RejectedMessage,
+    ImapAccountConfig, ImapDateRange, ImapGateway, MailboxDelta, MessageRejectionReason,
+    NativeTlsImapGateway, RawMessage, RejectedMessage,
 };
 use invoice_reimbursement::services::import::{EmailImportSource, ImportOutcome, ImportService};
 use invoice_reimbursement::services::recognition::RecognitionService;
@@ -100,6 +100,16 @@ impl ImapGateway for ConcurrentGateway {
         self.barrier.wait().await;
         Ok(self.delta.clone())
     }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
+    }
 }
 
 #[async_trait]
@@ -128,6 +138,16 @@ impl ImapGateway for OrderedCompletionGateway {
             1 => Ok(self.newer_delta.clone()),
             _ => panic!("ordered gateway received an unexpected fetch"),
         }
+    }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
     }
 }
 
@@ -166,6 +186,16 @@ impl ImapGateway for FakeImapGateway {
             .unwrap()
             .pop_front()
             .expect("fake IMAP delta")
+    }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
     }
 }
 

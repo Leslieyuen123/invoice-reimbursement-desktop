@@ -13,7 +13,9 @@ use invoice_reimbursement::db::accounts::{
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
 use invoice_reimbursement::infra::files::AppPaths;
-use invoice_reimbursement::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta};
+use invoice_reimbursement::infra::imap::{
+    ImapAccountConfig, ImapDateRange, ImapGateway, MailboxDelta,
+};
 use invoice_reimbursement::services::scheduler::{
     Clock, ManualClock, Scheduler, SyncRunner, SyncStartBarrier,
 };
@@ -45,6 +47,16 @@ impl ImapGateway for PassingGateway {
     ) -> Result<MailboxDelta, AppError> {
         unreachable!("settings tests do not fetch mail")
     }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
+    }
 }
 
 struct FailingConnectionGateway;
@@ -73,6 +85,16 @@ impl ImapGateway for CapturingGateway {
     ) -> Result<MailboxDelta, AppError> {
         unreachable!("settings tests do not fetch mail")
     }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
+    }
 }
 
 #[async_trait]
@@ -96,6 +118,16 @@ impl ImapGateway for FailingConnectionGateway {
         _cursor: Option<SyncCursor>,
     ) -> Result<MailboxDelta, AppError> {
         unreachable!("settings tests do not fetch mail")
+    }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
     }
 }
 

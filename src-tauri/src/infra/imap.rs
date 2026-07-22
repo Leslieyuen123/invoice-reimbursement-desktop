@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -43,6 +43,27 @@ impl ImapAccountConfig {
             mailbox: DEFAULT_MAILBOX.to_owned(),
             tls: true,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImapDateRange {
+    pub start: NaiveDate,
+    pub end_exclusive: NaiveDate,
+}
+
+impl ImapDateRange {
+    pub fn new(start: NaiveDate, end_exclusive: NaiveDate) -> Result<Self, AppError> {
+        if start >= end_exclusive {
+            return Err(AppError::validation(
+                "dateRange",
+                "IMAP start date must be before end date",
+            ));
+        }
+        Ok(Self {
+            start,
+            end_exclusive,
+        })
     }
 }
 
@@ -96,6 +117,14 @@ pub trait ImapGateway: Send + Sync {
         config: &ImapAccountConfig,
         secret: &str,
         cursor: Option<SyncCursor>,
+    ) -> Result<MailboxDelta, AppError>;
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        range: ImapDateRange,
     ) -> Result<MailboxDelta, AppError>;
 }
 
@@ -166,9 +195,28 @@ impl ImapGateway for NativeTlsImapGateway {
         let config = config.clone();
         let secret = secret.to_owned();
         let settings = self.settings;
-        tokio::task::spawn_blocking(move || fetch_blocking(&config, &secret, cursor, settings))
-            .await
-            .map_err(|_| imap_error("IMAP fetch task failed"))?
+        tokio::task::spawn_blocking(move || {
+            fetch_blocking(&config, &secret, cursor, None, settings)
+        })
+        .await
+        .map_err(|_| imap_error("IMAP fetch task failed"))?
+    }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        let config = config.clone();
+        let secret = secret.to_owned();
+        let settings = self.settings;
+        tokio::task::spawn_blocking(move || {
+            fetch_blocking(&config, &secret, cursor, Some(range), settings)
+        })
+        .await
+        .map_err(|_| imap_error("IMAP fetch task failed"))?
     }
 }
 
@@ -176,6 +224,7 @@ fn fetch_blocking(
     config: &ImapAccountConfig,
     secret: &str,
     cursor: Option<SyncCursor>,
+    range: Option<ImapDateRange>,
     settings: ImapGatewaySettings,
 ) -> Result<MailboxDelta, AppError> {
     let mut session = connect(config, secret, settings)?;
@@ -195,7 +244,7 @@ fn fetch_blocking(
     let (uids, mut high_water) = match uid_start(cursor, uid_validity) {
         Some(start_uid) if start_uid <= highest_uid => {
             let found = session
-                .uid_search(invoice_uid_search_query(start_uid))
+                .uid_search(uid_search_query(start_uid, range))
                 .map_err(|_| imap_error("IMAP UID search failed"))?;
             select_uid_batch(found, highest_uid, settings.max_messages)?
         }
@@ -291,8 +340,16 @@ fn fetch_blocking(
     })
 }
 
-fn invoice_uid_search_query(start_uid: u32) -> String {
-    format!("UID {start_uid}:* SINCE 1-Jun-2026 BEFORE 1-Aug-2026")
+fn uid_search_query(start_uid: u32, range: Option<ImapDateRange>) -> String {
+    let uid = format!("UID {start_uid}:*");
+    match range {
+        Some(range) => format!(
+            "{uid} SINCE {} BEFORE {}",
+            range.start.format("%-d-%b-%Y"),
+            range.end_exclusive.format("%-d-%b-%Y")
+        ),
+        None => uid,
+    }
 }
 
 fn uid_start(cursor: Option<SyncCursor>, uid_validity: u32) -> Option<u32> {
@@ -471,16 +528,40 @@ fn limit_error(message: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImapAccountConfig, MessageAdmission, MessageRejectionReason, NativeTlsImapGateway,
-        RawBudget, authentication_error, connect, imap_error, invoice_uid_search_query,
-        limit_error, select_uid_batch, uid_start,
+        ImapAccountConfig, ImapDateRange, MessageAdmission, MessageRejectionReason,
+        NativeTlsImapGateway, RawBudget, authentication_error, connect, imap_error, limit_error,
+        select_uid_batch, uid_search_query, uid_start,
     };
+    use chrono::NaiveDate;
 
     #[test]
-    fn invoice_search_is_limited_to_june_and_july_2026() {
+    fn incremental_search_is_not_limited_to_a_hard_coded_month() {
+        assert_eq!(uid_search_query(4073, None), "UID 4073:*");
+    }
+
+    #[test]
+    fn range_search_is_inclusive_at_start_and_exclusive_at_end() {
+        let range = ImapDateRange::new(
+            NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        )
+        .unwrap();
+
         assert_eq!(
-            invoice_uid_search_query(4073),
-            "UID 4073:* SINCE 1-Jun-2026 BEFORE 1-Aug-2026"
+            uid_search_query(1, Some(range)),
+            "UID 1:* SINCE 1-May-2026 BEFORE 1-Jun-2026"
+        );
+    }
+
+    #[test]
+    fn range_rejects_an_empty_or_reversed_window() {
+        let day = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let expected = AppError::validation("dateRange", "IMAP start date must be before end date");
+
+        assert_eq!(ImapDateRange::new(day, day), Err(expected.clone()));
+        assert_eq!(
+            ImapDateRange::new(day, day.pred_opt().unwrap()),
+            Err(expected)
         );
     }
     use crate::db::accounts::{MailboxProvider, SyncCursor};
