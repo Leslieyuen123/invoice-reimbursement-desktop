@@ -130,6 +130,7 @@ pub struct ItemPatch {
     pub batch_id: Option<Option<Uuid>>,
     pub suggested_category: Option<Option<Category>>,
     pub final_category: Option<Option<Category>>,
+    pub final_category_if_missing: Option<Category>,
     pub amount_cents: Option<Option<i64>>,
     pub currency: Option<String>,
     pub city: Option<Option<String>>,
@@ -626,6 +627,10 @@ impl ItemRepository {
         }
         if let Some(value) = patch.final_category {
             item.final_category = value;
+        } else if item.final_category.is_none()
+            && let Some(value) = patch.final_category_if_missing
+        {
+            item.final_category = Some(value);
         }
         if let Some(value) = patch.amount_cents {
             item.amount_cents = value;

@@ -1434,6 +1434,7 @@ async fn item_repository_update_fields_sets_and_clears_mutable_values() {
                 batch_id: Some(Some(batch_id)),
                 suggested_category: Some(Some(Category::Hospitality)),
                 final_category: Some(None),
+                final_category_if_missing: None,
                 amount_cents: Some(Some(54_321)),
                 currency: Some("USD".to_owned()),
                 city: Some(Some("Beijing".to_owned())),
@@ -1528,6 +1529,33 @@ async fn item_repository_update_fields_sets_and_clears_mutable_values() {
     assert_eq!(cleared.project_tag, None);
     assert_eq!(cleared.currency, "USD");
     assert_eq!(cleared.status(), ItemStatus::Ready);
+}
+
+#[tokio::test]
+async fn explicit_final_category_takes_precedence_over_fill_if_missing() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let repository = ItemRepository::new(pool);
+    let original = sample_item("explicit-category", "sha256-explicit-category");
+    repository
+        .insert(&original)
+        .await
+        .expect("original item should insert");
+
+    let updated = repository
+        .update_fields(
+            original.id,
+            ItemPatch {
+                final_category: Some(None),
+                final_category_if_missing: Some(Category::Hospitality),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("explicit category update should succeed");
+
+    assert_eq!(updated.final_category, None);
 }
 
 #[tokio::test]

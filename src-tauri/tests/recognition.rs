@@ -610,8 +610,7 @@ async fn confident_recognition_confirms_and_copies_the_suggested_category_to_fin
     let record = sample_item(Uuid::new_v4());
     repository.insert(&record).await.unwrap();
     let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
-        text: "发票日期：2026-05-08\n日期：2026-05-08\n价税合计：¥128.50\n出租车 客运服务"
-            .to_owned(),
+        text: "开票日期：2026-05-08\n价税合计：¥128.50\n出租车 客运服务".to_owned(),
         normalized_pdf: None,
         warnings: Vec::new(),
     })]));
@@ -625,6 +624,53 @@ async fn confident_recognition_confirms_and_copies_the_suggested_category_to_fin
     );
     assert_eq!(recognized.suggested_category, Some(Category::Transport));
     assert_eq!(recognized.final_category, Some(Category::Transport));
+}
+
+#[tokio::test]
+async fn confident_retry_fills_a_missing_final_category() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(Uuid::new_v4());
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026-05-08\n价税合计：¥128.50\n出租车 客运服务".to_owned(),
+        normalized_pdf: None,
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::new(repository, extractor);
+
+    let recognized = service.retry(record.id).await.unwrap();
+
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+    assert_eq!(recognized.suggested_category, Some(Category::Transport));
+    assert_eq!(recognized.final_category, Some(Category::Transport));
+}
+
+#[tokio::test]
+async fn confident_background_recognition_preserves_a_pending_items_final_category() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let mut record = sample_item(Uuid::new_v4());
+    record.final_category = Some(Category::Hospitality);
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026-05-08\n价税合计：¥128.50\n出租车 客运服务".to_owned(),
+        normalized_pdf: None,
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::new(repository, extractor);
+
+    let recognized = service.recognize_item(record.id).await.unwrap();
+
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+    assert_eq!(recognized.suggested_category, Some(Category::Transport));
+    assert_eq!(recognized.final_category, Some(Category::Hospitality));
 }
 
 #[tokio::test]
@@ -941,6 +987,52 @@ async fn concurrent_manual_update_is_preserved_while_extraction_is_running() {
         recognized.confirmation_status,
         ConfirmationStatus::Confirmed
     );
+}
+
+#[tokio::test]
+async fn concurrent_category_change_before_retry_persistence_is_not_overwritten() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(Uuid::new_v4());
+    repository.insert(&record).await.unwrap();
+    let item_id = record.id;
+    let (started_tx, started_rx) = sync_channel(1);
+    let (proceed_tx, proceed_rx) = sync_channel(1);
+    let extractor = Arc::new(GatedExtractor {
+        started: started_tx,
+        proceed: Mutex::new(proceed_rx),
+        result: Mutex::new(Some(ExtractedDocument {
+            text: "开票日期：2026-05-08\n价税合计：¥128.50\n出租车 客运服务".to_owned(),
+            normalized_pdf: None,
+            warnings: Vec::new(),
+        })),
+    });
+    let service = RecognitionService::new(repository.clone(), extractor);
+    let recognition = tokio::spawn(async move { service.retry(item_id).await });
+    tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    repository
+        .update_fields(
+            item_id,
+            ItemPatch {
+                final_category: Some(Some(Category::Hospitality)),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    proceed_tx.send(()).unwrap();
+
+    let recognized = recognition.await.unwrap().unwrap();
+
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+    assert_eq!(recognized.suggested_category, Some(Category::Transport));
+    assert_eq!(recognized.final_category, Some(Category::Hospitality));
 }
 
 #[tokio::test]
