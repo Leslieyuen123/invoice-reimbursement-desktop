@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use invoice_reimbursement::db;
 use invoice_reimbursement::db::accounts::{
     MailboxAccountRepository, MailboxProvider, NewMailboxAccount, SyncCursor, SyncRun,
@@ -65,6 +65,11 @@ impl DocumentExtractor for FailingExtractor {
 struct FakeImapGateway {
     deltas: Mutex<VecDeque<Result<MailboxDelta, AppError>>>,
     cursors: Mutex<Vec<Option<SyncCursor>>>,
+}
+
+struct RangeGateway {
+    deltas: Mutex<VecDeque<Result<MailboxDelta, AppError>>>,
+    requests: Mutex<Vec<(Option<SyncCursor>, ImapDateRange)>>,
 }
 
 struct ConcurrentGateway {
@@ -164,6 +169,19 @@ impl FakeImapGateway {
     }
 }
 
+impl RangeGateway {
+    fn new(deltas: Vec<Result<MailboxDelta, AppError>>) -> Self {
+        Self {
+            deltas: Mutex::new(deltas.into()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<(Option<SyncCursor>, ImapDateRange)> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
 #[async_trait]
 impl ImapGateway for FakeImapGateway {
     async fn test_connection(
@@ -197,6 +215,262 @@ impl ImapGateway for FakeImapGateway {
     ) -> Result<MailboxDelta, AppError> {
         self.fetch_since(config, secret, cursor).await
     }
+}
+
+#[async_trait]
+impl ImapGateway for RangeGateway {
+    async fn test_connection(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn fetch_since(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+        _cursor: Option<SyncCursor>,
+    ) -> Result<MailboxDelta, AppError> {
+        panic!("range gateway received an incremental fetch")
+    }
+
+    async fn fetch_range(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+        cursor: Option<SyncCursor>,
+        range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.requests.lock().unwrap().push((cursor, range));
+        self.deltas
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("fake IMAP range delta")
+    }
+}
+
+#[tokio::test]
+async fn range_sync_pages_history_without_reading_or_overwriting_daily_cursor() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::QQ,
+            email: "history@example.com".to_owned(),
+            imap_host: "imap.qq.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let daily_cursor = SyncCursor {
+        uid_validity: 9,
+        last_uid: 900,
+    };
+    accounts
+        .upsert_cursor(account.id, "INBOX", daily_cursor)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE mailbox_accounts SET last_error = 'old failure', last_error_at = ? WHERE id = ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(account.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "auth-code")
+        .unwrap();
+    let temporary_cursor = SyncCursor {
+        uid_validity: 9,
+        last_uid: 100,
+    };
+    let gateway = Arc::new(RangeGateway::new(vec![
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: temporary_cursor.uid_validity,
+            highest_uid: temporary_cursor.last_uid,
+            messages: vec![raw_message(
+                10,
+                include_bytes!("fixtures/mail/attachment.eml"),
+            )],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: temporary_cursor.uid_validity,
+            highest_uid: temporary_cursor.last_uid,
+            messages: vec![],
+        }),
+    ]));
+    let service = SyncService::new(
+        gateway.clone(),
+        credentials,
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+    let start = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+
+    let result = service.run_range(account.id, start, end).await.unwrap();
+
+    assert_eq!(result.imported_count, 1);
+    assert_eq!(
+        items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        gateway.requests(),
+        vec![
+            (
+                None,
+                ImapDateRange {
+                    start,
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+                },
+            ),
+            (
+                Some(temporary_cursor),
+                ImapDateRange {
+                    start,
+                    end_exclusive: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+                },
+            ),
+        ]
+    );
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(daily_cursor)
+    );
+    let refreshed = accounts.get(account.id).await.unwrap();
+    assert!(refreshed.last_synced_at.is_some());
+    assert_eq!(refreshed.last_error, None);
+    assert_eq!(refreshed.last_error_at, None);
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, imported_count FROM sync_runs WHERE account_id = ?",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("succeeded".to_owned(), 1)
+    );
+}
+
+#[tokio::test]
+async fn range_sync_rejects_reversed_and_unrepresentable_inclusive_ranges() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "invalid-range@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let gateway = Arc::new(RangeGateway::new(vec![]));
+    let service = SyncService::new(
+        gateway.clone(),
+        Arc::new(MemoryCredentialStore::default()),
+        accounts,
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items, Arc::new(FakeExtractor)),
+    );
+    let start = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+
+    let reversed = service.run_range(account.id, end, start).await.unwrap_err();
+    let overflow = service
+        .run_range(account.id, NaiveDate::MAX, NaiveDate::MAX)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(reversed, AppError::Validation { ref field, .. } if field == "dateRange"));
+    assert!(matches!(overflow, AppError::Validation { ref field, .. } if field == "dateRange"));
+    assert!(gateway.requests().is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn non_running_range_sync_run_cannot_commit_account_success_or_touch_cursor() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "finished-range-run@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let daily_cursor = SyncCursor {
+        uid_validity: 9,
+        last_uid: 900,
+    };
+    accounts
+        .upsert_cursor(account.id, "INBOX", daily_cursor)
+        .await
+        .unwrap();
+    let run = accounts.begin_sync_run(account.id).await.unwrap();
+    accounts
+        .finish_sync_failure(&run, "first failure")
+        .await
+        .unwrap();
+    let before = accounts.get(account.id).await.unwrap();
+
+    let error = accounts
+        .finish_range_sync_success(&run, 7)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        AppError::Conflict {
+            message: "sync run is missing or is no longer running".to_owned(),
+        }
+    );
+    assert_eq!(
+        accounts.get_cursor(account.id, "INBOX").await.unwrap(),
+        Some(daily_cursor)
+    );
+    let after = accounts.get(account.id).await.unwrap();
+    assert_eq!(after.last_synced_at, before.last_synced_at);
+    assert_eq!(after.last_error, before.last_error);
+    assert_eq!(after.last_error_at, before.last_error_at);
 }
 
 #[tokio::test]

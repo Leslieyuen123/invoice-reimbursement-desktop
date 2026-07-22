@@ -3,6 +3,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::NaiveDate;
 use kuchiki::traits::TendrilSink;
 use mail_parser::{MessageParser, MimeHeaders};
 use uuid::Uuid;
@@ -11,7 +12,7 @@ use crate::db::accounts::{MailboxAccountRepository, SyncCursor};
 use crate::domain::error::{AppError, sanitize_message};
 use crate::domain::model::{ConfirmationStatus, RecognitionStatus};
 use crate::infra::credentials::{CredentialStore, get_credential};
-use crate::infra::imap::{ImapAccountConfig, ImapGateway, MailboxDelta, RawMessage};
+use crate::infra::imap::{ImapAccountConfig, ImapDateRange, ImapGateway, MailboxDelta, RawMessage};
 use crate::services::import::{EmailImportSource, ImportOutcome, ImportService};
 use crate::services::recognition::RecognitionService;
 
@@ -134,6 +135,72 @@ impl SyncService {
         }
     }
 
+    pub async fn run_range(
+        &self,
+        account_id: Uuid,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<SyncResult, AppError> {
+        if start_date > end_date {
+            return Err(AppError::validation(
+                "dateRange",
+                "IMAP start date must not be after end date",
+            ));
+        }
+        let end_exclusive = end_date.succ_opt().ok_or_else(|| {
+            AppError::validation("dateRange", "IMAP end date is outside the supported range")
+        })?;
+        let range = ImapDateRange::new(start_date, end_exclusive)?;
+        let run = self.accounts.begin_sync_run(account_id).await?;
+        let account = match self.accounts.get(account_id).await {
+            Ok(account) => account,
+            Err(error) => {
+                let sanitized = sanitize_error(&error.to_string(), "");
+                self.accounts.finish_sync_failure(&run, &sanitized).await?;
+                return Err(sanitized_external_error(&error, sanitized));
+            }
+        };
+        let secret = match get_credential(self.credentials.clone(), account_id.to_string()).await {
+            Ok(Some(secret)) => secret,
+            Ok(None) => {
+                let error = authentication_error("mailbox credential is unavailable");
+                self.accounts
+                    .finish_sync_failure(&run, &error.to_string())
+                    .await?;
+                return Err(error);
+            }
+            Err(error) => {
+                self.accounts
+                    .finish_sync_failure(&run, &error.to_string())
+                    .await?;
+                return Err(error);
+            }
+        };
+        let config = ImapAccountConfig::from_account(&account);
+        let result = self
+            .run_range_deltas(account_id, &config, &secret, range)
+            .await;
+        match result {
+            Ok(result) => {
+                if let Err(error) = self
+                    .accounts
+                    .finish_range_sync_success(&run, result.imported_count)
+                    .await
+                {
+                    let sanitized = sanitize_error(&error.to_string(), &secret);
+                    self.accounts.finish_sync_failure(&run, &sanitized).await?;
+                    return Err(sanitized_external_error(&error, sanitized));
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                let sanitized = sanitize_error(&error.to_string(), &secret);
+                self.accounts.finish_sync_failure(&run, &sanitized).await?;
+                Err(sanitized_external_error(&error, sanitized))
+            }
+        }
+    }
+
     async fn run_delta(
         &self,
         account_id: Uuid,
@@ -144,6 +211,54 @@ impl SyncService {
         let delta = self.gateway.fetch_since(config, secret, cursor).await?;
         validate_delta(&delta, &config.mailbox)?;
         let rescan = cursor.is_some_and(|cursor| cursor.uid_validity != delta.uid_validity);
+        let result = self.process_delta(account_id, &delta, rescan).await?;
+        Ok((
+            result,
+            SyncCursor {
+                uid_validity: delta.uid_validity,
+                last_uid: delta.highest_uid,
+            },
+        ))
+    }
+
+    async fn run_range_deltas(
+        &self,
+        account_id: Uuid,
+        config: &ImapAccountConfig,
+        secret: &str,
+        range: ImapDateRange,
+    ) -> Result<SyncResult, AppError> {
+        let mut cursor = None;
+        let mut imported_count = 0_u32;
+        loop {
+            let delta = self
+                .gateway
+                .fetch_range(config, secret, cursor, range)
+                .await?;
+            validate_delta(&delta, &config.mailbox)?;
+            let rescan =
+                cursor.is_some_and(|cursor: SyncCursor| cursor.uid_validity != delta.uid_validity);
+            let result = self.process_delta(account_id, &delta, rescan).await?;
+            imported_count = imported_count
+                .checked_add(result.imported_count)
+                .ok_or_else(sync_import_count_overflow)?;
+            let next_cursor = SyncCursor {
+                uid_validity: delta.uid_validity,
+                last_uid: delta.highest_uid,
+            };
+            if cursor == Some(next_cursor) {
+                return Ok(SyncResult { imported_count });
+            }
+            cursor = Some(next_cursor);
+        }
+    }
+
+    async fn process_delta(
+        &self,
+        account_id: Uuid,
+        delta: &MailboxDelta,
+        rescan: bool,
+    ) -> Result<SyncResult, AppError> {
         let mut imported_count = 0_u32;
         for rejected in &delta.rejected_messages {
             let outcome = self
@@ -151,12 +266,9 @@ impl SyncService {
                 .import_email_rejection(account_id, delta.uid_validity, rejected, rescan)
                 .await?;
             if matches!(outcome, ImportOutcome::New(_)) {
-                imported_count =
-                    imported_count
-                        .checked_add(1)
-                        .ok_or_else(|| AppError::Internal {
-                            message: "sync import count overflow".to_owned(),
-                        })?;
+                imported_count = imported_count
+                    .checked_add(1)
+                    .ok_or_else(sync_import_count_overflow)?;
             }
         }
         for raw_message in &delta.messages {
@@ -181,12 +293,9 @@ impl SyncService {
                     .await?;
                 let item = match outcome {
                     ImportOutcome::New(item) => {
-                        imported_count =
-                            imported_count
-                                .checked_add(1)
-                                .ok_or_else(|| AppError::Internal {
-                                    message: "sync import count overflow".to_owned(),
-                                })?;
+                        imported_count = imported_count
+                            .checked_add(1)
+                            .ok_or_else(sync_import_count_overflow)?;
                         item
                     }
                     ImportOutcome::Existing(item) => item,
@@ -217,22 +326,19 @@ impl SyncService {
                     )
                     .await?;
                 if matches!(outcome, ImportOutcome::New(_)) {
-                    imported_count =
-                        imported_count
-                            .checked_add(1)
-                            .ok_or_else(|| AppError::Internal {
-                                message: "sync import count overflow".to_owned(),
-                            })?;
+                    imported_count = imported_count
+                        .checked_add(1)
+                        .ok_or_else(sync_import_count_overflow)?;
                 }
             }
         }
-        Ok((
-            SyncResult { imported_count },
-            SyncCursor {
-                uid_validity: delta.uid_validity,
-                last_uid: delta.highest_uid,
-            },
-        ))
+        Ok(SyncResult { imported_count })
+    }
+}
+
+fn sync_import_count_overflow() -> AppError {
+    AppError::Internal {
+        message: "sync import count overflow".to_owned(),
     }
 }
 

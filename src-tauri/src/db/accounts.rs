@@ -585,6 +585,65 @@ impl MailboxAccountRepository {
         }
     }
 
+    pub async fn finish_range_sync_success(
+        &self,
+        run: &SyncRun,
+        imported_count: u32,
+    ) -> Result<(), AppError> {
+        let now = Utc::now().to_rfc3339();
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin sync completion", error))?;
+        let result = async {
+            let run_update = sqlx::query(
+                "UPDATE sync_runs SET finished_at = ?, status = 'succeeded', imported_count = ?, \
+                    error_message = NULL WHERE id = ? AND account_id = ? AND status = 'running'",
+            )
+            .bind(&now)
+            .bind(i64::from(imported_count))
+            .bind(run.id.to_string())
+            .bind(run.account_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to finish sync run", error))?;
+            if run_update.rows_affected() != 1 {
+                return Err(AppError::Conflict {
+                    message: "sync run is missing or is no longer running".to_owned(),
+                });
+            }
+            let account_update = sqlx::query(
+                "UPDATE mailbox_accounts SET last_synced_at = ?, last_error = NULL, \
+                    last_error_at = NULL, updated_at = ? WHERE id = ?",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(run.account_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to update synced account", error))?;
+            if account_update.rows_affected() != 1 {
+                return Err(account_not_found(run.account_id));
+            }
+            Ok::<_, AppError>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .map_err(|error| map_database_error("failed to commit sync completion", error)),
+            Err(error) => {
+                transaction.rollback().await.map_err(|rollback| {
+                    map_database_error("failed to roll back sync completion", rollback)
+                })?;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn finish_sync_failure(&self, run: &SyncRun, message: &str) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
         let message = sanitize_error_message(message);
