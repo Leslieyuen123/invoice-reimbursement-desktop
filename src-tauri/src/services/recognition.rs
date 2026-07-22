@@ -163,6 +163,14 @@ impl RecognitionService {
         };
         let recognized =
             recognize_with_warnings(&extracted.text, received_date, &extracted.warnings);
+        let automatic_final_category = (recognized.confirmation_status
+            == ConfirmationStatus::Confirmed)
+            .then_some(recognized.category)
+            .flatten();
+        let automatic_final_category_patch = preserve_manual_confirmation
+            .then_some(automatic_final_category)
+            .flatten()
+            .map(Some);
 
         let persisted = self
             .persist_recognition_patch(
@@ -174,6 +182,7 @@ impl RecognitionService {
                     invoice_date: Some(recognized.invoice_date),
                     suggested_period: Some(Some(recognized.suggested_period)),
                     suggested_category: Some(recognized.category),
+                    final_category: automatic_final_category_patch,
                     amount_cents: Some(recognized.amount_cents),
                     city: Some(recognized.city),
                     company: Some(recognized.company),

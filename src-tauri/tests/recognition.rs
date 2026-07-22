@@ -584,6 +584,50 @@ fn extraction_warnings_keep_successful_recognition_pending() {
 }
 
 #[tokio::test]
+async fn extraction_warnings_persist_pending_without_a_final_category() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(Uuid::new_v4());
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026-05-08\n价税合计：¥128.50\n餐饮 食品".to_owned(),
+        normalized_pdf: None,
+        warnings: vec!["low_confidence".to_owned()],
+    })]));
+    let service = RecognitionService::new(repository, extractor);
+
+    let recognized = service.recognize_item(record.id).await.unwrap();
+
+    assert_eq!(recognized.suggested_category, Some(Category::Dining));
+    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
+    assert_eq!(recognized.final_category, None);
+}
+
+#[tokio::test]
+async fn confident_recognition_confirms_and_copies_the_suggested_category_to_final() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(Uuid::new_v4());
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "发票日期：2026-05-08\n日期：2026-05-08\n价税合计：¥128.50\n出租车 客运服务"
+            .to_owned(),
+        normalized_pdf: None,
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::new(repository, extractor);
+
+    let recognized = service.recognize_item(record.id).await.unwrap();
+
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+    assert_eq!(recognized.suggested_category, Some(Category::Transport));
+    assert_eq!(recognized.final_category, Some(Category::Transport));
+}
+
+#[tokio::test]
 async fn repository_get_by_id_returns_the_persisted_item() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let repository = ItemRepository::new(pool);
