@@ -195,6 +195,13 @@ impl BatchAutomationService {
                 });
             }
         }
+        if failed_accounts.len() == account_count {
+            return Err(AppError::External {
+                service: "mailbox".to_owned(),
+                retryable: true,
+                message: ALL_MAILBOXES_FAILED_MESSAGE.to_owned(),
+            });
+        }
 
         let mut cursor = None;
         let mut safe_ids = Vec::new();
@@ -261,13 +268,6 @@ impl BatchAutomationService {
         let assigned_count = u32::try_from(assigned_ids.len()).map_err(|_| count_overflow())?;
         let exception_count = u32::try_from(exception_ids.len()).map_err(|_| count_overflow())?;
         let resulting_batch = self.batches.get(batch_id).await?;
-        if failed_accounts.len() == account_count && resulting_batch.summary.item_count == 0 {
-            return Err(AppError::External {
-                service: "mailbox".to_owned(),
-                retryable: true,
-                message: ALL_MAILBOXES_FAILED_MESSAGE.to_owned(),
-            });
-        }
         let export = if resulting_batch.summary.item_count == 0 {
             None
         } else {

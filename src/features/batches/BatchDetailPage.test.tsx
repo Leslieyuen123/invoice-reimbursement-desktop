@@ -494,10 +494,10 @@ describe("Batch workspace", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("keeps the batch mounted and succeeds when automation is retried", async () => {
+  it("keeps a populated batch in failure state until automation is retried", async () => {
     const user = userEvent.setup();
     let attempt = 0;
-    mockDetail(detailFixture());
+    mockDetail(detailFixture([{ ...itemFixture(), batchId: "batch-summer" }]));
     mockCommand("run_batch_automation", () => {
       attempt += 1;
       return attempt === 1
@@ -507,7 +507,7 @@ describe("Batch workspace", () => {
             retryable: true,
             message: "邮箱同步暂时失败",
           })
-        : automationFixture({ export: null });
+        : automationFixture();
     });
 
     renderAppAt("/batches/batch-summer");
@@ -519,13 +519,12 @@ describe("Batch workspace", () => {
     expect(
       screen.getByRole("heading", { name: "6-8 月整理批次" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("高铁电子发票.pdf")).toBeInTheDocument();
+    expect(screen.queryByText("自动处理完成")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重试自动处理" }));
 
     expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
-    expect(screen.getByText("没有可导出的票据，本次未生成报销包")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "在文件夹中显示" }),
-    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "在文件夹中显示" })).toBeInTheDocument();
     expect(commandCalls("run_batch_automation")).toHaveLength(2);
   });
 

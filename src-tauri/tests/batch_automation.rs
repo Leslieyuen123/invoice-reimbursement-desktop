@@ -498,7 +498,7 @@ async fn one_account_failure_does_not_block_successful_accounts_or_export() {
 }
 
 #[tokio::test]
-async fn later_page_failure_keeps_completed_range_progress_for_exception_classification() {
+async fn all_failed_accounts_keep_partial_progress_without_assignment_or_export() {
     let gateway = Arc::new(FakeRangeGateway::default());
     gateway.queue(
         "a@example.com",
@@ -541,24 +541,21 @@ async fn later_page_failure_keeps_completed_range_progress_for_exception_classif
         .await
         .unwrap();
 
-    let result = harness
+    let error = harness
         .state
         .batch_automation_service()
         .run(batch.id)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.failed_accounts.len(), 1);
-    assert_eq!(result.failed_accounts[0].account_id, failed_account.id);
-    assert!(
-        !result.failed_accounts[0]
-            .message
-            .contains("secret-a@example.com")
+    assert_eq!(
+        error,
+        AppError::External {
+            service: "mailbox".to_owned(),
+            retryable: true,
+            message: "所有已启用邮箱同步失败，请检查网络和邮箱授权后重试".to_owned(),
+        }
     );
-    assert_eq!(result.imported_count, 1);
-    assert_eq!(result.assigned_count, 1);
-    assert_eq!(result.exception_count, 1);
-    assert_eq!(result.export.unwrap().item_count, 1);
     let sync_run = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT status, error_message FROM sync_runs WHERE account_id = ?",
     )
@@ -568,7 +565,7 @@ async fn later_page_failure_keeps_completed_range_progress_for_exception_classif
     .unwrap();
     assert_eq!(sync_run.0, "failed");
     assert!(!sync_run.1.unwrap().contains("secret-a@example.com"));
-    let items = ItemRepository::new(harness.pool)
+    let items = ItemRepository::new(harness.pool.clone())
         .list_bounded_for_tests(ItemFilter::default())
         .await
         .unwrap();
@@ -579,7 +576,7 @@ async fn later_page_failure_keeps_completed_range_progress_for_exception_classif
             .find(|item| item.id == safe_id)
             .unwrap()
             .batch_id,
-        Some(batch.id)
+        None
     );
     assert!(
         items
@@ -588,6 +585,14 @@ async fn later_page_failure_keeps_completed_range_progress_for_exception_classif
             .unwrap()
             .batch_id
             .is_none()
+    );
+    assert!(
+        BatchService::new(harness.pool)
+            .get(batch.id)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
     );
 }
 
