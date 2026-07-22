@@ -181,6 +181,18 @@ async fn exports_pdf_xlsx_originals_and_manifest() {
 }
 
 #[tokio::test]
+async fn immediate_sequential_exports_publish_to_distinct_directories() {
+    let app = TestApp::with_exportable_batch().await;
+
+    let first = app.exports.export(app.batch_id).await.unwrap();
+    let second = app.exports.export(app.batch_id).await.unwrap();
+
+    assert_ne!(first.directory, second.directory);
+    assert!(first.directory.is_dir());
+    assert!(second.directory.is_dir());
+}
+
+#[tokio::test]
 async fn export_keeps_a_missing_invoice_date_blank_in_the_workbook() {
     let app = TestApp::with_batch_item(ItemStatus::Ready).await;
     let item_id = app.item_ids[0];
@@ -506,7 +518,7 @@ async fn pdf_and_rows_sort_by_invoice_date_created_at_then_item_id() {
 }
 
 #[tokio::test]
-async fn timestamp_collision_never_overwrites_an_existing_directory() {
+async fn uuid_suffix_preserves_existing_timestamp_named_directories() {
     let app = TestApp::with_exportable_batch().await;
     let now = Utc::now();
     let mut collision_directories = Vec::new();
@@ -520,9 +532,10 @@ async fn timestamp_collision_never_overwrites_an_existing_directory() {
         collision_directories.push(directory);
     }
 
-    let error = app.exports.export(app.batch_id).await.unwrap_err();
+    let result = app.exports.export(app.batch_id).await.unwrap();
 
-    assert!(matches!(error, AppError::Conflict { message } if message.contains("已存在")));
+    assert!(!collision_directories.contains(&result.directory));
+    assert!(result.directory.join("manifest.json").is_file());
     for directory in collision_directories {
         assert!(directory.is_dir(), "pre-existing directory was removed");
         assert_eq!(

@@ -508,47 +508,30 @@ impl ItemRepository {
         Ok(ItemPage { items, next_cursor })
     }
 
-    pub(crate) async fn list_unassigned_email_ids_fetched_between(
-        &self,
-        account_ids: &[Uuid],
-        start_date: NaiveDate,
-        end_date: NaiveDate,
-    ) -> Result<Vec<Uuid>, AppError> {
-        if account_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let start = start_date
-            .and_hms_opt(0, 0, 0)
-            .expect("a valid date has a midnight")
-            .and_utc();
-        let end_exclusive = end_date
-            .succ_opt()
-            .ok_or_else(|| AppError::validation("dateRange", "end date is outside range"))?
-            .and_hms_opt(0, 0, 0)
-            .expect("a valid date has a midnight")
-            .and_utc();
-        let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT id FROM items WHERE source_type = 'email' AND batch_id IS NULL \
-             AND fetched_at >= ",
-        );
-        query
-            .push_bind(start.to_rfc3339())
-            .push(" AND fetched_at < ")
-            .push_bind(end_exclusive.to_rfc3339())
-            .push(" AND source_account_id IN (");
-        {
-            let mut separated = query.separated(", ");
-            for account_id in account_ids {
-                separated.push_bind(account_id.to_string());
+    pub(crate) async fn list_by_ids(&self, ids: &[Uuid]) -> Result<Vec<InvoiceItem>, AppError> {
+        let mut items = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(MAX_PAGE_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
+            query.push(ITEM_COLUMNS).push(" FROM items WHERE id IN (");
+            {
+                let mut separated = query.separated(", ");
+                for id in chunk {
+                    separated.push_bind(id.to_string());
+                }
             }
+            query.push(")");
+            let rows = query
+                .build_query_as::<DbItemRow>()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|error| internal_error("failed to list items by id", error))?;
+            items.extend(
+                rows.into_iter()
+                    .map(InvoiceItem::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
-        query.push(") ORDER BY fetched_at DESC, id DESC");
-        let ids = query
-            .build_query_scalar::<String>()
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| internal_error("failed to list email automation exceptions", error))?;
-        ids.into_iter().map(|id| parse_uuid(&id, "id")).collect()
+        Ok(items)
     }
 
     pub(crate) async fn list_by_batch_with_connection(

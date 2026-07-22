@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,8 +10,11 @@ use invoice_reimbursement::db;
 use invoice_reimbursement::db::accounts::{
     MailboxAccount, MailboxAccountRepository, MailboxProvider, NewMailboxAccount, SyncCursor,
 };
-use invoice_reimbursement::db::items::{ItemFilter, ItemRepository};
+use invoice_reimbursement::db::items::{ItemFilter, ItemRepository, NewItemRecord};
 use invoice_reimbursement::domain::error::AppError;
+use invoice_reimbursement::domain::model::{
+    Category, ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType,
+};
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use invoice_reimbursement::infra::files::AppPaths;
@@ -165,6 +169,7 @@ impl DocumentExtractor for SequenceExtractor {
 struct Harness {
     _directory: tempfile::TempDir,
     pool: sqlx::SqlitePool,
+    paths: AppPaths,
     state: AppState,
     accounts: MailboxAccountRepository,
     credentials: Arc<MemoryCredentialStore>,
@@ -178,7 +183,7 @@ impl Harness {
         let credentials = Arc::new(MemoryCredentialStore::default());
         let state = AppState::with_gateway_and_extractor(
             pool.clone(),
-            paths,
+            paths.clone(),
             credentials.clone(),
             gateway,
             extractor,
@@ -187,6 +192,7 @@ impl Harness {
             _directory: directory,
             accounts: MailboxAccountRepository::new(pool.clone()),
             pool,
+            paths,
             state,
             credentials,
         }
@@ -275,6 +281,51 @@ async fn imports_assigns_exceptions_and_exports_across_enabled_accounts() {
     ] {
         assert!(export.directory.join(name).is_file(), "missing {name}");
     }
+}
+
+#[tokio::test]
+async fn missing_or_unmanaged_invoice_files_remain_exceptions_without_blocking_the_batch() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    gateway.queue("a@example.com", completed_scan(Vec::new()));
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[]))).await;
+    harness.add_account("a@example.com", true).await;
+    let batch = harness.may_batch().await;
+    let repository = ItemRepository::new(harness.pool.clone());
+    let missing_original_id = uuid::Uuid::new_v4();
+    let mut missing_original = ready_item(&harness.paths, missing_original_id);
+    fs::write(
+        missing_original.normalized_pdf_path.as_deref().unwrap(),
+        include_bytes!("fixtures/text-invoice.pdf"),
+    )
+    .unwrap();
+    missing_original.original_path = harness
+        .paths
+        .originals
+        .join("missing.pdf")
+        .to_string_lossy()
+        .into_owned();
+    repository.insert(&missing_original).await.unwrap();
+
+    let unmanaged_pdf_id = uuid::Uuid::new_v4();
+    let mut unmanaged_pdf = ready_item(&harness.paths, unmanaged_pdf_id);
+    fs::write(&unmanaged_pdf.original_path, b"managed original").unwrap();
+    let outside_pdf = harness._directory.path().join("outside.pdf");
+    fs::write(&outside_pdf, include_bytes!("fixtures/text-invoice.pdf")).unwrap();
+    unmanaged_pdf.normalized_pdf_path = Some(outside_pdf.to_string_lossy().into_owned());
+    repository.insert(&unmanaged_pdf).await.unwrap();
+
+    let result = harness
+        .state
+        .batch_automation_service()
+        .run(batch.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.assigned_count, 0);
+    assert_eq!(result.exception_count, 2);
+    assert!(result.export.is_none());
+    let detail = BatchService::new(harness.pool).get(batch.id).await.unwrap();
+    assert!(detail.items.is_empty());
 }
 
 #[tokio::test]
@@ -392,7 +443,6 @@ async fn rerun_does_not_duplicate_rows_or_assignments() {
     let service = harness.state.batch_automation_service();
 
     let first = service.run(batch.id).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     let second = service.run(batch.id).await.unwrap();
 
     assert_eq!(first.imported_count, 1);
@@ -520,6 +570,81 @@ async fn missing_and_outside_invoice_dates_are_exceptions_but_are_not_assigned()
     );
 }
 
+#[tokio::test]
+async fn range_touched_existing_item_outside_utc_date_bounds_remains_an_exception() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    let mut message = raw_message(1, include_bytes!("fixtures/mail/attachment.eml"));
+    message.received_at = Utc
+        .with_ymd_and_hms(2026, 4, 30, 16, 30, 0)
+        .single()
+        .unwrap();
+    let mut responses = completed_scan(vec![message.clone()]);
+    responses.extend(completed_scan(vec![message]));
+    gateway.queue("a@example.com", responses);
+    let harness = Harness::new(
+        gateway,
+        Arc::new(SequenceExtractor::new(&[INCOMPLETE_TEXT])),
+    )
+    .await;
+    harness.add_account("a@example.com", true).await;
+    let batch = harness.may_batch().await;
+    let service = harness.state.batch_automation_service();
+
+    let first = service.run(batch.id).await.unwrap();
+    let second = service.run(batch.id).await.unwrap();
+
+    assert_eq!(first.imported_count, 1);
+    assert_eq!(first.exception_count, 1);
+    assert_eq!(second.imported_count, 0);
+    assert_eq!(second.exception_count, 1);
+    assert!(second.export.is_none());
+}
+
+#[tokio::test]
+async fn touched_item_owned_by_another_batch_is_an_exception_without_being_moved() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    let message = raw_message(1, include_bytes!("fixtures/mail/attachment.eml"));
+    let mut responses = completed_scan(vec![message.clone()]);
+    responses.extend(completed_scan(vec![message]));
+    gateway.queue("a@example.com", responses);
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[SAFE_TEXT]))).await;
+    harness.add_account("a@example.com", true).await;
+    let original_batch = harness.may_batch().await;
+    let target_batch = BatchService::new(harness.pool.clone())
+        .create(NewBatchInput {
+            name: "May reimbursement retry".to_owned(),
+            start_date: "2026-05-01".to_owned(),
+            end_date: "2026-05-31".to_owned(),
+            note: None,
+        })
+        .await
+        .unwrap();
+    let service = harness.state.batch_automation_service();
+
+    let first = service.run(original_batch.id).await.unwrap();
+    let item_id = BatchService::new(harness.pool.clone())
+        .get(original_batch.id)
+        .await
+        .unwrap()
+        .items[0]
+        .id;
+    let second = service.run(target_batch.id).await.unwrap();
+
+    assert_eq!(first.assigned_count, 1);
+    assert_eq!(second.imported_count, 0);
+    assert_eq!(second.assigned_count, 0);
+    assert_eq!(second.exception_count, 1);
+    assert!(second.export.is_none());
+    assert_eq!(
+        ItemRepository::new(harness.pool)
+            .get_by_id(item_id)
+            .await
+            .unwrap()
+            .batch_id,
+        Some(original_batch.id)
+    );
+}
+
 fn completed_scan(messages: Vec<RawMessage>) -> Vec<Result<MailboxDelta, AppError>> {
     let highest_uid = messages
         .iter()
@@ -548,5 +673,53 @@ fn raw_message(uid: u32, raw: &[u8]) -> RawMessage {
         mailbox: "INBOX".to_owned(),
         raw: raw.to_vec(),
         received_at: Utc.with_ymd_and_hms(2026, 5, 15, 8, 0, 0).single().unwrap(),
+    }
+}
+
+fn ready_item(paths: &AppPaths, id: uuid::Uuid) -> NewItemRecord {
+    let now = Utc.with_ymd_and_hms(2026, 5, 15, 8, 0, 0).single().unwrap();
+    NewItemRecord {
+        id,
+        original_name: format!("{id}.pdf"),
+        original_path: paths
+            .originals
+            .join(format!("{id}.pdf"))
+            .to_string_lossy()
+            .into_owned(),
+        normalized_pdf_path: Some(
+            paths
+                .normalized
+                .join(format!("{id}.pdf"))
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        sha256: format!("sha-{id}"),
+        mime_type: "application/pdf".to_owned(),
+        source_type: SourceType::ManualUpload,
+        source_account_id: None,
+        source_mailbox: None,
+        source_uid_validity: None,
+        source_uid: None,
+        source_message_id: None,
+        source_part_id: None,
+        fetched_at: now,
+        invoice_date: Some(NaiveDate::from_ymd_opt(2026, 5, 10).unwrap()),
+        suggested_period: Some("2026-05".to_owned()),
+        batch_id: None,
+        suggested_category: Some(Category::Dining),
+        final_category: Some(Category::Dining),
+        amount_cents: Some(12_850),
+        currency: "CNY".to_owned(),
+        city: None,
+        company: None,
+        recognition_status: RecognitionStatus::Succeeded,
+        confirmation_status: ConfirmationStatus::Confirmed,
+        dedupe_status: DedupeStatus::Unique,
+        duplicate_of_id: None,
+        note: None,
+        event_tag: None,
+        project_tag: None,
+        created_at: now,
+        updated_at: now,
     }
 }

@@ -42,9 +42,10 @@ impl Default for ZipExpansionBudget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncResult {
     pub imported_count: u32,
+    pub(crate) touched_item_ids: Vec<Uuid>,
 }
 
 #[derive(Clone)]
@@ -233,6 +234,8 @@ impl SyncService {
         let mut seen_cursors = HashSet::new();
         let mut page_count = 0_usize;
         let mut imported_count = 0_u32;
+        let mut touched_item_ids = Vec::new();
+        let mut touched_item_id_set = HashSet::new();
         loop {
             if page_count >= MAX_RANGE_SYNC_PAGES {
                 return Err(external_error("IMAP range scan exceeded page limit"));
@@ -264,8 +267,16 @@ impl SyncService {
             imported_count = imported_count
                 .checked_add(result.imported_count)
                 .ok_or_else(sync_import_count_overflow)?;
+            for id in result.touched_item_ids {
+                if touched_item_id_set.insert(id) {
+                    touched_item_ids.push(id);
+                }
+            }
             if finished {
-                return Ok(SyncResult { imported_count });
+                return Ok(SyncResult {
+                    imported_count,
+                    touched_item_ids,
+                });
             }
             seen_cursors.insert(cursor_key);
             cursor = Some(next_cursor);
@@ -279,16 +290,19 @@ impl SyncService {
         rescan: bool,
     ) -> Result<SyncResult, AppError> {
         let mut imported_count = 0_u32;
+        let mut touched_item_ids = Vec::new();
+        let mut touched_item_id_set = HashSet::new();
         for rejected in &delta.rejected_messages {
             let outcome = self
                 .import
                 .import_email_rejection(account_id, delta.uid_validity, rejected, rescan)
                 .await?;
-            if matches!(outcome, ImportOutcome::New(_)) {
-                imported_count = imported_count
-                    .checked_add(1)
-                    .ok_or_else(sync_import_count_overflow)?;
-            }
+            track_import_outcome(
+                outcome,
+                &mut imported_count,
+                &mut touched_item_ids,
+                &mut touched_item_id_set,
+            )?;
         }
         for raw_message in &delta.messages {
             let parsed = parse_invoice_parts(raw_message)?;
@@ -310,15 +324,12 @@ impl SyncService {
                         },
                     )
                     .await?;
-                let item = match outcome {
-                    ImportOutcome::New(item) => {
-                        imported_count = imported_count
-                            .checked_add(1)
-                            .ok_or_else(sync_import_count_overflow)?;
-                        item
-                    }
-                    ImportOutcome::Existing(item) => item,
-                };
+                let item = track_import_outcome(
+                    outcome,
+                    &mut imported_count,
+                    &mut touched_item_ids,
+                    &mut touched_item_id_set,
+                )?;
                 if item.recognition_status == RecognitionStatus::Pending
                     && item.confirmation_status == ConfirmationStatus::Pending
                     && let Err(error) = self.recognition.recognize_item(item.id).await
@@ -344,15 +355,40 @@ impl SyncService {
                         },
                     )
                     .await?;
-                if matches!(outcome, ImportOutcome::New(_)) {
-                    imported_count = imported_count
-                        .checked_add(1)
-                        .ok_or_else(sync_import_count_overflow)?;
-                }
+                track_import_outcome(
+                    outcome,
+                    &mut imported_count,
+                    &mut touched_item_ids,
+                    &mut touched_item_id_set,
+                )?;
             }
         }
-        Ok(SyncResult { imported_count })
+        Ok(SyncResult {
+            imported_count,
+            touched_item_ids,
+        })
     }
+}
+
+fn track_import_outcome(
+    outcome: ImportOutcome,
+    imported_count: &mut u32,
+    touched_item_ids: &mut Vec<Uuid>,
+    touched_item_id_set: &mut HashSet<Uuid>,
+) -> Result<crate::db::items::InvoiceItem, AppError> {
+    let item = match outcome {
+        ImportOutcome::New(item) => {
+            *imported_count = imported_count
+                .checked_add(1)
+                .ok_or_else(sync_import_count_overflow)?;
+            item
+        }
+        ImportOutcome::Existing(item) => item,
+    };
+    if touched_item_id_set.insert(item.id) {
+        touched_item_ids.push(item.id);
+    }
+    Ok(item)
 }
 
 fn sync_import_count_overflow() -> AppError {

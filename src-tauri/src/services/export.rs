@@ -386,7 +386,7 @@ impl ExportService {
         let exported_at = Utc::now();
         let operation_id = Uuid::new_v4();
         let staging_component = format!("export-{operation_id}");
-        let final_component = export_directory_name(&batch.name, &exported_at);
+        let final_component = export_directory_name(&batch.name, &exported_at, operation_id);
         let staging_path = paths.staging.join(&staging_component);
         let directory = paths.exports.join(&final_component);
         let journal = ExportJournal::new(self.pool.clone());
@@ -691,14 +691,18 @@ fn recoverable_finalization_error(message: &str) -> AppError {
     }
 }
 
-fn export_directory_name(batch_name: &str, exported_at: &DateTime<Utc>) -> String {
+fn export_directory_name(
+    batch_name: &str,
+    exported_at: &DateTime<Utc>,
+    operation_id: Uuid,
+) -> String {
     let sanitized = sanitize_filename::sanitize(batch_name);
     let sanitized = if sanitized.trim().is_empty() {
         "batch"
     } else {
         sanitized.as_str()
     };
-    let suffix = format!("-{}", exported_at.format("%Y%m%d-%H%M%S"));
+    let suffix = format!("-{}-{operation_id}", exported_at.format("%Y%m%d-%H%M%S"));
     let batch_budget = MAX_FILENAME_COMPONENT_BYTES.saturating_sub(suffix.len());
     let mut end = sanitized.len().min(batch_budget);
     while !sanitized.is_char_boundary(end) {
@@ -2306,11 +2310,12 @@ mod tests {
     #[test]
     fn batch_directory_name_reserves_suffix_at_utf8_boundary() {
         let exported_at = Utc.with_ymd_and_hms(2026, 7, 15, 12, 34, 56).unwrap();
+        let operation_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
 
-        let component = super::export_directory_name(&"报".repeat(100), &exported_at);
+        let component = super::export_directory_name(&"报".repeat(100), &exported_at, operation_id);
 
         assert!(component.len() <= 255);
-        assert!(component.ends_with("-20260715-123456"));
+        assert!(component.ends_with("-20260715-123456-12345678-1234-1234-1234-123456789abc"));
         assert!(component.starts_with('报'));
     }
 

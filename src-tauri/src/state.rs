@@ -171,6 +171,7 @@ impl AppState {
             self.export_service(),
             self.account_operations.clone(),
             self.batch_automation_coordinator.clone(),
+            self.paths.clone(),
         )
     }
 
