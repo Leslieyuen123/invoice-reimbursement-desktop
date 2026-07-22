@@ -443,7 +443,8 @@
 .batch-automation-copy > .batch-automation-directory {
   display: grid;
   min-width: 0;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
   gap: 8px;
   margin-top: 9px;
 }
@@ -459,6 +460,10 @@
   color: var(--text-secondary);
   font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
   font-size: 12px;
+}
+
+.batch-automation-directory .button {
+  justify-self: end;
 }
 
 .batch-automation-empty {
@@ -1064,6 +1069,10 @@
   .batch-automation-copy > .batch-automation-directory {
     grid-template-columns: minmax(0, 1fr);
     gap: 3px;
+  }
+
+  .batch-automation-directory .button {
+    justify-self: start;
   }
 
   .batch-export-blocked,

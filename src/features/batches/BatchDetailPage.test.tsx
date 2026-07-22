@@ -344,6 +344,68 @@ describe("Batch workspace", () => {
     await waitFor(() => expect(commandCalls("get_batch").length).toBeGreaterThan(1));
   });
 
+  it("reveals the automation export from its completion summary", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture());
+    mockCommand(
+      "run_batch_automation",
+      automationFixture({
+        export: {
+          directory: "/Users/finance/automated/2026-05",
+          itemCount: 1,
+          totalAmountCents: 12_850,
+        },
+      }),
+    );
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+
+    const completion = await screen.findByRole("status", {
+      name: "批次自动处理完成",
+    });
+    const reveal = within(completion).getByRole("button", {
+      name: "在文件夹中显示",
+    });
+    expect(screen.queryByText("报销包已生成")).not.toBeInTheDocument();
+    await user.click(reveal);
+
+    expect(revealMock).toHaveBeenCalledWith(
+      "/Users/finance/automated/2026-05/merged.pdf",
+    );
+  });
+
+  it("reports automation export reveal failures in its completion summary", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture());
+    mockCommand(
+      "run_batch_automation",
+      automationFixture({
+        export: {
+          directory: "/Users/finance/automated/2026-05",
+          itemCount: 1,
+          totalAmountCents: 12_850,
+        },
+      }),
+    );
+    revealMock.mockRejectedValue(new Error("Finder unavailable"));
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+
+    const completion = await screen.findByRole("status", {
+      name: "批次自动处理完成",
+    });
+    await user.click(
+      within(completion).getByRole("button", { name: "在文件夹中显示" }),
+    );
+
+    expect(await within(completion).findByRole("alert")).toHaveTextContent(
+      "无法在文件夹中显示",
+    );
+    expect(screen.queryByText("报销包已生成")).not.toBeInTheDocument();
+  });
+
   it("clears automation success when manual assignment changes batch content", async () => {
     const user = userEvent.setup();
     const candidate = candidateFixture(itemFixture());
@@ -376,6 +438,9 @@ describe("Batch workspace", () => {
     expect(
       screen.queryByText("/Users/finance/stale-automation-export"),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "在文件夹中显示" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps the batch mounted and succeeds when automation is retried", async () => {
@@ -407,6 +472,9 @@ describe("Batch workspace", () => {
 
     expect(await screen.findByText("自动处理完成")).toBeInTheDocument();
     expect(screen.getByText("没有可导出的票据，本次未生成报销包")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "在文件夹中显示" }),
+    ).not.toBeInTheDocument();
     expect(commandCalls("run_batch_automation")).toHaveLength(2);
   });
 

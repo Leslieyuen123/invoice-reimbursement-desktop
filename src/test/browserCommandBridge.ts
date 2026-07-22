@@ -46,6 +46,8 @@ type CommandHandler = (arguments_: CommandArguments) => unknown | Promise<unknow
 interface BrowserBridgeOptions {
   delayMs?: number;
   failCommands?: ReadonlySet<string>;
+  failOnceCommands?: ReadonlySet<string>;
+  automationScenario?: "success-with-exceptions";
   seed?: BrowserBridgeSeed;
   persist?: (state: BridgeState) => void;
 }
@@ -260,6 +262,75 @@ function isSafeAutomationCandidate(item: InvoiceItemDto, batch: BatchDto) {
   );
 }
 
+function seedAutomationScenario(
+  state: BridgeState,
+  batch: BatchDto,
+  accountId: string,
+  scenario: BrowserBridgeOptions["automationScenario"],
+) {
+  if (scenario !== "success-with-exceptions") return 0;
+  const period = batch.startDate.slice(0, 7);
+  const fixtures: InvoiceItemDto[] = [
+    {
+      id: `automation-safe-${batch.id}`,
+      originalName: "自动处理安全票据.pdf",
+      previewUrl: previewFixtureUrl,
+      sourceType: "email",
+      sourceAccountId: accountId,
+      fetchedAt: now,
+      invoiceDate: batch.startDate,
+      suggestedPeriod: period,
+      batchId: null,
+      suggestedCategory: "transport",
+      finalCategory: "transport",
+      amountCents: 8_600,
+      currency: "CNY",
+      city: "上海",
+      company: "自动处理测试交通",
+      status: "ready",
+      recognitionStatus: "succeeded",
+      confirmationStatus: "confirmed",
+      dedupeStatus: "unique",
+      note: null,
+      eventTag: null,
+      projectTag: null,
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: `automation-exception-${batch.id}`,
+      originalName: "自动处理待复核票据.pdf",
+      previewUrl: previewFixtureUrl,
+      sourceType: "email",
+      sourceAccountId: accountId,
+      fetchedAt: now,
+      invoiceDate: batch.startDate,
+      suggestedPeriod: period,
+      batchId: null,
+      suggestedCategory: "dining",
+      finalCategory: null,
+      amountCents: null,
+      currency: "CNY",
+      city: null,
+      company: null,
+      status: "pending_confirmation",
+      recognitionStatus: "succeeded",
+      confirmationStatus: "pending",
+      dedupeStatus: "unique",
+      note: null,
+      eventTag: null,
+      projectTag: null,
+      createdAt: now,
+      updatedAt: now,
+    },
+  ];
+  const imported = fixtures.filter(
+    (fixture) => !state.items.some((item) => item.id === fixture.id),
+  );
+  state.items.unshift(...imported);
+  return imported.length;
+}
+
 function itemMatches(item: InvoiceItemDto, filter: ItemFilter) {
   const query = filter.query?.trim().toLocaleLowerCase("zh-CN");
   return (
@@ -330,6 +401,7 @@ function dashboard(state: BridgeState): DashboardDto {
 function makeHandlers(
   state: BridgeState,
   persistState: () => void = () => undefined,
+  automationScenario?: BrowserBridgeOptions["automationScenario"],
 ): Map<string, CommandHandler> {
   const handlers: Array<[string, CommandHandler]> = [
     [API_COMMANDS.getDashboard, () => dashboard(state)],
@@ -526,6 +598,12 @@ function makeHandlers(
           message: "no enabled mailbox accounts are configured",
         } satisfies AppError;
       }
+      const importedCount = seedAutomationScenario(
+        state,
+        batch,
+        enabledAccounts[0].id,
+        automationScenario,
+      );
       const candidates = state.items.filter(
         (item) =>
           item.batchId === null &&
@@ -545,7 +623,7 @@ function makeHandlers(
       return {
         scannedAccountCount: enabledAccounts.length,
         failedAccounts: [],
-        importedCount: 0,
+        importedCount,
         assignedCount: safeCandidates.length,
         exceptionCount: candidates.length - safeCandidates.length,
         export: detail.items.length === 0 ? null : exportBatch(state, batchId),
@@ -640,14 +718,18 @@ export function createBrowserCommandBridge(
   const persistState = () => {
     options.persist?.(JSON.parse(JSON.stringify(state)) as BridgeState);
   };
-  const handlers = makeHandlers(state, persistState);
+  const handlers = makeHandlers(state, persistState, options.automationScenario);
+  const remainingFailOnceCommands = new Set(options.failOnceCommands);
   return async <T>(command: string, arguments_: CommandArguments = {}) => {
     const handler = handlers.get(command);
     if (!handler) throw new Error(`Unsupported browser command: ${command}`);
     if (options.delayMs && options.delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, options.delayMs));
     }
-    if (options.failCommands?.has(command)) {
+    if (
+      options.failCommands?.has(command) ||
+      remainingFailOnceCommands.delete(command)
+    ) {
       throw {
         code: "external",
         service: "browser_bridge",
@@ -677,6 +759,13 @@ export function installBrowserCommandBridge() {
   const failCommands = new Set(
     (search.get("bridgeError") ?? "").split(",").filter(Boolean),
   );
+  const failOnceCommands = new Set(
+    (search.get("bridgeErrorOnce") ?? "").split(",").filter(Boolean),
+  );
+  const automationScenario =
+    search.get("bridgeAutomation") === "success-with-exceptions"
+      ? "success-with-exceptions"
+      : undefined;
   let seed: BrowserBridgeSeed | undefined;
   const stored = window.sessionStorage.getItem(sessionStorageKey);
   if (stored) {
@@ -689,6 +778,8 @@ export function installBrowserCommandBridge() {
   window.__INVOICE_COMMAND_BRIDGE__ = createBrowserCommandBridge({
     delayMs,
     failCommands,
+    failOnceCommands,
+    automationScenario,
     seed,
     persist: (state) => {
       window.sessionStorage.setItem(sessionStorageKey, JSON.stringify(state));

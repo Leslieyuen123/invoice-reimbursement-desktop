@@ -383,23 +383,29 @@ export function BatchDetailPage() {
     }
   }
 
-  async function revealExport() {
-    if (!exportResult) return;
+  async function revealExportDirectory(directory: string) {
     const session = routeSession.current;
     const operationBatchId = batchId;
     const operationContentRevision = getBatchContentRevision(operationBatchId);
     setRevealError(null);
     try {
-      const mergedPdf = await join(exportResult.directory, "merged.pdf");
+      const mergedPdf = await join(directory, "merged.pdf");
       await revealItemInDir(mergedPdf);
     } catch {
       if (
+        viewActive.current &&
+        activeBatchId.current === operationBatchId &&
         session === routeSession.current &&
         operationContentRevision === getBatchContentRevision(operationBatchId)
       ) {
         setRevealError("无法在文件夹中显示，请从导出目录手动打开报销包");
       }
     }
+  }
+
+  async function revealExport() {
+    if (!exportResult) return;
+    await revealExportDirectory(exportResult.directory);
   }
 
   function closeAssignDialog() {
@@ -507,6 +513,9 @@ export function BatchDetailPage() {
 
   const detail = batchQuery.data;
   const exportBlocked = detail.summary.unconfirmedCount > 0;
+  const automationExport = automationFeedback.status === "success"
+    ? automationFeedback.result.export
+    : null;
 
   return (
     <section className="batch-detail-page" aria-labelledby="batch-detail-title">
@@ -602,11 +611,26 @@ export function BatchDetailPage() {
               <li>{automationFeedback.result.exceptionCount} 个异常项</li>
               <li>{automationFeedback.result.failedAccounts.length} 个邮箱失败</li>
             </ul>
-            {automationFeedback.result.export ? (
-              <p className="batch-automation-directory">
-                <span>导出目录</span>
-                <code>{automationFeedback.result.export.directory}</code>
-              </p>
+            {automationExport ? (
+              <>
+                <p className="batch-automation-directory">
+                  <span>导出目录</span>
+                  <code>{automationExport.directory}</code>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() => void revealExportDirectory(automationExport.directory)}
+                  >
+                    <FolderOpen size={16} strokeWidth={1.7} aria-hidden="true" />
+                    在文件夹中显示
+                  </button>
+                </p>
+                {revealError && !exportResult ? (
+                  <div className="batch-inline-error batch-reveal-error" role="alert">
+                    {revealError}
+                  </div>
+                ) : null}
+              </>
             ) : (
               <p className="batch-automation-empty">
                 没有可导出的票据，本次未生成报销包

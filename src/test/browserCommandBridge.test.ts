@@ -260,6 +260,52 @@ describe("browser command bridge", () => {
     });
   });
 
+  it("supports a deterministic automation fixture after one simulated command failure", async () => {
+    const bridge = createBrowserCommandBridge({
+      automationScenario: "success-with-exceptions",
+      failOnceCommands: new Set(["run_batch_automation"]),
+      seed: {
+        accounts: [accountFixture()],
+        batches: [
+          batchFixture("batch-may", {
+            name: "2026 年 5 月报销",
+            startDate: "2026-05-01",
+            endDate: "2026-05-31",
+          }),
+        ],
+      },
+    });
+
+    await expect(
+      bridge("run_batch_automation", { batchId: "batch-may" }),
+    ).rejects.toMatchObject({
+      code: "external",
+      retryable: true,
+    });
+    await expect(
+      bridge<BatchAutomationResultDto>("run_batch_automation", {
+        batchId: "batch-may",
+      }),
+    ).resolves.toEqual({
+      scannedAccountCount: 1,
+      failedAccounts: [],
+      importedCount: 2,
+      assignedCount: 1,
+      exceptionCount: 1,
+      export: {
+        directory: "/tmp/invoice-reimbursement/e2e/2026-05",
+        itemCount: 1,
+        totalAmountCents: 8_600,
+      },
+    });
+    await expect(
+      bridge<BatchDetailDto>("get_batch", { batchId: "batch-may" }),
+    ).resolves.toMatchObject({
+      batch: { status: "exported", itemCount: 1, totalAmountCents: 8_600 },
+      items: [{ originalName: "自动处理安全票据.pdf" }],
+    });
+  });
+
   it.each([
     ["no accounts", []],
     ["only disabled accounts", [accountFixture({ enabled: false })]],

@@ -299,7 +299,9 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
 test("automated May batch completes from the default create action", async ({
   page,
 }, testInfo) => {
-  await page.goto("/settings?bridgeReset=1&bridgeDelay=150");
+  await page.goto(
+    "/settings?bridgeReset=1&bridgeDelay=150&bridgeAutomation=success-with-exceptions",
+  );
   await expect(page.getByRole("heading", { name: "运行设置" })).toBeVisible();
 
   const newAccount = page.getByRole("form", { name: "新邮箱账号" });
@@ -332,15 +334,61 @@ test("automated May batch completes from the default create action", async ({
     page.getByRole("status", { name: "批次自动处理完成" }),
   ).toBeVisible();
   await expect(page.getByRole("heading", { name: "2026 年 5 月报销" })).toBeVisible();
-  await expect(page.getByText("0 张新导入")).toBeVisible();
-  await expect(page.getByText("0 张已自动纳入")).toBeVisible();
-  await expect(page.getByText("0 个异常项")).toBeVisible();
+  await expect(page.getByText("2 张新导入")).toBeVisible();
+  await expect(page.getByText("1 张已自动纳入")).toBeVisible();
+  await expect(page.getByText("1 个异常项")).toBeVisible();
   await expect(page.getByText("0 个邮箱失败")).toBeVisible();
+  await expect(page.getByText("导出目录", { exact: true })).toBeVisible();
+  await expect(page.getByText("/tmp/invoice-reimbursement/e2e/2026-05")).toBeVisible();
+  await expect(page.getByText("自动处理安全票据.pdf")).toBeVisible();
   await expect(
-    page.getByText("没有可导出的票据，本次未生成报销包"),
+    page.getByRole("status", { name: "批次自动处理完成" }).getByRole("button", {
+      name: "在文件夹中显示",
+    }),
   ).toBeVisible();
   await auditCurrentView(page);
   await attachView(page, testInfo, "automated-may-batch");
+});
+
+test("automated May batch failure remains retryable", async ({ page }, testInfo) => {
+  await page.goto(
+    "/settings?bridgeReset=1&bridgeDelay=150&bridgeAutomation=success-with-exceptions&bridgeErrorOnce=run_batch_automation",
+  );
+  await expect(page.getByRole("heading", { name: "运行设置" })).toBeVisible();
+
+  const newAccount = page.getByRole("form", { name: "新邮箱账号" });
+  await newAccount.getByLabel("邮箱地址").fill("retry@example.com");
+  await newAccount.locator('input[type="password"]').fill("e2e-app-password");
+  await newAccount.getByRole("button", { name: "测试连接" }).click();
+  await expect(newAccount.getByText("连接成功")).toBeVisible();
+  await newAccount.getByRole("button", { name: "保存账号" }).click();
+  await expect(page.getByRole("form", { name: "retry@example.com" })).toBeVisible();
+
+  await page.getByRole("link", { name: "报销批次" }).click();
+  await page.getByRole("link", { name: "新建批次" }).click();
+  await page.getByLabel("年份").fill("2026");
+  await page.getByLabel("月份").selectOption("5");
+  await page.getByRole("button", { name: "创建并自动处理" }).click();
+
+  await expect(
+    page.getByRole("status", { name: "正在自动处理批次" }),
+  ).toBeVisible();
+  const failure = page.getByRole("alert").filter({ hasText: "自动处理未完成" });
+  await expect(failure).toContainText("Simulated browser command failure");
+  await auditCurrentView(page);
+  await attachView(page, testInfo, "automated-may-batch-failure");
+
+  await page.getByRole("button", { name: "重试自动处理" }).click();
+  await expect(
+    page.getByRole("status", { name: "正在自动处理批次" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("status", { name: "批次自动处理完成" }),
+  ).toBeVisible();
+  await expect(page.getByText("1 个异常项")).toBeVisible();
+  await expect(page.getByText("/tmp/invoice-reimbursement/e2e/2026-05")).toBeVisible();
+  await auditCurrentView(page);
+  await attachView(page, testInfo, "automated-may-batch-retry-success");
 });
 
 test("loading, empty, and error states remain operable", async ({ page }) => {
