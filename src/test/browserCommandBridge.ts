@@ -327,7 +327,10 @@ function dashboard(state: BridgeState): DashboardDto {
   };
 }
 
-function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
+function makeHandlers(
+  state: BridgeState,
+  persistState: () => void = () => undefined,
+): Map<string, CommandHandler> {
   const handlers: Array<[string, CommandHandler]> = [
     [API_COMMANDS.getDashboard, () => dashboard(state)],
     [API_COMMANDS.listItems, (arguments_) => {
@@ -507,6 +510,22 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       const batchId = requiredString(arguments_, "batchId");
       const batch = state.batches.find((candidate) => candidate.id === batchId);
       if (!batch) throw notFound("batch");
+      const inclusiveDays =
+        (Date.parse(batch.endDate) - Date.parse(batch.startDate)) / 86_400_000 + 1;
+      if (inclusiveDays > 366) {
+        throw {
+          code: "validation",
+          field: "dateRange",
+          message: "batch automation date range must not exceed 366 days",
+        } satisfies AppError;
+      }
+      const enabledAccounts = state.accounts.filter((account) => account.enabled);
+      if (enabledAccounts.length === 0) {
+        throw {
+          code: "conflict",
+          message: "no enabled mailbox accounts are configured",
+        } satisfies AppError;
+      }
       const candidates = state.items.filter(
         (item) =>
           item.batchId === null &&
@@ -522,8 +541,9 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
         Object.assign(item, { batchId, updatedAt: now });
       }
       const detail = batchDetail(state, batchId);
+      persistState();
       return {
-        scannedAccountCount: state.accounts.filter((account) => account.enabled).length,
+        scannedAccountCount: enabledAccounts.length,
         failedAccounts: [],
         importedCount: 0,
         assignedCount: safeCandidates.length,
@@ -617,7 +637,10 @@ export function createBrowserCommandBridge(
   options: BrowserBridgeOptions = {},
 ): BrowserCommandBridge {
   const state = initialState(options.seed);
-  const handlers = makeHandlers(state);
+  const persistState = () => {
+    options.persist?.(JSON.parse(JSON.stringify(state)) as BridgeState);
+  };
+  const handlers = makeHandlers(state, persistState);
   return async <T>(command: string, arguments_: CommandArguments = {}) => {
     const handler = handlers.get(command);
     if (!handler) throw new Error(`Unsupported browser command: ${command}`);
@@ -633,7 +656,7 @@ export function createBrowserCommandBridge(
       } satisfies AppError;
     }
     const result = await handler(arguments_);
-    options.persist?.(JSON.parse(JSON.stringify(state)) as BridgeState);
+    persistState();
     return result as T;
   };
 }

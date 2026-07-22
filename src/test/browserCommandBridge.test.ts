@@ -80,7 +80,9 @@ function createSeededBridge(seed: {
   return createBrowserCommandBridge({ seed } as never);
 }
 
-function accountFixture(): MailboxAccountDto {
+function accountFixture(
+  overrides: Partial<MailboxAccountDto> = {},
+): MailboxAccountDto {
   return {
     id: "account-1",
     provider: "gmail",
@@ -93,6 +95,7 @@ function accountFixture(): MailboxAccountDto {
     lastError: null,
     lastErrorKind: null,
     lastErrorAt: null,
+    ...overrides,
   };
 }
 
@@ -255,6 +258,144 @@ describe("browser command bridge", () => {
       exceptionCount: 0,
       export: null,
     });
+  });
+
+  it.each([
+    ["no accounts", []],
+    ["only disabled accounts", [accountFixture({ enabled: false })]],
+  ])("rejects automation before mutation when there are %s", async (_case, accounts) => {
+    const bridge = createSeededBridge({
+      accounts,
+      batches: [
+        batchFixture("batch-1", {
+          status: "exported",
+          lastExportedAt: "2026-07-17T07:00:00Z",
+        }),
+      ],
+      items: [invoiceFixture("safe")],
+    });
+
+    await expect(
+      bridge("run_batch_automation", { batchId: "batch-1" }),
+    ).rejects.toEqual({
+      code: "conflict",
+      message: "no enabled mailbox accounts are configured",
+    });
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "safe" }),
+    ).resolves.toMatchObject({ batchId: null });
+    await expect(
+      bridge<BatchDetailDto>("get_batch", { batchId: "batch-1" }),
+    ).resolves.toMatchObject({
+      batch: {
+        status: "exported",
+        lastExportedAt: "2026-07-17T07:00:00Z",
+      },
+    });
+  });
+
+  it("persists automation assignments before a later export failure", async () => {
+    window.history.replaceState({}, "", "/?bridgeReset=1");
+    installBrowserCommandBridge();
+    const bridge = window.__INVOICE_COMMAND_BRIDGE__;
+    if (!bridge) throw new Error("browser bridge was not installed");
+    await bridge("save_mailbox_account", {
+      input: {
+        id: null,
+        provider: "gmail",
+        email: "account@example.invalid",
+        secret: "test-value",
+        imapHost: null,
+        imapPort: null,
+        enabled: true,
+        syncIntervalMinutes: 15,
+      },
+    });
+    const imports = await bridge<ManualImportOutcomeDto[]>(
+      "import_manual_files",
+      { paths: ["safe.png", "blocked.png"] },
+    );
+    const importedItems = imports.flatMap((outcome) =>
+      outcome.status === "imported" ? [outcome.item] : [],
+    );
+    const safe = importedItems.find((item) => item.originalName === "safe.png");
+    const blocked = importedItems.find(
+      (item) => item.originalName === "blocked.png",
+    );
+    if (!safe || !blocked) throw new Error("fixture imports were incomplete");
+    await bridge("review_item", {
+      input: {
+        id: safe.id,
+        invoiceDate: "2026-07-15",
+        suggestedPeriod: "2026-07",
+        finalCategory: "dining",
+        amountCents: 12_850,
+        city: "上海",
+        company: "测试餐厅",
+        note: null,
+        eventTag: null,
+        projectTag: null,
+      },
+    });
+    const batch = await bridge<BatchDto>("create_month_batch", {
+      year: 2026,
+      month: 7,
+    });
+    await bridge("assign_items_to_batch", {
+      batchId: batch.id,
+      itemIds: [blocked.id],
+    });
+
+    await expect(
+      bridge("run_batch_automation", { batchId: batch.id }),
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    window.history.replaceState({}, "", "/");
+    installBrowserCommandBridge();
+    const restoredBridge = window.__INVOICE_COMMAND_BRIDGE__;
+    if (!restoredBridge) throw new Error("browser bridge was not restored");
+    await expect(
+      restoredBridge<InvoiceItemDto>("get_item", { itemId: safe.id }),
+    ).resolves.toMatchObject({ batchId: batch.id });
+    await expect(
+      restoredBridge<BatchDetailDto>("get_batch", { batchId: batch.id }),
+    ).resolves.toMatchObject({
+      batch: { status: "draft", itemCount: 2, lastExportedAt: null },
+    });
+  });
+
+  it("rejects automation ranges longer than 366 days before mutation", async () => {
+    const bridge = createSeededBridge({
+      accounts: [accountFixture()],
+      batches: [
+        batchFixture("batch-1", {
+          startDate: "2025-01-01",
+          endDate: "2026-01-02",
+          status: "exported",
+          lastExportedAt: "2026-07-17T07:00:00Z",
+        }),
+      ],
+      items: [
+        invoiceFixture("safe", {
+          invoiceDate: "2025-07-15",
+          suggestedPeriod: "2025-07",
+        }),
+      ],
+    });
+
+    await expect(
+      bridge("run_batch_automation", { batchId: "batch-1" }),
+    ).rejects.toEqual({
+      code: "validation",
+      field: "dateRange",
+      message: "batch automation date range must not exceed 366 days",
+    });
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "safe" }),
+    ).resolves.toMatchObject({ batchId: null });
+    await expect(
+      bridge<BatchDetailDto>("get_batch", { batchId: "batch-1" }),
+    ).resolves.toMatchObject({ batch: { status: "exported" } });
   });
 
   it("implements every frontend command and rejects unknown commands clearly", async () => {
