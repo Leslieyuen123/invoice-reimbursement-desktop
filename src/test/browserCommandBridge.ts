@@ -1,5 +1,6 @@
 import type {
   AppError,
+  BatchAutomationResultDto,
   BatchCandidateDto,
   BatchDetailDto,
   BatchDetailSummaryDto,
@@ -212,6 +213,51 @@ function batchDetail(state: BridgeState, batchId: string): BatchDetailDto {
     updatedAt: now,
   });
   return { batch: { ...batch }, items: items.map((item) => ({ ...item })), summary, warnings: [] };
+}
+
+function exportBatch(state: BridgeState, batchId: string): ExportResultDto {
+  const detail = batchDetail(state, batchId);
+  if (detail.items.length === 0) {
+    throw { code: "conflict", message: "Batch is empty" } satisfies AppError;
+  }
+  const blocked = detail.items.find((item) =>
+    [
+      "pending_recognition",
+      "pending_confirmation",
+      "recognition_failed",
+      "suspected_duplicate",
+    ].includes(item.status),
+  );
+  if (blocked) {
+    throw {
+      code: "conflict",
+      message: `Batch contains blocked item ${blocked.id}`,
+    } satisfies AppError;
+  }
+  const batch = state.batches.find((candidate) => candidate.id === batchId);
+  if (!batch) throw notFound("batch");
+  Object.assign(batch, { status: "exported", lastExportedAt: now, updatedAt: now });
+  return {
+    directory: `${state.preferences.exportDirectory}/${detail.batch.startDate.slice(0, 7)}`,
+    itemCount: detail.summary.itemCount,
+    totalAmountCents: detail.summary.totalAmountCents,
+  };
+}
+
+function isSafeAutomationCandidate(item: InvoiceItemDto, batch: BatchDto) {
+  return (
+    item.status === "ready" &&
+    item.invoiceDate !== null &&
+    item.invoiceDate >= batch.startDate &&
+    item.invoiceDate <= batch.endDate &&
+    item.dedupeStatus !== "suspected_duplicate" &&
+    item.finalCategory !== null &&
+    item.amountCents !== null &&
+    Number.isSafeInteger(item.amountCents) &&
+    item.amountCents >= 0 &&
+    item.currency === "CNY" &&
+    item.suggestedPeriod !== null
+  );
 }
 
 function itemMatches(item: InvoiceItemDto, filter: ItemFilter) {
@@ -455,33 +501,35 @@ function makeHandlers(state: BridgeState): Map<string, CommandHandler> {
       Object.assign(item, { batchId: null, updatedAt: now });
       return batchDetail(state, batchId);
     }],
-    [API_COMMANDS.exportBatch, (arguments_) => {
-      const detail = batchDetail(state, requiredString(arguments_, "batchId"));
-      if (detail.items.length === 0) {
-        throw { code: "conflict", message: "Batch is empty" } satisfies AppError;
-      }
-      const blocked = detail.items.find((item) =>
-        [
-          "pending_recognition",
-          "pending_confirmation",
-          "recognition_failed",
-          "suspected_duplicate",
-        ].includes(item.status),
-      );
-      if (blocked) {
-        throw {
-          code: "conflict",
-          message: `Batch contains blocked item ${blocked.id}`,
-        } satisfies AppError;
-      }
-      const batch = state.batches.find((candidate) => candidate.id === detail.batch.id);
+    [API_COMMANDS.exportBatch, (arguments_) =>
+      exportBatch(state, requiredString(arguments_, "batchId"))],
+    [API_COMMANDS.runBatchAutomation, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      const batch = state.batches.find((candidate) => candidate.id === batchId);
       if (!batch) throw notFound("batch");
-      Object.assign(batch, { status: "exported", lastExportedAt: now, updatedAt: now });
+      const candidates = state.items.filter(
+        (item) =>
+          item.batchId === null &&
+          item.invoiceDate !== null &&
+          item.invoiceDate >= batch.startDate &&
+          item.invoiceDate <= batch.endDate,
+      );
+      const safeCandidates = candidates.filter((item) =>
+        isSafeAutomationCandidate(item, batch),
+      );
+      markBatchDraft(state, batchId);
+      for (const item of safeCandidates) {
+        Object.assign(item, { batchId, updatedAt: now });
+      }
+      const detail = batchDetail(state, batchId);
       return {
-        directory: `${state.preferences.exportDirectory}/${detail.batch.startDate.slice(0, 7)}`,
-        itemCount: detail.summary.itemCount,
-        totalAmountCents: detail.summary.totalAmountCents,
-      } satisfies ExportResultDto;
+        scannedAccountCount: state.accounts.filter((account) => account.enabled).length,
+        failedAccounts: [],
+        importedCount: 0,
+        assignedCount: safeCandidates.length,
+        exceptionCount: candidates.length - safeCandidates.length,
+        export: detail.items.length === 0 ? null : exportBatch(state, batchId),
+      } satisfies BatchAutomationResultDto;
     }],
     [API_COMMANDS.listMailboxAccounts, () =>
       state.accounts.map((account) => ({ ...account }))],

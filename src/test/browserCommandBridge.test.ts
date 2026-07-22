@@ -3,12 +3,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 import * as apiModule from "../lib/api";
 
 import type {
+  BatchAutomationResultDto,
   BatchCandidateDto,
   BatchDetailDto,
   BatchDto,
   ExportResultDto,
   InvoiceItemDto,
   ItemStatus,
+  MailboxAccountDto,
   ManualImportOutcomeDto,
   PageDto,
   StorageStatusDto,
@@ -73,8 +75,25 @@ function batchFixture(id = "batch-1", overrides: Partial<BatchDto> = {}): BatchD
 function createSeededBridge(seed: {
   items?: InvoiceItemDto[];
   batches?: BatchDto[];
+  accounts?: MailboxAccountDto[];
 }) {
   return createBrowserCommandBridge({ seed } as never);
+}
+
+function accountFixture(): MailboxAccountDto {
+  return {
+    id: "account-1",
+    provider: "gmail",
+    email: "account@example.invalid",
+    imapHost: "imap.example.invalid",
+    imapPort: 993,
+    enabled: true,
+    syncIntervalMinutes: 15,
+    lastSyncedAt: null,
+    lastError: null,
+    lastErrorKind: null,
+    lastErrorAt: null,
+  };
 }
 
 describe("browser command bridge", () => {
@@ -173,6 +192,69 @@ describe("browser command bridge", () => {
     await expect(
       bridge<BatchDetailDto>("get_batch", { batchId: batch.id }),
     ).resolves.toMatchObject({ batch: { status: "exported" } });
+  });
+
+  it("runs deterministic batch automation and persists assignment and export state", async () => {
+    const bridge = createSeededBridge({
+      accounts: [accountFixture()],
+      batches: [batchFixture()],
+      items: [
+        invoiceFixture("safe"),
+        invoiceFixture("needs-review", {
+          status: "pending_confirmation",
+          confirmationStatus: "pending",
+        }),
+      ],
+    });
+
+    const result = await bridge<BatchAutomationResultDto>(
+      "run_batch_automation",
+      { batchId: "batch-1" },
+    );
+
+    expect(result).toEqual({
+      scannedAccountCount: 1,
+      failedAccounts: [],
+      importedCount: 0,
+      assignedCount: 1,
+      exceptionCount: 1,
+      export: {
+        directory: "/tmp/invoice-reimbursement/e2e/2026-07",
+        itemCount: 1,
+        totalAmountCents: 12_850,
+      },
+    });
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "safe" }),
+    ).resolves.toMatchObject({ batchId: "batch-1" });
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "needs-review" }),
+    ).resolves.toMatchObject({ batchId: null });
+    await expect(
+      bridge<BatchDetailDto>("get_batch", { batchId: "batch-1" }),
+    ).resolves.toMatchObject({
+      batch: { status: "exported", itemCount: 1, totalAmountCents: 12_850 },
+    });
+  });
+
+  it("returns a complete automation result with a null export for an empty batch", async () => {
+    const bridge = createSeededBridge({
+      accounts: [accountFixture()],
+      batches: [batchFixture()],
+    });
+
+    await expect(
+      bridge<BatchAutomationResultDto>("run_batch_automation", {
+        batchId: "batch-1",
+      }),
+    ).resolves.toEqual({
+      scannedAccountCount: 1,
+      failedAccounts: [],
+      importedCount: 0,
+      assignedCount: 0,
+      exceptionCount: 0,
+      export: null,
+    });
   });
 
   it("implements every frontend command and rejects unknown commands clearly", async () => {
