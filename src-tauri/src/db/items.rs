@@ -192,6 +192,20 @@ impl ItemRepository {
         InvoiceItem::try_from(row)
     }
 
+    pub(crate) async fn find_by_id_with_connection(
+        connection: &mut SqliteConnection,
+        id: Uuid,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        let query = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?");
+        sqlx::query_as::<_, DbItemRow>(&query)
+            .bind(id.to_string())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to get item", error))?
+            .map(InvoiceItem::try_from)
+            .transpose()
+    }
+
     pub async fn insert(&self, item: &NewItemRecord) -> Result<InvoiceItem, AppError> {
         validate_amount(item.amount_cents)?;
         validate_source(item)?;

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -8,11 +7,10 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::db::accounts::MailboxAccountRepository;
-use crate::db::items::{InvoiceItem, ItemRepository};
-use crate::domain::amount::validate_amount_cents;
+use crate::db::items::ItemRepository;
 use crate::domain::error::{AppError, sanitize_message};
-use crate::domain::model::{DedupeStatus, ItemStatus};
-use crate::infra::files::{AppPaths, open_contained_regular_file};
+use crate::infra::files::AppPaths;
+use crate::services::batch_eligibility::is_safe_batch_candidate;
 use crate::services::batches::BatchService;
 use crate::services::export::{ExportResult, ExportService};
 use crate::services::operations::AccountOperationCoordinator;
@@ -206,7 +204,7 @@ impl BatchAutomationService {
                 .list_candidates(batch_id, None, cursor, CANDIDATE_PAGE_SIZE)
                 .await?;
             for item in page.items {
-                if is_safe_candidate(&self.paths, &item, batch.start_date, batch.end_date) {
+                if is_safe_batch_candidate(&self.paths, &item, batch.start_date, batch.end_date) {
                     if safe_id_set.insert(item.id) {
                         safe_ids.push(item.id);
                     }
@@ -241,7 +239,7 @@ impl BatchAutomationService {
             Vec::new()
         } else {
             self.batches
-                .assign_unassigned_items(&batch, &safe_ids)
+                .assign_unassigned_items(batch_id, &self.paths, &safe_ids)
                 .await?
         };
         let assigned_id_set = assigned_ids.iter().copied().collect::<HashSet<_>>();
@@ -276,34 +274,6 @@ impl BatchAutomationService {
             export,
         })
     }
-}
-
-fn is_safe_candidate(
-    paths: &AppPaths,
-    item: &InvoiceItem,
-    start_date: chrono::NaiveDate,
-    end_date: chrono::NaiveDate,
-) -> bool {
-    item.status() == ItemStatus::Ready
-        && item
-            .invoice_date
-            .is_some_and(|date| date >= start_date && date <= end_date)
-        && item.dedupe_status != DedupeStatus::SuspectedDuplicate
-        && item.final_category.is_some()
-        && item
-            .amount_cents
-            .is_some_and(|amount| validate_amount_cents(amount, "amountCents").is_ok())
-        && item.currency == "CNY"
-        && item.suggested_period.is_some()
-        && invoice_files_are_safe(paths, item)
-}
-
-fn invoice_files_are_safe(paths: &AppPaths, item: &InvoiceItem) -> bool {
-    open_contained_regular_file(Path::new(&item.original_path), &paths.originals, "original")
-        .is_ok()
-        && item.normalized_pdf_path.as_deref().is_some_and(|path| {
-            open_contained_regular_file(Path::new(path), &paths.normalized, "normalizedPdf").is_ok()
-        })
 }
 
 fn count_overflow() -> AppError {

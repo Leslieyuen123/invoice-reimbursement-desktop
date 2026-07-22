@@ -6,11 +6,13 @@ use uuid::Uuid;
 
 use crate::db::batches::{Batch, BatchPage, BatchPageCursor, BatchRepository, BatchSummary};
 use crate::db::items::{InvoiceItem, ItemPageCursor, ItemRepository};
-use crate::domain::amount::{MAX_SAFE_AMOUNT_CENTS, checked_add_amount_cents};
+use crate::domain::amount::checked_add_amount_cents;
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, NewBatch, RecognitionStatus,
 };
+use crate::infra::files::AppPaths;
+use crate::services::batch_eligibility::is_safe_batch_candidate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewBatchInput {
@@ -295,10 +297,10 @@ impl BatchService {
 
     pub(crate) async fn assign_unassigned_items(
         &self,
-        batch: &Batch,
+        batch_id: Uuid,
+        paths: &AppPaths,
         item_ids: &[Uuid],
     ) -> Result<Vec<Uuid>, AppError> {
-        let batch_id = batch.id;
         let mut seen = HashSet::with_capacity(item_ids.len());
         let item_ids = item_ids
             .iter()
@@ -312,44 +314,28 @@ impl BatchService {
             .map_err(|error| database_error("failed to begin automation assignment", error))?;
 
         let result = async {
-            let batch_exists =
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM batches WHERE id = ?")
-                    .bind(batch_id.to_string())
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(|error| {
-                        database_error("failed to validate automation batch", error)
-                    })?
-                    != 0;
-            if !batch_exists {
-                return Err(batch_not_found(batch_id));
-            }
+            let batch = BatchRepository::get_with_connection(&mut transaction, batch_id).await?;
 
             let updated_at = Utc::now().to_rfc3339();
             let mut assigned_ids = Vec::new();
             for item_id in item_ids {
+                let Some(item) =
+                    ItemRepository::find_by_id_with_connection(&mut transaction, item_id).await?
+                else {
+                    continue;
+                };
+                if item.batch_id.is_some()
+                    || !is_safe_batch_candidate(paths, &item, batch.start_date, batch.end_date)
+                {
+                    continue;
+                }
                 let result = sqlx::query(
                     "UPDATE items SET batch_id = ?, updated_at = ? \
-                     WHERE id = ? AND batch_id IS NULL \
-                       AND recognition_status = 'succeeded' \
-                       AND confirmation_status = 'confirmed' \
-                       AND dedupe_status != 'suspected_duplicate' \
-                       AND invoice_date >= ? AND invoice_date <= ? \
-                       AND amount_cents IS NOT NULL \
-                       AND amount_cents >= 0 AND amount_cents <= ? \
-                       AND currency = 'CNY' \
-                       AND final_category IS NOT NULL \
-                       AND suggested_period IS NOT NULL \
-                       AND TRIM(original_path) != '' \
-                       AND normalized_pdf_path IS NOT NULL \
-                       AND TRIM(normalized_pdf_path) != ''",
+                     WHERE id = ? AND batch_id IS NULL",
                 )
                 .bind(batch_id.to_string())
                 .bind(&updated_at)
                 .bind(item_id.to_string())
-                .bind(batch.start_date.to_string())
-                .bind(batch.end_date.to_string())
-                .bind(MAX_SAFE_AMOUNT_CENTS)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| database_error("failed to assign automation item", error))?;

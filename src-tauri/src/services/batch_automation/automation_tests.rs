@@ -293,7 +293,8 @@ async fn stale_safe_candidates_are_skipped_and_counted_as_exceptions() {
     let pause = Arc::new(AssignmentPause::default());
     let mut service = state.batch_automation_service();
     service.assignment_pause = Some(pause.clone());
-    let automation = tokio::spawn(async move { service.run(batch.id).await });
+    let batch_id = batch.id;
+    let automation = tokio::spawn(async move { service.run(batch_id).await });
     pause.reached.notified().await;
 
     sqlx::query("UPDATE items SET invoice_date = '2026-06-01' WHERE id = ?")
@@ -328,5 +329,140 @@ async fn stale_safe_candidates_are_skipped_and_counted_as_exceptions() {
     assert_eq!(
         items.get_by_id(owner_id).await.unwrap().batch_id,
         Some(manual_batch.id)
+    );
+}
+
+#[tokio::test]
+async fn current_batch_range_is_revalidated_after_candidate_scanning() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("batch-range-race.sqlite3");
+    let pool = db::connect(&format!("sqlite://{}", database_path.display()))
+        .await
+        .unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let email = "batch-range-race@example.com";
+    let gateway = Arc::new(AccountBudgetGateway::empty(email));
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let state = AppState::with_gateway_and_extractor(
+        pool.clone(),
+        paths.clone(),
+        credentials.clone(),
+        gateway,
+        Arc::new(AccountBudgetExtractor),
+    );
+    let account = MailboxAccountRepository::new(pool.clone())
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: email.to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    credentials.set(&account.id.to_string(), "secret").unwrap();
+    let batch = BatchService::new(pool.clone())
+        .create_month(2026, 5)
+        .await
+        .unwrap();
+    let item_id = Uuid::new_v4();
+    let items = ItemRepository::new(pool.clone());
+    items.insert(&safe_item(&paths, item_id)).await.unwrap();
+    let pause = Arc::new(AssignmentPause::default());
+    let mut service = state.batch_automation_service();
+    service.assignment_pause = Some(pause.clone());
+    let batch_id = batch.id;
+    let automation = tokio::spawn(async move { service.run(batch_id).await });
+    pause.reached.notified().await;
+
+    sqlx::query(
+        "UPDATE batches SET start_date = '2026-06-01', end_date = '2026-06-30' WHERE id = ?",
+    )
+    .bind(batch_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pause.release.notify_one();
+
+    let result = automation.await.unwrap().unwrap();
+    assert_eq!(result.assigned_count, 0);
+    assert_eq!(result.exception_count, 1);
+    assert!(result.export.is_none());
+    assert!(items.get_by_id(item_id).await.unwrap().batch_id.is_none());
+}
+
+#[tokio::test]
+async fn current_managed_paths_are_revalidated_after_candidate_scanning() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("managed-path-race.sqlite3");
+    let pool = db::connect(&format!("sqlite://{}", database_path.display()))
+        .await
+        .unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let email = "managed-path-race@example.com";
+    let gateway = Arc::new(AccountBudgetGateway::empty(email));
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let state = AppState::with_gateway_and_extractor(
+        pool.clone(),
+        paths.clone(),
+        credentials.clone(),
+        gateway,
+        Arc::new(AccountBudgetExtractor),
+    );
+    let account = MailboxAccountRepository::new(pool.clone())
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: email.to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    credentials.set(&account.id.to_string(), "secret").unwrap();
+    let batch = BatchService::new(pool.clone())
+        .create_month(2026, 5)
+        .await
+        .unwrap();
+    let stale_id = Uuid::new_v4();
+    let current_id = Uuid::new_v4();
+    let items = ItemRepository::new(pool.clone());
+    for id in [stale_id, current_id] {
+        items.insert(&safe_item(&paths, id)).await.unwrap();
+    }
+    let pause = Arc::new(AssignmentPause::default());
+    let mut service = state.batch_automation_service();
+    service.assignment_pause = Some(pause.clone());
+    let batch_id = batch.id;
+    let automation = tokio::spawn(async move { service.run(batch_id).await });
+    pause.reached.notified().await;
+
+    let outside_original = directory.path().join("outside-original.pdf");
+    let outside_normalized = directory.path().join("outside-normalized.pdf");
+    fs::write(&outside_original, b"outside original").unwrap();
+    fs::write(
+        &outside_normalized,
+        include_bytes!("../../../tests/fixtures/text-invoice.pdf"),
+    )
+    .unwrap();
+    sqlx::query("UPDATE items SET original_path = ?, normalized_pdf_path = ? WHERE id = ?")
+        .bind(outside_original.to_string_lossy().into_owned())
+        .bind(outside_normalized.to_string_lossy().into_owned())
+        .bind(stale_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pause.release.notify_one();
+
+    let result = automation.await.unwrap().unwrap();
+    assert_eq!(result.assigned_count, 1);
+    assert_eq!(result.exception_count, 1);
+    assert_eq!(result.export.unwrap().item_count, 1);
+    assert!(items.get_by_id(stale_id).await.unwrap().batch_id.is_none());
+    assert_eq!(
+        items.get_by_id(current_id).await.unwrap().batch_id,
+        Some(batch_id)
     );
 }
