@@ -406,6 +406,57 @@ describe("Batch workspace", () => {
     expect(screen.queryByText("报销包已生成")).not.toBeInTheDocument();
   });
 
+  it("keeps automation and manual reveal failures with their own export result", async () => {
+    const user = userEvent.setup();
+    mockDetail(detailFixture());
+    mockCommand("run_batch_automation", automationFixture());
+    mockCommand("export_batch", {
+      directory: "/Users/finance/manual/2026-05",
+      itemCount: 1,
+      totalAmountCents: 12_850,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "一键自动处理" }));
+    const automationResult = await screen.findByRole("status", {
+      name: "批次自动处理完成",
+    });
+    await user.click(screen.getByRole("button", { name: "导出报销包" }));
+    const manualResult = (await screen.findByText("报销包已生成")).closest<HTMLElement>(
+      ".batch-export-result",
+    );
+    if (!manualResult) throw new Error("manual export result is missing");
+
+    expect(automationResult).toBeVisible();
+    expect(manualResult).toBeVisible();
+
+    revealMock.mockRejectedValueOnce(new Error("automation Finder unavailable"));
+    await user.click(
+      within(automationResult).getByRole("button", { name: "在文件夹中显示" }),
+    );
+    expect(await within(automationResult).findByRole("alert")).toHaveTextContent(
+      "无法在文件夹中显示",
+    );
+    expect(within(manualResult).queryByRole("alert")).not.toBeInTheDocument();
+
+    revealMock.mockResolvedValueOnce(undefined);
+    await user.click(
+      within(automationResult).getByRole("button", { name: "在文件夹中显示" }),
+    );
+    await waitFor(() => {
+      expect(within(automationResult).queryByRole("alert")).not.toBeInTheDocument();
+    });
+
+    revealMock.mockRejectedValueOnce(new Error("manual Finder unavailable"));
+    await user.click(
+      within(manualResult).getByRole("button", { name: "在文件夹中显示" }),
+    );
+    expect(await within(manualResult).findByRole("alert")).toHaveTextContent(
+      "无法在文件夹中显示",
+    );
+    expect(within(automationResult).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("clears automation success when manual assignment changes batch content", async () => {
     const user = userEvent.setup();
     const candidate = candidateFixture(itemFixture());

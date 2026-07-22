@@ -1,3 +1,10 @@
+"""Build the shareable user-guide PDFs with pinned dependencies.
+
+Run with:
+uv run --with-requirements scripts/user-guide-requirements.txt python scripts/build_user_guide_pdfs.py --kind full docs/user-guide/invoice-reimbursement-user-manual.md output/pdf/invoice-reimbursement-user-manual-zh-cn.pdf
+uv run --with-requirements scripts/user-guide-requirements.txt python scripts/build_user_guide_pdfs.py --kind quick docs/user-guide/invoice-reimbursement-quick-start.md output/pdf/invoice-reimbursement-quick-start-zh-cn.pdf
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -40,6 +47,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_VERSION = json.loads(
     (REPO_ROOT / "package.json").read_text(encoding="utf-8")
 )["version"]
+DOCUMENT_DATE = "2026-07-22"
 FONT_PATH = Path("/System/Library/Fonts/STHeiti Light.ttc")
 FONT_NAME = "GuideHeiti"
 PAPER = colors.HexColor("#FFFFFF")
@@ -586,7 +594,7 @@ def cover_story(
         Paragraph("发票报销 · USER GUIDE", style_map["cover_kicker"]),
         Paragraph(inline_markup(title), style_map["cover_title"]),
         Paragraph(
-            "从邮箱同步、票据确认到报销包导出的完整操作说明",
+            "从批次创建、范围扫描到安全归属和报销包导出",
             style_map["cover_subtitle"],
         ),
         HRFlowable(width=55 * mm, thickness=4, color=PURPLE, hAlign="LEFT"),
@@ -597,7 +605,7 @@ def cover_story(
             image_flowables(
                 markdown_path,
                 "assets/workflow.png",
-                "同步 -> 识别 -> 确认 -> 批次 -> 导出",
+                "创建批次 -> 扫描/识别 -> 安全筛选 -> 归属/导出",
                 style_map,
                 "full",
             )
@@ -607,7 +615,7 @@ def cover_story(
             [Paragraph("适用版本", style_map["table_header"]), Paragraph(f"v{APP_VERSION}", style_map["table"])],
             [Paragraph("适用设备", style_map["table_header"]), Paragraph("Apple Silicon Mac", style_map["table"])],
             [Paragraph("最低系统", style_map["table_header"]), Paragraph("macOS 11", style_map["table"])],
-            [Paragraph("文档日期", style_map["table_header"]), Paragraph("2026-07-21", style_map["table"])],
+            [Paragraph("文档日期", style_map["table_header"]), Paragraph(DOCUMENT_DATE, style_map["table"])],
         ],
         colWidths=[36 * mm, 72 * mm],
         hAlign="LEFT",

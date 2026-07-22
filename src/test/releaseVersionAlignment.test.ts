@@ -6,8 +6,10 @@ import { describe, expect, it } from "vitest";
 
 import quickStart from "../../docs/user-guide/invoice-reimbursement-quick-start.md?raw";
 import userManual from "../../docs/user-guide/invoice-reimbursement-user-manual.md?raw";
+import ciWorkflow from "../../.github/workflows/ci.yml?raw";
 import packageLockSource from "../../package-lock.json?raw";
 import packageSource from "../../package.json?raw";
+import diagramBuilder from "../../scripts/build_user_guide_diagrams.py?raw";
 import pdfBuilder from "../../scripts/build_user_guide_pdfs.py?raw";
 import cargoLock from "../../src-tauri/Cargo.lock?raw";
 import cargoManifest from "../../src-tauri/Cargo.toml?raw";
@@ -54,6 +56,16 @@ function cargoManifestPackageVersion(source: string): string {
   return version;
 }
 
+function namedWorkflowStep(source: string, name: string): string {
+  const lines = source.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === `- name: ${name}`);
+  if (start < 0) return "";
+
+  let end = start + 1;
+  while (end < lines.length && !/^\s{6}-\s/.test(lines[end])) end += 1;
+  return lines.slice(start, end).join("\n");
+}
+
 async function pdfText(relativePath: string): Promise<string> {
   const loadingTask = getDocument({
     data: new Uint8Array(await readFile(join(REPO_ROOT, relativePath))),
@@ -78,6 +90,25 @@ async function pdfText(relativePath: string): Promise<string> {
         }
       }
       return pages.join("\n");
+    } finally {
+      await document.cleanup();
+      await document.destroy();
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+async function pdfPageCount(relativePath: string): Promise<number> {
+  const loadingTask = getDocument({
+    data: new Uint8Array(await readFile(join(REPO_ROOT, relativePath))),
+    standardFontDataUrl: STANDARD_FONT_DATA_URL,
+  });
+
+  try {
+    const document = await loadingTask.promise;
+    try {
+      return document.numPages;
     } finally {
       await document.cleanup();
       await document.destroy();
@@ -139,21 +170,71 @@ name = "invoice_reimbursement"`;
     expect.soft(pdfBuilder).not.toContain("0.1.0");
   });
 
+  it("documents the automatic batch workflow and its exception loop", () => {
+    const mainStages = ["创建自动批次", "范围扫描/识别", "安全筛选", "归属/导出"];
+    const stageOffsets = mainStages.map((stage) => diagramBuilder.indexOf(stage));
+
+    expect.soft(stageOffsets.every((offset) => offset >= 0)).toBe(true);
+    expect.soft(stageOffsets).toEqual([...stageOffsets].sort((left, right) => left - right));
+    expect.soft(diagramBuilder).toContain("待处理池");
+    expect.soft(diagramBuilder).toContain("人工修正");
+    expect.soft(diagramBuilder).toContain("再次运行");
+    expect.soft(diagramBuilder).not.toContain("立即同步 -> 待处理池");
+    expect.soft(diagramBuilder).not.toContain("导出前仍需要人工");
+  });
+
+  it("publishes one canonical DMG with a verified checksum", () => {
+    const prepare = namedWorkflowStep(ciWorkflow, "Prepare canonical release artifacts");
+    const upload = namedWorkflowStep(ciWorkflow, "Upload canonical release artifacts");
+
+    expect.soft(prepare).toContain(
+      'dmg_files=("$PWD"/src-tauri/target/release/bundle/dmg/*_aarch64.dmg)',
+    );
+    expect.soft(prepare).toContain('test "${#dmg_files[@]}" -eq 1');
+    expect.soft(prepare).toContain(`canonical_name="${EXPECTED_DMG}"`);
+    expect.soft(prepare).toContain('cp "${dmg_files[0]}" "$artifact_dir/$canonical_name"');
+    expect.soft(prepare).toContain('shasum -a 256 "$canonical_name" > "$canonical_name.sha256"');
+    expect.soft(prepare).toContain('shasum -a 256 -c "$canonical_name.sha256"');
+
+    expect.soft(upload).toContain(`release-artifacts/${EXPECTED_DMG}`);
+    expect.soft(upload).toContain(`release-artifacts/${EXPECTED_DMG}.sha256`);
+    expect.soft(upload).not.toContain("*.dmg");
+  });
+
+  it("pins the user-guide generator and renders the current document date", async () => {
+    const requirements = await readFile(
+      join(REPO_ROOT, "scripts/user-guide-requirements.txt"),
+      "utf-8",
+    ).catch(() => "");
+
+    expect.soft(requirements).toMatch(/^reportlab==\d+\.\d+\.\d+$/mu);
+    expect.soft(requirements).toMatch(/^Pillow==\d+\.\d+\.\d+$/mu);
+    expect.soft(pdfBuilder).toContain('DOCUMENT_DATE = "2026-07-22"');
+    expect.soft(pdfBuilder).toContain('Paragraph(DOCUMENT_DATE, style_map["table"])');
+    expect.soft(pdfBuilder).toContain(
+      "uv run --with-requirements scripts/user-guide-requirements.txt",
+    );
+    expect.soft(pdfBuilder).not.toContain('Paragraph("2026-07-21"');
+  });
+
   it("keeps both committed user-guide PDFs aligned with the release", async () => {
     const guides = [
       {
         path: "output/pdf/invoice-reimbursement-user-manual-zh-cn.pdf",
+        pageCount: 17,
         identity: "发票报销完整用户手册",
         distinctContent: ["9. 导出报销材料", "附录 C：导出文件对照表"],
       },
       {
         path: "output/pdf/invoice-reimbursement-quick-start-zh-cn.pdf",
+        pageCount: 3,
         identity: "发票报销快速入门",
         distinctContent: ["3. 批次与导出", "更多说明请查看"],
       },
     ];
 
     for (const guide of guides) {
+      expect.soft(await pdfPageCount(guide.path)).toBe(guide.pageCount);
       const text = (await pdfText(guide.path)).replace(/\s+/gu, "");
       expect.soft(text).toContain(guide.identity.replace(/\s+/gu, ""));
       expect.soft(text).toContain(`v${EXPECTED_VERSION}`);

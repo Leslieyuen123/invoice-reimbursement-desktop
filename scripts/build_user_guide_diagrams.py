@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -57,46 +58,60 @@ def arrow(
     color: str = MUTED,
 ) -> None:
     draw.line((start, end), fill=color, width=5)
-    x, y = end
-    draw.polygon(((x, y), (x - 18, y - 11), (x - 18, y + 11)), fill=color)
+    angle = math.atan2(end[1] - start[1], end[0] - start[0])
+    base_x = end[0] - 18 * math.cos(angle)
+    base_y = end[1] - 18 * math.sin(angle)
+    perpendicular_x = 11 * math.sin(angle)
+    perpendicular_y = -11 * math.cos(angle)
+    draw.polygon(
+        (
+            end,
+            (base_x + perpendicular_x, base_y + perpendicular_y),
+            (base_x - perpendicular_x, base_y - perpendicular_y),
+        ),
+        fill=color,
+    )
 
 
 def build_workflow(path: Path) -> None:
     image = Image.new("RGB", (1800, 650), BACKGROUND)
     draw = ImageDraw.Draw(image)
-    draw.text((90, 60), "从邮箱发票到报销材料", font=font(54), fill=TEXT)
+    draw.text((80, 30), "从创建批次到报销材料", font=font(48), fill=TEXT)
     draw.text(
-        (90, 130),
-        "绑定邮箱只是开始。导出前仍需要人工检查和确认。",
-        font=font(27),
+        (80, 88),
+        "安全项自动归属并导出；只有异常项进入待处理池。",
+        font=font(25),
         fill=MUTED,
     )
 
     boxes = [
-        (80, 235, 375, 505),
-        (420, 235, 715, 505),
-        (760, 235, 1055, 505),
-        (1100, 235, 1395, 505),
-        (1440, 235, 1735, 505),
+        (80, 145, 430, 335),
+        (500, 145, 850, 335),
+        (920, 145, 1270, 335),
+        (1340, 145, 1690, 335),
     ]
     stages = [
-        ("同步或导入", "立即同步\n后台自动同步\n手动导入", PURPLE),
-        ("自动识别", "读取日期、金额\n分类和公司", PURPLE),
-        ("检查并确认", "修正字段\n保存并确认", ORANGE),
-        ("归入批次", "创建月度或\n自定义批次", ORANGE),
-        ("导出材料", "PDF + Excel\n原件 + 清单", GREEN),
+        ("创建自动批次", "按月或自定义范围\n保留自动处理", PURPLE),
+        ("范围扫描/识别", "同步已启用邮箱\n提取日期、金额和分类", PURPLE),
+        ("安全筛选", "排除重复、缺失\n损坏和归属冲突", ORANGE),
+        ("归属/导出", "安全项加入批次\n生成完整报销包", GREEN),
     ]
     for box, (title, detail, accent) in zip(boxes, stages, strict=True):
         centered_text(draw, box, title, detail, accent)
     for left, right in zip(boxes, boxes[1:]):
-        arrow(draw, (left[2] + 12, 370), (right[0] - 12, 370))
+        arrow(draw, (left[2] + 12, 240), (right[0] - 12, 240))
 
-    draw.text(
-        (90, 570),
-        "推荐日常路径：打开控制台 -> 立即同步 -> 待处理池 -> 报销批次 -> 导出报销包",
-        font=font(25),
-        fill=TEXT,
-    )
+    pending = (610, 430, 890, 585)
+    correction = (990, 430, 1270, 585)
+    rerun = (1370, 430, 1650, 585)
+    centered_text(draw, pending, "待处理池", "仅保留不确定项", RED)
+    centered_text(draw, correction, "人工修正", "处理重复或补全字段", ORANGE)
+    centered_text(draw, rerun, "再次运行", "回到原批次重试", PURPLE)
+    arrow(draw, (1095, 335), (750, 415), RED)
+    arrow(draw, (pending[2] + 12, 508), (correction[0] - 12, 508), ORANGE)
+    arrow(draw, (correction[2] + 12, 508), (rerun[0] - 12, 508), PURPLE)
+    draw.text((770, 368), "发现异常", font=font(22), fill=RED)
+    draw.text((1400, 603), "重新扫描与安全筛选", font=font(20), fill=MUTED)
     image.save(path, optimize=True)
 
 

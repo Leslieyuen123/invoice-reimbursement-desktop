@@ -119,6 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle_app="$PWD/src-tauri/target/release/bundle/macos/发票报销.app"
+          shopt -s nullglob
           dmg_files=("$PWD"/src-tauri/target/release/bundle/dmg/*_aarch64.dmg)
           test -d "$bundle_app"
           test "${#dmg_files[@]}" -eq 1
@@ -216,10 +217,29 @@ jobs:
           mounted=0
           rmdir "$mount_dir"
           trap - EXIT
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Prepare canonical release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmg_files=("$PWD"/src-tauri/target/release/bundle/dmg/*_aarch64.dmg)
+          test "${#dmg_files[@]}" -eq 1
+
+          artifact_dir="$PWD/release-artifacts"
+          canonical_name="invoice-reimbursement-0.2.0-macos-arm64.dmg"
+          mkdir -p "$artifact_dir"
+          cp "${dmg_files[0]}" "$artifact_dir/$canonical_name"
+          (
+            cd "$artifact_dir"
+            shasum -a 256 "$canonical_name" > "$canonical_name.sha256"
+            shasum -a 256 -c "$canonical_name.sha256"
+          )
+
+      - name: Upload canonical release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-macos-bundle
           path: |
-            src-tauri/target/release/bundle/macos/*.app
-            src-tauri/target/release/bundle/dmg/*.dmg
+            release-artifacts/invoice-reimbursement-0.2.0-macos-arm64.dmg
+            release-artifacts/invoice-reimbursement-0.2.0-macos-arm64.dmg.sha256
           if-no-files-found: error

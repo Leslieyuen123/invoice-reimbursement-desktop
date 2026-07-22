@@ -76,6 +76,8 @@ type AutomationFeedback =
     }
   | { status: "error"; message: string };
 
+type RevealSource = "automation" | "manual";
+
 function categoryLabel(category: Category | null) {
   return category ? categoryLabels[category] : "待分类";
 }
@@ -151,7 +153,9 @@ export function BatchDetailPage() {
   const [exportPending, setExportPending] = useState(false);
   const [exportResult, setExportResult] = useState<ExportResultDto | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
-  const [revealError, setRevealError] = useState<string | null>(null);
+  const [automationRevealError, setAutomationRevealError] =
+    useState<string | null>(null);
+  const [manualRevealError, setManualRevealError] = useState<string | null>(null);
   const [assignDialogOpen, setAssignDialogOpen] = useState(false);
   const [assignDialogSession, setAssignDialogSession] = useState(0);
   const nextDialogSession = useRef(0);
@@ -194,7 +198,8 @@ export function BatchDetailPage() {
     setExportPending(false);
     setExportResult(null);
     setExportError(null);
-    setRevealError(null);
+    setAutomationRevealError(null);
+    setManualRevealError(null);
     setAssignDialogOpen(false);
     activeRemoveDialogSession.current = null;
     setRemoveTarget(null);
@@ -211,7 +216,8 @@ export function BatchDetailPage() {
     setExportPending(false);
     setExportResult(null);
     setExportError(null);
-    setRevealError(null);
+    setAutomationRevealError(null);
+    setManualRevealError(null);
     setAutomationFeedback((feedback) =>
       feedback.status === "success" &&
       feedback.contentRevision !== batchContentRevision
@@ -252,6 +258,7 @@ export function BatchDetailPage() {
 
   async function runAutomation(operationBatchId: string) {
     const session = routeSession.current;
+    setAutomationRevealError(null);
     setAutomationFeedback({ status: "pending" });
     try {
       const result = await automationMutation.mutateAsync(operationBatchId);
@@ -351,7 +358,7 @@ export function BatchDetailPage() {
     const operationContentRevision = getBatchContentRevision(operationBatchId);
     setExportPending(true);
     setExportError(null);
-    setRevealError(null);
+    setManualRevealError(null);
     setExportResult(null);
     try {
       const result = await api.exportBatch(operationBatchId);
@@ -383,11 +390,14 @@ export function BatchDetailPage() {
     }
   }
 
-  async function revealExportDirectory(directory: string) {
+  async function revealExportDirectory(directory: string, source: RevealSource) {
     const session = routeSession.current;
     const operationBatchId = batchId;
     const operationContentRevision = getBatchContentRevision(operationBatchId);
-    setRevealError(null);
+    const setSourceError = source === "automation"
+      ? setAutomationRevealError
+      : setManualRevealError;
+    setSourceError(null);
     try {
       const mergedPdf = await join(directory, "merged.pdf");
       await revealItemInDir(mergedPdf);
@@ -398,14 +408,14 @@ export function BatchDetailPage() {
         session === routeSession.current &&
         operationContentRevision === getBatchContentRevision(operationBatchId)
       ) {
-        setRevealError("无法在文件夹中显示，请从导出目录手动打开报销包");
+        setSourceError("无法在文件夹中显示，请从导出目录手动打开报销包");
       }
     }
   }
 
   async function revealExport() {
     if (!exportResult) return;
-    await revealExportDirectory(exportResult.directory);
+    await revealExportDirectory(exportResult.directory, "manual");
   }
 
   function closeAssignDialog() {
@@ -619,15 +629,18 @@ export function BatchDetailPage() {
                   <button
                     type="button"
                     className="button button-secondary"
-                    onClick={() => void revealExportDirectory(automationExport.directory)}
+                    onClick={() => void revealExportDirectory(
+                      automationExport.directory,
+                      "automation",
+                    )}
                   >
                     <FolderOpen size={16} strokeWidth={1.7} aria-hidden="true" />
                     在文件夹中显示
                   </button>
                 </p>
-                {revealError && !exportResult ? (
+                {automationRevealError ? (
                   <div className="batch-inline-error batch-reveal-error" role="alert">
-                    {revealError}
+                    {automationRevealError}
                   </div>
                 ) : null}
               </>
@@ -804,9 +817,9 @@ export function BatchDetailPage() {
             <ul>
               {exportFiles.map((file) => <li key={file}>{file}</li>)}
             </ul>
-            {revealError ? (
+            {manualRevealError ? (
               <div className="batch-inline-error batch-reveal-error" role="alert">
-                {revealError}
+                {manualRevealError}
               </div>
             ) : null}
           </div>
