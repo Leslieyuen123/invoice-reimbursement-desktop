@@ -145,6 +145,14 @@ pub struct ItemPatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmailLinkReplacement {
+    pub(crate) original_name: String,
+    pub(crate) original_path: String,
+    pub(crate) sha256: String,
+    pub(crate) mime_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReviewedItemFields {
     pub invoice_date: Option<NaiveDate>,
     pub suggested_period: String,
@@ -296,6 +304,121 @@ impl ItemRepository {
             .await
             .map_err(|error| map_database_error("failed to find email part", error))?;
         row.map(InvoiceItem::try_from).transpose()
+    }
+
+    pub(crate) async fn replace_email_link_placeholder(
+        &self,
+        id: Uuid,
+        replacement: EmailLinkReplacement,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        if replacement.original_name.trim().is_empty()
+            || replacement.original_path.trim().is_empty()
+            || replacement.sha256.trim().is_empty()
+            || replacement.mime_type.trim().is_empty()
+        {
+            return Err(AppError::Internal {
+                message: "email link replacement metadata is incomplete".to_owned(),
+            });
+        }
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin link replacement", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if !is_replaceable_email_link(&item) {
+                return Ok(None);
+            }
+            let canonical_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM items \
+                 WHERE id != ? AND sha256 = ? AND duplicate_of_id IS NULL \
+                 ORDER BY CASE WHEN dedupe_status = 'unique' THEN 0 ELSE 1 END, \
+                          created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(id.to_string())
+            .bind(&replacement.sha256)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to deduplicate link replacement", error))?
+            .map(|value| parse_uuid(&value, "id"))
+            .transpose()?;
+            let (dedupe_status, duplicate_of_id) = match canonical_id {
+                Some(canonical_id) => ("suspected_duplicate", Some(canonical_id)),
+                None => ("unique", None),
+            };
+            let updated_at = Utc::now();
+            sqlx::query(
+                "UPDATE items SET \
+                    original_name = ?, original_path = ?, normalized_pdf_path = NULL, \
+                    sha256 = ?, mime_type = ?, invoice_date = NULL, suggested_period = NULL, \
+                    suggested_category = NULL, final_category = NULL, amount_cents = NULL, \
+                    city = NULL, company = NULL, recognition_status = 'pending', \
+                    confirmation_status = 'pending', dedupe_status = ?, duplicate_of_id = ?, \
+                    note = NULL, event_tag = NULL, project_tag = NULL, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(replacement.original_name)
+            .bind(replacement.original_path)
+            .bind(replacement.sha256)
+            .bind(replacement.mime_type)
+            .bind(dedupe_status)
+            .bind(duplicate_of_id.map(|value| value.to_string()))
+            .bind(updated_at.to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to replace email link item", error))?;
+            get_with_connection(&mut transaction, id).await.map(Some)
+        }
+        .await;
+        finish_transaction(transaction, result).await
+    }
+
+    pub(crate) async fn delete_email_link_placeholder(
+        &self,
+        account_id: Uuid,
+        mailbox: &str,
+        uid_validity: u32,
+        uid: u32,
+        part_id: &str,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin link discard", error))?;
+        let result = async {
+            let query = format!(
+                "SELECT {ITEM_COLUMNS} FROM items WHERE source_type = 'email' \
+                 AND source_account_id = ? AND source_mailbox = ? AND source_uid_validity = ? \
+                 AND source_uid = ? AND source_part_id = ? LIMIT 1"
+            );
+            let item = sqlx::query_as::<_, DbItemRow>(&query)
+                .bind(account_id.to_string())
+                .bind(mailbox)
+                .bind(i64::from(uid_validity))
+                .bind(i64::from(uid))
+                .bind(part_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|error| map_database_error("failed to find ignored email link", error))?
+                .map(InvoiceItem::try_from)
+                .transpose()?;
+            let Some(item) = item.filter(is_replaceable_email_link) else {
+                return Ok(None);
+            };
+            sqlx::query("DELETE FROM items WHERE id = ?")
+                .bind(item.id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    map_database_error("failed to discard ignored email link", error)
+                })?;
+            Ok(Some(item))
+        }
+        .await;
+        finish_transaction(transaction, result).await
     }
 
     pub async fn find_rescanned_email_part(
@@ -952,6 +1075,17 @@ impl ItemRepository {
     }
 }
 
+fn is_replaceable_email_link(item: &InvoiceItem) -> bool {
+    item.source_type == SourceType::Email
+        && item.mime_type == "text/uri-list"
+        && item
+            .original_name
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("url"))
+        && item.confirmation_status == ConfirmationStatus::Pending
+        && item.batch_id.is_none()
+}
+
 fn validate_page_size(page_size: usize) -> Result<(), AppError> {
     if page_size == 0 || page_size > MAX_PAGE_SIZE {
         return Err(AppError::validation(
@@ -1210,10 +1344,10 @@ impl FileRecoveryClaim {
     }
 }
 
-async fn finish_transaction(
+async fn finish_transaction<T>(
     transaction: Transaction<'_, Sqlite>,
-    result: Result<InvoiceItem, AppError>,
-) -> Result<InvoiceItem, AppError> {
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
     match result {
         Ok(item) => transaction
             .commit()

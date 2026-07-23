@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
-use crate::db::items::{InvoiceItem, ItemRepository, NewItemRecord};
+use crate::db::items::{EmailLinkReplacement, InvoiceItem, ItemRepository, NewItemRecord};
 use crate::domain::error::AppError;
 use crate::domain::model::{ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType};
 use crate::infra::files::AppPaths;
@@ -95,6 +95,136 @@ impl ImportService {
             source,
         })
         .await
+    }
+
+    pub(crate) async fn import_downloaded_email_link(
+        &self,
+        file_name: &str,
+        bytes: &[u8],
+        source: EmailImportSource,
+    ) -> Result<ImportOutcome, AppError> {
+        validate_email_source(&source)?;
+        let Some(existing) = self
+            .items
+            .find_email_part(
+                source.account_id,
+                &source.mailbox,
+                source.uid_validity,
+                source.uid,
+                &source.part_id,
+            )
+            .await?
+        else {
+            return self.import_email_bytes(file_name, bytes, source).await;
+        };
+        if existing.mime_type != "text/uri-list"
+            || !existing
+                .original_name
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("url"))
+            || existing.confirmation_status != ConfirmationStatus::Pending
+            || existing.batch_id.is_some()
+        {
+            return Ok(ImportOutcome::Existing(existing));
+        }
+
+        let original_name = sanitize_mail_filename(file_name)?;
+        let extension = supported_extension(Path::new(&original_name))?;
+        let (staged, writer) = self.paths.begin_staged_original(Uuid::new_v4())?;
+        let mut reader = bytes;
+        let staged = copy_source_to_staging(&mut reader, staged, writer, false).await?;
+        let sha256 = match sha256_file(staged.path()).await {
+            Ok(value) => value,
+            Err(error) => return Err(staged.cleanup_after(error)),
+        };
+        let mime_type = match detect_mime(staged.path(), &extension).await {
+            Ok(value) => value,
+            Err(error) => return Err(staged.cleanup_after(error)),
+        };
+        let promoted = staged.promote(source.received_at.date_naive(), existing.id, &extension)?;
+        let replacement = EmailLinkReplacement {
+            original_name,
+            original_path: promoted.path().to_string_lossy().into_owned(),
+            sha256,
+            mime_type,
+        };
+        match self
+            .items
+            .replace_email_link_placeholder(existing.id, replacement)
+            .await
+        {
+            Ok(Some(replaced)) => {
+                promoted.commit();
+                if self.paths.delete_original(&existing.original_path).is_err() {
+                    tracing::warn!(
+                        item_id = %existing.id,
+                        "replaced email link left an unreferenced placeholder for startup recovery"
+                    );
+                }
+                Ok(ImportOutcome::Existing(replaced))
+            }
+            Ok(None) => {
+                promoted.rollback()?;
+                let current = self
+                    .items
+                    .find_email_part(
+                        source.account_id,
+                        &source.mailbox,
+                        source.uid_validity,
+                        source.uid,
+                        &source.part_id,
+                    )
+                    .await?
+                    .ok_or_else(|| AppError::Conflict {
+                        message: "email link changed while its download was being imported"
+                            .to_owned(),
+                    })?;
+                Ok(ImportOutcome::Existing(current))
+            }
+            Err(database_error) => match promoted.rollback() {
+                Ok(()) => Err(database_error),
+                Err(cleanup_error) => Err(AppError::External {
+                    service: "filesystem_sync".to_owned(),
+                    retryable: false,
+                    message: format!(
+                        "email link replacement failed and downloaded file cleanup was incomplete; \
+                         manual recovery is required: database error: {database_error}; cleanup \
+                         error: {cleanup_error}"
+                    ),
+                }),
+            },
+        }
+    }
+
+    pub(crate) async fn discard_email_link_placeholder(
+        &self,
+        source: &EmailImportSource,
+    ) -> Result<bool, AppError> {
+        validate_email_source(source)?;
+        let Some(discarded) = self
+            .items
+            .delete_email_link_placeholder(
+                source.account_id,
+                &source.mailbox,
+                source.uid_validity,
+                source.uid,
+                &source.part_id,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        if self
+            .paths
+            .delete_original(&discarded.original_path)
+            .is_err()
+        {
+            tracing::warn!(
+                item_id = %discarded.id,
+                "discarded email link left an unreferenced placeholder for startup recovery"
+            );
+        }
+        Ok(true)
     }
 
     pub(crate) async fn import_email_rejection(
@@ -546,14 +676,32 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
 mod tests {
     use std::fs;
 
+    use chrono::{TimeZone, Utc};
     use tokio::io::{AsyncRead, AsyncReadExt};
     use uuid::Uuid;
 
-    use super::{ImportService, copy_source_to_staging, signature_matches_extension};
+    use super::{
+        EmailImportSource, ImportOutcome, ImportService, copy_source_to_staging,
+        signature_matches_extension,
+    };
     use crate::db;
-    use crate::db::items::ItemRepository;
+    use crate::db::items::{ItemPatch, ItemRepository};
     use crate::domain::error::AppError;
+    use crate::domain::model::{ConfirmationStatus, DedupeStatus, RecognitionStatus};
     use crate::infra::files::AppPaths;
+
+    fn email_source(uid: u32, part_id: &str) -> EmailImportSource {
+        EmailImportSource {
+            account_id: Uuid::new_v4(),
+            mailbox: "INBOX".to_owned(),
+            uid_validity: 71,
+            uid,
+            message_id: Some(format!("invoice-{uid}@example.com")),
+            part_id: part_id.to_owned(),
+            received_at: Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 0).unwrap(),
+            rescan: false,
+        }
+    }
 
     #[test]
     fn signature_compatibility_uses_exact_families_for_supported_extensions() {
@@ -655,5 +803,108 @@ mod tests {
             fs::read(source).expect("replacement should read"),
             replacement
         );
+    }
+
+    #[tokio::test]
+    async fn downloaded_link_replaces_the_legacy_placeholder_and_recalculates_dedupe() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let items = ItemRepository::new(pool);
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items.clone(), paths.clone());
+        let source = email_source(103, "1.link.0");
+        let ImportOutcome::New(legacy) = service
+            .import_email_link("https://invoice.example/103.pdf", source.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("legacy link should be new")
+        };
+        let legacy_path = legacy.original_path.clone();
+        let pdf = b"%PDF-1.7\ninvoice contents\n%%EOF\n";
+        let canonical_source = directory.path().join("canonical.pdf");
+        fs::write(&canonical_source, pdf).unwrap();
+        let canonical = service.import_manual(&canonical_source).await.unwrap();
+
+        let ImportOutcome::Existing(replaced) = service
+            .import_downloaded_email_link("invoice-103.pdf", pdf, source.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("placeholder replacement should retain its item identity")
+        };
+
+        assert_eq!(replaced.id, legacy.id);
+        assert_eq!(replaced.original_name, "invoice-103.pdf");
+        assert_eq!(replaced.mime_type, "application/pdf");
+        assert_eq!(replaced.recognition_status, RecognitionStatus::Pending);
+        assert_eq!(replaced.confirmation_status, ConfirmationStatus::Pending);
+        assert_eq!(replaced.dedupe_status, DedupeStatus::SuspectedDuplicate);
+        assert_eq!(replaced.duplicate_of_id, Some(canonical.id));
+        assert_eq!(replaced.source_account_id, Some(source.account_id));
+        assert_eq!(replaced.source_uid, Some(i64::from(source.uid)));
+        assert_eq!(replaced.source_part_id.as_deref(), Some("1.link.0"));
+        assert_eq!(fs::read(&replaced.original_path).unwrap(), pdf);
+        assert!(!std::path::Path::new(&legacy_path).exists());
+        assert!(fs::read_dir(&paths.staging).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn ignored_link_discards_only_an_unassigned_pending_placeholder() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let items = ItemRepository::new(pool);
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items.clone(), paths);
+        let disposable_source = email_source(201, "1.link.0");
+        let ImportOutcome::New(disposable) = service
+            .import_email_link(
+                "https://invoice.example/invoice.xml",
+                disposable_source.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("disposable link should be new")
+        };
+        let protected_source = email_source(202, "1.link.0");
+        let ImportOutcome::New(protected) = service
+            .import_email_link("https://fp.nuonuo.com/#/", protected_source.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("protected link should be new")
+        };
+        items
+            .update_fields(
+                protected.id,
+                ItemPatch {
+                    confirmation_status: Some(ConfirmationStatus::Confirmed),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .discard_email_link_placeholder(&disposable_source)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service
+                .discard_email_link_placeholder(&protected_source)
+                .await
+                .unwrap()
+        );
+
+        assert!(items.get_by_id(disposable.id).await.is_err());
+        assert!(!std::path::Path::new(&disposable.original_path).exists());
+        assert_eq!(
+            items.get_by_id(protected.id).await.unwrap().id,
+            protected.id
+        );
+        assert!(std::path::Path::new(&protected.original_path).exists());
     }
 }
