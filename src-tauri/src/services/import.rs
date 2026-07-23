@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
-use crate::db::items::{EmailLinkReplacement, InvoiceItem, ItemRepository, NewItemRecord};
+use crate::db::items::{
+    EmailLinkReplacement, InvoiceItem, ItemPatch, ItemRepository, NewItemRecord,
+};
 use crate::domain::error::AppError;
 use crate::domain::model::{ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType};
 use crate::infra::files::AppPaths;
@@ -74,10 +76,83 @@ impl ImportService {
         .await
     }
 
+    pub(crate) async fn find_email_part(
+        &self,
+        source: &EmailImportSource,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        validate_email_source(source)?;
+        self.items
+            .find_email_part(
+                source.account_id,
+                &source.mailbox,
+                source.uid_validity,
+                source.uid,
+                &source.part_id,
+            )
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn import_email_link(
         &self,
         url: &str,
         source: EmailImportSource,
+    ) -> Result<ImportOutcome, AppError> {
+        self.import_email_link_with_status(
+            url,
+            source,
+            RecognitionStatus::Succeeded,
+            Some(url.to_owned()),
+        )
+        .await
+    }
+
+    pub(crate) async fn import_failed_email_link(
+        &self,
+        url: &str,
+        source: EmailImportSource,
+    ) -> Result<ImportOutcome, AppError> {
+        let outcome = self
+            .import_email_link_with_status(
+                url,
+                source,
+                RecognitionStatus::Failed,
+                Some("invoice link download failed".to_owned()),
+            )
+            .await?;
+        let ImportOutcome::Existing(existing) = outcome else {
+            return Ok(outcome);
+        };
+        if existing.mime_type != "text/uri-list"
+            || !existing
+                .original_name
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("url"))
+            || existing.confirmation_status != ConfirmationStatus::Pending
+            || existing.batch_id.is_some()
+        {
+            return Ok(ImportOutcome::Existing(existing));
+        }
+        let updated = self
+            .items
+            .update_fields(
+                existing.id,
+                ItemPatch {
+                    recognition_status: Some(RecognitionStatus::Failed),
+                    note: Some(Some("invoice link download failed".to_owned())),
+                    ..ItemPatch::default()
+                },
+            )
+            .await?;
+        Ok(ImportOutcome::Existing(updated))
+    }
+
+    async fn import_email_link_with_status(
+        &self,
+        url: &str,
+        source: EmailImportSource,
+        recognition_status: RecognitionStatus,
+        note: Option<String>,
     ) -> Result<ImportOutcome, AppError> {
         let original_name = format!(
             "download-{}-{}.url",
@@ -90,8 +165,8 @@ impl ImportService {
             extension: "url".to_owned(),
             bytes: payload.as_bytes(),
             mime_type: Some("text/uri-list".to_owned()),
-            recognition_status: RecognitionStatus::Succeeded,
-            note: Some(url.to_owned()),
+            recognition_status,
+            note,
             source,
         })
         .await

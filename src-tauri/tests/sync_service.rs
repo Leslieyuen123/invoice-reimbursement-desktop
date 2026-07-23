@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,9 @@ use invoice_reimbursement::infra::files::AppPaths;
 use invoice_reimbursement::infra::imap::{
     ImapAccountConfig, ImapDateRange, ImapGateway, MailboxDelta, MessageRejectionReason,
     NativeTlsImapGateway, RawMessage, RejectedMessage,
+};
+use invoice_reimbursement::infra::invoice_download::{
+    DownloadedInvoice, InvoiceLinkDownload, InvoiceLinkDownloader,
 };
 use invoice_reimbursement::services::import::{EmailImportSource, ImportOutcome, ImportService};
 use invoice_reimbursement::services::recognition::RecognitionService;
@@ -65,6 +69,36 @@ impl DocumentExtractor for FailingExtractor {
 struct FakeImapGateway {
     deltas: Mutex<VecDeque<Result<MailboxDelta, AppError>>>,
     cursors: Mutex<Vec<Option<SyncCursor>>>,
+}
+
+struct FakeInvoiceLinkDownloader {
+    results: Mutex<VecDeque<Result<InvoiceLinkDownload, AppError>>>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl FakeInvoiceLinkDownloader {
+    fn new(results: Vec<Result<InvoiceLinkDownload, AppError>>) -> Self {
+        Self {
+            results: Mutex::new(results.into()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl InvoiceLinkDownloader for FakeInvoiceLinkDownloader {
+    async fn download(&self, source_url: &str) -> Result<InvoiceLinkDownload, AppError> {
+        self.calls.lock().unwrap().push(source_url.to_owned());
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("fake invoice link download")
+    }
 }
 
 struct RangeGateway {
@@ -1098,7 +1132,7 @@ async fn cid_image_without_content_disposition_is_imported() {
 }
 
 #[tokio::test]
-async fn https_download_link_becomes_a_local_pending_placeholder_without_network_access() {
+async fn https_download_link_imports_and_recognizes_a_local_pdf() {
     let directory = tempfile::tempdir().unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let accounts = MailboxAccountRepository::new(pool.clone());
@@ -1132,12 +1166,17 @@ async fn https_download_link_becomes_a_local_pending_placeholder_without_network
         AppPaths::create(directory.path().join("storage")).unwrap(),
     );
     let recognition = RecognitionService::new(items.clone(), Arc::new(FakeExtractor));
-    let service = SyncService::new(gateway, credentials, accounts.clone(), import, recognition);
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(vec![Ok(
+        InvoiceLinkDownload::Downloaded(DownloadedInvoice {
+            file_name: "invoice-103.pdf".to_owned(),
+            bytes: b"%PDF-1.7\n1 0 obj\n<</Type/Catalog>>\nendobj\n%%EOF\n".to_vec(),
+            mime_type: "application/pdf".to_owned(),
+        }),
+    )]));
+    let service = SyncService::new(gateway, credentials, accounts.clone(), import, recognition)
+        .with_link_downloader(downloader.clone());
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), service.run(account.id))
-        .await
-        .expect("sync must not try to fetch the unreachable URL")
-        .unwrap();
+    let result = service.run(account.id).await.unwrap();
 
     assert_eq!(result.imported_count, 1);
     let stored = items
@@ -1145,26 +1184,23 @@ async fn https_download_link_becomes_a_local_pending_placeholder_without_network
         .await
         .unwrap();
     assert_eq!(stored.len(), 1);
-    let link = &stored[0];
-    assert_eq!(link.mime_type, "text/uri-list");
+    let downloaded = &stored[0];
+    assert_eq!(downloaded.original_name, "invoice-103.pdf");
+    assert_eq!(downloaded.mime_type, "application/pdf");
+    assert_eq!(downloaded.recognition_status, RecognitionStatus::Succeeded);
+    assert_eq!(downloaded.confirmation_status, ConfirmationStatus::Pending);
+    assert_eq!(downloaded.source_account_id, Some(account.id));
+    assert_eq!(downloaded.source_mailbox.as_deref(), Some("INBOX"));
+    assert_eq!(downloaded.source_uid, Some(103));
     assert_eq!(
-        link.note.as_deref(),
-        Some("https://127.0.0.1:1/invoices/103.pdf")
-    );
-    assert_eq!(link.recognition_status, RecognitionStatus::Succeeded);
-    assert_eq!(link.confirmation_status, ConfirmationStatus::Pending);
-    assert_eq!(link.source_account_id, Some(account.id));
-    assert_eq!(link.source_mailbox.as_deref(), Some("INBOX"));
-    assert_eq!(link.source_uid, Some(103));
-    assert_eq!(
-        link.source_message_id.as_deref(),
+        downloaded.source_message_id.as_deref(),
         Some("link-103@example.com")
     );
-    assert_eq!(link.source_part_id.as_deref(), Some("0.link.0"));
-    assert!(!link.original_path.starts_with("https://"));
+    assert_eq!(downloaded.source_part_id.as_deref(), Some("0.link.0"));
+    assert!(!downloaded.original_path.ends_with(".url"));
     assert_eq!(
-        std::fs::read_to_string(&link.original_path).unwrap(),
-        "https://127.0.0.1:1/invoices/103.pdf\r\n"
+        downloader.calls(),
+        vec!["https://127.0.0.1:1/invoices/103.pdf".to_owned()]
     );
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
@@ -1173,6 +1209,398 @@ async fn https_download_link_becomes_a_local_pending_placeholder_without_network
             last_uid: 103,
         })
     );
+}
+
+#[tokio::test]
+async fn failed_https_download_isolated_as_exception_while_later_link_succeeds() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "link-failure@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let raw = many_download_links_message(2);
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(vec![
+        Err(AppError::External {
+            service: "invoice_download".to_owned(),
+            retryable: true,
+            message: "request failed for https://vendor.example/invoice?token=secret".to_owned(),
+        }),
+        Ok(InvoiceLinkDownload::Downloaded(DownloadedInvoice {
+            file_name: "invoice-01.pdf".to_owned(),
+            bytes: b"%PDF-1.7\n%%EOF\n".to_vec(),
+            mime_type: "application/pdf".to_owned(),
+        })),
+    ]));
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 23,
+            highest_uid: 203,
+            messages: vec![raw_message(203, raw.as_bytes())],
+        })])),
+        credentials,
+        accounts,
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    )
+    .with_link_downloader(downloader.clone());
+
+    let result = service.run(account.id).await.unwrap();
+
+    assert_eq!(result.imported_count, 2);
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    let failed = stored
+        .iter()
+        .find(|item| item.source_part_id.as_deref() == Some("0.link.0"))
+        .unwrap();
+    let succeeded = stored
+        .iter()
+        .find(|item| item.source_part_id.as_deref() == Some("0.link.1"))
+        .unwrap();
+    assert!(failed.original_name.ends_with(".url"));
+    assert_eq!(failed.mime_type, "text/uri-list");
+    assert_eq!(failed.recognition_status, RecognitionStatus::Failed);
+    assert_eq!(failed.note.as_deref(), Some("invoice link download failed"));
+    assert!(!failed.note.as_deref().unwrap().contains("secret"));
+    assert_eq!(succeeded.original_name, "invoice-01.pdf");
+    assert_eq!(succeeded.recognition_status, RecognitionStatus::Succeeded);
+    assert_eq!(downloader.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn range_rescan_retries_failed_link_and_replaces_placeholder_in_place() {
+    let context = RangeTestContext::new("link-retry@example.com", "password").await;
+    let raw = many_download_links_message(1);
+    let message = raw_message(204, raw.as_bytes());
+    let gateway = Arc::new(RangeGateway::new(vec![
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 25,
+            highest_uid: 204,
+            messages: vec![message.clone()],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 25,
+            highest_uid: 204,
+            messages: vec![],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 25,
+            highest_uid: 204,
+            messages: vec![message],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 25,
+            highest_uid: 204,
+            messages: vec![],
+        }),
+    ]));
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(vec![
+        Err(AppError::External {
+            service: "invoice_download".to_owned(),
+            retryable: true,
+            message: "temporary link failure".to_owned(),
+        }),
+        Ok(InvoiceLinkDownload::Downloaded(DownloadedInvoice {
+            file_name: "invoice-204.pdf".to_owned(),
+            bytes: b"%PDF-1.7\n%%EOF\n".to_vec(),
+            mime_type: "application/pdf".to_owned(),
+        })),
+    ]));
+    let service = context
+        .service(gateway)
+        .with_link_downloader(downloader.clone());
+    let start = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+
+    let first = Box::pin(service.run_range(context.account_id, start, end))
+        .await
+        .unwrap();
+    let failed = context
+        .items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(first.imported_count, 1);
+    assert_eq!(failed.recognition_status, RecognitionStatus::Failed);
+    assert!(failed.original_name.ends_with(".url"));
+
+    let second = Box::pin(service.run_range(context.account_id, start, end))
+        .await
+        .unwrap();
+    let retried = context
+        .items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(second.imported_count, 0);
+    assert_eq!(retried.id, failed.id);
+    assert_eq!(retried.original_name, "invoice-204.pdf");
+    assert_eq!(retried.recognition_status, RecognitionStatus::Succeeded);
+    assert!(!retried.original_path.ends_with(".url"));
+    assert_eq!(downloader.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn ignored_xml_and_homepage_links_discard_old_unassigned_placeholders() {
+    let context = RangeTestContext::new("link-ignore@example.com", "password").await;
+    let raw = download_links_message(&[
+        "https://example.com/invoices/invoice-205.xml",
+        "https://fp.nuonuo.com/#/",
+    ]);
+    let message = raw_message(205, raw.as_bytes());
+    let gateway = Arc::new(RangeGateway::new(vec![
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 26,
+            highest_uid: 205,
+            messages: vec![message.clone()],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 26,
+            highest_uid: 205,
+            messages: vec![],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 26,
+            highest_uid: 205,
+            messages: vec![message],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 26,
+            highest_uid: 205,
+            messages: vec![],
+        }),
+    ]));
+    let failure = || AppError::External {
+        service: "invoice_download".to_owned(),
+        retryable: false,
+        message: "unsupported link".to_owned(),
+    };
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(vec![
+        Err(failure()),
+        Err(failure()),
+        Ok(InvoiceLinkDownload::Ignored),
+        Ok(InvoiceLinkDownload::Ignored),
+    ]));
+    let service = context
+        .service(gateway)
+        .with_link_downloader(downloader.clone());
+    let start = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+
+    let first = Box::pin(service.run_range(context.account_id, start, end))
+        .await
+        .unwrap();
+    assert_eq!(first.imported_count, 2);
+    assert_eq!(
+        context
+            .items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let second = Box::pin(service.run_range(context.account_id, start, end))
+        .await
+        .unwrap();
+    assert_eq!(second.imported_count, 0);
+    assert!(
+        context
+            .items
+            .list_bounded_for_tests(ItemFilter::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(count_files(&context.paths.originals), 0);
+    assert_eq!(downloader.calls().len(), 4);
+}
+
+#[tokio::test]
+async fn successful_range_rescan_skips_download_when_real_source_part_exists() {
+    let context = RangeTestContext::new("link-idempotent@example.com", "password").await;
+    let raw = many_download_links_message(1);
+    let message = raw_message(206, raw.as_bytes());
+    let gateway = Arc::new(RangeGateway::new(vec![
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 27,
+            highest_uid: 206,
+            messages: vec![message.clone()],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 27,
+            highest_uid: 206,
+            messages: vec![],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 27,
+            highest_uid: 206,
+            messages: vec![message],
+        }),
+        Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 27,
+            highest_uid: 206,
+            messages: vec![],
+        }),
+    ]));
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(vec![Ok(
+        InvoiceLinkDownload::Downloaded(DownloadedInvoice {
+            file_name: "invoice-206.pdf".to_owned(),
+            bytes: b"%PDF-1.7\n%%EOF\n".to_vec(),
+            mime_type: "application/pdf".to_owned(),
+        }),
+    )]));
+    let service = context
+        .service(gateway)
+        .with_link_downloader(downloader.clone());
+    let start = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+
+    let first = Box::pin(service.run_range(context.account_id, start, end))
+        .await
+        .unwrap();
+    assert_eq!(first.imported_count, 1);
+    let original_id = context
+        .items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .id;
+    let second = Box::pin(service.run_range(context.account_id, start, end))
+        .await
+        .unwrap();
+    let rescanned = context
+        .items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    assert_eq!(second.imported_count, 0);
+    assert_eq!(rescanned.id, original_id);
+    assert_eq!(rescanned.original_name, "invoice-206.pdf");
+    assert_eq!(rescanned.recognition_status, RecognitionStatus::Succeeded);
+    assert_eq!(downloader.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn downloaded_zip_expands_and_recognizes_supported_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::QQ,
+            email: "link-zip@example.com".to_owned(),
+            imap_host: "imap.qq.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "auth-code")
+        .unwrap();
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive
+        .start_file("invoice-103.pdf", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive.write_all(b"%PDF-1.7\n%%EOF\n").unwrap();
+    archive
+        .start_file("notes.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive.write_all(b"not an invoice").unwrap();
+    let zip_bytes = archive.finish().unwrap().into_inner();
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(vec![Ok(
+        InvoiceLinkDownload::Downloaded(DownloadedInvoice {
+            file_name: "invoice-bundle.zip".to_owned(),
+            bytes: zip_bytes,
+            mime_type: "application/zip".to_owned(),
+        }),
+    )]));
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 24,
+            highest_uid: 103,
+            messages: vec![raw_message(
+                103,
+                include_bytes!("fixtures/mail/download-link.eml"),
+            )],
+        })])),
+        credentials,
+        accounts,
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    )
+    .with_link_downloader(downloader);
+
+    let result = service.run(account.id).await.unwrap();
+
+    assert_eq!(result.imported_count, 2);
+    let stored = items
+        .list_bounded_for_tests(ItemFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().any(|item| {
+        item.original_name == "invoice-bundle.zip"
+            && item.source_part_id.as_deref() == Some("0.link.0")
+    }));
+    let invoice = stored
+        .iter()
+        .find(|item| item.original_name == "invoice-103.pdf")
+        .unwrap();
+    assert_eq!(invoice.source_part_id.as_deref(), Some("0.link.0.zip.0"));
+    assert_eq!(invoice.mime_type, "application/pdf");
+    assert_eq!(invoice.recognition_status, RecognitionStatus::Succeeded);
 }
 
 #[tokio::test]
@@ -1196,6 +1624,18 @@ async fn html_links_only_import_download_candidates_from_the_message_body() {
     credentials
         .set(&account.id.to_string(), "password")
         .unwrap();
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(
+        ["invoice-201.pdf", "material-202.pdf", "receipt-203.pdf"]
+            .into_iter()
+            .map(|file_name| {
+                Ok(InvoiceLinkDownload::Downloaded(DownloadedInvoice {
+                    file_name: file_name.to_owned(),
+                    bytes: b"%PDF-1.7\n%%EOF\n".to_vec(),
+                    mime_type: "application/pdf".to_owned(),
+                }))
+            })
+            .collect(),
+    ));
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
             rejected_messages: vec![],
@@ -1213,7 +1653,8 @@ async fn html_links_only_import_download_candidates_from_the_message_body() {
             AppPaths::create(directory.path().join("storage")).unwrap(),
         ),
         RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
-    );
+    )
+    .with_link_downloader(downloader.clone());
 
     let result = service.run(account.id).await.unwrap();
 
@@ -1223,13 +1664,17 @@ async fn html_links_only_import_download_candidates_from_the_message_body() {
         .await
         .unwrap();
     assert_eq!(stored.len(), 3);
-    let mut urls = stored
+    let mut names = stored
         .iter()
-        .map(|item| item.note.clone().unwrap())
+        .map(|item| item.original_name.clone())
         .collect::<Vec<_>>();
-    urls.sort();
+    names.sort();
     assert_eq!(
-        urls,
+        names,
+        ["invoice-201.pdf", "material-202.pdf", "receipt-203.pdf",]
+    );
+    assert_eq!(
+        downloader.calls(),
         [
             "https://example.com/materials/invoice-201.pdf",
             "https://example.com/secure/material?id=202",
@@ -1267,6 +1712,12 @@ async fn excessive_download_candidates_are_truncated_and_cursor_advances() {
         .set(&account.id.to_string(), "password")
         .unwrap();
     let raw = many_download_links_message(35);
+    let downloader = Arc::new(FakeInvoiceLinkDownloader::new(vec![
+        Ok(
+            InvoiceLinkDownload::Ignored
+        );
+        32
+    ]));
     let service = SyncService::new(
         Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
             rejected_messages: vec![],
@@ -1281,25 +1732,28 @@ async fn excessive_download_candidates_are_truncated_and_cursor_advances() {
             AppPaths::create(directory.path().join("storage")).unwrap(),
         ),
         RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
-    );
+    )
+    .with_link_downloader(downloader.clone());
 
     let result = service.run(account.id).await.unwrap();
 
-    assert_eq!(result.imported_count, 32);
+    assert_eq!(result.imported_count, 0);
     let stored = items
         .list_bounded_for_tests(ItemFilter::default())
         .await
         .unwrap();
-    assert_eq!(stored.len(), 32);
-    assert!(stored.iter().any(|item| {
-        item.note.as_deref() == Some("https://example.com/invoices/invoice-00.pdf")
-    }));
-    assert!(stored.iter().any(|item| {
-        item.note.as_deref() == Some("https://example.com/invoices/invoice-31.pdf")
-    }));
-    assert!(!stored.iter().any(|item| {
-        item.note.as_deref() == Some("https://example.com/invoices/invoice-32.pdf")
-    }));
+    assert!(stored.is_empty());
+    let calls = downloader.calls();
+    assert_eq!(calls.len(), 32);
+    assert_eq!(
+        calls.first().unwrap(),
+        "https://example.com/invoices/invoice-00.pdf"
+    );
+    assert_eq!(
+        calls.last().unwrap(),
+        "https://example.com/invoices/invoice-31.pdf"
+    );
+    assert!(!calls.iter().any(|url| url.ends_with("invoice-32.pdf")));
     assert_eq!(
         accounts.get_cursor(account.id, "INBOX").await.unwrap(),
         Some(SyncCursor {
@@ -2667,10 +3121,17 @@ fn raw_message(uid: u32, raw: &[u8]) -> RawMessage {
 }
 
 fn many_download_links_message(count: usize) -> String {
+    let links = (0..count)
+        .map(|index| format!("https://example.com/invoices/invoice-{index:02}.pdf"))
+        .collect::<Vec<_>>();
+    download_links_message(&links.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn download_links_message(links: &[&str]) -> String {
     let mut body = String::from("<html><body>\n");
-    for index in 0..count {
+    for (index, link) in links.iter().enumerate() {
         body.push_str(&format!(
-            "<a href=\"https://example.com/invoices/invoice-{index:02}.pdf\">Invoice {index:02}</a>\n"
+            "<a href=\"{link}\">Download invoice {index:02}</a>\n"
         ));
     }
     body.push_str("</body></html>");

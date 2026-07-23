@@ -13,6 +13,9 @@ use crate::domain::error::{AppError, sanitize_message};
 use crate::domain::model::{ConfirmationStatus, RecognitionStatus};
 use crate::infra::credentials::{CredentialStore, get_credential};
 use crate::infra::imap::{ImapAccountConfig, ImapDateRange, ImapGateway, MailboxDelta, RawMessage};
+use crate::infra::invoice_download::{
+    InvoiceLinkDownload, InvoiceLinkDownloader, SecureInvoiceLinkDownloader,
+};
 use crate::services::import::{EmailImportSource, ImportOutcome, ImportService};
 use crate::services::recognition::RecognitionService;
 
@@ -168,6 +171,7 @@ pub struct SyncService {
     accounts: MailboxAccountRepository,
     import: ImportService,
     recognition: RecognitionService,
+    link_downloader: Arc<dyn InvoiceLinkDownloader>,
 }
 
 impl SyncService {
@@ -184,7 +188,13 @@ impl SyncService {
             accounts,
             import,
             recognition,
+            link_downloader: Arc::new(SecureInvoiceLinkDownloader),
         }
+    }
+
+    pub fn with_link_downloader(mut self, downloader: Arc<dyn InvoiceLinkDownloader>) -> Self {
+        self.link_downloader = downloader;
+        self
     }
 
     pub async fn run(&self, account_id: Uuid) -> Result<SyncResult, AppError> {
@@ -386,8 +396,7 @@ impl SyncService {
         validate_delta(&delta, &config.mailbox)?;
         let rescan = cursor.is_some_and(|cursor| cursor.uid_validity != delta.uid_validity);
         let mut budget = TouchedItemBudget::default();
-        let result = self
-            .process_delta(account_id, &delta, rescan, &mut budget)
+        let result = Box::pin(self.process_delta(account_id, &delta, rescan, &mut budget))
             .await
             .map_err(|failure| failure.error)?
             .into_result();
@@ -445,7 +454,7 @@ impl SyncService {
                     completed,
                 ));
             }
-            match self.process_delta(account_id, &delta, true, budget).await {
+            match Box::pin(self.process_delta(account_id, &delta, true, budget)).await {
                 Ok(page) => {
                     if let Err(error) = completed.merge(page) {
                         return Err(sync_progress_failure(error, completed));
@@ -493,7 +502,12 @@ impl SyncService {
         for raw_message in &delta.messages {
             let parsed = parse_invoice_parts(raw_message)
                 .map_err(|error| sync_progress_failure(error, completed.clone()))?;
-            for part in parsed.files {
+            let ParsedInvoiceParts {
+                files,
+                links,
+                mut zip_budget,
+            } = parsed;
+            for part in files {
                 budget
                     .reserve()
                     .map_err(|error| sync_progress_failure(error, completed.clone()))?;
@@ -515,42 +529,134 @@ impl SyncService {
                     )
                     .await
                     .map_err(|error| sync_progress_failure(error, completed.clone()))?;
-                let item = track_import_outcome(outcome, &mut completed)
-                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
-                if item.recognition_status == RecognitionStatus::Pending
-                    && item.confirmation_status == ConfirmationStatus::Pending
-                    && let Err(error) = self.recognition.recognize_item(item.id).await
-                    && !is_document_recognition_failure(&error)
-                {
-                    return Err(sync_progress_failure(error, completed));
-                }
-            }
-            for link in parsed.links {
-                budget
-                    .reserve()
-                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
-                let outcome = self
-                    .import
-                    .import_email_link(
-                        &link.url,
-                        EmailImportSource {
-                            account_id,
-                            mailbox: raw_message.mailbox.clone(),
-                            uid_validity: delta.uid_validity,
-                            uid: raw_message.uid,
-                            message_id: link.message_id,
-                            part_id: link.part_id,
-                            received_at: raw_message.received_at,
-                            rescan,
-                        },
-                    )
+                self.track_and_recognize(outcome, &mut completed)
                     .await
                     .map_err(|error| sync_progress_failure(error, completed.clone()))?;
-                track_import_outcome(outcome, &mut completed)
-                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+            }
+            for link in links {
+                Box::pin(self.process_link(
+                    account_id,
+                    delta.uid_validity,
+                    raw_message,
+                    rescan,
+                    link,
+                    budget,
+                    &mut zip_budget,
+                    &mut completed,
+                ))
+                .await
+                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
             }
         }
         Ok(completed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn process_link(
+        &self,
+        account_id: Uuid,
+        uid_validity: u32,
+        raw_message: &RawMessage,
+        rescan: bool,
+        link: DownloadLink,
+        budget: &mut TouchedItemBudget,
+        zip_budget: &mut ZipExpansionBudget,
+        completed: &mut SyncProgress,
+    ) -> Result<(), AppError> {
+        budget.reserve()?;
+        let source = EmailImportSource {
+            account_id,
+            mailbox: raw_message.mailbox.clone(),
+            uid_validity,
+            uid: raw_message.uid,
+            message_id: link.message_id,
+            part_id: link.part_id,
+            received_at: raw_message.received_at,
+            rescan,
+        };
+        if let Some(existing) = self.import.find_email_part(&source).await?
+            && !is_email_link_placeholder(&existing)
+        {
+            self.track_and_recognize(ImportOutcome::Existing(existing), completed)
+                .await?;
+            return Ok(());
+        }
+        let download = match self.link_downloader.download(&link.url).await {
+            Ok(download) => download,
+            Err(_) => {
+                let outcome = self
+                    .import
+                    .import_failed_email_link(&link.url, source)
+                    .await?;
+                track_import_outcome(outcome, completed)?;
+                return Ok(());
+            }
+        };
+        match download {
+            InvoiceLinkDownload::Downloaded(downloaded) => {
+                let downloaded_part = InvoicePart {
+                    part_id: source.part_id.clone(),
+                    file_name: downloaded.file_name,
+                    bytes: downloaded.bytes,
+                    message_id: source.message_id.clone(),
+                };
+                let expanded = if file_name_has_extension(&downloaded_part.file_name, "zip") {
+                    expand_zip_part(&downloaded_part, zip_budget).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let outcome = self
+                    .import
+                    .import_downloaded_email_link(
+                        &downloaded_part.file_name,
+                        &downloaded_part.bytes,
+                        source,
+                    )
+                    .await?;
+                self.track_and_recognize(outcome, completed).await?;
+                for child in expanded {
+                    budget.reserve()?;
+                    let outcome = self
+                        .import
+                        .import_email_bytes(
+                            &child.file_name,
+                            &child.bytes,
+                            EmailImportSource {
+                                account_id,
+                                mailbox: raw_message.mailbox.clone(),
+                                uid_validity,
+                                uid: raw_message.uid,
+                                message_id: child.message_id,
+                                part_id: child.part_id,
+                                received_at: raw_message.received_at,
+                                rescan,
+                            },
+                        )
+                        .await?;
+                    self.track_and_recognize(outcome, completed).await?;
+                }
+            }
+            InvoiceLinkDownload::Ignored => {
+                self.import.discard_email_link_placeholder(&source).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn track_and_recognize(
+        &self,
+        outcome: ImportOutcome,
+        completed: &mut SyncProgress,
+    ) -> Result<(), AppError> {
+        let item = track_import_outcome(outcome, completed)?;
+        if item.recognition_status == RecognitionStatus::Pending
+            && item.confirmation_status == ConfirmationStatus::Pending
+            && let Err(error) = self.recognition.recognize_item(item.id).await
+            && !is_document_recognition_failure(&error)
+        {
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -568,6 +674,14 @@ fn track_import_outcome(
     };
     completed.record_item(item.id, imported)?;
     Ok(item)
+}
+
+fn is_email_link_placeholder(item: &crate::db::items::InvoiceItem) -> bool {
+    item.mime_type == "text/uri-list"
+        && item
+            .original_name
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("url"))
 }
 
 fn sync_import_count_overflow() -> AppError {
@@ -601,6 +715,7 @@ struct DownloadLink {
 struct ParsedInvoiceParts {
     files: Vec<InvoicePart>,
     links: Vec<DownloadLink>,
+    zip_budget: ZipExpansionBudget,
 }
 
 fn validate_delta(delta: &MailboxDelta, expected_mailbox: &str) -> Result<(), AppError> {
@@ -731,7 +846,11 @@ fn parse_invoice_parts_with_zip_budget(
             &mut links,
         )?;
     }
-    Ok(ParsedInvoiceParts { files, links })
+    Ok(ParsedInvoiceParts {
+        files,
+        links,
+        zip_budget,
+    })
 }
 
 fn preflight_zip_entries(bytes: &[u8]) -> Result<usize, ()> {
