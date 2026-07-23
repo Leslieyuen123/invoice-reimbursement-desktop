@@ -375,6 +375,38 @@ impl ItemRepository {
         finish_transaction(transaction, result).await
     }
 
+    pub(crate) async fn mark_email_link_download_failed(
+        &self,
+        id: Uuid,
+    ) -> Result<InvoiceItem, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin link failure update", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if !is_replaceable_email_link(&item) {
+                return Ok(item);
+            }
+            sqlx::query(
+                "UPDATE items SET recognition_status = 'failed', note = ?, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind("invoice link download failed")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                map_database_error("failed to mark email link download failed", error)
+            })?;
+            get_with_connection(&mut transaction, id).await
+        }
+        .await;
+        finish_transaction(transaction, result).await
+    }
+
     pub(crate) async fn delete_email_link_placeholder(
         &self,
         account_id: Uuid,

@@ -5,9 +5,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
-use crate::db::items::{
-    EmailLinkReplacement, InvoiceItem, ItemPatch, ItemRepository, NewItemRecord,
-};
+use crate::db::items::{EmailLinkReplacement, InvoiceItem, ItemRepository, NewItemRecord};
 use crate::domain::error::AppError;
 use crate::domain::model::{ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType};
 use crate::infra::files::AppPaths;
@@ -123,26 +121,9 @@ impl ImportService {
         let ImportOutcome::Existing(existing) = outcome else {
             return Ok(outcome);
         };
-        if existing.mime_type != "text/uri-list"
-            || !existing
-                .original_name
-                .rsplit_once('.')
-                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("url"))
-            || existing.confirmation_status != ConfirmationStatus::Pending
-            || existing.batch_id.is_some()
-        {
-            return Ok(ImportOutcome::Existing(existing));
-        }
         let updated = self
             .items
-            .update_fields(
-                existing.id,
-                ItemPatch {
-                    recognition_status: Some(RecognitionStatus::Failed),
-                    note: Some(Some("invoice link download failed".to_owned())),
-                    ..ItemPatch::default()
-                },
-            )
+            .mark_email_link_download_failed(existing.id)
             .await?;
         Ok(ImportOutcome::Existing(updated))
     }
@@ -205,7 +186,8 @@ impl ImportService {
 
         let original_name = sanitize_mail_filename(file_name)?;
         let extension = supported_extension(Path::new(&original_name))?;
-        let (staged, writer) = self.paths.begin_staged_original(Uuid::new_v4())?;
+        let candidate_id = Uuid::new_v4();
+        let (staged, writer) = self.paths.begin_staged_original(candidate_id)?;
         let mut reader = bytes;
         let staged = copy_source_to_staging(&mut reader, staged, writer, false).await?;
         let sha256 = match sha256_file(staged.path()).await {
@@ -216,7 +198,7 @@ impl ImportService {
             Ok(value) => value,
             Err(error) => return Err(staged.cleanup_after(error)),
         };
-        let promoted = staged.promote(source.received_at.date_naive(), existing.id, &extension)?;
+        let promoted = staged.promote(source.received_at.date_naive(), candidate_id, &extension)?;
         let replacement = EmailLinkReplacement {
             original_name,
             original_path: promoted.path().to_string_lossy().into_owned(),
@@ -750,6 +732,7 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use chrono::{TimeZone, Utc};
     use tokio::io::{AsyncRead, AsyncReadExt};
@@ -925,6 +908,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_download_failure_cannot_mark_a_replaced_pdf_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let items = ItemRepository::new(pool);
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items.clone(), paths);
+        let source = email_source(104, "1.link.0");
+        let ImportOutcome::New(placeholder) = service
+            .import_email_link(
+                "https://invoice.example/104.pdf?signature=private",
+                source.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("legacy link should be new")
+        };
+        let pdf = b"%PDF-1.7\nwinning invoice\n%%EOF\n";
+        let ImportOutcome::Existing(replaced) = service
+            .import_downloaded_email_link("invoice-104.pdf", pdf, source)
+            .await
+            .unwrap()
+        else {
+            panic!("download should replace the placeholder")
+        };
+
+        let after_stale_failure = items
+            .mark_email_link_download_failed(placeholder.id)
+            .await
+            .unwrap();
+
+        assert_eq!(after_stale_failure.id, placeholder.id);
+        assert_eq!(after_stale_failure.original_name, "invoice-104.pdf");
+        assert_eq!(after_stale_failure.mime_type, "application/pdf");
+        assert_eq!(
+            after_stale_failure.recognition_status,
+            RecognitionStatus::Pending
+        );
+        assert_eq!(after_stale_failure.note, None);
+        assert_eq!(after_stale_failure.original_path, replaced.original_path);
+        assert_eq!(fs::read(after_stale_failure.original_path).unwrap(), pdf);
+    }
+
+    #[tokio::test]
+    async fn concurrent_download_failure_and_success_leave_the_real_pdf_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("failure-success.sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let pool = db::connect(&database_url).await.unwrap();
+        let items = ItemRepository::new(pool);
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items.clone(), paths.clone());
+        let source = email_source(106, "1.link.0");
+        let ImportOutcome::New(placeholder) = service
+            .import_email_link(
+                "https://invoice.example/106.pdf?signature=private",
+                source.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("legacy link should be new")
+        };
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        pdf.resize(4 * 1024 * 1024, b'y');
+        pdf.extend_from_slice(b"\n%%EOF\n");
+        let barrier = tokio::sync::Barrier::new(2);
+
+        let (failure, success) = tokio::join!(
+            async {
+                barrier.wait().await;
+                service
+                    .import_failed_email_link(
+                        "https://invoice.example/106.pdf?signature=private",
+                        source.clone(),
+                    )
+                    .await
+            },
+            async {
+                barrier.wait().await;
+                service
+                    .import_downloaded_email_link("invoice-106.pdf", &pdf, source.clone())
+                    .await
+            }
+        );
+        failure.unwrap();
+        success.unwrap();
+
+        let current = items.get_by_id(placeholder.id).await.unwrap();
+        assert_eq!(current.original_name, "invoice-106.pdf");
+        assert_eq!(current.mime_type, "application/pdf");
+        assert_eq!(current.recognition_status, RecognitionStatus::Pending);
+        assert_eq!(current.note, None);
+        assert_eq!(fs::read(current.original_path).unwrap(), pdf);
+        assert_eq!(count_files(&paths.originals), 1);
+        assert!(fs::read_dir(&paths.staging).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn failure_guard_preserves_confirmed_and_batch_assigned_placeholders() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let items = ItemRepository::new(pool.clone());
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items.clone(), paths);
+        let confirmed_source = email_source(107, "1.link.0");
+        let ImportOutcome::New(confirmed) = service
+            .import_email_link("https://invoice.example/107.pdf", confirmed_source.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("confirmed fixture should be new")
+        };
+        items
+            .update_fields(
+                confirmed.id,
+                ItemPatch {
+                    confirmation_status: Some(ConfirmationStatus::Confirmed),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        let confirmed_before = items.get_by_id(confirmed.id).await.unwrap();
+
+        let batched_source = email_source(108, "1.link.0");
+        let ImportOutcome::New(batched) = service
+            .import_email_link("https://invoice.example/108.pdf", batched_source)
+            .await
+            .unwrap()
+        else {
+            panic!("batched fixture should be new")
+        };
+        let batch_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO batches (id, name, start_date, end_date, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(batch_id.to_string())
+        .bind("Protected placeholders")
+        .bind("2026-07-01")
+        .bind("2026-07-31")
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE items SET batch_id = ? WHERE id = ?")
+            .bind(batch_id.to_string())
+            .bind(batched.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let batched_before = items.get_by_id(batched.id).await.unwrap();
+
+        let confirmed_after = items
+            .mark_email_link_download_failed(confirmed.id)
+            .await
+            .unwrap();
+        let batched_after = items
+            .mark_email_link_download_failed(batched.id)
+            .await
+            .unwrap();
+
+        assert_eq!(confirmed_after, confirmed_before);
+        assert_eq!(batched_after, batched_before);
+        assert_eq!(
+            confirmed_after.recognition_status,
+            RecognitionStatus::Succeeded
+        );
+        assert_eq!(
+            batched_after.recognition_status,
+            RecognitionStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_successful_link_retries_share_one_replaced_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("concurrent-link.sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let pool = db::connect(&database_url).await.unwrap();
+        let items = ItemRepository::new(pool);
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items.clone(), paths.clone());
+        let source = email_source(105, "1.link.0");
+        let ImportOutcome::New(placeholder) = service
+            .import_email_link("https://invoice.example/105.pdf", source.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("legacy link should be new")
+        };
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        pdf.resize(8 * 1024 * 1024, b'x');
+        pdf.extend_from_slice(b"\n%%EOF\n");
+        let barrier = tokio::sync::Barrier::new(2);
+
+        let (first, second) = tokio::join!(
+            async {
+                barrier.wait().await;
+                service
+                    .import_downloaded_email_link("invoice-105.pdf", &pdf, source.clone())
+                    .await
+            },
+            async {
+                barrier.wait().await;
+                service
+                    .import_downloaded_email_link("invoice-105.pdf", &pdf, source.clone())
+                    .await
+            }
+        );
+        let ImportOutcome::Existing(first) = first.unwrap() else {
+            panic!("first retry should retain the placeholder identity")
+        };
+        let ImportOutcome::Existing(second) = second.unwrap() else {
+            panic!("second retry should retain the placeholder identity")
+        };
+
+        assert_eq!(first.id, placeholder.id);
+        assert_eq!(second.id, placeholder.id);
+        assert_eq!(first.original_path, second.original_path);
+        assert_eq!(first.original_name, "invoice-105.pdf");
+        assert_eq!(first.mime_type, "application/pdf");
+        assert_eq!(first.recognition_status, RecognitionStatus::Pending);
+        assert_eq!(items.get_by_id(placeholder.id).await.unwrap(), first);
+        assert_eq!(count_files(&paths.originals), 1);
+        assert!(fs::read_dir(&paths.staging).unwrap().next().is_none());
+        assert_eq!(fs::read(first.original_path).unwrap(), pdf);
+    }
+
+    #[tokio::test]
     async fn ignored_link_discards_only_an_unassigned_pending_placeholder() {
         let directory = tempfile::tempdir().unwrap();
         let pool = db::connect("sqlite::memory:").await.unwrap();
@@ -981,5 +1197,15 @@ mod tests {
             protected.id
         );
         assert!(std::path::Path::new(&protected.original_path).exists());
+    }
+
+    fn count_files(path: &Path) -> usize {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() { count_files(&path) } else { 1 }
+            })
+            .sum()
     }
 }
