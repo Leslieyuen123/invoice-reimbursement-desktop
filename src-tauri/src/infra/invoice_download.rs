@@ -1,7 +1,12 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use url::Url;
+use reqwest::header::LOCATION;
+use reqwest::redirect::Policy;
+use serde::Deserialize;
+use tokio::net::lookup_host;
+use url::{Host, Url};
 
 use crate::domain::error::AppError;
 
@@ -23,8 +28,305 @@ pub trait InvoiceLinkDownloader: Send + Sync {
     async fn download(&self, source_url: &str) -> Result<InvoiceLinkDownload, AppError>;
 }
 
+pub const MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const USER_AGENT: &str = "invoice-reimbursement-desktop/0.2";
+const NUONUO_HOST: &str = "nnfp.jss.com.cn";
+const NUONUO_LANDING_PATH: &str = "/scan-invoice/printQrcode";
+const NUONUO_DETAIL_PATH: &str = "/sapi/scan2/getIvcDetailShow.do";
+const NUONUO_FORM_FIELDS: [&str; 5] = [
+    "paramList",
+    "code",
+    "aliView",
+    "invoiceDetailMiddleUri",
+    "shortLinkSource",
+];
+
+#[derive(Clone, Default)]
+pub struct SecureInvoiceLinkDownloader;
+
+#[async_trait]
+impl InvoiceLinkDownloader for SecureInvoiceLinkDownloader {
+    async fn download(&self, source_url: &str) -> Result<InvoiceLinkDownload, AppError> {
+        let source = Url::parse(source_url).map_err(|_| invalid_download_url())?;
+        validate_source_url(&source)?;
+        if is_ignored_source(&source) {
+            return Ok(InvoiceLinkDownload::Ignored);
+        }
+
+        let fetched = fetch_get(&source, MAX_DOWNLOAD_BYTES).await?;
+        if let Ok(invoice) = classify_download(&fetched.final_url, &fetched.bytes) {
+            return Ok(InvoiceLinkDownload::Downloaded(invoice));
+        }
+        if !is_nuonuo_landing(&fetched.final_url) {
+            return Err(unsupported_download_body());
+        }
+
+        let pdf_url = resolve_nuonuo_pdf_url(&fetched.final_url).await?;
+        let fetched = fetch_get(&pdf_url, MAX_DOWNLOAD_BYTES).await?;
+        classify_download(&fetched.final_url, &fetched.bytes).map(InvoiceLinkDownload::Downloaded)
+    }
+}
+
+struct FetchedBody {
+    final_url: Url,
+    bytes: Vec<u8>,
+}
+
+async fn fetch_get(source: &Url, max_bytes: u64) -> Result<FetchedBody, AppError> {
+    let mut current = source.clone();
+    for redirect_count in 0..=MAX_REDIRECTS {
+        validate_source_url(&current)?;
+        let client = client_for_url(&current).await?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|_| request_failure(true))?;
+        if response.status().is_redirection() {
+            if redirect_count == MAX_REDIRECTS {
+                return Err(download_error(
+                    false,
+                    "invoice link exceeded the redirect limit",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| download_error(false, "invoice link redirect was invalid"))?;
+            current = current
+                .join(location)
+                .map_err(|_| download_error(false, "invoice link redirect was invalid"))?;
+            continue;
+        }
+        validate_success_status(response.status())?;
+        let bytes = read_response_body(response, max_bytes).await?;
+        return Ok(FetchedBody {
+            final_url: current,
+            bytes,
+        });
+    }
+    Err(download_error(
+        false,
+        "invoice link exceeded the redirect limit",
+    ))
+}
+
+async fn client_for_url(url: &Url) -> Result<reqwest::Client, AppError> {
+    let (domain, addresses) = resolve_public_target(url).await?;
+    let mut builder = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(USER_AGENT);
+    if let Some(domain) = domain {
+        builder = builder.resolve_to_addrs(&domain, &addresses);
+    }
+    builder.build().map_err(|_| request_failure(false))
+}
+
+async fn resolve_public_target(url: &Url) -> Result<(Option<String>, Vec<SocketAddr>), AppError> {
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(invalid_download_url)?;
+    let (domain, addresses) = match url.host().ok_or_else(invalid_download_url)? {
+        Host::Ipv4(ip) => (None, vec![SocketAddr::new(IpAddr::V4(ip), port)]),
+        Host::Ipv6(ip) => (None, vec![SocketAddr::new(IpAddr::V6(ip), port)]),
+        Host::Domain(domain) => {
+            let mut addresses = lookup_host((domain, port))
+                .await
+                .map_err(|_| request_failure(true))?
+                .collect::<Vec<_>>();
+            addresses.sort_unstable();
+            addresses.dedup();
+            (Some(domain.to_owned()), addresses)
+        }
+    };
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(download_error(
+            false,
+            "invoice link target is not a public network address",
+        ));
+    }
+    Ok((domain, addresses))
+}
+
+async fn read_response_body(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
+    validate_content_length_with_limit(response.content_length(), max_bytes)?;
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.map_err(|_| request_failure(true))? {
+        append_bounded_chunk(&mut bytes, &chunk, max_bytes)?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn validate_content_length(content_length: Option<u64>) -> Result<(), AppError> {
+    validate_content_length_with_limit(content_length, MAX_DOWNLOAD_BYTES)
+}
+
+fn validate_content_length_with_limit(
+    content_length: Option<u64>,
+    max_bytes: u64,
+) -> Result<(), AppError> {
+    if content_length.is_some_and(|length| length > max_bytes) {
+        return Err(download_error(
+            false,
+            "invoice link response exceeded the size limit",
+        ));
+    }
+    Ok(())
+}
+
+fn append_bounded_chunk(
+    destination: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: u64,
+) -> Result<(), AppError> {
+    let next_length = destination
+        .len()
+        .checked_add(chunk.len())
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or_else(|| download_error(false, "invoice link response exceeded the size limit"))?;
+    if next_length > max_bytes {
+        return Err(download_error(
+            false,
+            "invoice link response exceeded the size limit",
+        ));
+    }
+    destination.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn is_nuonuo_landing(url: &Url) -> bool {
+    url.host_str() == Some(NUONUO_HOST) && url.path() == NUONUO_LANDING_PATH
+}
+
+fn nuonuo_form_fields(url: &Url) -> Result<Vec<(String, String)>, AppError> {
+    if !is_nuonuo_landing(url) {
+        return Err(nuonuo_failure());
+    }
+    let pairs = url.query_pairs().collect::<Vec<_>>();
+    NUONUO_FORM_FIELDS
+        .into_iter()
+        .map(|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| (name.to_owned(), value.to_string()))
+                .filter(|(_, value)| !value.trim().is_empty())
+                .ok_or_else(nuonuo_failure)
+        })
+        .collect()
+}
+
+async fn resolve_nuonuo_pdf_url(landing: &Url) -> Result<Url, AppError> {
+    let mut form = nuonuo_form_fields(landing)?;
+    form.push((
+        "_timestamp".to_owned(),
+        chrono::Utc::now().timestamp_millis().to_string(),
+    ));
+    let endpoint = Url::parse(&format!("https://{NUONUO_HOST}{NUONUO_DETAIL_PATH}"))
+        .map_err(|_| nuonuo_failure())?;
+    let client = client_for_url(&endpoint).await?;
+    let response = client
+        .post(endpoint)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|_| request_failure(true))?;
+    validate_success_status(response.status())?;
+    let body = read_response_body(response, MAX_METADATA_BYTES).await?;
+    parse_nuonuo_pdf_url(&body)
+}
+
+#[derive(Deserialize)]
+struct NuonuoResponse {
+    status: String,
+    data: Option<NuonuoData>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NuonuoData {
+    invoice_simple_vo: Option<NuonuoInvoice>,
+}
+
+#[derive(Deserialize)]
+struct NuonuoInvoice {
+    url: Option<String>,
+}
+
+fn parse_nuonuo_pdf_url(body: &[u8]) -> Result<Url, AppError> {
+    let response = serde_json::from_slice::<NuonuoResponse>(body).map_err(|_| nuonuo_failure())?;
+    if response.status != "0000" {
+        return Err(nuonuo_failure());
+    }
+    let url = response
+        .data
+        .and_then(|data| data.invoice_simple_vo)
+        .and_then(|invoice| invoice.url)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(nuonuo_failure)
+        .and_then(|value| Url::parse(&value).map_err(|_| nuonuo_failure()))?;
+    validate_source_url(&url).map_err(|_| nuonuo_failure())?;
+    Ok(url)
+}
+
+fn validate_success_status(status: reqwest::StatusCode) -> Result<(), AppError> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(download_error(
+        status.is_server_error() || status.as_u16() == 429,
+        "invoice link returned an unsuccessful response",
+    ))
+}
+
+fn invalid_download_url() -> AppError {
+    AppError::validation("invoiceLink", "invoice download URL is invalid")
+}
+
+fn request_failure(retryable: bool) -> AppError {
+    download_error(retryable, "invoice link request failed")
+}
+
+fn unsupported_download_body() -> AppError {
+    download_error(
+        false,
+        "invoice link did not return a supported PDF, image, or ZIP file",
+    )
+}
+
+fn nuonuo_failure() -> AppError {
+    download_error(false, "Nuonuo invoice link could not be resolved")
+}
+
+fn download_error(retryable: bool, message: &str) -> AppError {
+    AppError::External {
+        service: "invoice_download".to_owned(),
+        retryable,
+        message: message.to_owned(),
+    }
+}
+
 fn validate_source_url(url: &Url) -> Result<(), AppError> {
-    if url.scheme() != "https" || url.host_str().is_none() {
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(AppError::validation(
             "invoiceLink",
             "invoice download URL must use HTTPS and include a host",
@@ -107,11 +409,7 @@ fn classify_download(url: &Url, bytes: &[u8]) -> Result<DownloadedInvoice, AppEr
     {
         ("zip", "application/zip")
     } else {
-        return Err(AppError::External {
-            service: "invoice_download".to_owned(),
-            retryable: false,
-            message: "invoice link did not return a supported PDF, image, or ZIP file".to_owned(),
-        });
+        return Err(unsupported_download_body());
     };
     let file_name = download_file_name(url, extension);
     Ok(DownloadedInvoice {
@@ -137,133 +435,4 @@ fn download_file_name(url: &Url, extension: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    use url::Url;
-
-    use super::{
-        DownloadedInvoice, classify_download, is_ignored_source, is_public_ip, validate_source_url,
-    };
-
-    #[test]
-    fn source_url_policy_requires_https_and_a_host() {
-        for value in [
-            "http://invoice.example/invoice.pdf",
-            "file:///tmp/invoice.pdf",
-        ] {
-            let parsed = Url::parse(value).expect("fixture URL should parse");
-            assert!(validate_source_url(&parsed).is_err(), "{value} must fail");
-        }
-
-        let accepted = Url::parse("https://invoice.example/invoice.pdf").unwrap();
-        assert!(validate_source_url(&accepted).is_ok());
-    }
-
-    #[test]
-    fn public_ip_policy_rejects_local_private_and_reserved_ranges() {
-        for ip in [
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
-            IpAddr::V4(Ipv4Addr::BROADCAST),
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            IpAddr::V6("fc00::1".parse().unwrap()),
-            IpAddr::V6("fe80::1".parse().unwrap()),
-            IpAddr::V6("ff02::1".parse().unwrap()),
-            IpAddr::V6("2001:db8::1".parse().unwrap()),
-            IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()),
-        ] {
-            assert!(!is_public_ip(ip), "{ip} must be rejected");
-        }
-
-        for ip in [
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            IpAddr::V6("2606:4700:4700::1111".parse().unwrap()),
-        ] {
-            assert!(is_public_ip(ip), "{ip} must be accepted");
-        }
-    }
-
-    #[test]
-    fn classifies_supported_downloads_by_magic_bytes() {
-        let cases: [(&str, &[u8], &str, &str); 4] = [
-            (
-                "https://invoice.example/opaque?id=1",
-                b"%PDF-1.7\n%%EOF\n",
-                "downloaded-invoice.pdf",
-                "application/pdf",
-            ),
-            (
-                "https://invoice.example/photo",
-                &[0xff, 0xd8, 0xff, 0xe0],
-                "downloaded-invoice.jpg",
-                "image/jpeg",
-            ),
-            (
-                "https://invoice.example/invoice.png?signature=secret",
-                &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
-                "invoice.png",
-                "image/png",
-            ),
-            (
-                "https://invoice.example/archive.zip",
-                b"PK\x05\x06payload",
-                "archive.zip",
-                "application/zip",
-            ),
-        ];
-
-        for (url, bytes, expected_name, expected_mime) in cases {
-            assert_eq!(
-                classify_download(&Url::parse(url).unwrap(), bytes).unwrap(),
-                DownloadedInvoice {
-                    file_name: expected_name.to_owned(),
-                    bytes: bytes.to_vec(),
-                    mime_type: expected_mime.to_owned(),
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_html_xml_and_unknown_download_bodies() {
-        let url = Url::parse("https://invoice.example/invoice.pdf").unwrap();
-
-        for bytes in [
-            b"<!doctype html><title>portal</title>".as_slice(),
-            b"<?xml version=\"1.0\"?><invoice/>".as_slice(),
-            b"unknown".as_slice(),
-        ] {
-            assert!(classify_download(&url, bytes).is_err());
-        }
-    }
-
-    #[test]
-    fn ignores_xml_and_the_parameterless_nuonuo_home_page() {
-        for value in [
-            "https://invoice.example/invoice.xml?signature=secret",
-            "https://fp.nuonuo.com/#/",
-        ] {
-            assert!(is_ignored_source(&Url::parse(value).unwrap()));
-        }
-
-        for value in [
-            "https://fp.nuonuo.com/invoice/123",
-            "https://nnfp.jss.com.cn/6zs=8fpWZO-1bZaS",
-            "https://invoice.example/invoice.pdf",
-        ] {
-            assert!(!is_ignored_source(&Url::parse(value).unwrap()));
-        }
-    }
-}
+mod tests;
