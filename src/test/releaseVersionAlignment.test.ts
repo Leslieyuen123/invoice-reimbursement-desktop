@@ -15,8 +15,9 @@ import cargoLock from "../../src-tauri/Cargo.lock?raw";
 import cargoManifest from "../../src-tauri/Cargo.toml?raw";
 import tauriConfigSource from "../../src-tauri/tauri.conf.json?raw";
 
-const EXPECTED_VERSION = "0.2.0";
-const EXPECTED_DMG = "invoice-reimbursement-0.2.0-macos-arm64.dmg";
+const EXPECTED_VERSION = "0.2.1";
+const EXPECTED_DMG = "invoice-reimbursement-0.2.1-macos-arm64.dmg";
+const EXPECTED_DOCUMENT_DATE = "2026-07-23";
 const REPO_ROOT = process.cwd();
 const STANDARD_FONT_DATA_URL =
   join(REPO_ROOT, "node_modules/pdfjs-dist/standard_fonts") + sep;
@@ -132,7 +133,7 @@ name = "invoice_reimbursement"`;
     expect(cargoManifestPackageVersion(manifest)).toBe(EXPECTED_VERSION);
   });
 
-  it("keeps every release-facing source at v0.2.0", () => {
+  it("keeps every release-facing source at v0.2.1", () => {
     const packageJson = JSON.parse(packageSource) as { version: string };
     const packageLock = JSON.parse(packageLockSource) as {
       version: string;
@@ -153,6 +154,8 @@ name = "invoice_reimbursement"`;
     for (const guide of [quickStart, userManual]) {
       expect.soft(guide).toContain(`v${EXPECTED_VERSION}`);
       expect.soft(guide).toContain(EXPECTED_DMG);
+      expect.soft(guide).toContain(EXPECTED_DOCUMENT_DATE);
+      expect.soft(guide).not.toContain("v0.2.0");
       expect.soft(guide).not.toContain("v0.1.0");
       expect.soft(guide).not.toContain("发票报销_0.1.0_aarch64.dmg");
       expect
@@ -183,6 +186,33 @@ name = "invoice_reimbursement"`;
     expect.soft(diagramBuilder).not.toContain("导出前仍需要人工");
   });
 
+  it("documents verified HTTPS invoice originals and visible portal exceptions", () => {
+    const requiredConcepts = [
+      "HTTPS 链接",
+      "PDF、JPEG、PNG 或 ZIP",
+      "自动下载",
+      "诺诺短链接",
+      "真实 PDF",
+      "XML 配套链接",
+      "fp.nuonuo.com/#/",
+      "临时失败",
+      "重新运行原批次，或新建覆盖邮件日期的批次",
+      "不会重复导入已成功下载的原件",
+      "需要登录",
+      "依赖脚本",
+      "不会中断后续发票或邮箱",
+      "并非支持所有发票门户",
+      "所有处理都在《发票报销》App 内完成",
+    ];
+
+    for (const guide of [quickStart, userManual]) {
+      for (const concept of requiredConcepts) {
+        expect.soft(guide).toContain(concept);
+      }
+      expect.soft(guide).not.toContain("只支持邮件附件");
+    }
+  });
+
   it("publishes one canonical DMG with a verified checksum", () => {
     const prepare = namedWorkflowStep(ciWorkflow, "Prepare canonical release artifacts");
     const upload = namedWorkflowStep(ciWorkflow, "Upload canonical release artifacts");
@@ -209,19 +239,27 @@ name = "invoice_reimbursement"`;
 
     expect.soft(requirements).toMatch(/^reportlab==\d+\.\d+\.\d+$/mu);
     expect.soft(requirements).toMatch(/^Pillow==\d+\.\d+\.\d+$/mu);
-    expect.soft(pdfBuilder).toContain('DOCUMENT_DATE = "2026-07-22"');
+    expect.soft(pdfBuilder).toContain(`DOCUMENT_DATE = "${EXPECTED_DOCUMENT_DATE}"`);
     expect.soft(pdfBuilder).toContain('Paragraph(DOCUMENT_DATE, style_map["table"])');
     expect.soft(pdfBuilder).toContain(
       "uv run --with-requirements scripts/user-guide-requirements.txt",
     );
     expect.soft(pdfBuilder).not.toContain('Paragraph("2026-07-21"');
+    expect.soft(pdfBuilder).not.toContain('Paragraph("2026-07-22"');
   });
 
   it("keeps both committed user-guide PDFs aligned with the release", async () => {
+    const normalizedReleaseConcepts = [
+      "HTTPS",
+      "诺诺短链接",
+      "XML配套链接",
+      "并非支持所有发票门户",
+      "重新运行原批次，或新建覆盖邮件日期的批次",
+    ];
     const guides = [
       {
         path: "output/pdf/invoice-reimbursement-user-manual-zh-cn.pdf",
-        pageCount: 17,
+        pageCount: 18,
         identity: "发票报销完整用户手册",
         distinctContent: ["9. 导出报销材料", "附录 C：导出文件对照表"],
       },
@@ -238,9 +276,14 @@ name = "invoice_reimbursement"`;
       const text = (await pdfText(guide.path)).replace(/\s+/gu, "");
       expect.soft(text).toContain(guide.identity.replace(/\s+/gu, ""));
       expect.soft(text).toContain(`v${EXPECTED_VERSION}`);
+      expect.soft(text).toContain(EXPECTED_DOCUMENT_DATE);
+      expect.soft(text).not.toContain("v0.2.0");
       expect.soft(text).not.toContain("v0.1.0");
       expect.soft(text).toContain("立即同步");
       expect.soft(text).toContain("保存并确认");
+      for (const concept of normalizedReleaseConcepts) {
+        expect.soft(text).toContain(concept);
+      }
       for (const expected of guide.distinctContent) {
         expect.soft(text).toContain(expected.replace(/\s+/gu, ""));
       }
