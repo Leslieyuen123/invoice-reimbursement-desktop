@@ -145,11 +145,17 @@ pub struct ItemPatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EmailLinkReplacement {
+pub(crate) struct EmailFileReplacement {
     pub(crate) original_name: String,
     pub(crate) original_path: String,
     pub(crate) sha256: String,
     pub(crate) mime_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmailFileReplacementGuard {
+    LinkPlaceholder,
+    FailedAttachment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,7 +315,26 @@ impl ItemRepository {
     pub(crate) async fn replace_email_link_placeholder(
         &self,
         id: Uuid,
-        replacement: EmailLinkReplacement,
+        replacement: EmailFileReplacement,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        self.replace_email_file(id, replacement, EmailFileReplacementGuard::LinkPlaceholder)
+            .await
+    }
+
+    pub(crate) async fn replace_failed_email_attachment(
+        &self,
+        id: Uuid,
+        replacement: EmailFileReplacement,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        self.replace_email_file(id, replacement, EmailFileReplacementGuard::FailedAttachment)
+            .await
+    }
+
+    async fn replace_email_file(
+        &self,
+        id: Uuid,
+        replacement: EmailFileReplacement,
+        guard: EmailFileReplacementGuard,
     ) -> Result<Option<InvoiceItem>, AppError> {
         if replacement.original_name.trim().is_empty()
             || replacement.original_path.trim().is_empty()
@@ -317,17 +342,23 @@ impl ItemRepository {
             || replacement.mime_type.trim().is_empty()
         {
             return Err(AppError::Internal {
-                message: "email link replacement metadata is incomplete".to_owned(),
+                message: "email file replacement metadata is incomplete".to_owned(),
             });
         }
         let mut transaction = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| map_database_error("failed to begin link replacement", error))?;
+            .map_err(|error| map_database_error("failed to begin email file replacement", error))?;
         let result = async {
             let item = get_with_connection(&mut transaction, id).await?;
-            if !is_replaceable_email_link(&item) {
+            let replaceable = match guard {
+                EmailFileReplacementGuard::LinkPlaceholder => is_replaceable_email_link(&item),
+                EmailFileReplacementGuard::FailedAttachment => {
+                    is_replaceable_failed_email_attachment(&item)
+                }
+            };
+            if !replaceable {
                 return Ok(None);
             }
             let canonical_id = sqlx::query_scalar::<_, String>(
@@ -340,7 +371,7 @@ impl ItemRepository {
             .bind(&replacement.sha256)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|error| map_database_error("failed to deduplicate link replacement", error))?
+            .map_err(|error| map_database_error("failed to deduplicate email replacement", error))?
             .map(|value| parse_uuid(&value, "id"))
             .transpose()?;
             let (dedupe_status, duplicate_of_id) = match canonical_id {
@@ -368,7 +399,7 @@ impl ItemRepository {
             .bind(id.to_string())
             .execute(&mut *transaction)
             .await
-            .map_err(|error| map_database_error("failed to replace email link item", error))?;
+            .map_err(|error| map_database_error("failed to replace email item", error))?;
             get_with_connection(&mut transaction, id).await.map(Some)
         }
         .await;
@@ -729,6 +760,92 @@ impl ItemRepository {
         patch: ItemPatch,
     ) -> Result<InvoiceItem, AppError> {
         self.update_fields_internal(id, patch, true).await
+    }
+
+    pub(crate) async fn record_semantic_identity(
+        &self,
+        id: Uuid,
+        fingerprint: &str,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<InvoiceItem, AppError> {
+        if fingerprint.trim().is_empty() {
+            return Err(AppError::Internal {
+                message: "semantic invoice fingerprint must not be blank".to_owned(),
+            });
+        }
+
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin semantic dedupe", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if item.updated_at != expected_updated_at
+                || item.batch_id.is_some()
+                || item.dedupe_status != DedupeStatus::Unique
+            {
+                return Ok(item);
+            }
+
+            let now = Utc::now();
+            sqlx::query(
+                "INSERT INTO item_semantic_identities (item_id, fingerprint, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(item_id) DO UPDATE SET \
+                    fingerprint = excluded.fingerprint, \
+                    created_at = CASE \
+                        WHEN item_semantic_identities.fingerprint = excluded.fingerprint \
+                        THEN item_semantic_identities.created_at \
+                        ELSE excluded.created_at \
+                    END, \
+                    updated_at = excluded.updated_at",
+            )
+            .bind(id.to_string())
+            .bind(fingerprint)
+            .bind(now.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to save semantic identity", error))?;
+
+            let canonical_id = sqlx::query_scalar::<_, String>(
+                "SELECT identity.item_id \
+                 FROM item_semantic_identities identity \
+                 JOIN items item ON item.id = identity.item_id \
+                 WHERE identity.fingerprint = ? AND identity.item_id != ? \
+                   AND item.duplicate_of_id IS NULL \
+                 ORDER BY identity.created_at ASC, identity.item_id ASC \
+                 LIMIT 1",
+            )
+            .bind(fingerprint)
+            .bind(id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to find semantic duplicate", error))?
+            .map(|value| parse_uuid(&value, "item_id"))
+            .transpose()?;
+
+            let Some(canonical_id) = canonical_id else {
+                return Ok(item);
+            };
+            sqlx::query(
+                "UPDATE items SET dedupe_status = 'suspected_duplicate', duplicate_of_id = ?, \
+                    updated_at = ? \
+                 WHERE id = ? AND batch_id IS NULL AND dedupe_status = 'unique' AND updated_at = ?",
+            )
+            .bind(canonical_id.to_string())
+            .bind(now.to_rfc3339())
+            .bind(id.to_string())
+            .bind(expected_updated_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to mark semantic duplicate", error))?;
+
+            get_with_connection(&mut transaction, id).await
+        }
+        .await;
+        finish_transaction(transaction, result).await
     }
 
     async fn update_fields_internal(
@@ -1114,6 +1231,14 @@ fn is_replaceable_email_link(item: &InvoiceItem) -> bool {
             .original_name
             .rsplit_once('.')
             .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("url"))
+        && item.confirmation_status == ConfirmationStatus::Pending
+        && item.batch_id.is_none()
+}
+
+fn is_replaceable_failed_email_attachment(item: &InvoiceItem) -> bool {
+    item.source_type == SourceType::Email
+        && item.mime_type != "text/uri-list"
+        && item.recognition_status == RecognitionStatus::Failed
         && item.confirmation_status == ConfirmationStatus::Pending
         && item.batch_id.is_none()
 }

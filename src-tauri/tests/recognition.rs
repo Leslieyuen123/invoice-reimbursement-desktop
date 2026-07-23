@@ -98,6 +98,155 @@ async fn recognition_persists_normalized_pdf_for_export() {
     assert_eq!(std::fs::read(normalized_path).unwrap(), normalized_bytes);
 }
 
+#[tokio::test]
+async fn semantically_identical_invoice_formats_mark_the_later_item_duplicate() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    repository.insert(&sample_item(first_id)).await.unwrap();
+    repository.insert(&sample_item(second_id)).await.unwrap();
+    let first_text = "发票号码：26312000002007059821\n\
+        开票日期：2026年04月01日\n\
+        销售方名称：上海市浦东新区麒麒餐饮店\n\
+        销售方纳税人识别号：92310115MACPYYNJ12\n\
+        销售方地址：上海市浦东新区\n\
+        餐饮服务 食品\n价税合计（小写）：¥109.44";
+    let second_text = "电子发票（普通发票） 发票号码：\n\
+        开票日期：\n购\n买\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n\
+        销\n售\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n名称： 名称：\n\
+        项目名称 规格型号 单位 数量 单价 金额 税率/征收率 税额\n合计\n\
+        价税合计（大写）（小写）\n备注\n开票人：\n26312000002007059821\n\
+        2026年04月01日\n上海大绍文化传媒有限公司\n91310230MA1K0PRP1X\n\
+        上海市浦东新区麒麒餐饮店\n92310115MACPYYNJ12\n¥108.36 ¥1.08\n\
+        壹佰零玖圆肆角肆分 ¥109.44\n张聪\n*餐饮服务*餐饮服务 1 108.36 108.36 1% 1.08";
+    let extractor = Arc::new(FakeExtractor::new(vec![
+        Ok(ExtractedDocument {
+            text: first_text.to_owned(),
+            normalized_pdf: None,
+            warnings: Vec::new(),
+        }),
+        Ok(ExtractedDocument {
+            text: second_text.to_owned(),
+            normalized_pdf: None,
+            warnings: Vec::new(),
+        }),
+    ]));
+    let service = RecognitionService::new(repository.clone(), extractor);
+
+    let first = service.recognize_item(first_id).await.unwrap();
+    let second = service.recognize_item(second_id).await.unwrap();
+
+    assert_eq!(first.dedupe_status, DedupeStatus::Unique);
+    assert_eq!(second.dedupe_status, DedupeStatus::SuspectedDuplicate);
+    assert_eq!(second.duplicate_of_id, Some(first.id));
+    assert_eq!(second.status(), ItemStatus::SuspectedDuplicate);
+}
+
+#[tokio::test]
+async fn semantic_dedupe_preserves_a_user_keep_decision() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    repository.insert(&sample_item(first_id)).await.unwrap();
+    let mut kept = sample_item(second_id);
+    kept.dedupe_status = DedupeStatus::Resolved;
+    repository.insert(&kept).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![
+        Ok(semantic_invoice_document()),
+        Ok(semantic_invoice_document()),
+    ]));
+    let service = RecognitionService::new(repository.clone(), extractor);
+
+    service.recognize_item(first_id).await.unwrap();
+    let recognized = service.recognize_item(second_id).await.unwrap();
+
+    assert_eq!(recognized.dedupe_status, DedupeStatus::Resolved);
+    assert_eq!(recognized.duplicate_of_id, None);
+}
+
+#[tokio::test]
+async fn semantic_dedupe_preserves_a_batch_assigned_item() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool.clone());
+    let batch = BatchRepository::new(pool.clone())
+        .create(NewBatch::try_new("April claims", "2026-04-01", "2026-04-30", None).unwrap())
+        .await
+        .unwrap();
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    repository.insert(&sample_item(first_id)).await.unwrap();
+    repository.insert(&sample_item(second_id)).await.unwrap();
+    sqlx::query("UPDATE items SET batch_id = ? WHERE id = ?")
+        .bind(batch.id.to_string())
+        .bind(second_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![
+        Ok(semantic_invoice_document()),
+        Ok(semantic_invoice_document()),
+    ]));
+    let service = RecognitionService::new(repository.clone(), extractor);
+
+    service.recognize_item(first_id).await.unwrap();
+    let recognized = service.recognize_item(second_id).await.unwrap();
+
+    assert_eq!(recognized.batch_id, Some(batch.id));
+    assert_eq!(recognized.dedupe_status, DedupeStatus::Unique);
+    assert_eq!(recognized.duplicate_of_id, None);
+}
+
+#[tokio::test]
+async fn semantic_dedupe_preserves_a_manually_confirmed_item() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    repository.insert(&sample_item(first_id)).await.unwrap();
+    let mut confirmed = sample_item(second_id);
+    confirmed.invoice_date = NaiveDate::from_ymd_opt(2026, 4, 1);
+    confirmed.suggested_period = Some("2026-04".to_owned());
+    confirmed.suggested_category = Some(Category::Dining);
+    confirmed.final_category = Some(Category::Dining);
+    confirmed.amount_cents = Some(10_944);
+    confirmed.city = Some("上海".to_owned());
+    confirmed.company = Some("上海市浦东新区麒麒餐饮店".to_owned());
+    confirmed.recognition_status = RecognitionStatus::Succeeded;
+    confirmed.confirmation_status = ConfirmationStatus::Confirmed;
+    repository.insert(&confirmed).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![
+        Ok(semantic_invoice_document()),
+        Ok(semantic_invoice_document()),
+    ]));
+    let service = RecognitionService::new(repository.clone(), extractor);
+
+    service.recognize_item(first_id).await.unwrap();
+    let recognized = service.recognize_item(second_id).await.unwrap();
+
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+    assert_eq!(recognized.dedupe_status, DedupeStatus::Unique);
+    assert_eq!(recognized.duplicate_of_id, None);
+}
+
+fn semantic_invoice_document() -> ExtractedDocument {
+    ExtractedDocument {
+        text: "发票号码：26312000002007059821\n\
+            开票日期：2026年04月01日\n\
+            销售方名称：上海市浦东新区麒麒餐饮店\n\
+            销售方纳税人识别号：92310115MACPYYNJ12\n\
+            销售方地址：上海市浦东新区\n\
+            餐饮服务 食品\n价税合计（小写）：¥109.44"
+            .to_owned(),
+        normalized_pdf: None,
+        warnings: Vec::new(),
+    }
+}
+
 impl DocumentExtractor for GatedExtractor {
     fn extract(&self, _path: &Path) -> Result<ExtractedDocument, AppError> {
         self.started.send(()).unwrap();
@@ -136,8 +285,79 @@ fn flattened_pdf_text_recovers_trailing_invoice_values() {
     assert_eq!(recognized.amount_cents, Some(146));
     assert_eq!(recognized.category, Some(Category::Transport));
     assert_eq!(recognized.company, None);
-    assert_eq!(recognized.warnings, ["invalid_invoice_date"]);
-    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
+    assert!(recognized.warnings.is_empty());
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+}
+
+#[test]
+fn flattened_invoice_recovers_date_after_inline_exact_remarks_label() {
+    let recognized = recognize(
+        "电子发票（普通发票） 发票号码：\n\
+         开票日期：\n购\n买\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n\
+         销\n售\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n名称： 名称：\n\
+         项目名称 规格型号 单位 数量 单价 金额 税率/征收率 税额\n合计\n\
+         价税合计（大写）（小写） 备注\n开票人：\n26312000002007059821\n\
+         2026年04月01日\n上海大绍文化传媒有限公司\n91310230MA1K0PRP1X\n\
+         上海市浦东新区麒麒餐饮店\n92310115MACPYYNJ12\n¥108.36 ¥1.08\n\
+         壹佰零玖圆肆角肆分 ¥109.44\n张聪\n*餐饮服务*餐饮服务 1 108.36 108.36 1% 1.08",
+        NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+    );
+
+    assert_eq!(recognized.invoice_date, NaiveDate::from_ymd_opt(2026, 4, 1));
+    assert!(recognized.warnings.is_empty());
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+}
+
+#[test]
+fn flattened_invoice_recovers_date_after_fragmented_remarks_label() {
+    let recognized = recognize(
+        "电子发票（普通发票） 发票号码：\n\
+         开票日期：\n购\n买\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n\
+         销\n售\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n名称： 名称：\n\
+         项目名称 规格型号 单位 数量 单价 金额 税率/征收率 税额\n合计\n\
+         价税合计（大写）（小写）\n备\n注\n开票人：\n26312000002007059821\n\
+         2026年04月01日\n上海大绍文化传媒有限公司\n91310230MA1K0PRP1X\n\
+         上海市浦东新区麒麒餐饮店\n92310115MACPYYNJ12\n¥108.36 ¥1.08\n\
+         壹佰零玖圆肆角肆分 ¥109.44\n张聪\n*餐饮服务*餐饮服务 1 108.36 108.36 1% 1.08",
+        NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+    );
+
+    assert_eq!(recognized.invoice_date, NaiveDate::from_ymd_opt(2026, 4, 1));
+    assert!(recognized.warnings.is_empty());
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
+}
+
+#[test]
+fn flattened_invoice_ignores_incidental_fragmented_remarks_characters() {
+    let preface = "说明".repeat(130);
+    let text = format!(
+        "设备\n注意事项\n{preface}\n电子发票（普通发票） 发票号码：\n\
+         开票日期：\n购\n买\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n\
+         销\n售\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n名称： 名称：\n\
+         项目名称 规格型号 单位 数量 单价 金额 税率/征收率 税额\n合计\n\
+         价税合计（大写）（小写）\n备\n注\n开票人：\n26312000002007059821\n\
+         2026年04月01日\n上海大绍文化传媒有限公司\n91310230MA1K0PRP1X\n\
+         上海市浦东新区麒麒餐饮店\n92310115MACPYYNJ12\n¥108.36 ¥1.08\n\
+         壹佰零玖圆肆角肆分 ¥109.44\n张聪\n*餐饮服务*餐饮服务 1 108.36 108.36 1% 1.08"
+    );
+
+    let recognized = recognize(&text, NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+
+    assert_eq!(recognized.invoice_date, NaiveDate::from_ymd_opt(2026, 4, 1));
+    assert!(recognized.warnings.is_empty());
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
 }
 
 #[test]
@@ -154,7 +374,7 @@ fn flattened_date_search_window_counts_unicode_characters() {
         NaiveDate::from_ymd_opt(2026, 6, 14)
     );
     assert_eq!(recognized.suggested_period, "2026-06");
-    assert_eq!(recognized.warnings, ["invalid_invoice_date"]);
+    assert!(recognized.warnings.is_empty());
     assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
 }
 
@@ -388,30 +608,53 @@ fn a_single_or_repeated_keyword_does_not_reach_the_category_threshold() {
 }
 
 #[test]
-fn company_prefers_the_buyer_name_segment_over_the_seller() {
+fn company_prefers_the_seller_name_segment_over_the_buyer() {
     let recognized = recognize(
         "销售方名称：北京远方服务有限公司\n购买方名称：上海星河科技有限公司\n购买方税号：123",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
     );
 
-    assert_eq!(recognized.company.as_deref(), Some("上海星河科技有限公司"));
+    assert_eq!(recognized.company.as_deref(), Some("北京远方服务有限公司"));
 }
 
 #[test]
-fn company_reads_buyer_name_from_separated_ocr_section_layout() {
+fn company_reads_seller_name_from_separated_ocr_section_layout() {
     let recognized = recognize(
         "购买方信息\n销售方信息\n名称：上海大绍文化传媒有限公司\n名称：上海路桥发展有限公司\n统一社会信用代码/纳税人识别号：91310230MA1K0PRP1X\n统一社会信用代码/纳税人识别号：91310000631588023C\n项目名称",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
     );
 
+    assert_eq!(recognized.company.as_deref(), Some("上海路桥发展有限公司"));
+}
+
+#[test]
+fn flattened_invoice_recovers_the_seller_company_and_city() {
+    let recognized = recognize(
+        "电子发票（普通发票） 发票号码：\n\
+         开票日期：\n购\n买\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n\
+         销\n售\n方\n信\n息\n统一社会信用代码/纳税人识别号：\n名称： 名称：\n\
+         项目名称 规格型号 单位 数量 单价 金额 税率/征收率 税额\n合计\n\
+         价税合计（大写）（小写）\n备注\n开票人：\n26312000002007059821\n\
+         2026年04月01日\n上海大绍文化传媒有限公司\n91310230MA1K0PRP1X\n\
+         上海市浦东新区麒麒餐饮店\n92310115MACPYYNJ12\n¥108.36 ¥1.08\n\
+         壹佰零玖圆肆角肆分 ¥109.44\n张聪\n*餐饮服务*餐饮服务 1 108.36 108.36 1% 1.08",
+        NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+    );
+
     assert_eq!(
         recognized.company.as_deref(),
-        Some("上海大绍文化传媒有限公司")
+        Some("上海市浦东新区麒麒餐饮店")
+    );
+    assert_eq!(recognized.city.as_deref(), Some("上海"));
+    assert!(recognized.warnings.is_empty());
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
     );
 }
 
 #[test]
-fn company_reads_buyer_from_character_fragmented_ocr_header() {
+fn company_reads_seller_from_character_fragmented_ocr_header() {
     let recognized = recognize(
         "购\n买\n方\n信\n息\n名称：上海大绍文化传媒有限公司\n统一社会信用代码/纳税人识别号：91310230MA1K0PRP1X\n销\n售\n方\n信\n息\n名称：阿斯兰航空服务（上海）有限公司",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
@@ -419,7 +662,7 @@ fn company_reads_buyer_from_character_fragmented_ocr_header() {
 
     assert_eq!(
         recognized.company.as_deref(),
-        Some("上海大绍文化传媒有限公司")
+        Some("阿斯兰航空服务（上海）有限公司")
     );
 }
 
@@ -476,7 +719,7 @@ fn company_name_stops_at_inline_invoice_field_labels() {
         ),
         (
             "购买方名称：上海星河科技有限公司 销售方名称：北京远方服务有限公司",
-            "上海星河科技有限公司",
+            "北京远方服务有限公司",
         ),
         (
             "销售方名称：北京远方服务有限公司 纳税人识别号：91110000 地址：北京市朝阳区",

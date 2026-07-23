@@ -220,6 +220,36 @@ fn append_fake_eocd(bytes: &mut Vec<u8>, count: u16) {
 }
 
 #[test]
+fn mislabeled_text_pdf_preserves_binary_bytes() {
+    let expected = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+    let raw = RawMessage {
+        uid: 5454,
+        mailbox: "INBOX".to_owned(),
+        raw: b"From: billing@example.com\r\n\
+            To: finance@example.com\r\n\
+            Message-ID: <mislabeled-pdf@example.com>\r\n\
+            MIME-Version: 1.0\r\n\
+            Content-Type: multipart/mixed; boundary=invoice-boundary\r\n\
+            \r\n\
+            --invoice-boundary\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Disposition: attachment; filename=invoice.pdf\r\n\
+            Content-Transfer-Encoding: base64\r\n\
+            \r\n\
+            JVBERi0xLjcKJeLjz9MKMSAwIG9iago8PD4+CmVuZG9iagolJUVPRgo=\r\n\
+            --invoice-boundary--\r\n"
+            .to_vec(),
+        received_at: Utc::now(),
+    };
+
+    let parsed = parse_invoice_parts(&raw).unwrap();
+
+    assert_eq!(parsed.files.len(), 1);
+    assert_eq!(parsed.files[0].file_name, "invoice.pdf");
+    assert_eq!(parsed.files[0].bytes, expected);
+}
+
+#[test]
 fn rejected_messages_count_toward_the_delta_limit() {
     let rejected_messages = (1..=MAX_MESSAGES_PER_SYNC as u32)
         .map(rejected_message)
@@ -401,7 +431,7 @@ fn zip_attachments_expand_supported_invoice_files() {
 }
 
 #[test]
-fn parsed_zip_attachment_preserves_original_and_appends_expanded_files() {
+fn parsed_zip_attachment_keeps_only_successfully_expanded_invoice_files() {
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     archive
         .start_file("folder/invoice.pdf", SimpleFileOptions::default())
@@ -446,19 +476,12 @@ fn parsed_zip_attachment_preserves_original_and_appends_expanded_files() {
 
     let parsed = parse_invoice_parts(&raw).unwrap();
 
-    assert_eq!(parsed.files.len(), 2);
-    assert_eq!(parsed.files[0].part_id, "4");
-    assert_eq!(parsed.files[0].file_name, "invoices.zip");
-    assert_eq!(parsed.files[0].bytes, zip_bytes);
+    assert_eq!(parsed.files.len(), 1);
+    assert_eq!(parsed.files[0].part_id, "4.zip.0");
+    assert_eq!(parsed.files[0].file_name, "invoice.pdf");
+    assert_eq!(parsed.files[0].bytes, b"%PDF-invoice");
     assert_eq!(
         parsed.files[0].message_id.as_deref(),
-        Some("zip@example.com")
-    );
-    assert_eq!(parsed.files[1].part_id, "4.zip.0");
-    assert_eq!(parsed.files[1].file_name, "invoice.pdf");
-    assert_eq!(parsed.files[1].bytes, b"%PDF-invoice");
-    assert_eq!(
-        parsed.files[1].message_id.as_deref(),
         Some("zip@example.com")
     );
 }
@@ -483,7 +506,7 @@ fn zip_entry_budget_is_shared_across_message_attachments() {
         .filter(|file| file.file_name.ends_with(".pdf"))
         .collect::<Vec<_>>();
 
-    assert_eq!(originals, vec!["first.zip", "second.zip"]);
+    assert_eq!(originals, vec!["second.zip"]);
     assert_eq!(expanded.len(), 33);
     assert!(
         expanded
@@ -519,7 +542,7 @@ fn zip_byte_budget_is_shared_across_message_attachments() {
         .filter(|file| file.file_name.ends_with(".pdf"))
         .collect::<Vec<_>>();
 
-    assert_eq!(originals, vec!["first.zip", "second.zip"]);
+    assert_eq!(originals, vec!["second.zip"]);
     assert_eq!(expanded.len(), 1);
     assert_eq!(expanded[0].file_name, "first-0.pdf");
 }

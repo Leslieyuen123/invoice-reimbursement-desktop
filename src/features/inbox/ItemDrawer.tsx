@@ -195,6 +195,7 @@ export function ItemDrawer({
         projectTag: optional(projectTag),
       });
       onSaved(saved);
+      onClose();
     } catch (error) {
       setSaveError(messageFromError(error));
     } finally {

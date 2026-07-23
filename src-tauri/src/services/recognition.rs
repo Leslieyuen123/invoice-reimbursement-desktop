@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use sha2::{Digest, Sha256};
 
 use crate::db::items::{InvoiceItem, ItemPatch, ItemRepository};
 use crate::domain::error::AppError;
@@ -163,6 +164,14 @@ impl RecognitionService {
         };
         let recognized =
             recognize_with_warnings(&extracted.text, received_date, &extracted.warnings);
+        let semantic_fingerprint = semantic_invoice_fingerprint(
+            &extracted.text,
+            recognized.amount_cents,
+            recognized.city.as_deref(),
+        );
+        let semantic_dedupe_eligible = item.confirmation_status == ConfirmationStatus::Pending
+            && item.batch_id.is_none()
+            && item.dedupe_status == DedupeStatus::Unique;
         let automatic_final_category = (recognized.confirmation_status
             == ConfirmationStatus::Confirmed)
             .then_some(recognized.category)
@@ -199,7 +208,17 @@ impl RecognitionService {
                     .await?;
                 Ok(item)
             }
-            Ok(item) => Ok(item),
+            Ok(item) => {
+                if semantic_dedupe_eligible
+                    && let Some(fingerprint) = semantic_fingerprint.as_deref()
+                {
+                    return self
+                        .items
+                        .record_semantic_identity(id, fingerprint, item.updated_at)
+                        .await;
+                }
+                Ok(item)
+            }
             Err(error) => {
                 if let Some(path) = created_normalized {
                     self.cleanup_created_normalized(path).await?;
@@ -271,13 +290,19 @@ pub fn recognize_with_warnings(
         }
     };
     let category = scored_category(text);
-    let company = labeled_company_value(text, "购买方名称")
-        .or_else(|| company_value_from_compact_section(text, "购买方信息"))
-        .or_else(|| company_value_from_ocr_section(text, &["购买方信息", "购 买 方 信 息"]))
-        .or_else(|| labeled_company_value(text, "销售方名称"))
+    let company = labeled_company_value(text, "销售方名称")
+        .or_else(|| company_value_from_parallel_ocr_sections(text, 1))
         .or_else(|| company_value_from_compact_section(text, "销售方信息"))
-        .or_else(|| company_value_from_ocr_section(text, &["销售方信息", "销 售 方 信 息"]));
-    let city = recognized_city(text);
+        .or_else(|| company_value_from_ocr_section(text, &["销售方信息", "销 售 方 信 息"]))
+        .or_else(|| flattened_seller_company(text))
+        .or_else(|| labeled_company_value(text, "购买方名称"))
+        .or_else(|| company_value_from_parallel_ocr_sections(text, 0))
+        .or_else(|| company_value_from_compact_section(text, "购买方信息"))
+        .or_else(|| company_value_from_ocr_section(text, &["购买方信息", "购 买 方 信 息"]));
+    let city = company
+        .as_deref()
+        .and_then(city_from_company_name)
+        .or_else(|| recognized_city(text));
     let period_date = recognized_date.unwrap_or(received_date);
     let suggested_period = format!("{:04}-{:02}", period_date.year(), period_date.month());
     let confirmation_status = if invoice_date.is_some()
@@ -318,6 +343,14 @@ fn recognized_city(text: &str) -> Option<String> {
             text.match_indices(*city)
                 .any(|(index, _)| bare_city_has_location_context(text, index, city))
         })
+        .max_by_key(|city| city.chars().count())
+        .map(|city| (*city).to_owned())
+}
+
+fn city_from_company_name(company: &str) -> Option<String> {
+    CITY_NAMES
+        .iter()
+        .filter(|city| company.contains(**city))
         .max_by_key(|city| city.chars().count())
         .map(|city| (*city).to_owned())
 }
@@ -421,6 +454,144 @@ fn company_value_from_ocr_section(text: &str, section_labels: &[&str]) -> Option
     })
 }
 
+fn company_value_from_parallel_ocr_sections(text: &str, index: usize) -> Option<String> {
+    let buyer_header = text.find("购买方信息")?;
+    let seller_header = text.find("销售方信息")?;
+    let first_name = text.find("名称")?;
+    if buyer_header > first_name || seller_header > first_name {
+        return None;
+    }
+
+    const END_LABELS: &[&str] = &[
+        "名称",
+        "统一社会信用代码",
+        "纳税人识别号",
+        "税号",
+        "地址",
+        "电话",
+        "项目名称",
+    ];
+    text.match_indices("名称")
+        .filter(|(position, _)| company_label_has_field_boundary(text, *position, "名称"))
+        .filter_map(|(position, _)| {
+            company_value_after_label(&text[position + "名称".len()..], END_LABELS)
+        })
+        .nth(index)
+}
+
+fn flattened_seller_company(text: &str) -> Option<String> {
+    if !is_known_flattened_invoice_template(text) {
+        return None;
+    }
+    let (_, tail) = text
+        .split_once("开票人：")
+        .or_else(|| text.split_once("开票人:"))?;
+    let fields = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let mut company_tax_pairs = fields.windows(2).filter_map(|pair| {
+        (looks_like_company_name(pair[0]) && looks_like_tax_id(pair[1])).then_some(pair[0])
+    });
+
+    company_tax_pairs.nth(1).map(str::to_owned)
+}
+
+fn semantic_invoice_fingerprint(
+    text: &str,
+    amount_cents: Option<i64>,
+    city: Option<&str>,
+) -> Option<String> {
+    let invoice_number = labeled_ascii_identifier(text, &["发票号码", "发票号"])
+        .or_else(|| flattened_invoice_number(text))?;
+    let seller_tax_id = labeled_ascii_identifier(
+        text,
+        &["销售方纳税人识别号", "销售方统一社会信用代码", "销售方税号"],
+    )
+    .or_else(|| flattened_seller_tax_id(text))?;
+    let amount_cents = amount_cents?;
+    let city = city?.trim();
+    if city.is_empty() {
+        return None;
+    }
+
+    let identity = format!("{invoice_number}|{seller_tax_id}|{amount_cents}|{city}");
+    Some(format!("{:x}", Sha256::digest(identity.as_bytes())))
+}
+
+fn labeled_ascii_identifier(text: &str, labels: &[&str]) -> Option<String> {
+    labels.iter().find_map(|label| {
+        text.match_indices(label).find_map(|(index, _)| {
+            let value = text[index + label.len()..].trim_start_matches(|character: char| {
+                character.is_whitespace() || matches!(character, '：' | ':')
+            });
+            let identifier: String = value
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric())
+                .collect();
+            valid_invoice_identifier(&identifier).then_some(identifier)
+        })
+    })
+}
+
+fn valid_invoice_identifier(value: &str) -> bool {
+    (8..=24).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+}
+
+fn flattened_invoice_number(text: &str) -> Option<String> {
+    let record = flattened_invoice_record(text)?;
+    let number = record.tail[..record.date_offset].trim();
+    valid_invoice_identifier(number).then(|| number.to_owned())
+}
+
+fn flattened_seller_tax_id(text: &str) -> Option<String> {
+    if !is_known_flattened_invoice_template(text) {
+        return None;
+    }
+    let (_, tail) = text
+        .split_once("开票人：")
+        .or_else(|| text.split_once("开票人:"))?;
+    let fields = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let mut company_tax_pairs = fields.windows(2).filter_map(|pair| {
+        (looks_like_company_name(pair[0]) && looks_like_tax_id(pair[1])).then_some(pair[1])
+    });
+
+    company_tax_pairs.nth(1).map(str::to_owned)
+}
+
+fn looks_like_company_name(value: &str) -> bool {
+    let length = value.chars().count();
+    (4..=80).contains(&length)
+        && value
+            .chars()
+            .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
+        && !value.contains(['：', ':', '¥', '￥'])
+        && !["发票", "项目", "合计", "备注", "开票人"]
+            .iter()
+            .any(|label| value.contains(label))
+}
+
+fn looks_like_tax_id(value: &str) -> bool {
+    let length = value.len();
+    (15..=20).contains(&length)
+        && value
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+        && value
+            .chars()
+            .filter(|character| character.is_ascii_digit())
+            .count()
+            >= 6
+}
+
 fn company_value_from_compact_section(text: &str, section_label: &str) -> Option<String> {
     const END_LABELS: &[&str] = &[
         "名称",
@@ -486,7 +657,17 @@ fn labeled_date(text: &str) -> (Option<NaiveDate>, bool) {
         if generic_date.is_some() {
             return (generic_date, true);
         }
-        return (flattened_invoice_date(text), true);
+        let flattened_date = flattened_invoice_date(text);
+        let labeled_value = after_invoice_label
+            .trim_start_matches(['：', ':'])
+            .trim_start_matches([' ', '\t']);
+        let empty_labeled_value = labeled_value.is_empty()
+            || labeled_value.starts_with('\n')
+            || labeled_value.starts_with("\r\n");
+        return (
+            flattened_date,
+            flattened_date.is_none() || !empty_labeled_value,
+        );
     }
 
     generic_labeled_date(text)
@@ -545,7 +726,7 @@ fn flattened_invoice_record(text: &str) -> Option<FlattenedInvoiceRecord<'_>> {
         return None;
     }
 
-    let (_, tail) = text.split_once("备注")?;
+    let tail = tail_after_remarks_label(text)?;
     tail.char_indices().take(256).find_map(|(index, _)| {
         parse_date_prefix(&tail[index..])?;
         let before_date = &tail[..index];
@@ -559,6 +740,28 @@ fn flattened_invoice_record(text: &str) -> Option<FlattenedInvoiceRecord<'_>> {
             tail: &tail[invoice_number_start..],
             date_offset: index - invoice_number_start,
         })
+    })
+}
+
+fn tail_after_remarks_label(text: &str) -> Option<&str> {
+    if let Some((_, tail)) = text.split_once("备注") {
+        return Some(tail);
+    }
+    text.match_indices('备').find_map(|(index, _)| {
+        let line_start = text[..index].rfind('\n').map_or(0, |newline| newline + 1);
+        if !text[line_start..index].chars().all(char::is_whitespace) {
+            return None;
+        }
+        let after_first_character = &text[index + "备".len()..];
+        let after_whitespace = after_first_character.trim_start_matches(char::is_whitespace);
+        if after_whitespace.len() == after_first_character.len() {
+            return None;
+        }
+        let tail = after_whitespace.strip_prefix('注')?;
+        tail.chars()
+            .next()
+            .is_none_or(|character| character.is_whitespace() || matches!(character, '：' | ':'))
+            .then_some(tail)
     })
 }
 
@@ -576,14 +779,16 @@ fn is_known_flattened_invoice_template(text: &str) -> bool {
         .lines()
         .map(str::trim)
         .any(|line| matches!(line, "开票日期：" | "开票日期:"));
-    let empty_company_names = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| matches!(*line, "名称：" | "名称:"))
-        .count();
+    let empty_company_names = text.matches("名称：").count() + text.matches("名称:").count();
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
     has_empty_invoice_date
         && empty_company_names >= 2
-        && TEMPLATE_SIGNALS.iter().all(|signal| text.contains(signal))
+        && TEMPLATE_SIGNALS
+            .iter()
+            .all(|signal| compact.contains(signal))
 }
 
 fn labeled_amount(text: &str) -> Result<Option<i64>, ()> {

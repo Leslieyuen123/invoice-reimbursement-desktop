@@ -15,8 +15,8 @@ import cargoLock from "../../src-tauri/Cargo.lock?raw";
 import cargoManifest from "../../src-tauri/Cargo.toml?raw";
 import tauriConfigSource from "../../src-tauri/tauri.conf.json?raw";
 
-const EXPECTED_VERSION = "0.2.1";
-const EXPECTED_DMG = "invoice-reimbursement-0.2.1-macos-arm64.dmg";
+const EXPECTED_VERSION = "0.2.2";
+const EXPECTED_DMG = "invoice-reimbursement-0.2.2-macos-arm64.dmg";
 const EXPECTED_DOCUMENT_DATE = "2026-07-23";
 const REPO_ROOT = process.cwd();
 const STANDARD_FONT_DATA_URL =
@@ -133,7 +133,7 @@ name = "invoice_reimbursement"`;
     expect(cargoManifestPackageVersion(manifest)).toBe(EXPECTED_VERSION);
   });
 
-  it("keeps every release-facing source at v0.2.1", () => {
+  it("keeps every release-facing source at v0.2.2", () => {
     const packageJson = JSON.parse(packageSource) as { version: string };
     const packageLock = JSON.parse(packageLockSource) as {
       version: string;

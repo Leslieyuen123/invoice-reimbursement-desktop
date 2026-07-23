@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use chrono::NaiveDate;
 use kuchiki::traits::TendrilSink;
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::{MessageParser, MimeHeaders, PartType};
 use uuid::Uuid;
 
 use crate::db::accounts::{MailboxAccountRepository, SyncCursor};
@@ -814,17 +814,17 @@ fn parse_invoice_parts_with_zip_budget(
             if !is_supported_file_name(&file_name) {
                 continue;
             }
+            let bytes = binary_safe_attachment_bytes(raw, part, &file_name)?;
             let file = InvoicePart {
                 part_id: index.to_string(),
                 file_name,
-                bytes: part.contents().to_vec(),
+                bytes,
                 message_id: message_id.clone(),
             };
             if file_name_has_extension(&file.file_name, "zip") {
-                let expanded = expand_zip_part(&file, &mut zip_budget);
-                files.push(file);
-                if let Ok(expanded) = expanded {
-                    files.extend(expanded);
+                match expand_zip_part(&file, &mut zip_budget) {
+                    Ok(expanded) if !expanded.is_empty() => files.extend(expanded),
+                    _ => files.push(file),
                 }
             } else {
                 files.push(file);
@@ -851,6 +851,38 @@ fn parse_invoice_parts_with_zip_budget(
         links,
         zip_budget,
     })
+}
+
+fn binary_safe_attachment_bytes(
+    raw: &RawMessage,
+    part: &mail_parser::MessagePart<'_>,
+    file_name: &str,
+) -> Result<Vec<u8>, AppError> {
+    if !is_supported_file_name(file_name)
+        || !matches!(part.body, PartType::Text(_) | PartType::Html(_))
+    {
+        return Ok(part.contents().to_vec());
+    }
+
+    let start = usize::try_from(part.offset_body)
+        .map_err(|_| external_error("mailbox attachment body offset is invalid"))?;
+    let end = usize::try_from(part.offset_end)
+        .map_err(|_| external_error("mailbox attachment body offset is invalid"))?;
+    let encoded = raw
+        .raw
+        .get(start..end)
+        .ok_or_else(|| external_error("mailbox attachment body offset is invalid"))?;
+    match part.content_transfer_encoding() {
+        Some(encoding) if encoding.eq_ignore_ascii_case("base64") => {
+            mail_parser::decoders::base64::base64_decode(encoded)
+                .ok_or_else(|| external_error("mailbox attachment base64 is invalid"))
+        }
+        Some(encoding) if encoding.eq_ignore_ascii_case("quoted-printable") => {
+            mail_parser::decoders::quoted_printable::quoted_printable_decode(encoded)
+                .ok_or_else(|| external_error("mailbox attachment quoted-printable is invalid"))
+        }
+        _ => Ok(encoded.to_vec()),
+    }
 }
 
 fn preflight_zip_entries(bytes: &[u8]) -> Result<usize, ()> {

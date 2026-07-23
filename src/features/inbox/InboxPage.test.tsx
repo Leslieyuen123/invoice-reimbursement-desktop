@@ -137,6 +137,29 @@ describe("InboxPage", () => {
     expect(commandCalls("review_item")[0].amountCents).toBe(12850);
   });
 
+  it("closes the item drawer after a manual correction is saved", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+    mockCommand(
+      "review_item",
+      pendingInvoiceFixture({ status: "ready", confirmationStatus: "confirmed" }),
+    );
+
+    renderAppAt("/inbox");
+    await user.click(
+      await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "票据详情" })).not.toBeInTheDocument();
+    });
+  });
+
   it("invalidates the dashboard after reviewing an item", async () => {
     const user = userEvent.setup();
     const queryClient = new QueryClient({
@@ -934,9 +957,9 @@ describe("InboxPage", () => {
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: "酒店住宿发票.pdf" })).not.toBeInTheDocument();
     });
-    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
-
-    expect(screen.getByRole("button", { name: "出租车电子发票.pdf" })).toHaveFocus();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "出租车电子发票.pdf" })).toHaveFocus();
+    });
   });
 
   it("focuses the selected status tab after save removes the only visible row", async () => {
@@ -967,11 +990,10 @@ describe("InboxPage", () => {
         screen.queryByRole("button", { name: "出租车电子发票.pdf" }),
       ).not.toBeInTheDocument();
     });
-    await user.click(screen.getByRole("button", { name: "关闭票据详情" }));
 
     const selectedTab = screen.getByRole("tab", { name: "待确认" });
     expect(selectedTab).toHaveAttribute("aria-selected", "true");
-    expect(selectedTab).toHaveFocus();
+    await waitFor(() => expect(selectedTab).toHaveFocus());
   });
 
   it("focuses the selected status tab when keep removes the only visible row", async () => {

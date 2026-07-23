@@ -238,7 +238,7 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
   await auditCurrentView(page);
   await attachView(page, testInfo, "item-detail");
   await page.getByRole("button", { name: "保存并确认" }).click();
-  await page.getByRole("button", { name: "关闭票据详情" }).click();
+  await expect(drawer).toBeHidden();
   await expect(invoiceRow).toBeFocused();
   await expect(
     invoiceRow.locator("xpath=ancestor::tr").getByText("可纳入批次", { exact: true }),

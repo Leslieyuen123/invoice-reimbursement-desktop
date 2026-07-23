@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
-use crate::db::items::{EmailLinkReplacement, InvoiceItem, ItemRepository, NewItemRecord};
+use crate::db::items::{EmailFileReplacement, InvoiceItem, ItemRepository, NewItemRecord};
 use crate::domain::error::AppError;
 use crate::domain::model::{ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType};
 use crate::infra::files::AppPaths;
@@ -199,7 +199,7 @@ impl ImportService {
             Err(error) => return Err(staged.cleanup_after(error)),
         };
         let promoted = staged.promote(source.received_at.date_naive(), candidate_id, &extension)?;
-        let replacement = EmailLinkReplacement {
+        let replacement = EmailFileReplacement {
             original_name,
             original_path: promoted.path().to_string_lossy().into_owned(),
             sha256,
@@ -334,6 +334,17 @@ impl ImportService {
             )
             .await?
         {
+            if payload.source.rescan
+                && existing.recognition_status == RecognitionStatus::Failed
+                && existing.confirmation_status == ConfirmationStatus::Pending
+                && existing.batch_id.is_none()
+                && existing.mime_type != "text/uri-list"
+                && !payload.bytes.is_empty()
+            {
+                return self
+                    .replace_failed_email_attachment(payload, existing)
+                    .await;
+            }
             return Ok(ImportOutcome::Existing(existing));
         }
         let id = Uuid::new_v4();
@@ -454,6 +465,88 @@ impl ImportService {
                 }
                 Err(database_error)
             }
+        }
+    }
+
+    async fn replace_failed_email_attachment(
+        &self,
+        payload: EmailPayload<'_>,
+        existing: InvoiceItem,
+    ) -> Result<ImportOutcome, AppError> {
+        let candidate_id = Uuid::new_v4();
+        let (staged, writer) = self.paths.begin_staged_original(candidate_id)?;
+        let mut reader = payload.bytes;
+        let staged = copy_source_to_staging(&mut reader, staged, writer, false).await?;
+        let sha256 = match sha256_file(staged.path()).await {
+            Ok(value) => value,
+            Err(error) => return Err(staged.cleanup_after(error)),
+        };
+        if sha256 == existing.sha256 {
+            staged.discard()?;
+            return Ok(ImportOutcome::Existing(existing));
+        }
+        let mime_type = match payload.mime_type {
+            Some(mime_type) => mime_type,
+            None => match detect_mime(staged.path(), &payload.extension).await {
+                Ok(mime_type) => mime_type,
+                Err(error) => return Err(staged.cleanup_after(error)),
+            },
+        };
+        let promoted = staged.promote(
+            payload.source.received_at.date_naive(),
+            candidate_id,
+            &payload.extension,
+        )?;
+        let replacement = EmailFileReplacement {
+            original_name: payload.original_name,
+            original_path: promoted.path().to_string_lossy().into_owned(),
+            sha256,
+            mime_type,
+        };
+        match self
+            .items
+            .replace_failed_email_attachment(existing.id, replacement)
+            .await
+        {
+            Ok(Some(replaced)) => {
+                promoted.commit();
+                if let Some(normalized) = existing.normalized_pdf_path.as_deref()
+                    && self
+                        .paths
+                        .delete_normalized_pdf(Path::new(normalized))
+                        .is_err()
+                {
+                    tracing::warn!(
+                        item_id = %existing.id,
+                        "repaired email attachment left an unreferenced normalized PDF"
+                    );
+                }
+                if self.paths.delete_original(&existing.original_path).is_err() {
+                    tracing::warn!(
+                        item_id = %existing.id,
+                        "repaired email attachment left an unreferenced original"
+                    );
+                }
+                Ok(ImportOutcome::Existing(replaced))
+            }
+            Ok(None) => {
+                promoted.rollback()?;
+                Ok(ImportOutcome::Existing(
+                    self.items.get_by_id(existing.id).await?,
+                ))
+            }
+            Err(database_error) => match promoted.rollback() {
+                Ok(()) => Err(database_error),
+                Err(cleanup_error) => Err(AppError::External {
+                    service: "filesystem_sync".to_owned(),
+                    retryable: false,
+                    message: format!(
+                        "email attachment repair failed and corrected file cleanup was incomplete; \
+                         manual recovery is required: database error: {database_error}; cleanup \
+                         error: {cleanup_error}"
+                    ),
+                }),
+            },
         }
     }
 
@@ -861,6 +954,53 @@ mod tests {
             fs::read(source).expect("replacement should read"),
             replacement
         );
+    }
+
+    #[tokio::test]
+    async fn rescan_replaces_failed_unreviewed_email_attachment() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let items = ItemRepository::new(pool);
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items.clone(), paths.clone());
+        let mut source = email_source(5454, "2");
+        let corrupted = b"%PDF-1.7\n%\xef\xbf\xbd\xef\xbf\xbd\n%%EOF\n";
+        let corrected = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n%%EOF\n";
+        let ImportOutcome::New(imported) = service
+            .import_email_bytes("invoice.pdf", corrupted, source.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("first attachment should be new")
+        };
+        items
+            .update_fields(
+                imported.id,
+                ItemPatch {
+                    recognition_status: Some(RecognitionStatus::Failed),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        let old_path = imported.original_path.clone();
+        source.rescan = true;
+
+        let ImportOutcome::Existing(repaired) = service
+            .import_email_bytes("invoice.pdf", corrected, source)
+            .await
+            .unwrap()
+        else {
+            panic!("rescan should preserve the item identity")
+        };
+
+        assert_eq!(repaired.id, imported.id);
+        assert_eq!(repaired.recognition_status, RecognitionStatus::Pending);
+        assert_eq!(fs::read(&repaired.original_path).unwrap(), corrected);
+        assert_ne!(repaired.original_path, old_path);
+        assert!(!Path::new(&old_path).exists());
+        assert_eq!(count_files(&paths.originals), 1);
+        assert!(fs::read_dir(&paths.staging).unwrap().next().is_none());
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ coverage/
 playwright-report/
 test-results/
 output/playwright/
+release-artifacts/
 tmp/pdfs/
 __pycache__/
 src-tauri/target/
