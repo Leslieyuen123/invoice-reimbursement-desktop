@@ -138,14 +138,14 @@ describe("release workflow", () => {
       mountedVerification,
     );
     const explicitDetach = workflow.indexOf(
-      'hdiutil detach "$mount_dir" -quiet',
+      'hdiutil detach "$mount_dir" -force',
       mountedOcrTest,
     );
     const clearCleanupTrap = workflow.indexOf("trap - EXIT", explicitDetach);
 
     expect(workflow).toContain("trap cleanup EXIT");
     expect(workflow).toContain(
-      'hdiutil detach "$mount_dir" -quiet || true',
+      'hdiutil detach "$mount_dir" -force || true',
     );
     expect(mountedVerification).toBeGreaterThan(attach);
     expect(mountedOcrTest).toBeGreaterThan(mountedVerification);
