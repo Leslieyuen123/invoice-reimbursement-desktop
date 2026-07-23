@@ -24,6 +24,7 @@ lopdf = "0.36"
 mail-parser = "0.11"
 native-tls = "0.2"
 printpdf = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rust_decimal = "1"
 rustix = { version = "1", features = ["fs"] }
 rust_xlsxwriter = "0.90"
@@ -36,7 +37,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "io-util", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "io-util", "sync", "net"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2"
