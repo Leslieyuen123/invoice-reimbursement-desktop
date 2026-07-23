@@ -181,7 +181,7 @@ jobs:
           mounted=0
           cleanup() {
             if [[ "$mounted" -eq 1 ]]; then
-              hdiutil detach "$mount_dir" -quiet || true
+              hdiutil detach "$mount_dir" -force || true
             fi
             rmdir "$mount_dir" 2>/dev/null || true
           }
@@ -213,7 +213,7 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --test extraction \
               packaged_sidecar_runs_through_process_gateway_with_cold_start_margin \
               -- --ignored
-          hdiutil detach "$mount_dir" -quiet
+          hdiutil detach "$mount_dir" -force
           mounted=0
           rmdir "$mount_dir"
           trap - EXIT
