@@ -188,4 +188,3 @@ Mount the DMG, verify the application and sidecar, run `codesign --verify --deep
 - [ ] **Step 4: Commit and publish**
 
 Commit only the feature, tests, docs, version files, and lockfiles. Push `main`, wait for GitHub Actions to pass, tag `v0.2.1`, and publish the arm64 DMG plus checksum in the GitHub Release.
-

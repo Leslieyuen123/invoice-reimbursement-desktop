@@ -55,4 +55,3 @@
 - 前端无新交互分支；现有原件预览、异常列表和批次摘要通过回归测试。
 - 完整运行 Vitest、ESLint、TypeScript/Vite build、Rust fmt/clippy/test 和三尺寸 Playwright。
 - 构建 Apple Silicon DMG，验证应用、OCR sidecar、签名、挂载和 SHA-256。
-
