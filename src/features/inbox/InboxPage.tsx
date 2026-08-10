@@ -206,11 +206,14 @@ export function InboxPage() {
   }
 
   function updateItem(item: InvoiceItemDto, sessionId: number) {
-    reconcileCachedItem(item, false);
-    setSelection((current) =>
-      current?.sessionId === sessionId ? { ...current, item } : current,
-    );
-    invalidateItemLists();
+    try {
+      reconcileCachedItem(item, false);
+    } finally {
+      setSelection((current) =>
+        current?.sessionId === sessionId ? { ...current, item } : current,
+      );
+      invalidateItemLists();
+    }
   }
 
   function deleteItem(itemId: string, sessionId: number) {

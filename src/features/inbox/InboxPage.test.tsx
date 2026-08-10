@@ -165,6 +165,7 @@ describe("InboxPage", () => {
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
     mockCommand("list_items", {
       items: [pendingInvoiceFixture()],
       nextCursor: null,
@@ -187,6 +188,8 @@ describe("InboxPage", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: "票据详情" })).not.toBeInTheDocument();
     });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.itemLists });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.dashboard });
   });
 
   it("invalidates the dashboard after reviewing an item", async () => {
