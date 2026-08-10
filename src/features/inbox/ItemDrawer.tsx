@@ -194,8 +194,11 @@ export function ItemDrawer({
         eventTag: optional(eventTag),
         projectTag: optional(projectTag),
       });
-      onSaved(saved);
-      onClose();
+      try {
+        onSaved(saved);
+      } finally {
+        onClose();
+      }
     } catch (error) {
       setSaveError(messageFromError(error));
     } finally {

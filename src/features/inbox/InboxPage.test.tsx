@@ -160,6 +160,35 @@ describe("InboxPage", () => {
     });
   });
 
+  it("still closes the item drawer when cache reconciliation fails after saving", async () => {
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+    mockCommand(
+      "review_item",
+      pendingInvoiceFixture({ status: "ready", confirmationStatus: "confirmed" }),
+    );
+
+    renderInboxAt("/inbox", queryClient);
+    await user.click(
+      await screen.findByRole("button", { name: "出租车电子发票.pdf" }),
+    );
+    vi.spyOn(queryClient, "setQueryData").mockImplementation(() => {
+      throw new Error("cache reconciliation failed");
+    });
+
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "票据详情" })).not.toBeInTheDocument();
+    });
+  });
+
   it("invalidates the dashboard after reviewing an item", async () => {
     const user = userEvent.setup();
     const queryClient = new QueryClient({
