@@ -80,7 +80,8 @@ impl ImportService {
         source: &EmailImportSource,
     ) -> Result<Option<InvoiceItem>, AppError> {
         validate_email_source(source)?;
-        self.items
+        let existing = self
+            .items
             .find_email_part(
                 source.account_id,
                 &source.mailbox,
@@ -88,7 +89,14 @@ impl ImportService {
                 source.uid,
                 &source.part_id,
             )
-            .await
+            .await?;
+        match existing {
+            Some(item) => self
+                .refresh_email_received_metadata(item, source)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     #[cfg(test)]
@@ -161,17 +169,7 @@ impl ImportService {
         source: EmailImportSource,
     ) -> Result<ImportOutcome, AppError> {
         validate_email_source(&source)?;
-        let Some(existing) = self
-            .items
-            .find_email_part(
-                source.account_id,
-                &source.mailbox,
-                source.uid_validity,
-                source.uid,
-                &source.part_id,
-            )
-            .await?
-        else {
+        let Some(existing) = self.find_email_part(&source).await? else {
             return self.import_email_bytes(file_name, bytes, source).await;
         };
         if existing.mime_type != "text/uri-list"
@@ -223,20 +221,13 @@ impl ImportService {
             }
             Ok(None) => {
                 promoted.rollback()?;
-                let current = self
-                    .items
-                    .find_email_part(
-                        source.account_id,
-                        &source.mailbox,
-                        source.uid_validity,
-                        source.uid,
-                        &source.part_id,
-                    )
-                    .await?
-                    .ok_or_else(|| AppError::Conflict {
-                        message: "email link changed while its download was being imported"
-                            .to_owned(),
-                    })?;
+                let current =
+                    self.find_email_part(&source)
+                        .await?
+                        .ok_or_else(|| AppError::Conflict {
+                            message: "email link changed while its download was being imported"
+                                .to_owned(),
+                        })?;
                 Ok(ImportOutcome::Existing(current))
             }
             Err(database_error) => match promoted.rollback() {
@@ -325,17 +316,7 @@ impl ImportService {
         payload: EmailPayload<'_>,
     ) -> Result<ImportOutcome, AppError> {
         validate_email_source(&payload.source)?;
-        if let Some(existing) = self
-            .items
-            .find_email_part(
-                payload.source.account_id,
-                &payload.source.mailbox,
-                payload.source.uid_validity,
-                payload.source.uid,
-                &payload.source.part_id,
-            )
-            .await?
-        {
+        if let Some(existing) = self.find_email_part(&payload.source).await? {
             if payload.source.rescan
                 && existing.recognition_status == RecognitionStatus::Failed
                 && existing.confirmation_status == ConfirmationStatus::Pending
@@ -373,6 +354,9 @@ impl ImportService {
         };
         if let Some(legacy) = legacy {
             staged.discard()?;
+            let legacy = self
+                .refresh_email_received_metadata(legacy, &payload.source)
+                .await?;
             return Ok(ImportOutcome::Existing(legacy));
         }
         if payload.source.rescan {
@@ -393,6 +377,9 @@ impl ImportService {
             };
             if let Some(existing) = existing {
                 staged.discard()?;
+                let existing = self
+                    .refresh_email_received_metadata(existing, &payload.source)
+                    .await?;
                 return Ok(ImportOutcome::Existing(existing));
             }
         }
@@ -450,22 +437,27 @@ impl ImportService {
             Err(database_error) => {
                 promoted.rollback()?;
                 if matches!(database_error, AppError::Conflict { .. })
-                    && let Some(existing) = self
-                        .items
-                        .find_email_part(
-                            payload.source.account_id,
-                            &payload.source.mailbox,
-                            payload.source.uid_validity,
-                            payload.source.uid,
-                            &payload.source.part_id,
-                        )
-                        .await?
+                    && let Some(existing) = self.find_email_part(&payload.source).await?
                 {
                     return Ok(ImportOutcome::Existing(existing));
                 }
                 Err(database_error)
             }
         }
+    }
+
+    async fn refresh_email_received_metadata(
+        &self,
+        existing: InvoiceItem,
+        source: &EmailImportSource,
+    ) -> Result<InvoiceItem, AppError> {
+        self.items
+            .update_email_received_metadata(
+                existing.id,
+                source.received_at,
+                source.source_received_date,
+            )
+            .await
     }
 
     async fn replace_failed_email_attachment(
@@ -927,6 +919,79 @@ mod tests {
             imported.batch_membership_date(),
             chrono::NaiveDate::from_ymd_opt(2026, 8, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn rescan_repairs_received_metadata_for_every_existing_email_match_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let items = ItemRepository::new(pool.clone());
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items, paths);
+        let pdf = b"%PDF-1.7\nreceived metadata repair\n%%EOF\n";
+        let mut fixtures = Vec::new();
+
+        for (uid, part_id) in [(811, "exact"), (812, "legacy"), (813, "rescanned")] {
+            let source = email_source(uid, part_id);
+            let ImportOutcome::New(item) = service
+                .import_email_bytes(&format!("{part_id}.pdf"), pdf, source.clone())
+                .await
+                .unwrap()
+            else {
+                panic!("{part_id} fixture should be newly imported")
+            };
+            fixtures.push((item, source));
+        }
+
+        sqlx::query("UPDATE items SET source_received_date = NULL WHERE id = ?")
+            .bind(fixtures[0].0.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE items SET source_uid_validity = 0, source_received_date = NULL WHERE id = ?",
+        )
+        .bind(fixtures[1].0.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE items SET source_uid_validity = 70, source_received_date = NULL WHERE id = ?",
+        )
+        .bind(fixtures[2].0.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let local_received_at = chrono::FixedOffset::east_opt(8 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 8, 1, 0, 30, 0)
+            .single()
+            .unwrap();
+        for (original, mut source) in fixtures {
+            source.received_at = local_received_at.with_timezone(&Utc);
+            source.source_received_date = local_received_at.date_naive();
+            source.rescan = true;
+
+            let ImportOutcome::Existing(repaired) = service
+                .import_email_bytes(&original.original_name, pdf, source)
+                .await
+                .unwrap()
+            else {
+                panic!("rescan should preserve the existing item identity")
+            };
+
+            assert_eq!(repaired.id, original.id);
+            assert_eq!(repaired.fetched_at, local_received_at.with_timezone(&Utc));
+            assert_eq!(
+                repaired.source_received_date,
+                Some(local_received_at.date_naive())
+            );
+            assert_eq!(
+                repaired.batch_membership_date(),
+                Some(local_received_at.date_naive())
+            );
+        }
     }
 
     #[tokio::test]

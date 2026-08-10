@@ -246,6 +246,8 @@ test("manual invoice to exported reimbursement package", async ({ page }, testIn
 
   await page.getByRole("link", { name: "报销批次" }).click();
   await page.getByRole("link", { name: "新建批次" }).click();
+  await page.getByLabel("年份").fill("2026");
+  await page.getByLabel("月份").selectOption("7");
   const automateAfterCreation = page.getByRole("checkbox", {
     name: "创建后自动处理并导出",
   });

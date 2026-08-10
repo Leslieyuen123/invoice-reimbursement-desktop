@@ -65,9 +65,7 @@ impl InvoiceItem {
 
     pub fn batch_membership_date(&self) -> Option<NaiveDate> {
         match self.source_type {
-            SourceType::Email => self
-                .source_received_date
-                .or_else(|| Some(self.fetched_at.date_naive())),
+            SourceType::Email => self.source_received_date,
             SourceType::ManualUpload => self.invoice_date,
         }
     }
@@ -321,6 +319,83 @@ impl ItemRepository {
             .await
             .map_err(|error| map_database_error("failed to find email part", error))?;
         row.map(InvoiceItem::try_from).transpose()
+    }
+
+    pub(crate) async fn update_email_received_metadata(
+        &self,
+        id: Uuid,
+        received_at: DateTime<Utc>,
+        source_received_date: NaiveDate,
+    ) -> Result<InvoiceItem, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin email metadata update", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if item.source_type != SourceType::Email {
+                return Err(AppError::Conflict {
+                    message: "only email items can update IMAP received metadata".to_owned(),
+                });
+            }
+            let mismatched_batch_id = match item.batch_id {
+                Some(batch_id) => {
+                    let range = sqlx::query_as::<_, (String, String)>(
+                        "SELECT start_date, end_date FROM batches WHERE id = ?",
+                    )
+                    .bind(batch_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        map_database_error("failed to validate email batch range", error)
+                    })?
+                    .ok_or_else(|| AppError::Internal {
+                        message: "email item references a missing batch".to_owned(),
+                    })?;
+                    let start_date = parse_optional_date(Some(range.0), "batch.start_date")?
+                        .expect("batch start date query must return a value");
+                    let end_date = parse_optional_date(Some(range.1), "batch.end_date")?
+                        .expect("batch end date query must return a value");
+                    (source_received_date < start_date || source_received_date > end_date)
+                        .then_some(batch_id)
+                }
+                None => None,
+            };
+            if item.fetched_at == received_at
+                && item.source_received_date == Some(source_received_date)
+                && mismatched_batch_id.is_none()
+            {
+                return Ok(item);
+            }
+            let updated_at = Utc::now();
+            let mut query = QueryBuilder::<Sqlite>::new("UPDATE items SET fetched_at = ");
+            query
+                .push_bind(received_at.to_rfc3339())
+                .push(", source_received_date = ")
+                .push_bind(source_received_date.to_string());
+            if mismatched_batch_id.is_some() {
+                query.push(", batch_id = NULL");
+            }
+            query
+                .push(", updated_at = ")
+                .push_bind(updated_at.to_rfc3339())
+                .push(" WHERE id = ")
+                .push_bind(id.to_string());
+            query
+                .build()
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    map_database_error("failed to update email received metadata", error)
+                })?;
+            if let Some(batch_id) = mismatched_batch_id {
+                validate_and_draft_batch(&mut transaction, batch_id, &updated_at).await?;
+            }
+            get_with_connection(&mut transaction, id).await
+        }
+        .await;
+        finish_transaction(transaction, result).await
     }
 
     pub(crate) async fn replace_email_link_placeholder(
@@ -670,9 +745,9 @@ impl ItemRepository {
             push_item_search_filter(&mut query, search);
         } else {
             query
-                .push(" AND ((source_type = 'email' AND COALESCE(source_received_date, substr(fetched_at, 1, 10)) >= ")
+                .push(" AND ((source_type = 'email' AND source_received_date >= ")
                 .push_bind(start_date.to_string())
-                .push(" AND COALESCE(source_received_date, substr(fetched_at, 1, 10)) <= ")
+                .push(" AND source_received_date <= ")
                 .push_bind(end_date.to_string())
                 .push(") OR (source_type = 'manual_upload' AND invoice_date >= ")
                 .push_bind(start_date.to_string())

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -266,13 +266,7 @@ fn fetch_blocking(
             .ok_or_else(|| imap_error("IMAP response omitted UID"))?;
         let size = usize::try_from(metadata.size.unwrap_or(0))
             .map_err(|_| limit_error("IMAP message size is invalid"))?;
-        let (received_at, source_received_date) = match metadata.internal_date() {
-            Some(date) => (date.with_timezone(&Utc), date.date_naive()),
-            None => {
-                let now = Utc::now();
-                (now, now.date_naive())
-            }
-        };
+        let (received_at, source_received_date) = received_metadata(metadata.internal_date())?;
         match budget.admission(size)? {
             MessageAdmission::Admit => {}
             MessageAdmission::Reject(reason) => {
@@ -358,6 +352,13 @@ fn uid_search_query(start_uid: u32, range: Option<ImapDateRange>) -> String {
         ),
         None => uid,
     }
+}
+
+fn received_metadata(
+    internal_date: Option<DateTime<FixedOffset>>,
+) -> Result<(DateTime<Utc>, NaiveDate), AppError> {
+    let date = internal_date.ok_or_else(|| imap_error("IMAP response omitted INTERNALDATE"))?;
+    Ok((date.with_timezone(&Utc), date.date_naive()))
 }
 
 fn uid_start(cursor: Option<SyncCursor>, uid_validity: u32) -> Option<u32> {
@@ -538,9 +539,9 @@ mod tests {
     use super::{
         ImapAccountConfig, ImapDateRange, MessageAdmission, MessageRejectionReason,
         NativeTlsImapGateway, RawBudget, authentication_error, connect, imap_error, limit_error,
-        select_uid_batch, uid_search_query, uid_start,
+        received_metadata, select_uid_batch, uid_search_query, uid_start,
     };
-    use chrono::NaiveDate;
+    use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
 
     #[test]
     fn incremental_search_is_not_limited_to_a_hard_coded_month() {
@@ -571,6 +572,39 @@ mod tests {
             ImapDateRange::new(day, day.pred_opt().unwrap()),
             Err(expected)
         );
+    }
+
+    #[test]
+    fn received_metadata_preserves_the_imap_calendar_date_across_utc_boundary() {
+        let internal_date = FixedOffset::east_opt(8 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 8, 1, 0, 30, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            received_metadata(Some(internal_date)).unwrap(),
+            (
+                Utc.with_ymd_and_hms(2026, 7, 31, 16, 30, 0)
+                    .single()
+                    .unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            )
+        );
+    }
+
+    #[test]
+    fn received_metadata_rejects_a_missing_imap_internal_date() {
+        let error = received_metadata(None).expect_err("missing INTERNALDATE must fail safely");
+
+        assert!(matches!(
+            error,
+            AppError::External {
+                ref service,
+                retryable: true,
+                ref message,
+            } if service == "imap" && message.contains("INTERNALDATE")
+        ));
     }
     use crate::db::accounts::{MailboxProvider, SyncCursor};
     use crate::domain::error::AppError;

@@ -956,6 +956,68 @@ async fn touched_item_owned_by_another_batch_is_an_exception_without_being_moved
     );
 }
 
+#[tokio::test]
+async fn authoritative_rescan_moves_a_legacy_email_out_of_the_wrong_exported_month() {
+    let gateway = Arc::new(FakeRangeGateway::default());
+    let message = raw_message(1, include_bytes!("fixtures/mail/attachment.eml"));
+    let mut responses = completed_scan(vec![message.clone()]);
+    responses.extend(completed_scan(vec![message]));
+    gateway.queue("a@example.com", responses);
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[SAFE_TEXT]))).await;
+    harness.add_account("a@example.com", true).await;
+    let may_batch = harness.may_batch().await;
+    let april_batch = BatchService::new(harness.pool.clone())
+        .create_month(2026, 4)
+        .await
+        .unwrap();
+    let service = harness.state.batch_automation_service();
+
+    let first = service.run(may_batch.id).await.unwrap();
+    assert_eq!(first.assigned_count, 1);
+    let item_id = BatchService::new(harness.pool.clone())
+        .get(may_batch.id)
+        .await
+        .unwrap()
+        .items[0]
+        .id;
+    BatchService::new(harness.pool.clone())
+        .assign_items(april_batch.id, &[item_id])
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE batches SET status = 'exported', last_exported_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind("2026-05-31T16:00:00Z")
+    .bind("2026-05-31T16:00:00Z")
+    .bind(april_batch.id.to_string())
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+
+    let second = service.run(may_batch.id).await.unwrap();
+    assert_eq!(second.imported_count, 0);
+    assert_eq!(second.assigned_count, 1);
+    assert_eq!(second.exception_count, 0);
+    assert_eq!(
+        ItemRepository::new(harness.pool.clone())
+            .get_by_id(item_id)
+            .await
+            .unwrap()
+            .batch_id,
+        Some(may_batch.id)
+    );
+    let repaired_old_batch = BatchService::new(harness.pool)
+        .get(april_batch.id)
+        .await
+        .unwrap()
+        .batch;
+    assert_eq!(
+        repaired_old_batch.status,
+        invoice_reimbursement::domain::model::BatchStatus::Draft
+    );
+    assert!(repaired_old_batch.last_exported_at.is_some());
+}
+
 fn completed_scan(messages: Vec<RawMessage>) -> Vec<Result<MailboxDelta, AppError>> {
     let highest_uid = messages
         .iter()

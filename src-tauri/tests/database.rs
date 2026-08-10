@@ -362,13 +362,30 @@ async fn migrations_upgrade_original_retry_schema_and_preserve_state() {
 }
 
 #[tokio::test]
-async fn migration_0011_backfills_legacy_email_received_dates_without_touching_manual_uploads() {
+async fn migration_0012_preserves_the_released_0011_checksum_and_clears_ambiguous_email_dates() {
+    const RELEASED_0011: &str = r#"ALTER TABLE items ADD COLUMN source_received_date TEXT CHECK (
+    source_received_date IS NULL OR
+    source_received_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+);
+
+UPDATE items
+SET source_received_date = substr(fetched_at, 1, 10)
+WHERE source_type = 'email';
+
+CREATE INDEX idx_items_source_received_date
+    ON items (source_type, source_received_date);
+"#;
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
     let current = sqlx::migrate!("./migrations");
+    assert_eq!(
+        RELEASED_0011.as_bytes(),
+        current.iter().nth(10).unwrap().sql.as_bytes(),
+        "published migrations must be immutable so existing databases keep a valid checksum"
+    );
     let through_0010 = sqlx::migrate::Migrator {
         migrations: Cow::Owned(current.iter().take(10).cloned().collect()),
         ..sqlx::migrate::Migrator::DEFAULT
@@ -407,8 +424,24 @@ async fn migration_0011_backfills_legacy_email_received_dates_without_touching_m
     .await
     .unwrap();
 
-    current.run(&pool).await.unwrap();
-
+    let released_through_0011 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            current
+                .iter()
+                .take(10)
+                .cloned()
+                .chain(std::iter::once(sqlx::migrate::Migration::new(
+                    11,
+                    Cow::Borrowed("item source received date"),
+                    sqlx::migrate::MigrationType::Simple,
+                    Cow::Borrowed(RELEASED_0011),
+                    false,
+                )))
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    released_through_0011.run(&pool).await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT source_received_date FROM items WHERE id = 'legacy-email'",
@@ -419,6 +452,35 @@ async fn migration_0011_backfills_legacy_email_received_dates_without_touching_m
         .as_deref(),
         Some("2026-07-31")
     );
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, sha256, mime_type, source_type,
+            source_account_id, source_mailbox, source_uid_validity, source_uid, source_part_id,
+            fetched_at, source_received_date, created_at, updated_at
+         ) VALUES (
+            'authoritative-email', 'authoritative-email.pdf',
+            '/invoices/authoritative-email.pdf', 'authoritative-email-sha',
+            'application/pdf', 'email', ?, 'INBOX', 1, 2, '1',
+            '2026-08-05T02:30:00Z', '2026-08-05',
+            '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z'
+         )",
+    )
+    .bind(account_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    current.run(&pool).await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT source_received_date FROM items WHERE id = 'legacy-email'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        None
+    );
     assert_eq!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT source_received_date FROM items WHERE id = 'legacy-manual'",
@@ -427,6 +489,16 @@ async fn migration_0011_backfills_legacy_email_received_dates_without_touching_m
         .await
         .unwrap(),
         None
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT source_received_date FROM items WHERE id = 'authoritative-email'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("2026-08-05")
     );
 }
 

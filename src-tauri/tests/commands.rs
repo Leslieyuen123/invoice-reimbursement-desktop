@@ -748,12 +748,14 @@ async fn batch_candidate_date_hint_uses_received_date_only_for_email_items() {
         "INSERT INTO items (
             id, original_name, original_path, sha256, mime_type, source_type,
             source_account_id, source_mailbox, source_uid_validity, source_uid,
-            source_message_id, source_part_id, fetched_at, invoice_date, company,
+            source_message_id, source_part_id, fetched_at, source_received_date,
+            invoice_date, company,
             currency, recognition_status, confirmation_status, dedupe_status,
             created_at, updated_at
          ) VALUES (?, 'email-membership-hint.pdf', ?, ?, 'application/pdf', 'email',
                    ?, 'INBOX', 1, 1, '<membership-hint@example.com>', '1',
-                   '2026-08-15T08:00:00+00:00', '2026-07-31', 'membership-hint',
+                   '2026-08-15T08:00:00+00:00', '2026-08-15', '2026-07-31',
+                   'membership-hint',
                    'CNY', 'succeeded', 'pending', 'unique',
                    '2026-08-15T08:00:00+00:00', '2026-08-15T08:00:00+00:00')",
     )

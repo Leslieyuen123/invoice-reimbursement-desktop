@@ -432,6 +432,74 @@ async fn batch_candidates_keep_the_imap_internal_date_calendar_day_across_utc_bo
 }
 
 #[tokio::test]
+async fn batch_candidates_do_not_guess_a_legacy_email_month_from_utc_fetched_at() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let july = service
+        .create_month(2026, 7)
+        .await
+        .expect("July batch should create");
+    let august = service
+        .create_month(2026, 8)
+        .await
+        .expect("August batch should create");
+    let account_id = Uuid::from_u128(20_100);
+    sqlx::query(
+        "INSERT INTO mailbox_accounts (
+            id, provider, email, imap_host, imap_port, sync_interval_minutes, created_at, updated_at
+         ) VALUES (?, 'qq', 'legacy-boundary@example.com', 'imap.qq.com', 993, 15, ?, ?)",
+    )
+    .bind(account_id.to_string())
+    .bind("2026-08-01T00:30:00+08:00")
+    .bind("2026-08-01T00:30:00+08:00")
+    .execute(&pool)
+    .await
+    .expect("mailbox account fixture should insert");
+
+    let item_id = Uuid::from_u128(20_101);
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, sha256, mime_type, source_type,
+            source_account_id, source_mailbox, source_uid_validity, source_uid,
+            source_message_id, source_part_id, fetched_at, source_received_date,
+            recognition_status, confirmation_status, dedupe_status, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'application/pdf', 'email', ?, 'INBOX', 1, 1, ?, '1', ?, NULL,
+                   'pending', 'pending', 'unique', ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind("legacy-august-boundary.pdf")
+    .bind("/invoices/legacy-august-boundary.pdf")
+    .bind("sha256-legacy-august-boundary")
+    .bind(account_id.to_string())
+    .bind("<legacy-august-boundary@example.com>")
+    .bind("2026-07-31T16:30:00Z")
+    .bind("2026-07-31T16:30:00Z")
+    .bind("2026-07-31T16:30:00Z")
+    .execute(&pool)
+    .await
+    .expect("legacy email fixture should insert");
+
+    for batch in [july, august] {
+        let page = service
+            .list_candidates(batch.id, None, None, 20)
+            .await
+            .expect("candidate list should load");
+        assert!(
+            page.items.is_empty(),
+            "unknown legacy calendar dates must wait for an authoritative IMAP rescan"
+        );
+    }
+
+    let item = ItemRepository::new(pool)
+        .get_by_id(item_id)
+        .await
+        .expect("legacy item should load");
+    assert_eq!(item.batch_membership_date(), None);
+}
+
+#[tokio::test]
 async fn assign_is_idempotent_deduplicates_input_and_warns_only_for_outside_dates() {
     let pool = db::connect("sqlite::memory:")
         .await
