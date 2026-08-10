@@ -733,6 +733,89 @@ async fn item_queries_return_safe_dtos_and_structured_errors() {
 }
 
 #[tokio::test]
+async fn batch_candidate_date_hint_uses_received_date_only_for_email_items() {
+    let app = TestApp::with_dashboard_fixture().await;
+    let batch = batches::create_month(&app.state, 2026, 8).await.unwrap();
+    let batch_id = Uuid::parse_str(&batch.id).unwrap();
+    let account_id = sqlx::query_scalar::<_, String>("SELECT id FROM mailbox_accounts LIMIT 1")
+        .fetch_one(app.state.pool())
+        .await
+        .unwrap();
+    let email_item_id = Uuid::new_v4();
+    let manual_item_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, sha256, mime_type, source_type,
+            source_account_id, source_mailbox, source_uid_validity, source_uid,
+            source_message_id, source_part_id, fetched_at, invoice_date, company,
+            currency, recognition_status, confirmation_status, dedupe_status,
+            created_at, updated_at
+         ) VALUES (?, 'email-membership-hint.pdf', ?, ?, 'application/pdf', 'email',
+                   ?, 'INBOX', 1, 1, '<membership-hint@example.com>', '1',
+                   '2026-08-15T08:00:00+00:00', '2026-07-31', 'membership-hint',
+                   'CNY', 'succeeded', 'pending', 'unique',
+                   '2026-08-15T08:00:00+00:00', '2026-08-15T08:00:00+00:00')",
+    )
+    .bind(email_item_id.to_string())
+    .bind(
+        app.state
+            .paths()
+            .originals
+            .join(format!("{email_item_id}.pdf"))
+            .to_string_lossy(),
+    )
+    .bind(format!("sha-{email_item_id}"))
+    .bind(account_id)
+    .execute(app.state.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, sha256, mime_type, source_type,
+            fetched_at, invoice_date, company, currency, recognition_status,
+            confirmation_status, dedupe_status, created_at, updated_at
+         ) VALUES (?, 'manual-membership-hint.pdf', ?, ?, 'application/pdf', 'manual_upload',
+                   '2026-08-15T08:00:00+00:00', '2026-07-31', 'membership-hint',
+                   'CNY', 'succeeded', 'pending', 'unique',
+                   '2026-08-15T08:00:01+00:00', '2026-08-15T08:00:01+00:00')",
+    )
+    .bind(manual_item_id.to_string())
+    .bind(
+        app.state
+            .paths()
+            .originals
+            .join(format!("{manual_item_id}.pdf"))
+            .to_string_lossy(),
+    )
+    .bind(format!("sha-{manual_item_id}"))
+    .execute(app.state.pool())
+    .await
+    .unwrap();
+
+    let candidates = batches::list_candidates(
+        &app.state,
+        batch_id,
+        Some("membership-hint".to_owned()),
+        None,
+    )
+    .await
+    .unwrap()
+    .items;
+    let email = candidates
+        .iter()
+        .find(|candidate| candidate.item.id == email_item_id.to_string())
+        .unwrap();
+    let manual = candidates
+        .iter()
+        .find(|candidate| candidate.item.id == manual_item_id.to_string())
+        .unwrap();
+
+    assert!(!email.outside_batch_range);
+    assert!(manual.outside_batch_range);
+}
+
+#[tokio::test]
 async fn batch_adapters_use_service_summaries_for_assignment_and_removal() {
     let app = TestApp::with_dashboard_fixture().await;
     let pending_item = items::list(

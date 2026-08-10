@@ -288,7 +288,7 @@ pub async fn list_candidates(
         .into_iter()
         .map(|item| {
             let outside_batch_range = item
-                .invoice_date
+                .batch_membership_date()
                 .is_none_or(|date| date < batch.start_date || date > batch.end_date);
             let disabled_reason = if item.dedupe_status == DedupeStatus::SuspectedDuplicate {
                 Some(BatchCandidateDisabledReason::SuspectedDuplicate)
