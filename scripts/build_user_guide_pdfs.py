@@ -47,7 +47,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_VERSION = json.loads(
     (REPO_ROOT / "package.json").read_text(encoding="utf-8")
 )["version"]
-DOCUMENT_DATE = "2026-07-23"
+DOCUMENT_DATE = "2026-08-10"
 FONT_PATH = Path("/System/Library/Fonts/STHeiti Light.ttc")
 FONT_NAME = "GuideHeiti"
 PAPER = colors.HexColor("#FFFFFF")
