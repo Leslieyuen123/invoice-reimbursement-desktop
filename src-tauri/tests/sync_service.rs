@@ -475,6 +475,7 @@ async fn range_sync_rescans_every_page_without_duplicating_an_older_epoch_part()
                 message_id: Some("attachment-101@example.com".to_owned()),
                 part_id: "2".to_owned(),
                 received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                source_received_date: NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
                 rescan: false,
             },
         )
@@ -896,6 +897,7 @@ async fn refetched_existing_pending_part_resumes_recognition_without_reimporting
                 message_id: Some("attachment-101@example.com".to_owned()),
                 part_id: "2".to_owned(),
                 received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                source_received_date: NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
                 rescan: false,
             },
         )
@@ -917,6 +919,7 @@ async fn refetched_existing_pending_part_resumes_recognition_without_reimporting
                 message_id: Some("attachment-101@example.com".to_owned()),
                 part_id: "2".to_owned(),
                 received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                source_received_date: NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
                 rescan: false,
             },
         )
@@ -1012,6 +1015,7 @@ async fn first_sync_recovers_a_legacy_epoch_zero_pending_part() {
                 message_id: Some("attachment-101@example.com".to_owned()),
                 part_id: "2".to_owned(),
                 received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                source_received_date: NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
                 rescan: false,
             },
         )
@@ -2306,6 +2310,7 @@ async fn oversized_message_creates_a_rejection_item_and_later_mail_continues_onc
         uid: 101,
         mailbox: "INBOX".to_owned(),
         received_at: Utc.with_ymd_and_hms(2026, 7, 14, 9, 0, 0).unwrap(),
+        source_received_date: NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
         reason: MessageRejectionReason::MessageTooLarge,
     };
     let gateway = Arc::new(FakeImapGateway::new(vec![
@@ -3093,6 +3098,7 @@ async fn email_filename_is_a_sanitized_cross_platform_basename_and_url_stays_int
                 message_id: Some("filename@example.com".to_owned()),
                 part_id: "1".to_owned(),
                 received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+                source_received_date: NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
                 rescan: false,
             },
         )
@@ -3117,6 +3123,7 @@ fn raw_message(uid: u32, raw: &[u8]) -> RawMessage {
         mailbox: "INBOX".to_owned(),
         raw: raw.to_vec(),
         received_at: Utc.with_ymd_and_hms(2026, 7, 14, 10, 0, 0).unwrap(),
+        source_received_date: NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
     }
 }
 

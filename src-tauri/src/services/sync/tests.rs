@@ -137,6 +137,7 @@ fn rejected_message(uid: u32) -> RejectedMessage {
         uid,
         mailbox: "INBOX".to_owned(),
         received_at: Utc::now(),
+        source_received_date: Utc::now().date_naive(),
         reason: MessageRejectionReason::MessageTooLarge,
     }
 }
@@ -195,6 +196,7 @@ fn raw_message_with_zip_attachments(attachments: &[(&str, &[u8])]) -> RawMessage
         mailbox: "INBOX".to_owned(),
         raw: message,
         received_at: Utc::now(),
+        source_received_date: Utc::now().date_naive(),
     }
 }
 
@@ -240,6 +242,7 @@ fn mislabeled_text_pdf_preserves_binary_bytes() {
             --invoice-boundary--\r\n"
             .to_vec(),
         received_at: Utc::now(),
+        source_received_date: Utc::now().date_naive(),
     };
 
     let parsed = parse_invoice_parts(&raw).unwrap();
@@ -261,6 +264,7 @@ fn rejected_messages_count_toward_the_delta_limit() {
             mailbox: "INBOX".to_owned(),
             raw: Vec::new(),
             received_at: Utc::now(),
+            source_received_date: Utc::now().date_naive(),
         }],
         rejected_messages,
         highest_uid: MAX_MESSAGES_PER_SYNC as u32 + 1,
@@ -472,6 +476,7 @@ fn parsed_zip_attachment_keeps_only_successfully_expanded_invoice_files() {
         mailbox: "INBOX".to_owned(),
         raw: message,
         received_at: Utc::now(),
+        source_received_date: Utc::now().date_naive(),
     };
 
     let parsed = parse_invoice_parts(&raw).unwrap();
@@ -654,6 +659,7 @@ fn rejected_message_uids_must_be_unique_across_the_delta() {
             mailbox: "INBOX".to_owned(),
             raw: Vec::new(),
             received_at: Utc::now(),
+            source_received_date: Utc::now().date_naive(),
         }],
         rejected_messages: vec![rejected_message(7)],
         highest_uid: 7,

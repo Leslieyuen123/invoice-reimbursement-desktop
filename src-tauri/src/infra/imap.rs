@@ -73,6 +73,7 @@ pub struct RawMessage {
     pub mailbox: String,
     pub raw: Vec<u8>,
     pub received_at: DateTime<Utc>,
+    pub source_received_date: NaiveDate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,7 @@ pub struct RejectedMessage {
     pub uid: u32,
     pub mailbox: String,
     pub received_at: DateTime<Utc>,
+    pub source_received_date: NaiveDate,
     pub reason: MessageRejectionReason,
 }
 
@@ -264,10 +266,13 @@ fn fetch_blocking(
             .ok_or_else(|| imap_error("IMAP response omitted UID"))?;
         let size = usize::try_from(metadata.size.unwrap_or(0))
             .map_err(|_| limit_error("IMAP message size is invalid"))?;
-        let received_at = metadata
-            .internal_date()
-            .map(|date| date.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
+        let (received_at, source_received_date) = match metadata.internal_date() {
+            Some(date) => (date.with_timezone(&Utc), date.date_naive()),
+            None => {
+                let now = Utc::now();
+                (now, now.date_naive())
+            }
+        };
         match budget.admission(size)? {
             MessageAdmission::Admit => {}
             MessageAdmission::Reject(reason) => {
@@ -275,6 +280,7 @@ fn fetch_blocking(
                     uid: actual_uid,
                     mailbox: config.mailbox.clone(),
                     received_at,
+                    source_received_date,
                     reason,
                 });
                 processed_high_water = Some(uid);
@@ -309,6 +315,7 @@ fn fetch_blocking(
                     uid: actual_uid,
                     mailbox: config.mailbox.clone(),
                     received_at,
+                    source_received_date,
                     reason,
                 });
                 processed_high_water = Some(uid);
@@ -328,6 +335,7 @@ fn fetch_blocking(
             mailbox: config.mailbox.clone(),
             raw: raw.to_vec(),
             received_at,
+            source_received_date,
         });
         processed_high_water = Some(uid);
     }

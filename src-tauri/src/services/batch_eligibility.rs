@@ -15,7 +15,7 @@ pub(crate) fn is_safe_batch_candidate(
 ) -> bool {
     item.status() == ItemStatus::Ready
         && item
-            .invoice_date
+            .batch_membership_date()
             .is_some_and(|date| date >= start_date && date <= end_date)
         && item.dedupe_status != DedupeStatus::SuspectedDuplicate
         && item.final_category.is_some()

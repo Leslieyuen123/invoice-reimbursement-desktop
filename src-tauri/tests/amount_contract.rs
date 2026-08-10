@@ -344,6 +344,7 @@ impl AmountFixture {
             source_message_id: None,
             source_part_id: None,
             fetched_at: now,
+            source_received_date: None,
             invoice_date: Some(NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()),
             suggested_period: Some("2026-07".to_owned()),
             batch_id: None,

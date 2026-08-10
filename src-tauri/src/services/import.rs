@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
@@ -25,6 +25,7 @@ pub struct EmailImportSource {
     pub message_id: Option<String>,
     pub part_id: String,
     pub received_at: DateTime<Utc>,
+    pub source_received_date: NaiveDate,
     pub rescan: bool,
 }
 
@@ -198,7 +199,7 @@ impl ImportService {
             Ok(value) => value,
             Err(error) => return Err(staged.cleanup_after(error)),
         };
-        let promoted = staged.promote(source.received_at.date_naive(), candidate_id, &extension)?;
+        let promoted = staged.promote(source.source_received_date, candidate_id, &extension)?;
         let replacement = EmailFileReplacement {
             original_name,
             original_path: promoted.path().to_string_lossy().into_owned(),
@@ -312,6 +313,7 @@ impl ImportService {
                 message_id: None,
                 part_id: "message.rejected".to_owned(),
                 received_at: rejected.received_at,
+                source_received_date: rejected.source_received_date,
                 rescan,
             },
         })
@@ -401,11 +403,8 @@ impl ImportService {
                 Err(error) => return Err(staged.cleanup_after(error)),
             },
         };
-        let promoted = staged.promote(
-            payload.source.received_at.date_naive(),
-            id,
-            &payload.extension,
-        )?;
+        let promoted =
+            staged.promote(payload.source.source_received_date, id, &payload.extension)?;
         let original_path = promoted.path().to_path_buf();
         let now = Utc::now();
         let item = NewItemRecord {
@@ -423,6 +422,7 @@ impl ImportService {
             source_message_id: payload.source.message_id.clone(),
             source_part_id: Some(payload.source.part_id.clone()),
             fetched_at: payload.source.received_at,
+            source_received_date: Some(payload.source.source_received_date),
             invoice_date: None,
             suggested_period: None,
             batch_id: None,
@@ -493,7 +493,7 @@ impl ImportService {
             },
         };
         let promoted = staged.promote(
-            payload.source.received_at.date_naive(),
+            payload.source.source_received_date,
             candidate_id,
             &payload.extension,
         )?;
@@ -606,6 +606,7 @@ impl ImportService {
             source_message_id: None,
             source_part_id: None,
             fetched_at: now,
+            source_received_date: None,
             invoice_date: None,
             suggested_period: None,
             batch_id: None,
@@ -850,6 +851,7 @@ mod tests {
             message_id: Some(format!("invoice-{uid}@example.com")),
             part_id: part_id.to_owned(),
             received_at: Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 0).unwrap(),
+            source_received_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
             rescan: false,
         }
     }
@@ -883,6 +885,48 @@ mod tests {
         assert!(!signature_matches_extension("doc", &zip));
         assert!(!signature_matches_extension("docx", &ole));
         assert!(!signature_matches_extension("pdf", b"unknown"));
+    }
+
+    #[tokio::test]
+    async fn email_import_preserves_imap_calendar_date_across_a_utc_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let items = ItemRepository::new(pool);
+        let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+        let service = ImportService::new(items, paths);
+        let local_received_at = chrono::FixedOffset::east_opt(8 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 8, 1, 0, 30, 0)
+            .single()
+            .unwrap();
+        let source = EmailImportSource {
+            received_at: local_received_at.with_timezone(&Utc),
+            source_received_date: local_received_at.date_naive(),
+            ..email_source(801, "1")
+        };
+
+        let ImportOutcome::New(imported) = service
+            .import_email_bytes("august-boundary.pdf", b"%PDF-1.7\n%%EOF\n", source)
+            .await
+            .unwrap()
+        else {
+            panic!("boundary email fixture should be newly imported")
+        };
+
+        assert_eq!(
+            imported.fetched_at,
+            Utc.with_ymd_and_hms(2026, 7, 31, 16, 30, 0)
+                .single()
+                .unwrap()
+        );
+        assert_eq!(
+            imported.source_received_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 1)
+        );
+        assert_eq!(
+            imported.batch_membership_date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 1)
+        );
     }
 
     #[tokio::test]

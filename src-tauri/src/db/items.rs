@@ -11,10 +11,10 @@ use crate::domain::model::{
 
 const ITEM_COLUMNS: &str = "id, original_name, original_path, normalized_pdf_path, sha256, \
     mime_type, source_type, source_account_id, source_mailbox, source_uid_validity, source_uid, \
-    source_message_id, source_part_id, fetched_at, invoice_date, suggested_period, batch_id, \
-    suggested_category, final_category, amount_cents, currency, city, company, \
-    recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, event_tag, \
-    project_tag, created_at, updated_at";
+    source_message_id, source_part_id, fetched_at, source_received_date, invoice_date, \
+    suggested_period, batch_id, suggested_category, final_category, amount_cents, currency, city, \
+    company, recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, \
+    event_tag, project_tag, created_at, updated_at";
 const MAX_PAGE_SIZE: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +33,7 @@ pub struct InvoiceItem {
     pub source_message_id: Option<String>,
     pub source_part_id: Option<String>,
     pub fetched_at: DateTime<Utc>,
+    pub source_received_date: Option<NaiveDate>,
     pub invoice_date: Option<NaiveDate>,
     pub suggested_period: Option<String>,
     pub batch_id: Option<Uuid>,
@@ -61,6 +62,15 @@ impl InvoiceItem {
             self.dedupe_status,
         )
     }
+
+    pub fn batch_membership_date(&self) -> Option<NaiveDate> {
+        match self.source_type {
+            SourceType::Email => self
+                .source_received_date
+                .or_else(|| Some(self.fetched_at.date_naive())),
+            SourceType::ManualUpload => self.invoice_date,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +89,7 @@ pub struct NewItemRecord {
     pub source_message_id: Option<String>,
     pub source_part_id: Option<String>,
     pub fetched_at: DateTime<Utc>,
+    pub source_received_date: Option<NaiveDate>,
     pub invoice_date: Option<NaiveDate>,
     pub suggested_period: Option<String>,
     pub batch_id: Option<Uuid>,
@@ -659,10 +670,15 @@ impl ItemRepository {
             push_item_search_filter(&mut query, search);
         } else {
             query
-                .push(" AND invoice_date >= ")
+                .push(" AND ((source_type = 'email' AND COALESCE(source_received_date, substr(fetched_at, 1, 10)) >= ")
+                .push_bind(start_date.to_string())
+                .push(" AND COALESCE(source_received_date, substr(fetched_at, 1, 10)) <= ")
+                .push_bind(end_date.to_string())
+                .push(") OR (source_type = 'manual_upload' AND invoice_date >= ")
                 .push_bind(start_date.to_string())
                 .push(" AND invoice_date <= ")
-                .push_bind(end_date.to_string());
+                .push_bind(end_date.to_string())
+                .push("))");
         }
         if let Some(cursor) = cursor {
             let created_at = cursor.created_at.to_rfc3339();
@@ -1548,11 +1564,11 @@ async fn insert_with_connection(
         "INSERT INTO items (\
             id, original_name, original_path, normalized_pdf_path, sha256, mime_type, \
             source_type, source_account_id, source_mailbox, source_uid_validity, source_uid, \
-            source_message_id, source_part_id, fetched_at, invoice_date, suggested_period, batch_id, \
-            suggested_category, final_category, amount_cents, currency, city, company, \
-            recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, \
-            event_tag, project_tag, created_at, updated_at\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+            source_message_id, source_part_id, fetched_at, source_received_date, invoice_date, \
+            suggested_period, batch_id, suggested_category, final_category, amount_cents, currency, \
+            city, company, recognition_status, confirmation_status, dedupe_status, duplicate_of_id, \
+            note, event_tag, project_tag, created_at, updated_at\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
             ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(item.id.to_string())
@@ -1569,6 +1585,7 @@ async fn insert_with_connection(
     .bind(&item.source_message_id)
     .bind(&item.source_part_id)
     .bind(item.fetched_at.to_rfc3339())
+    .bind(item.source_received_date.map(|date| date.to_string()))
     .bind(item.invoice_date.map(|date| date.to_string()))
     .bind(&item.suggested_period)
     .bind(item.batch_id.map(|id| id.to_string()))
@@ -1626,6 +1643,7 @@ struct DbItemRow {
     source_message_id: Option<String>,
     source_part_id: Option<String>,
     fetched_at: String,
+    source_received_date: Option<String>,
     invoice_date: Option<String>,
     suggested_period: Option<String>,
     batch_id: Option<String>,
@@ -1665,6 +1683,10 @@ impl TryFrom<DbItemRow> for InvoiceItem {
             source_message_id: row.source_message_id,
             source_part_id: row.source_part_id,
             fetched_at: parse_datetime(&row.fetched_at, "fetched_at")?,
+            source_received_date: parse_optional_date(
+                row.source_received_date,
+                "source_received_date",
+            )?,
             invoice_date: parse_optional_date(row.invoice_date, "invoice_date")?,
             suggested_period: row.suggested_period,
             batch_id: parse_optional_uuid(row.batch_id, "batch_id")?,
@@ -1716,6 +1738,18 @@ fn validate_source(item: &NewItemRecord) -> Result<(), AppError> {
         return Err(AppError::validation(
             "source_uid_validity",
             "manual uploads must not have IMAP UIDVALIDITY",
+        ));
+    }
+    if item.source_type == SourceType::Email && item.source_received_date.is_none() {
+        return Err(AppError::validation(
+            "source_received_date",
+            "email sources must preserve the IMAP INTERNALDATE calendar date",
+        ));
+    }
+    if item.source_type == SourceType::ManualUpload && item.source_received_date.is_some() {
+        return Err(AppError::validation(
+            "source_received_date",
+            "manual uploads must not have an IMAP received date",
         ));
     }
 

@@ -836,7 +836,7 @@ async fn all_failed_accounts_with_no_items_return_failures_without_export() {
 }
 
 #[tokio::test]
-async fn missing_and_outside_invoice_dates_are_exceptions_but_are_not_assigned() {
+async fn email_received_in_batch_month_uses_received_date_for_automatic_assignment() {
     let gateway = Arc::new(FakeRangeGateway::default());
     gateway.queue(
         "a@example.com",
@@ -861,21 +861,24 @@ async fn missing_and_outside_invoice_dates_are_exceptions_but_are_not_assigned()
         .unwrap();
 
     assert_eq!(result.imported_count, 2);
-    assert_eq!(result.assigned_count, 0);
-    assert_eq!(result.exception_count, 2);
-    assert!(result.export.is_none());
+    assert_eq!(result.assigned_count, 1);
+    assert_eq!(result.exception_count, 1);
+    assert_eq!(result.export.unwrap().item_count, 1);
     let items = ItemRepository::new(harness.pool)
         .list_bounded_for_tests(ItemFilter::default())
         .await
         .unwrap();
     assert_eq!(items.len(), 2);
-    assert!(items.iter().all(|item| item.batch_id.is_none()));
-    assert!(items.iter().any(|item| item.invoice_date.is_none()));
-    assert!(
-        items.iter().any(|item| {
-            item.invoice_date == Some(NaiveDate::from_ymd_opt(2026, 4, 30).unwrap())
-        })
-    );
+    let incomplete = items
+        .iter()
+        .find(|item| item.invoice_date.is_none())
+        .expect("incomplete item should remain visible");
+    assert!(incomplete.batch_id.is_none());
+    let april_invoice = items
+        .iter()
+        .find(|item| item.invoice_date == Some(NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()))
+        .expect("April-dated invoice should remain visible");
+    assert_eq!(april_invoice.batch_id, Some(batch.id));
 }
 
 #[tokio::test]
@@ -981,6 +984,7 @@ fn raw_message(uid: u32, raw: &[u8]) -> RawMessage {
         mailbox: "INBOX".to_owned(),
         raw: raw.to_vec(),
         received_at: Utc.with_ymd_and_hms(2026, 5, 15, 8, 0, 0).single().unwrap(),
+        source_received_date: NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),
     }
 }
 
@@ -1011,6 +1015,7 @@ fn ready_item(paths: &AppPaths, id: uuid::Uuid) -> NewItemRecord {
         source_message_id: None,
         source_part_id: None,
         fetched_at: now,
+        source_received_date: None,
         invoice_date: Some(NaiveDate::from_ymd_opt(2026, 5, 10).unwrap()),
         suggested_period: Some("2026-05".to_owned()),
         batch_id: None,

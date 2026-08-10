@@ -1064,6 +1064,7 @@ async fn retry_clears_or_replaces_old_automatic_fields_and_preserves_everything_
     record.source_uid = Some(77);
     record.source_message_id = Some("message-77".to_owned());
     record.source_part_id = Some("2".to_owned());
+    record.source_received_date = Some(record.fetched_at.date_naive());
     record.invoice_date = NaiveDate::from_ymd_opt(2025, 1, 1);
     record.suggested_period = Some("2025-01".to_owned());
     record.suggested_category = Some(Category::Dining);
@@ -1481,6 +1482,7 @@ fn sample_item(id: Uuid) -> NewItemRecord {
         source_message_id: None,
         source_part_id: None,
         fetched_at: Utc.with_ymd_and_hms(2026, 7, 2, 9, 30, 0).single().unwrap(),
+        source_received_date: None,
         invoice_date: None,
         suggested_period: None,
         batch_id: None,

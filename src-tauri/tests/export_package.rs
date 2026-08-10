@@ -1146,6 +1146,7 @@ fn sample_item(paths: &AppPaths, batch_id: Uuid, status: ItemStatus) -> NewItemR
         source_message_id: None,
         source_part_id: None,
         fetched_at: now,
+        source_received_date: None,
         invoice_date: Some(
             NaiveDate::from_ymd_opt(2026, 7, 12).expect("fixture date should be valid"),
         ),

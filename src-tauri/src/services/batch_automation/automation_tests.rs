@@ -116,6 +116,7 @@ fn completed_rejection_scan() -> Vec<Result<MailboxDelta, AppError>> {
         uid: 1,
         mailbox: "INBOX".to_owned(),
         received_at: Utc::now(),
+        source_received_date: Utc::now().date_naive(),
         reason: MessageRejectionReason::MessageTooLarge,
     };
     vec![
@@ -160,6 +161,7 @@ fn safe_item(paths: &AppPaths, id: Uuid) -> NewItemRecord {
         source_message_id: None,
         source_part_id: None,
         fetched_at: now,
+        source_received_date: None,
         invoice_date: Some(NaiveDate::from_ymd_opt(2026, 5, 10).unwrap()),
         suggested_period: Some("2026-05".to_owned()),
         batch_id: None,

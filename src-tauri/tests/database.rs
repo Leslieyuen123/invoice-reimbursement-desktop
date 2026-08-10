@@ -362,6 +362,75 @@ async fn migrations_upgrade_original_retry_schema_and_preserve_state() {
 }
 
 #[tokio::test]
+async fn migration_0011_backfills_legacy_email_received_dates_without_touching_manual_uploads() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let current = sqlx::migrate!("./migrations");
+    let through_0010 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(current.iter().take(10).cloned().collect()),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0010.run(&pool).await.unwrap();
+    let account_id = Uuid::new_v4();
+    insert_mailbox_account(&pool, account_id).await;
+
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, sha256, mime_type, source_type,
+            source_account_id, source_mailbox, source_uid_validity, source_uid, source_part_id,
+            fetched_at, created_at, updated_at
+         ) VALUES (
+            'legacy-email', 'legacy-email.pdf', '/invoices/legacy-email.pdf', 'legacy-email-sha',
+            'application/pdf', 'email', ?, 'INBOX', 1, 1, '1',
+            '2026-07-31T16:30:00Z', '2026-07-31T16:30:00Z', '2026-07-31T16:30:00Z'
+         )",
+    )
+    .bind(account_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, sha256, mime_type, source_type,
+            fetched_at, created_at, updated_at
+         ) VALUES (
+            'legacy-manual', 'legacy-manual.pdf', '/invoices/legacy-manual.pdf',
+            'legacy-manual-sha', 'application/pdf', 'manual_upload',
+            '2026-08-01T00:30:00+08:00', '2026-08-01T00:30:00+08:00',
+            '2026-08-01T00:30:00+08:00'
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    current.run(&pool).await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT source_received_date FROM items WHERE id = 'legacy-email'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("2026-07-31")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT source_received_date FROM items WHERE id = 'legacy-manual'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn mailbox_sync_repository_maps_real_sqlite_busy_errors_as_retryable() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -508,6 +577,7 @@ async fn item_email_lookups_map_real_sqlite_busy_errors_as_retryable() {
     current.source_uid = Some(42);
     current.source_message_id = Some("busy-current@example.com".to_owned());
     current.source_part_id = Some("2".to_owned());
+    current.source_received_date = Some(current.fetched_at.date_naive());
     setup_items.insert(&current).await.unwrap();
     let mut legacy = sample_item("busy-legacy", "sha256-busy-legacy");
     legacy.source_type = SourceType::Email;
@@ -517,6 +587,7 @@ async fn item_email_lookups_map_real_sqlite_busy_errors_as_retryable() {
     legacy.source_uid = Some(43);
     legacy.source_message_id = Some("busy-legacy@example.com".to_owned());
     legacy.source_part_id = Some("3".to_owned());
+    legacy.source_received_date = Some(legacy.fetched_at.date_naive());
     setup_items.insert(&legacy).await.unwrap();
     sqlx::query("UPDATE items SET source_uid_validity = 0 WHERE id = ?")
         .bind(legacy.id.to_string())
@@ -1075,6 +1146,7 @@ async fn item_repository_maps_duplicate_email_parts_to_an_actionable_conflict() 
     first.source_uid = Some(42);
     first.source_message_id = Some("message-first".to_owned());
     first.source_part_id = Some("2".to_owned());
+    first.source_received_date = Some(first.fetched_at.date_naive());
     let mut duplicate = sample_item("email-duplicate", "sha256-email-duplicate");
     duplicate.source_type = SourceType::Email;
     duplicate.source_account_id = Some(account_id);
@@ -1083,6 +1155,7 @@ async fn item_repository_maps_duplicate_email_parts_to_an_actionable_conflict() 
     duplicate.source_uid = Some(42);
     duplicate.source_message_id = Some("message-duplicate".to_owned());
     duplicate.source_part_id = Some("2".to_owned());
+    duplicate.source_received_date = Some(duplicate.fetched_at.date_naive());
 
     repository
         .insert(&first)
@@ -1114,6 +1187,7 @@ async fn deleting_mailbox_account_preserves_imported_email_provenance() {
     email_item.source_uid_validity = Some(10);
     email_item.source_uid = Some(42);
     email_item.source_part_id = Some("2".to_owned());
+    email_item.source_received_date = Some(email_item.fetched_at.date_naive());
     repository
         .insert(&email_item)
         .await
@@ -1153,6 +1227,7 @@ async fn item_repository_validates_email_provenance_before_sql() {
     valid_email.source_uid_validity = Some(10);
     valid_email.source_uid = Some(42);
     valid_email.source_part_id = Some("2".to_owned());
+    valid_email.source_received_date = Some(valid_email.fetched_at.date_naive());
 
     let mut invalid_items = Vec::new();
     invalid_items.push({
@@ -1308,6 +1383,7 @@ async fn item_repository_combines_typed_filters_text_search_and_deterministic_or
     target.source_uid_validity = Some(10);
     target.source_uid = Some(3);
     target.source_part_id = Some("1".to_owned());
+    target.source_received_date = Some(target.fetched_at.date_naive());
     target.suggested_period = Some("2026-Q3".to_owned());
     target.batch_id = Some(batch_id);
     target.suggested_category = Some(Category::Transport);
@@ -2464,6 +2540,7 @@ async fn persisted_domain_enums_round_trip_through_repository_rows() {
             item.source_uid_validity = Some(10);
             item.source_uid = Some(index as i64 + 1);
             item.source_part_id = Some("1".to_owned());
+            item.source_received_date = Some(item.fetched_at.date_naive());
         }
         item.recognition_status = recognition_cases[index % recognition_cases.len()];
         item.confirmation_status = confirmation_cases[index % confirmation_cases.len()];
@@ -2695,6 +2772,7 @@ fn sample_item(suffix: &str, sha256: &str) -> NewItemRecord {
             .with_ymd_and_hms(2026, 7, 13, 2, 0, 0)
             .single()
             .expect("valid fetched time"),
+        source_received_date: None,
         invoice_date: chrono::NaiveDate::from_ymd_opt(2026, 7, 12),
         suggested_period: Some("2026-07".to_owned()),
         batch_id: None,

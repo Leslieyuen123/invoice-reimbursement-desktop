@@ -435,7 +435,7 @@ impl BatchService {
         let warnings = items
             .iter()
             .filter(|item| {
-                item.invoice_date
+                item.batch_membership_date()
                     .is_some_and(|date| date < batch.start_date || date > batch.end_date)
             })
             .map(|item| format!("outside_date_range:{}", item.id))

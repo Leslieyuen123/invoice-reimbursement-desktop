@@ -524,6 +524,7 @@ impl SyncService {
                             message_id: part.message_id.clone(),
                             part_id: part.part_id,
                             received_at: raw_message.received_at,
+                            source_received_date: raw_message.source_received_date,
                             rescan,
                         },
                     )
@@ -572,6 +573,7 @@ impl SyncService {
             message_id: link.message_id,
             part_id: link.part_id,
             received_at: raw_message.received_at,
+            source_received_date: raw_message.source_received_date,
             rescan,
         };
         if let Some(existing) = self.import.find_email_part(&source).await?
@@ -629,6 +631,7 @@ impl SyncService {
                                 message_id: child.message_id,
                                 part_id: child.part_id,
                                 received_at: raw_message.received_at,
+                                source_received_date: raw_message.source_received_date,
                                 rescan,
                             },
                         )

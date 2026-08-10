@@ -12,6 +12,7 @@ use invoice_reimbursement::services::batches::{BatchService, NewBatchInput};
 use invoice_reimbursement::services::items::{ItemReview, ItemService};
 use invoice_reimbursement::services::recognition::RecognitionService;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Barrier;
@@ -49,6 +50,7 @@ fn sample_item(id: u128, period: Option<&str>) -> NewItemRecord {
         source_message_id: None,
         source_part_id: None,
         fetched_at: now,
+        source_received_date: None,
         invoice_date: Some(date(2026, 2, 15)),
         suggested_period: period.map(str::to_owned),
         batch_id: None,
@@ -68,6 +70,30 @@ fn sample_item(id: u128, period: Option<&str>) -> NewItemRecord {
         created_at: now,
         updated_at: now,
     }
+}
+
+fn email_item(
+    id: u128,
+    fetched_at: chrono::DateTime<Utc>,
+    invoice_date: Option<NaiveDate>,
+) -> NewItemRecord {
+    let mut item = sample_item(
+        id,
+        invoice_date
+            .map(|date| date.format("%Y-%m").to_string())
+            .as_deref(),
+    );
+    item.source_type = SourceType::Email;
+    item.source_account_id = Some(Uuid::from_u128(10_000 + id));
+    item.source_mailbox = Some("INBOX".to_owned());
+    item.source_uid_validity = Some(1);
+    item.source_uid = Some(i64::try_from(id).expect("test id should fit in i64"));
+    item.source_message_id = Some(format!("<message-{id}@example.com>"));
+    item.source_part_id = Some("1".to_owned());
+    item.fetched_at = fetched_at;
+    item.source_received_date = Some(fetched_at.date_naive());
+    item.invoice_date = invoice_date;
+    item
 }
 
 async fn mark_exported(pool: &SqlitePool, batch_id: Uuid) {
@@ -257,6 +283,152 @@ async fn recommend_rejects_non_iso_impossible_and_reversed_ranges() {
             "unexpected error for {start}..={end}: {error:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn batch_candidates_match_email_by_received_date_and_manual_uploads_by_invoice_date() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool);
+    let batch = service
+        .create_month(2026, 8)
+        .await
+        .expect("August batch should create");
+    let other_batch = service
+        .create_month(2026, 9)
+        .await
+        .expect("other batch should create");
+
+    let august_received = Utc.with_ymd_and_hms(2026, 8, 15, 8, 0, 0).single().unwrap();
+    let july_received = Utc
+        .with_ymd_and_hms(2026, 7, 31, 23, 59, 59)
+        .single()
+        .unwrap();
+    let email_with_july_invoice = email_item(100, august_received, Some(date(2026, 7, 31)));
+    let email_without_invoice_date = email_item(101, august_received, None);
+    let email_received_in_july = email_item(102, july_received, Some(date(2026, 8, 1)));
+    let email_received_at_month_end = email_item(
+        106,
+        Utc.with_ymd_and_hms(2026, 8, 31, 23, 59, 59)
+            .single()
+            .unwrap(),
+        Some(date(2026, 9, 1)),
+    );
+    let email_received_in_september = email_item(
+        107,
+        Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).single().unwrap(),
+        Some(date(2026, 8, 31)),
+    );
+    let mut manual_with_august_invoice = sample_item(103, Some("2026-08"));
+    manual_with_august_invoice.invoice_date = Some(date(2026, 8, 31));
+    let mut manual_with_july_invoice = sample_item(104, Some("2026-07"));
+    manual_with_july_invoice.fetched_at = august_received;
+    manual_with_july_invoice.invoice_date = Some(date(2026, 7, 31));
+    let mut already_assigned = email_item(105, august_received, Some(date(2026, 8, 10)));
+    already_assigned.batch_id = Some(other_batch.id);
+
+    for item in [
+        &email_with_july_invoice,
+        &email_without_invoice_date,
+        &email_received_in_july,
+        &email_received_at_month_end,
+        &email_received_in_september,
+        &manual_with_august_invoice,
+        &manual_with_july_invoice,
+        &already_assigned,
+    ] {
+        items
+            .insert(item)
+            .await
+            .expect("candidate fixture should insert");
+    }
+
+    let page = service
+        .list_candidates(batch.id, None, None, 20)
+        .await
+        .expect("candidate list should load");
+    let candidate_ids = page
+        .items
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<HashSet<_>>();
+
+    assert_eq!(
+        candidate_ids,
+        HashSet::from([
+            email_with_july_invoice.id,
+            email_without_invoice_date.id,
+            email_received_at_month_end.id,
+            manual_with_august_invoice.id,
+        ])
+    );
+}
+
+#[tokio::test]
+async fn batch_candidates_keep_the_imap_internal_date_calendar_day_across_utc_boundary() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let batch = service
+        .create_month(2026, 8)
+        .await
+        .expect("August batch should create");
+    let account_id = Uuid::from_u128(20_000);
+    sqlx::query(
+        "INSERT INTO mailbox_accounts (
+            id, provider, email, imap_host, imap_port, sync_interval_minutes, created_at, updated_at
+         ) VALUES (?, 'qq', 'boundary@example.com', 'imap.qq.com', 993, 15, ?, ?)",
+    )
+    .bind(account_id.to_string())
+    .bind("2026-08-01T00:30:00+08:00")
+    .bind("2026-08-01T00:30:00+08:00")
+    .execute(&pool)
+    .await
+    .expect("mailbox account fixture should insert");
+
+    let local_received_at = chrono::FixedOffset::east_opt(8 * 60 * 60)
+        .unwrap()
+        .with_ymd_and_hms(2026, 8, 1, 0, 30, 0)
+        .single()
+        .unwrap();
+    let fetched_at = local_received_at.with_timezone(&Utc);
+    assert_eq!(fetched_at.date_naive(), date(2026, 7, 31));
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, sha256, mime_type, source_type,
+            source_account_id, source_mailbox, source_uid_validity, source_uid,
+            source_message_id, source_part_id, fetched_at, source_received_date,
+            recognition_status, confirmation_status, dedupe_status, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'application/pdf', 'email', ?, 'INBOX', 1, 1, ?, '1', ?, ?,
+                   'pending', 'pending', 'unique', ?, ?)",
+    )
+    .bind(Uuid::from_u128(20_001).to_string())
+    .bind("august-boundary.pdf")
+    .bind("/invoices/august-boundary.pdf")
+    .bind("sha256-august-boundary")
+    .bind(account_id.to_string())
+    .bind("<august-boundary@example.com>")
+    .bind(fetched_at.to_rfc3339())
+    .bind(local_received_at.date_naive().to_string())
+    .bind(fetched_at.to_rfc3339())
+    .bind(fetched_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("boundary email fixture should insert");
+
+    let page = service
+        .list_candidates(batch.id, None, None, 20)
+        .await
+        .expect("candidate list should load");
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].batch_membership_date(),
+        Some(date(2026, 8, 1))
+    );
 }
 
 #[tokio::test]

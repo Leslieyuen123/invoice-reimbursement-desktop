@@ -113,7 +113,9 @@ impl RecognitionService {
         preserve_manual_confirmation: bool,
     ) -> Result<InvoiceItem, AppError> {
         let item = self.items.get_by_id(id).await?;
-        let received_date = item.fetched_at.date_naive();
+        let received_date = item
+            .batch_membership_date()
+            .unwrap_or_else(|| item.fetched_at.date_naive());
         let path = PathBuf::from(&item.original_path);
         let extractor = self.extractor.clone();
         let extraction = tokio::task::spawn_blocking(move || extractor.extract(&path))

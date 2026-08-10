@@ -1926,6 +1926,7 @@ fn sample_item(paths: &AppPaths, suffix: &str) -> NewItemRecord {
         source_message_id: Some(format!("message-{suffix}")),
         source_part_id: None,
         fetched_at,
+        source_received_date: None,
         invoice_date: None,
         suggested_period: Some("2026-06".to_owned()),
         batch_id: None,
