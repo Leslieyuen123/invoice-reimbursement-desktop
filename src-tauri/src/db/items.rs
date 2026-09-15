@@ -1869,7 +1869,7 @@ fn parse_source_type(value: &str) -> Result<SourceType, AppError> {
     }
 }
 
-fn category_str(value: Category) -> &'static str {
+pub(crate) fn category_str(value: Category) -> &'static str {
     match value {
         Category::Transport => "transport",
         Category::Dining => "dining",

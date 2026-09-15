@@ -199,6 +199,29 @@ export interface BatchRepairDto {
   issues: BatchIssueDto[];
 }
 
+/** One invoice the bulk confirm could not settle, with a stable reason code. */
+export interface SkippedBatchItemDto {
+  itemId: string;
+  fileName: string;
+  code: string;
+  message: string;
+}
+
+export interface SettleBatchInputDto {
+  fillInvoiceDateFromReceived: boolean;
+  applySuggestedCategory: boolean;
+  defaultCategory: Category | null;
+}
+
+export interface SettleBatchOutcomeDto {
+  confirmedCount: number;
+  filledInvoiceDateCount: number;
+  appliedCategoryCount: number;
+  repairedCount: number;
+  skipped: SkippedBatchItemDto[];
+  issues: BatchIssueDto[];
+}
+
 export type BatchCandidateDisabledReason =
   | "recognition_failed"
   | "suspected_duplicate"

@@ -75,7 +75,10 @@ function itemFixture(overrides: Partial<InvoiceItemDto> = {}): InvoiceItemDto {
   };
 }
 
-function detailFixture(items: InvoiceItemDto[] = []): BatchDetailDto {
+function detailFixture(
+  items: InvoiceItemDto[] = [],
+  summaryOverrides: Partial<BatchDetailDto["summary"]> = {},
+): BatchDetailDto {
   const totalAmountCents = items.reduce(
     (total, item) => total + (item.amountCents ?? 0),
     0,
@@ -94,6 +97,7 @@ function detailFixture(items: InvoiceItemDto[] = []): BatchDetailDto {
       accommodation: { itemCount: 0, amountCents: 0 },
       hospitality: { itemCount: 0, amountCents: 0 },
       unconfirmedCount: 0,
+      ...summaryOverrides,
     },
     warnings: [],
     issues: [],
@@ -239,6 +243,107 @@ describe("Batch workspace", () => {
     await user.click(screen.getByRole("button", { name: "加入推荐票据" }));
     await user.click(screen.getByRole("button", { name: "导出报销包" }));
     expect(await screen.findByText(/merged\.pdf/)).toBeInTheDocument();
+  });
+
+  it("removes the selected invoices in one bulk call", async () => {
+    const user = userEvent.setup();
+    const first = itemFixture({ id: "invoice-one", originalName: "一号.pdf" });
+    const second = itemFixture({ id: "invoice-two", originalName: "二号.pdf" });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    let detail = detailFixture([first, second]);
+    mockCommand("get_batch", () => detail);
+    mockCommand("remove_batch_items", (arguments_) => {
+      const removed = (arguments_ as { itemIds: string[] }).itemIds;
+      expect(removed).toEqual(["invoice-one"]);
+      detail = detailFixture([second]);
+      return detail;
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("checkbox", { name: "选择 一号.pdf" }),
+    );
+
+    expect(screen.getByText("已选 1 张")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "移出所选票据" }));
+
+    await waitFor(() =>
+      expect(commandCalls("remove_batch_items")).toHaveLength(1),
+    );
+    expect(
+      await screen.findByRole("checkbox", { name: "选择 二号.pdf" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: "选择 一号.pdf" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("settles derivable invoices and reports the ones that still need work", async () => {
+    const user = userEvent.setup();
+    const pending = itemFixture({
+      id: "invoice-pending",
+      originalName: "待确认.pdf",
+      status: "pending_confirmation",
+      confirmationStatus: "pending",
+      finalCategory: null,
+      suggestedCategory: "dining",
+    });
+    const noAmount = itemFixture({
+      id: "invoice-no-amount",
+      originalName: "缺金额.pdf",
+      status: "pending_confirmation",
+      confirmationStatus: "pending",
+      amountCents: null,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    let detail = detailFixture([pending, noAmount], { unconfirmedCount: 2 });
+    mockCommand("get_batch", () => detail);
+    mockCommand("settle_batch_items", () => {
+      detail = detailFixture(
+        [
+          { ...pending, confirmationStatus: "confirmed", status: "ready" },
+          noAmount,
+        ],
+        { unconfirmedCount: 1 },
+      );
+      return {
+        confirmedCount: 1,
+        filledInvoiceDateCount: 1,
+        appliedCategoryCount: 1,
+        repairedCount: 0,
+        skipped: [
+          {
+            itemId: "invoice-no-amount",
+            fileName: "缺金额.pdf",
+            code: "missing_amount",
+            message: "缺少金额，必须对照原件人工填写",
+          },
+        ],
+      };
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("button", { name: "清空待确认（2）" }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "确认可推导的票据" }),
+    );
+
+    // commandCalls unwraps the `input` payload of wire commands.
+    expect(commandCalls("settle_batch_items")[0]).toEqual({
+      fillInvoiceDateFromReceived: true,
+      applySuggestedCategory: true,
+      defaultCategory: null,
+    });
+    const report = await screen.findByRole("status", {
+      name: "已确认 1 张票据",
+    });
+    expect(within(report).getByText("1 张按邮件收到日期补齐开票日期")).toBeInTheDocument();
+    expect(within(report).getByText("缺金额.pdf")).toBeInTheDocument();
+    expect(
+      within(report).getByText("缺少金额，必须对照原件人工填写"),
+    ).toBeInTheDocument();
   });
 
   it("automatically processes and exports a newly created monthly batch", async () => {

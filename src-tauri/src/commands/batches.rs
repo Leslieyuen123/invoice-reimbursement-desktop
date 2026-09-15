@@ -7,12 +7,12 @@ use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
 use crate::db::batches::{Batch, BatchPageCursor, BatchSummary};
 use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::AppError;
-use crate::domain::model::BatchStatus;
+use crate::domain::model::{BatchStatus, Category};
 use crate::services::batch_automation::{AccountAutomationFailure, BatchAutomationResult};
 use crate::services::batch_eligibility::{BatchBlocker, BatchIssue, batch_issues, export_blocker};
 use crate::services::batch_repair::repair_missing_normalized_pdfs;
 use crate::services::batches::{
-    BatchDetail, BatchDetailSummary, BatchService, CategorySummary, NewBatchInput,
+    BatchDetail, BatchDetailSummary, BatchService, CategorySummary, NewBatchInput, SettleBatchInput,
 };
 use crate::services::recognition::original_can_be_normalized;
 use crate::state::AppState;
@@ -424,6 +424,111 @@ pub struct BatchRepairDto {
     pub issues: Vec<BatchIssueDto>,
 }
 
+/// Options for the bulk confirm action on the batch detail page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SettleBatchInputDto {
+    #[serde(default)]
+    pub fill_invoice_date_from_received: bool,
+    #[serde(default)]
+    pub apply_suggested_category: bool,
+    #[serde(default)]
+    pub default_category: Option<Category>,
+}
+
+/// One invoice the bulk confirm could not settle, with a stable reason code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedBatchItemDto {
+    pub item_id: String,
+    pub file_name: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleBatchOutcomeDto {
+    pub confirmed_count: u32,
+    pub filled_invoice_date_count: u32,
+    pub applied_category_count: u32,
+    pub repaired_count: u32,
+    pub skipped: Vec<SkippedBatchItemDto>,
+    pub issues: Vec<BatchIssueDto>,
+}
+
+fn skipped_message(code: &str) -> &'static str {
+    match code {
+        "suspected_duplicate" => "疑似重复，需先处理重复",
+        "recognition_failed" => "识别失败，需重新识别或更换原件",
+        "not_recognized" => "尚未完成识别",
+        "missing_amount" => "缺少金额，必须对照原件人工填写",
+        "missing_invoice_date" => "缺少开票日期，且无法从邮件日期推导",
+        "missing_category" => "缺少分类，且没有可采用的建议分类",
+        "unsupported_format" => "原件格式不支持生成归一化 PDF，请改用 PDF/JPG/PNG 或移出批次",
+        "outside_date_range" => "票据日期不在批次范围内",
+        _ => "未满足批量确认条件",
+    }
+}
+
+/// Confirms every batch member whose values can be completed from its own data,
+/// then repairs the normalized PDFs that were still missing.
+pub async fn settle_batch_items(
+    state: &AppState,
+    batch_id: Uuid,
+    input: SettleBatchInputDto,
+) -> Result<SettleBatchOutcomeDto, AppError> {
+    let service = BatchService::new(state.pool().clone());
+    let outcome = service
+        .settle_items(
+            batch_id,
+            SettleBatchInput {
+                fill_invoice_date_from_received: input.fill_invoice_date_from_received,
+                apply_suggested_category: input.apply_suggested_category,
+                default_category: input.default_category,
+            },
+        )
+        .await?;
+    let detail = service.get(batch_id).await?;
+    let repaired_count =
+        repair_missing_normalized_pdfs(state.paths(), &state.recognition_service(), &detail.items)
+            .await;
+    let refreshed = if repaired_count == 0 {
+        detail
+    } else {
+        service.get(batch_id).await?
+    };
+    Ok(SettleBatchOutcomeDto {
+        confirmed_count: outcome.confirmed_count,
+        filled_invoice_date_count: outcome.filled_invoice_date_count,
+        applied_category_count: outcome.applied_category_count,
+        repaired_count,
+        skipped: outcome
+            .skipped
+            .into_iter()
+            .map(|skipped| SkippedBatchItemDto {
+                item_id: skipped.item_id.to_string(),
+                file_name: skipped.file_name,
+                message: skipped_message(&skipped.code).to_owned(),
+                code: skipped.code,
+            })
+            .collect(),
+        issues: batch_issue_dtos(batch_issues(state.paths(), &refreshed.items)),
+    })
+}
+
+/// Removes several invoices from a batch; ids outside the batch are ignored.
+pub async fn remove_batch_items(
+    state: &AppState,
+    batch_id: Uuid,
+    item_ids: Vec<Uuid>,
+) -> Result<BatchDetailDto, AppError> {
+    let (detail, _removed) = BatchService::new(state.pool().clone())
+        .remove_items(batch_id, &item_ids)
+        .await?;
+    detail_dto(state, detail)
+}
+
 pub async fn create_month(state: &AppState, year: i32, month: u32) -> Result<BatchDto, AppError> {
     let service = BatchService::new(state.pool().clone());
     let batch = service.create_month(year, month).await?;
@@ -487,7 +592,7 @@ pub(crate) mod ipc {
 
     use super::{
         BatchAutomationResultDto, BatchCandidateDto, BatchDetailDto, BatchDto, BatchRepairDto,
-        NewBatchInputDto,
+        NewBatchInputDto, SettleBatchInputDto, SettleBatchOutcomeDto,
     };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
@@ -507,6 +612,24 @@ pub(crate) mod ipc {
         batch_id: Uuid,
     ) -> Result<BatchDetailDto, AppError> {
         super::get(&state, batch_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn settle_batch_items(
+        state: State<'_, AppState>,
+        batch_id: Uuid,
+        input: SettleBatchInputDto,
+    ) -> Result<SettleBatchOutcomeDto, AppError> {
+        super::settle_batch_items(&state, batch_id, input).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn remove_batch_items(
+        state: State<'_, AppState>,
+        batch_id: Uuid,
+        item_ids: Vec<Uuid>,
+    ) -> Result<BatchDetailDto, AppError> {
+        super::remove_batch_items(&state, batch_id, item_ids).await
     }
 
     #[tauri::command(rename_all = "camelCase")]

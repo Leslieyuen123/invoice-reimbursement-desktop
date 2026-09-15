@@ -4,6 +4,7 @@ import * as apiModule from "../lib/api";
 
 import type {
   BatchAutomationResultDto,
+  SettleBatchOutcomeDto,
   BatchCandidateDto,
   BatchDetailDto,
   BatchDto,
@@ -434,6 +435,86 @@ describe("browser command bridge", () => {
     ).resolves.toMatchObject({
       batch: { status: "exported", itemCount: 1 },
     });
+  });
+
+  it("settles derivable invoices and reports the ones that still need work", async () => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture()],
+      items: [
+        invoiceFixture("derivable", {
+          batchId: "batch-1",
+          sourceType: "email",
+          fetchedAt: "2026-07-15T08:00:00Z",
+          invoiceDate: null,
+          suggestedPeriod: null,
+          finalCategory: null,
+          suggestedCategory: "dining",
+          status: "pending_confirmation",
+          confirmationStatus: "pending",
+        }),
+        invoiceFixture("no-amount", {
+          batchId: "batch-1",
+          amountCents: null,
+          status: "pending_confirmation",
+          confirmationStatus: "pending",
+        }),
+      ],
+    });
+
+    const outcome = await bridge<SettleBatchOutcomeDto>("settle_batch_items", {
+      batchId: "batch-1",
+      input: {
+        fillInvoiceDateFromReceived: true,
+        applySuggestedCategory: true,
+        defaultCategory: null,
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      confirmedCount: 1,
+      filledInvoiceDateCount: 1,
+      appliedCategoryCount: 1,
+      skipped: [
+        {
+          itemId: "no-amount",
+          code: "missing_amount",
+          message: "缺少金额，必须对照原件人工填写",
+        },
+      ],
+    });
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "derivable" }),
+    ).resolves.toMatchObject({
+      invoiceDate: "2026-07-15",
+      finalCategory: "dining",
+      confirmationStatus: "confirmed",
+      status: "ready",
+    });
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "no-amount" }),
+    ).resolves.toMatchObject({ confirmationStatus: "pending" });
+  });
+
+  it("removes several invoices from a batch and ignores foreign ids", async () => {
+    const bridge = createSeededBridge({
+      batches: [batchFixture("batch-1"), batchFixture("batch-2")],
+      items: [
+        invoiceFixture("first", { batchId: "batch-1" }),
+        invoiceFixture("second", { batchId: "batch-1" }),
+        invoiceFixture("foreign", { batchId: "batch-2" }),
+      ],
+    });
+
+    const detail = await bridge<BatchDetailDto>("remove_batch_items", {
+      batchId: "batch-1",
+      itemIds: ["first", "second", "foreign"],
+    });
+
+    expect(detail.items.map((item) => item.id)).toEqual([]);
+    expect(detail.batch.status).toBe("draft");
+    await expect(
+      bridge<InvoiceItemDto>("get_item", { itemId: "foreign" }),
+    ).resolves.toMatchObject({ batchId: "batch-2" });
   });
 
   it("rejects automation ranges longer than 366 days before mutation", async () => {
