@@ -48,6 +48,7 @@ function dashboardFixture(
     pendingConfirmationCount: 4,
     recognitionFailedCount: 1,
     suspectedDuplicateCount: 2,
+    mailNeedsAttentionCount: 0,
     recentBatches: [
       {
         id: "batch-july",
@@ -179,6 +180,7 @@ describe("DashboardPage", () => {
         pendingConfirmationCount: 0,
         recognitionFailedCount: 0,
         suspectedDuplicateCount: 0,
+        mailNeedsAttentionCount: 0,
         recentBatches: [],
       }),
     );

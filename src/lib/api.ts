@@ -13,6 +13,10 @@ import type {
   InvoiceItemDto,
   ItemFilter,
   MailboxAccountDto,
+  MailLedgerCountsDto,
+  MailLedgerFilter,
+  MailLedgerPageDto,
+  MailLedgerPageRequestDto,
   ManualImportOutcomeDto,
   NewBatchInputDto,
   PageDto,
@@ -80,6 +84,8 @@ export const API_COMMANDS = {
   getStorageStatus: "get_storage_status",
   retryExportRecovery: "retry_export_recovery",
   syncAccountNow: "sync_account_now",
+  listMailLedger: "list_mail_ledger",
+  getMailLedgerCounts: "get_mail_ledger_counts",
 } as const;
 
 export function apiCommandNames() {
@@ -150,4 +156,8 @@ export const api = {
     call<StorageStatusDto>(API_COMMANDS.retryExportRecovery),
   syncAccountNow: (accountId: string) =>
     call<void>(API_COMMANDS.syncAccountNow, { accountId }),
+  listMailLedger: (filter: MailLedgerFilter, page?: MailLedgerPageRequestDto) =>
+    call<MailLedgerPageDto>(API_COMMANDS.listMailLedger, { filter, page }),
+  getMailLedgerCounts: () =>
+    call<MailLedgerCountsDto>(API_COMMANDS.getMailLedgerCounts),
 };

@@ -417,6 +417,7 @@ describe("Settings page", () => {
       pendingConfirmationCount: 0,
       recognitionFailedCount: 0,
       suspectedDuplicateCount: 0,
+      mailNeedsAttentionCount: 0,
       recentBatches: [],
     });
     renderAppAt("/");
@@ -448,6 +449,7 @@ describe("Settings page", () => {
         pendingConfirmationCount: 0,
         recognitionFailedCount: 0,
         suspectedDuplicateCount: 0,
+        mailNeedsAttentionCount: 0,
         recentBatches: [],
       }));
 
@@ -492,6 +494,7 @@ describe("Settings page", () => {
       pendingConfirmationCount: 0,
       recognitionFailedCount: 0,
       suspectedDuplicateCount: 0,
+      mailNeedsAttentionCount: 0,
       recentBatches: [],
     });
 
@@ -520,6 +523,7 @@ describe("Settings page", () => {
       pendingConfirmationCount: 0,
       recognitionFailedCount: 0,
       suspectedDuplicateCount: 0,
+      mailNeedsAttentionCount: 0,
       recentBatches: [],
     }));
     mockCommand("list_mailbox_accounts", () =>

@@ -1,7 +1,13 @@
-import type { ItemFilter, PageRequestDto } from "../types";
+import type {
+  ItemFilter,
+  MailLedgerFilter,
+  MailLedgerPageRequestDto,
+  PageRequestDto,
+} from "../types";
 
 const itemLists = ["invoice-reimbursement", "items", "list"] as const;
 const batchLists = ["invoice-reimbursement", "batches", "list"] as const;
+const mailLedgerLists = ["invoice-reimbursement", "mail-ledger", "list"] as const;
 
 export const queryKeys = {
   all: ["invoice-reimbursement"] as const,
@@ -43,4 +49,7 @@ export const queryKeys = {
   mailboxAccounts: ["invoice-reimbursement", "mailbox-accounts"] as const,
   preferences: ["invoice-reimbursement", "preferences"] as const,
   storageStatus: ["invoice-reimbursement", "storage-status"] as const,
+  mailLedger: (filter: MailLedgerFilter, page?: MailLedgerPageRequestDto) =>
+    [...mailLedgerLists, filter, page] as const,
+  mailLedgerCounts: ["invoice-reimbursement", "mail-ledger", "counts"] as const,
 };

@@ -111,6 +111,8 @@ pub struct NewItemRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemFilter {
     pub status: Option<ItemStatus>,
+    pub source_account_id: Option<Uuid>,
+    pub source_uid: Option<i64>,
     pub created_after: Option<DateTime<Utc>>,
     pub suggested_period: Option<String>,
     pub category: Option<Category>,
@@ -1382,6 +1384,14 @@ fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
                 );
             }
         }
+    }
+    if let Some(account_id) = filter.source_account_id {
+        query
+            .push(" AND source_account_id = ")
+            .push_bind(account_id.to_string());
+    }
+    if let Some(source_uid) = filter.source_uid {
+        query.push(" AND source_uid = ").push_bind(source_uid);
     }
     if let Some(period) = filter.suggested_period {
         query.push(" AND suggested_period = ").push_bind(period);

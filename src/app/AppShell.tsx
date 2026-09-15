@@ -5,6 +5,7 @@ import {
   LayoutDashboard,
   ReceiptText,
   Settings2,
+  MailSearch,
 } from "lucide-react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 
@@ -18,12 +19,14 @@ const DASHBOARD_REFRESH_INTERVAL_MS = 15_000;
 const navigation = [
   { to: "/", label: "控制台", icon: LayoutDashboard, end: true },
   { to: "/inbox", label: "待处理池", icon: Inbox, end: false },
+  { to: "/mail", label: "邮件台账", icon: MailSearch, end: false },
   { to: "/batches", label: "报销批次", icon: FolderKanban, end: false },
   { to: "/settings", label: "设置", icon: Settings2, end: false },
 ] as const;
 
 function pageTitle(pathname: string) {
   if (pathname.startsWith("/inbox")) return "待处理池";
+  if (pathname.startsWith("/mail")) return "邮件台账";
   if (pathname.startsWith("/batches/new")) return "新建批次";
   if (pathname.startsWith("/batches/")) return "批次详情";
   if (pathname.startsWith("/batches")) return "报销批次";

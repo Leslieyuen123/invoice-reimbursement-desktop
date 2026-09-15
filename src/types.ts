@@ -121,11 +121,15 @@ export interface DashboardDto {
   pendingConfirmationCount: number;
   recognitionFailedCount: number;
   suspectedDuplicateCount: number;
+  /** Mails whose invoices still need attention (partial or failed extraction). */
+  mailNeedsAttentionCount: number;
   recentBatches: BatchDto[];
 }
 
 export interface ItemFilter {
   status?: ItemStatus;
+  sourceAccountId?: string;
+  sourceUid?: number;
   recent?: boolean;
   suggestedPeriod?: string;
   category?: Category;
@@ -194,6 +198,59 @@ export interface BatchDetailDto {
   summary: BatchDetailSummaryDto;
   warnings: string[];
   issues: BatchIssueDto[];
+}
+
+/** How one scanned mail ended up in the invoice library. */
+export type MailOutcome = "imported" | "partial" | "failed" | "ignored";
+
+export interface MailLedgerEntryDto {
+  accountId: string;
+  mailbox: string;
+  uid: number;
+  subject: string | null;
+  sender: string | null;
+  receivedAt: string;
+  processedAt: string;
+  candidateCount: number;
+  importedCount: number;
+  existingCount: number;
+  failedCount: number;
+  outcome: MailOutcome;
+  reason: string | null;
+  markedSeen: boolean;
+  /** Invoices are in the library but the mailbox still shows the mail unread. */
+  seenMismatch: boolean;
+}
+
+export interface MailLedgerCountsDto {
+  imported: number;
+  partial: number;
+  failed: number;
+  ignored: number;
+  needsAttention: number;
+}
+
+export interface MailLedgerCursorDto {
+  receivedAt: string;
+  uid: number;
+  accountId: string;
+}
+
+export interface MailLedgerPageDto {
+  items: MailLedgerEntryDto[];
+  nextCursor: MailLedgerCursorDto | null;
+}
+
+export interface MailLedgerFilter {
+  outcome?: MailOutcome;
+  needsAttention?: boolean;
+  accountId?: string;
+  query?: string;
+}
+
+export interface MailLedgerPageRequestDto {
+  cursor?: MailLedgerCursorDto;
+  pageSize?: number;
 }
 
 export interface BatchRepairDto {

@@ -13,6 +13,10 @@ import type {
   InvoiceItemDto,
   ItemFilter,
   ItemStatus,
+  MailLedgerCountsDto,
+  MailLedgerEntryDto,
+  MailLedgerFilter,
+  MailLedgerPageDto,
   MailboxAccountDto,
   SettleBatchInputDto,
   SettleBatchOutcomeDto,
@@ -37,6 +41,7 @@ export type BrowserCommandBridge = <T>(
 
 interface BridgeState {
   items: InvoiceItemDto[];
+  mailLedger: MailLedgerEntryDto[];
   batches: BatchDto[];
   accounts: MailboxAccountDto[];
   preferences: PreferencesDto;
@@ -59,6 +64,7 @@ interface BrowserBridgeOptions {
 
 export interface BrowserBridgeSeed {
   items?: InvoiceItemDto[];
+  mailLedger?: MailLedgerEntryDto[];
   batches?: BatchDto[];
   accounts?: MailboxAccountDto[];
   preferences?: PreferencesDto;
@@ -152,6 +158,7 @@ function paginate<T>(
 function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
   const defaults: BridgeState = {
     items: [],
+    mailLedger: [],
     batches: [],
     accounts: [],
     preferences: {
@@ -173,6 +180,8 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
     ...defaults,
     ...seed,
     items: seed.items?.map((item) => ({ ...item })) ?? defaults.items,
+    mailLedger:
+      seed.mailLedger?.map((entry) => ({ ...entry })) ?? defaults.mailLedger,
     batches: seed.batches?.map((batch) => ({ ...batch })) ?? defaults.batches,
     accounts: seed.accounts?.map((account) => ({ ...account })) ?? defaults.accounts,
     preferences: { ...(seed.preferences ?? defaults.preferences) },
@@ -601,6 +610,9 @@ function dashboard(state: BridgeState): DashboardDto {
     suspectedDuplicateCount: state.items.filter(
       (item) => item.status === "suspected_duplicate",
     ).length,
+    mailNeedsAttentionCount: state.mailLedger.filter(
+      (entry) => entry.outcome === "partial" || entry.outcome === "failed",
+    ).length,
     recentBatches: state.batches.slice(0, 5).map((batch) => ({ ...batch })),
   };
 }
@@ -880,6 +892,50 @@ function makeHandlers(
         repairedCount,
         issues: batchDetail(state, batchId).issues,
       } satisfies BatchRepairDto;
+    }],
+    [API_COMMANDS.listMailLedger, (arguments_) => {
+      const filter = (arguments_.filter ?? {}) as MailLedgerFilter;
+      const query = filter.query?.trim().toLocaleLowerCase("zh-CN");
+      const matching = state.mailLedger
+        .filter((entry) => {
+          if (filter.needsAttention && !["partial", "failed"].includes(entry.outcome)) {
+            return false;
+          }
+          if (filter.outcome && entry.outcome !== filter.outcome) return false;
+          if (filter.accountId && entry.accountId !== filter.accountId) return false;
+          if (!query) return true;
+          return [entry.subject, entry.sender]
+            .filter((value): value is string => Boolean(value))
+            .some((value) => value.toLocaleLowerCase("zh-CN").includes(query));
+        })
+        .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt));
+      const cursor = (arguments_.page as { cursor?: { receivedAt: string } } | undefined)
+        ?.cursor;
+      const remaining = cursor
+        ? matching.filter((entry) => entry.receivedAt < cursor.receivedAt)
+        : matching;
+      const pageSize =
+        (arguments_.page as { pageSize?: number } | undefined)?.pageSize ?? 50;
+      const items = remaining.slice(0, pageSize);
+      const last = items.at(-1);
+      return {
+        items: items.map((entry) => ({ ...entry })),
+        nextCursor:
+          remaining.length > items.length && last
+            ? { receivedAt: last.receivedAt, uid: last.uid, accountId: last.accountId }
+            : null,
+      } satisfies MailLedgerPageDto;
+    }],
+    [API_COMMANDS.getMailLedgerCounts, () => {
+      const count = (outcome: string) =>
+        state.mailLedger.filter((entry) => entry.outcome === outcome).length;
+      return {
+        imported: count("imported"),
+        partial: count("partial"),
+        failed: count("failed"),
+        ignored: count("ignored"),
+        needsAttention: count("partial") + count("failed"),
+      } satisfies MailLedgerCountsDto;
     }],
     [API_COMMANDS.listMailboxAccounts, () =>
       state.accounts.map((account) => ({ ...account }))],

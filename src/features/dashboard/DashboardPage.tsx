@@ -36,6 +36,11 @@ const queueDefinitions = [
     count: (dashboard: DashboardDto) => dashboard.suspectedDuplicateCount,
     to: "/inbox?status=suspected_duplicate",
   },
+  {
+    label: "邮件待关注",
+    count: (dashboard: DashboardDto) => dashboard.mailNeedsAttentionCount,
+    to: "/mail",
+  },
 ] as const;
 
 const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
