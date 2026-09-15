@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,12 +26,11 @@ const MAX_RANGE_SYNC_PAGES: usize = 64;
 const MAX_TOUCHED_ITEM_IDS: usize = MAX_MESSAGES_PER_SYNC * MAX_RANGE_SYNC_PAGES;
 const MAX_RAW_MESSAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_TOTAL_RAW_BYTES: usize = 200 * 1024 * 1024;
+/// Encoded size limit for attachments whose extension is not recognized.
+const MAX_UNKNOWN_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARTS_PER_MESSAGE: usize = 256;
 const MAX_DOWNLOAD_LINKS_PER_MESSAGE: usize = 32;
 const MAX_DOWNLOAD_URL_LENGTH: usize = 2_048;
-const MAX_ZIP_ENTRIES: usize = 64;
-const MAX_ZIP_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
-const MAX_ZIP_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TouchedItemBudget {
@@ -64,20 +62,9 @@ impl Default for TouchedItemBudget {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ZipExpansionBudget {
-    remaining_entries: usize,
-    remaining_bytes: u64,
-}
-
-impl Default for ZipExpansionBudget {
-    fn default() -> Self {
-        Self {
-            remaining_entries: MAX_ZIP_ENTRIES,
-            remaining_bytes: MAX_ZIP_TOTAL_BYTES,
-        }
-    }
-}
+/// Archive limits are owned by the archive module so attachment archives and
+/// downloaded archives share one budget per mail.
+type ZipExpansionBudget = crate::infra::archive::ArchiveBudget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncResult {
@@ -570,14 +557,25 @@ impl SyncService {
                 files,
                 links,
                 mut zip_budget,
+                archive_notes,
+                archive_passwords,
                 subject,
                 sender,
             } = parsed;
+            let _ = &mut zip_budget;
             let mut accumulator = MailAccumulator {
                 candidates: u32::try_from(files.len().saturating_add(links.len()))
                     .unwrap_or(u32::MAX),
                 ..MailAccumulator::default()
             };
+            // An archive that could not be opened is a mail the user has to
+            // look at, even though the attachment itself was stored.
+            for note in archive_notes {
+                accumulator.failed = accumulator.failed.saturating_add(1);
+                if accumulator.reason.is_none() {
+                    accumulator.reason = Some(note.to_owned());
+                }
+            }
             for part in files {
                 budget
                     .reserve()
@@ -615,6 +613,7 @@ impl SyncService {
                     link,
                     budget,
                     &mut zip_budget,
+                    &archive_passwords,
                     &mut completed,
                 ))
                 .await
@@ -732,6 +731,7 @@ impl SyncService {
         link: DownloadLink,
         budget: &mut TouchedItemBudget,
         zip_budget: &mut ZipExpansionBudget,
+        passwords: &[String],
         completed: &mut SyncProgress,
     ) -> Result<LinkOutcome, AppError> {
         budget.reserve()?;
@@ -776,11 +776,12 @@ impl SyncService {
                     bytes: downloaded.bytes,
                     message_id: source.message_id.clone(),
                 };
-                let expanded = if file_name_has_extension(&downloaded_part.file_name, "zip") {
-                    expand_zip_part(&downloaded_part, zip_budget).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let expanded =
+                    if crate::infra::file_signature::detect(&downloaded_part.bytes).is_archive() {
+                        expand_zip_part(&downloaded_part, zip_budget, passwords).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                 let outcome = self
                     .import
                     .import_downloaded_email_link(
@@ -959,10 +960,60 @@ struct DownloadLink {
     message_id: Option<String>,
 }
 
+/// Passwords a mail offers for its encrypted archives.
+///
+/// Only values written in the mail itself are tried: guessing passwords for a
+/// user's attachments would be both unreliable and inappropriate.
+fn archive_passwords(message: &mail_parser::Message<'_>) -> Vec<String> {
+    const LABELS: [&str; 6] = [
+        "解压密码",
+        "解压码",
+        "压缩密码",
+        "密码",
+        "password",
+        "Password",
+    ];
+    const MAX_PASSWORDS: usize = 3;
+    const MAX_LENGTH: usize = 64;
+
+    let mut passwords = Vec::new();
+    for part in message.text_bodies() {
+        let Some(text) = part.text_contents() else {
+            continue;
+        };
+        for label in LABELS {
+            for (index, _) in text.match_indices(label) {
+                let after = text[index + label.len()..]
+                    .trim_start_matches([' ', '\t', '：', ':', '是', '为', '"', '\'', '“']);
+                let candidate: String = after
+                    .chars()
+                    .take_while(|character| {
+                        !character.is_whitespace()
+                            && !matches!(character, ',' | '，' | '。' | ';' | '；' | ')' | '）')
+                    })
+                    .take(MAX_LENGTH)
+                    .collect();
+                let candidate = candidate.trim().to_owned();
+                if (4..=MAX_LENGTH).contains(&candidate.len()) && !passwords.contains(&candidate) {
+                    passwords.push(candidate);
+                }
+                if passwords.len() >= MAX_PASSWORDS {
+                    return passwords;
+                }
+            }
+        }
+    }
+    passwords
+}
+
 struct ParsedInvoiceParts {
     files: Vec<InvoicePart>,
     links: Vec<DownloadLink>,
     zip_budget: ZipExpansionBudget,
+    /// Reasons an archive could not be turned into invoices.
+    archive_notes: Vec<&'static str>,
+    /// Passwords the mail body offers for its encrypted archives.
+    archive_passwords: Vec<String>,
     subject: Option<String>,
     sender: Option<String>,
 }
@@ -1046,6 +1097,10 @@ fn parse_invoice_parts_with_zip_budget(
     let mut files = Vec::new();
     let mut links = Vec::new();
     let mut seen_links = HashSet::new();
+    let mut archive_notes = Vec::new();
+    // Portals that encrypt the archive mail the password in the body, so the
+    // body is the only place a working password can come from.
+    let passwords = archive_passwords(&message);
     for (index, part) in message.parts.iter().enumerate() {
         let disposition = part.content_disposition();
         let is_attachment = disposition.is_some_and(|value| value.is_attachment());
@@ -1060,23 +1115,41 @@ fn parse_invoice_parts_with_zip_budget(
             else {
                 continue;
             };
-            if !is_supported_file_name(&file_name) {
+            // A recognized extension is the fast path. An unrecognized one is
+            // still inspected when the part is small, because portals do send
+            // invoices with a wrong or missing extension.
+            let named_supported = is_supported_file_name(&file_name);
+            if !named_supported && part.contents().len() > MAX_UNKNOWN_ATTACHMENT_BYTES {
                 continue;
             }
             let bytes = binary_safe_attachment_bytes(raw, part, &file_name)?;
+            let detected = crate::infra::file_signature::detect(&bytes);
+            if !named_supported && !detected.is_invoice_document() && !detected.is_archive() {
+                continue;
+            }
             let file = InvoicePart {
                 part_id: index.to_string(),
                 file_name,
                 bytes,
                 message_id: message_id.clone(),
             };
-            if file_name_has_extension(&file.file_name, "zip") {
-                match expand_zip_part(&file, &mut zip_budget) {
-                    Ok(expanded) if !expanded.is_empty() => files.extend(expanded),
-                    _ => files.push(file),
-                }
-            } else {
+            // Decide by content: a `.zip` attachment that is really a video, or
+            // a DOCX that reports `application/zip`, must not be expanded.
+            let kind = crate::infra::file_signature::detect(&file.bytes);
+            if !kind.is_archive() {
                 files.push(file);
+                continue;
+            }
+            match expand_zip_part(&file, &mut zip_budget, &passwords) {
+                Ok(expanded) if !expanded.is_empty() => files.extend(expanded),
+                Ok(_) => {
+                    archive_notes.push("archive_without_invoice");
+                    files.push(file);
+                }
+                Err(note) => {
+                    archive_notes.push(note);
+                    files.push(file);
+                }
             }
         }
     }
@@ -1099,6 +1172,8 @@ fn parse_invoice_parts_with_zip_budget(
         files,
         links,
         zip_budget,
+        archive_notes,
+        archive_passwords: passwords,
         subject: message.subject().map(summarize_header),
         sender: message
             .from()
@@ -1151,129 +1226,38 @@ fn binary_safe_attachment_bytes(
     }
 }
 
-fn preflight_zip_entries(bytes: &[u8]) -> Result<usize, ()> {
-    const EOCD_BYTES: usize = 22;
-    const MAX_COMMENT_BYTES: usize = u16::MAX as usize;
-
-    let search_start = bytes
-        .len()
-        .saturating_sub(EOCD_BYTES.saturating_add(MAX_COMMENT_BYTES));
-    let mut eocd_offset = None;
-    for (offset, signature) in bytes.windows(4).enumerate() {
-        if signature == b"PK\x06\x06" || signature == b"PK\x06\x07" {
-            return Err(());
-        }
-        if signature == b"PK\x05\x06" && eocd_offset.replace(offset).is_some() {
-            return Err(());
-        }
-    }
-    let eocd_offset = eocd_offset
-        .filter(|offset| *offset >= search_start)
-        .ok_or(())?;
-    let record = bytes
-        .get(eocd_offset..eocd_offset.checked_add(EOCD_BYTES).ok_or(())?)
-        .ok_or(())?;
-    let comment_bytes = u16::from_le_bytes([record[20], record[21]]) as usize;
-    if eocd_offset
-        .checked_add(EOCD_BYTES)
-        .and_then(|end| end.checked_add(comment_bytes))
-        != Some(bytes.len())
-    {
-        return Err(());
-    }
-    let disk = u16::from_le_bytes([record[4], record[5]]);
-    let central_directory_disk = u16::from_le_bytes([record[6], record[7]]);
-    let entries_on_disk = u16::from_le_bytes([record[8], record[9]]);
-    let total_entries = u16::from_le_bytes([record[10], record[11]]);
-    let central_directory_bytes =
-        u32::from_le_bytes([record[12], record[13], record[14], record[15]]);
-    let central_directory_offset =
-        u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
-    if disk != 0
-        || central_directory_disk != 0
-        || entries_on_disk != total_entries
-        || entries_on_disk == u16::MAX
-        || total_entries == u16::MAX
-        || central_directory_bytes == u32::MAX
-        || central_directory_offset == u32::MAX
-    {
-        return Err(());
-    }
-    let central_directory_end = usize::try_from(central_directory_offset)
-        .map_err(|_| ())?
-        .checked_add(usize::try_from(central_directory_bytes).map_err(|_| ())?)
-        .ok_or(())?;
-    if central_directory_end > eocd_offset {
-        return Err(());
-    }
-    Ok(usize::from(total_entries))
-}
-
+/// Expands an attachment archive into invoice parts.
+///
+/// Returns a stable reason code when the archive could not be turned into
+/// invoices, so the mail ledger can tell the user what to do about it.
 fn expand_zip_part(
     part: &InvoicePart,
     budget: &mut ZipExpansionBudget,
-) -> Result<Vec<InvoicePart>, ()> {
-    let declared_entries = preflight_zip_entries(&part.bytes)?;
-    if declared_entries > MAX_ZIP_ENTRIES {
-        return Err(());
+    passwords: &[String],
+) -> Result<Vec<InvoicePart>, &'static str> {
+    use crate::infra::archive::{ArchiveOutcome, extract_invoices};
+    use crate::infra::file_signature::FileKind;
+
+    match extract_invoices(&part.bytes, budget, passwords) {
+        ArchiveOutcome::Extracted(entries) => Ok(entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| InvoicePart {
+                part_id: format!("{}.zip.{index}", part.part_id),
+                file_name: entry.name,
+                bytes: entry.bytes,
+                message_id: part.message_id.clone(),
+            })
+            .collect()),
+        ArchiveOutcome::Encrypted { .. } => Err("archive_encrypted"),
+        ArchiveOutcome::Unsupported { kind } => Err(match kind {
+            FileKind::Rar => "archive_rar_unsupported",
+            FileKind::SevenZip => "archive_7z_unsupported",
+            _ => "archive_unsupported",
+        }),
+        ArchiveOutcome::NoInvoiceEntries { .. } => Err("archive_without_invoice"),
+        ArchiveOutcome::Refused => Err("archive_relimit"),
     }
-    let Some(remaining_entries) = budget.remaining_entries.checked_sub(declared_entries) else {
-        budget.remaining_entries = 0;
-        return Err(());
-    };
-    budget.remaining_entries = remaining_entries;
-    if declared_entries == 0 {
-        return Ok(Vec::new());
-    }
-    let mut archive = zip::ZipArchive::new(Cursor::new(&part.bytes)).map_err(|_| ())?;
-    if archive.len() != declared_entries {
-        return Err(());
-    }
-    let mut expanded = Vec::new();
-    let mut total_bytes = 0_u64;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|_| ())?;
-        if entry.is_dir() || entry.size() > MAX_ZIP_ENTRY_BYTES {
-            continue;
-        }
-        let Some(enclosed) = entry.enclosed_name() else {
-            continue;
-        };
-        let Some(file_name) = enclosed.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !is_recognizable_file_name(file_name) {
-            continue;
-        }
-        let entry_size = entry.size();
-        total_bytes = total_bytes.checked_add(entry_size).ok_or(())?;
-        if total_bytes > MAX_ZIP_TOTAL_BYTES {
-            return Err(());
-        }
-        let Some(remaining_bytes) = budget.remaining_bytes.checked_sub(entry_size) else {
-            budget.remaining_bytes = 0;
-            return Err(());
-        };
-        budget.remaining_bytes = remaining_bytes;
-        let capacity = usize::try_from(entry_size).map_err(|_| ())?;
-        let mut bytes = Vec::with_capacity(capacity);
-        entry
-            .by_ref()
-            .take(entry_size)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ())?;
-        let mut extra = [0_u8; 1];
-        if bytes.len() as u64 != entry_size || entry.read(&mut extra).map_err(|_| ())? != 0 {
-            return Err(());
-        }
-        expanded.push(InvoicePart {
-            part_id: format!("{}.zip.{index}", part.part_id),
-            file_name: file_name.to_owned(),
-            bytes,
-            message_id: part.message_id.clone(),
-        });
-    }
-    Ok(expanded)
 }
 
 fn collect_https_links(
@@ -1352,25 +1336,6 @@ fn is_supported_file_name(file_name: &str) -> bool {
                 "pdf" | "jpg" | "jpeg" | "png" | "doc" | "docx" | "xls" | "xlsx" | "zip"
             )
         })
-}
-
-fn is_recognizable_file_name(file_name: &str) -> bool {
-    Path::new(file_name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "pdf" | "jpg" | "jpeg" | "png"
-            )
-        })
-}
-
-fn file_name_has_extension(file_name: &str, expected: &str) -> bool {
-    Path::new(file_name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
 fn sanitize_error(message: &str, secret: &str) -> String {

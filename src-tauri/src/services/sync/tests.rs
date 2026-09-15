@@ -11,8 +11,7 @@ use zip::write::SimpleFileOptions;
 
 use super::{
     InvoicePart, MAX_MESSAGES_PER_SYNC, SyncProgress, TouchedItemBudget, ZipExpansionBudget,
-    expand_zip_part, parse_invoice_parts, parse_invoice_parts_with_zip_budget,
-    preflight_zip_entries, validate_delta,
+    expand_zip_part, parse_invoice_parts, parse_invoice_parts_with_zip_budget, validate_delta,
 };
 use crate::db;
 use crate::db::accounts::{
@@ -152,6 +151,8 @@ fn rejection_delta(uid: u32) -> MailboxDelta {
 }
 
 fn zip_with_pdf_entries(prefix: &str, count: usize, contents: &[u8]) -> Vec<u8> {
+    // Entries carry a real PDF signature: the ingestion path decides by content,
+    // so a fixture full of plain text is no longer an invoice.
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for index in 0..count {
         archive
@@ -160,9 +161,99 @@ fn zip_with_pdf_entries(prefix: &str, count: usize, contents: &[u8]) -> Vec<u8> 
                 SimpleFileOptions::default(),
             )
             .unwrap();
+        archive.write_all(b"%PDF-1.7\n").unwrap();
         archive.write_all(contents).unwrap();
     }
     archive.finish().unwrap().into_inner()
+}
+
+fn raw_message_with_body_and_zip(body: Option<&str>, archive: &[u8]) -> RawMessage {
+    let boundary = "encrypted-zip-boundary";
+    let mut message = format!(
+        "From: billing@example.com\r\n\
+             To: finance@example.com\r\n\
+             Message-ID: <encrypted-zip@example.com>\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\
+             \r\n"
+    )
+    .into_bytes();
+    if let Some(body) = body {
+        message.extend_from_slice(
+            format!(
+                "--{boundary}\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\
+                     \r\n{body}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    message.extend_from_slice(
+        format!(
+            "--{boundary}\r\n\
+                 Content-Type: application/zip; name=\"invoice.zip\"\r\n\
+                 Content-Disposition: attachment; filename=\"invoice.zip\"\r\n\
+                 Content-Transfer-Encoding: binary\r\n\
+                 \r\n"
+        )
+        .as_bytes(),
+    );
+    message.extend_from_slice(archive);
+    message.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    RawMessage {
+        uid: 11,
+        mailbox: "INBOX".to_owned(),
+        raw: message,
+        received_at: Utc::now(),
+        source_received_date: Utc::now().date_naive(),
+    }
+}
+
+fn encrypted_zip_entry(password: &str) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
+        let options =
+            SimpleFileOptions::default().with_aes_encryption(zip::AesMode::Aes256, password);
+        writer
+            .start_file("ASHH451E2123B033789B_LS092701.pdf", options)
+            .unwrap();
+        writer
+            .write_all(b"%PDF-1.7\nencrypted invoice\n%%EOF\n")
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    buffer
+}
+
+#[test]
+fn a_mailed_archive_password_unlocks_the_invoice_inside() {
+    let archive = encrypted_zip_entry("9527");
+    let raw = raw_message_with_body_and_zip(Some("解压密码：9527"), &archive);
+
+    let parsed = parse_invoice_parts(&raw).unwrap();
+
+    assert!(
+        parsed.archive_notes.is_empty(),
+        "an unlocked archive is not an exception: {:?}",
+        parsed.archive_notes
+    );
+    assert_eq!(parsed.files.len(), 1);
+    assert!(parsed.files[0].file_name.ends_with(".pdf"));
+    assert!(parsed.files[0].bytes.starts_with(b"%PDF-"));
+}
+
+#[test]
+fn an_encrypted_archive_without_a_mailed_password_is_reported() {
+    let archive = encrypted_zip_entry("9527");
+    let raw = raw_message_with_body_and_zip(Some("发票见附件"), &archive);
+
+    let parsed = parse_invoice_parts(&raw).unwrap();
+
+    assert_eq!(parsed.archive_notes, vec!["archive_encrypted"]);
+    // The attachment is still stored, so nothing the user received is lost.
+    assert_eq!(parsed.files.len(), 1);
+    assert_eq!(parsed.files[0].file_name, "invoice.zip");
 }
 
 fn raw_message_with_zip_attachments(attachments: &[(&str, &[u8])]) -> RawMessage {
@@ -432,7 +523,7 @@ fn zip_attachments_expand_supported_invoice_files() {
     };
 
     let mut budget = ZipExpansionBudget::default();
-    let expanded = expand_zip_part(&part, &mut budget).unwrap();
+    let expanded = expand_zip_part(&part, &mut budget, &[]).unwrap();
 
     assert_eq!(expanded.len(), 1);
     assert_eq!(expanded[0].part_id, "4.zip.0");
@@ -538,7 +629,8 @@ fn zip_byte_budget_is_shared_across_message_attachments() {
         &raw,
         ZipExpansionBudget {
             remaining_entries: 2,
-            remaining_bytes: 3,
+            // One real PDF entry fits; the second archive cannot.
+            remaining_bytes: 12,
         },
     )
     .unwrap();
@@ -569,8 +661,8 @@ fn zip64_entry_metadata_is_rejected_while_originals_are_preserved() {
     locator[..4].copy_from_slice(b"PK\x06\x07");
     locator_zip.splice(eocd..eocd, locator);
 
-    assert!(preflight_zip_entries(&sentinel_zip).is_err());
-    assert!(preflight_zip_entries(&locator_zip).is_err());
+    assert!(crate::infra::archive::preflight_zip_entries(&sentinel_zip).is_err());
+    assert!(crate::infra::archive::preflight_zip_entries(&locator_zip).is_err());
     let raw = raw_message_with_zip_attachments(&[
         ("sentinel.zip", &sentinel_zip),
         ("locator.zip", &locator_zip),
@@ -608,13 +700,14 @@ fn zip_entry_budget_is_reserved_before_archive_parser_runs() {
         message_id: None,
     };
     let mut budget = ZipExpansionBudget {
+        // The entry budget is the only constraint this test exercises.
         remaining_entries: 2,
-        remaining_bytes: 10,
+        remaining_bytes: 1000,
     };
 
-    assert!(expand_zip_part(&first, &mut budget).is_ok());
+    assert!(expand_zip_part(&first, &mut budget, &[]).is_ok());
     assert_eq!(budget.remaining_entries, 1);
-    assert!(expand_zip_part(&second, &mut budget).is_err());
+    assert!(expand_zip_part(&second, &mut budget, &[]).is_err());
     assert_eq!(budget.remaining_entries, 0);
 }
 
@@ -623,7 +716,7 @@ fn ambiguous_classic_eocd_is_rejected_before_budget_reservation() {
     let mut ambiguous_zip = zip_with_pdf_entries("invoice", 1, b"pdf");
     append_fake_eocd(&mut ambiguous_zip, 1);
 
-    assert!(preflight_zip_entries(&ambiguous_zip).is_err());
+    assert!(crate::infra::archive::preflight_zip_entries(&ambiguous_zip).is_err());
     let part = InvoicePart {
         part_id: "1".to_owned(),
         file_name: "ambiguous.zip".to_owned(),
@@ -631,7 +724,7 @@ fn ambiguous_classic_eocd_is_rejected_before_budget_reservation() {
         message_id: None,
     };
     let mut budget = ZipExpansionBudget::default();
-    assert!(expand_zip_part(&part, &mut budget).is_err());
+    assert!(expand_zip_part(&part, &mut budget, &[]).is_err());
     assert_eq!(budget.remaining_entries, 64);
     let raw = raw_message_with_zip_attachments(&[("ambiguous.zip", &ambiguous_zip)]);
 
@@ -653,8 +746,8 @@ fn zip64_signatures_are_rejected_at_any_archive_offset() {
             .any(|window| window == b"PK\x06\x07")
     );
 
-    assert!(preflight_zip_entries(&zip64_eocd).is_err());
-    assert!(preflight_zip_entries(&zip64_locator).is_err());
+    assert!(crate::infra::archive::preflight_zip_entries(&zip64_eocd).is_err());
+    assert!(crate::infra::archive::preflight_zip_entries(&zip64_locator).is_err());
 }
 
 #[test]

@@ -1,6 +1,8 @@
+pub(crate) mod archive;
 pub mod credentials;
 pub(crate) mod exporters;
 pub mod extraction;
+pub mod file_signature;
 pub mod files;
 pub mod imap;
 pub mod invoice_download;

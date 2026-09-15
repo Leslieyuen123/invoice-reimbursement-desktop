@@ -165,6 +165,7 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
       backgroundSyncEnabled: true,
       exportDirectory: "/tmp/invoice-reimbursement/e2e",
       batchDirectoryPattern: "{batchName}-{timestamp}",
+      markProcessedMailSeen: true,
     },
     storage: {
       localDataDirectory: "/tmp/invoice-reimbursement/e2e/data",

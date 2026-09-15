@@ -142,6 +142,8 @@ export interface PreferencesDto {
   backgroundSyncEnabled: boolean;
   exportDirectory: string;
   batchDirectoryPattern: string;
+  /** Mark a mail as read once every invoice from it is in the library. */
+  markProcessedMailSeen: boolean;
 }
 
 export interface StorageStatusDto {

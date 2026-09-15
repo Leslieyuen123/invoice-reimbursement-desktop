@@ -25,12 +25,14 @@ export function SettingsPage() {
     queryFn: api.getStorageStatus,
   });
   const [backgroundSyncEnabled, setBackgroundSyncEnabled] = useState(true);
+  const [markProcessedMailSeen, setMarkProcessedMailSeen] = useState(true);
   const [exportDirectory, setExportDirectory] = useState("exports");
   const [isAddingAccount, setIsAddingAccount] = useState(false);
 
   useEffect(() => {
     if (preferencesQuery.data) {
       setBackgroundSyncEnabled(preferencesQuery.data.backgroundSyncEnabled);
+      setMarkProcessedMailSeen(preferencesQuery.data.markProcessedMailSeen);
       setExportDirectory(preferencesQuery.data.exportDirectory);
     }
   }, [preferencesQuery.data]);
@@ -47,6 +49,7 @@ export function SettingsPage() {
         backgroundSyncEnabled,
         exportDirectory,
         batchDirectoryPattern: "{batchName}-{timestamp}",
+        markProcessedMailSeen,
       }),
     onSuccess: async () => {
       await Promise.all([
@@ -206,6 +209,16 @@ export function SettingsPage() {
               onChange={(event) => setBackgroundSyncEnabled(event.target.checked)}
             />
             <span>后台自动同步</span>
+          </label>
+
+          <label className="settings-switch settings-runtime-switch">
+            <input
+              type="checkbox"
+              role="switch"
+              checked={markProcessedMailSeen}
+              onChange={(event) => setMarkProcessedMailSeen(event.target.checked)}
+            />
+            <span>发票全部提取完成后标记邮件为已读</span>
           </label>
 
           <div className="settings-storage-row">
