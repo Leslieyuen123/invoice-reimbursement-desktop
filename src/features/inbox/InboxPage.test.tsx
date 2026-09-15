@@ -1464,13 +1464,15 @@ describe("InboxPage", () => {
     await screen.findByText("当前筛选下没有票据");
     await user.click(screen.getByRole("button", { name: "选择文件" }));
 
+    // `history.pushState` is visible before React commits the tab state, so the
+    // URL and the rendered tab have to be awaited together.
     await waitFor(() => {
       expect(window.location.search).toBe("?status=suspected_duplicate");
+      expect(screen.getByRole("tab", { name: "疑似重复" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     });
-    expect(screen.getByRole("tab", { name: "疑似重复" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
     expect(await screen.findByText("重复票据.pdf")).toBeInTheDocument();
   });
 });
