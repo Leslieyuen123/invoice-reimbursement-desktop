@@ -37,6 +37,7 @@ function emptyBatchDetail(batch: BatchDto): BatchDetailDto {
       unconfirmedCount: 0,
     },
     warnings: [],
+    issues: [],
   };
 }
 

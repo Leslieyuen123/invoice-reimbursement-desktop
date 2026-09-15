@@ -867,6 +867,25 @@ async fn missing_original_and_normalized_pdf_are_rejected_before_staging() {
 }
 
 #[tokio::test]
+async fn export_names_the_invoice_that_blocks_the_batch() {
+    let app = TestApp::with_exportable_batch().await;
+    sqlx::query("UPDATE items SET normalized_pdf_path = NULL WHERE id = ?")
+        .bind(app.item_ids[0].to_string())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let error = app.exports.export(app.batch_id).await.unwrap_err();
+
+    // A bare "票据缺少归一化 PDF" left the user with a batch of dozens of
+    // invoices and no way to find the broken one.
+    let message = error.to_string();
+    assert!(message.contains("归一化 PDF"), "{message}");
+    assert!(message.contains("invoice-1.pdf"), "{message}");
+    assert_storage_empty(&app.paths);
+}
+
+#[tokio::test]
 async fn original_changed_after_import_is_rejected_without_residue() {
     let app = TestApp::with_exportable_batch().await;
     let original_path =

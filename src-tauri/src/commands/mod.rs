@@ -88,6 +88,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
         items::ipc::retry_recognition,
         batches::ipc::list_batches,
         batches::ipc::get_batch,
+        batches::ipc::repair_batch_normalized_pdfs,
         batches::ipc::list_batch_candidates,
         batches::ipc::create_month_batch,
         batches::ipc::create_custom_batch,

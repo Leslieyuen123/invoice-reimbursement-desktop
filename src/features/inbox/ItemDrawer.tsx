@@ -265,6 +265,12 @@ export function ItemDrawer({
         />
 
         <div className="item-editor">
+          {!item.hasNormalizedPdf ? (
+            <p className="item-normalization-warning" role="status">
+              这张票据还没有归一化 PDF，导出时会被拒绝。PDF、JPG、PNG
+              原件可点击“重新识别”补齐；其他格式请重新导入可报销的原件。
+            </p>
+          ) : null}
           <section className="item-readonly" aria-labelledby="automatic-title">
             <h3 id="automatic-title">自动识别值</h3>
             <dl>

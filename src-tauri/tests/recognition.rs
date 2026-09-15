@@ -99,6 +99,133 @@ async fn recognition_persists_normalized_pdf_for_export() {
 }
 
 #[tokio::test]
+async fn backfill_normalizes_a_confirmed_invoice_without_touching_reviewed_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let mut record = sample_item(Uuid::new_v4());
+    // The state a manually confirmed invoice ended up in: reviewed and Ready,
+    // but with no normalized PDF, which used to block the whole batch export.
+    record.recognition_status = RecognitionStatus::Failed;
+    repository.insert(&record).await.unwrap();
+    repository
+        .update_fields(
+            record.id,
+            ItemPatch {
+                invoice_date: Some(Some(NaiveDate::from_ymd_opt(2026, 6, 18).unwrap())),
+                suggested_period: Some(Some("2026-06".to_owned())),
+                final_category: Some(Some(Category::Hospitality)),
+                amount_cents: Some(Some(9_999)),
+                city: Some(Some("上海".to_owned())),
+                company: Some(Some("人工确认公司".to_owned())),
+                recognition_status: Some(RecognitionStatus::Succeeded),
+                confirmation_status: Some(ConfirmationStatus::Confirmed),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let normalized_bytes = b"%PDF-1.4 backfilled invoice".to_vec();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026年06月18日 餐饮 食品 价税合计 ￥99.99".to_owned(),
+        normalized_pdf: Some(normalized_bytes.clone()),
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::with_paths(repository.clone(), paths.clone(), extractor);
+
+    let repaired = service.backfill_normalized_pdf(record.id).await.unwrap();
+
+    let normalized_path_string = repaired
+        .normalized_pdf_path
+        .clone()
+        .expect("backfill should record the normalized PDF");
+    let normalized_path = PathBuf::from(&normalized_path_string);
+    assert!(normalized_path.starts_with(&paths.normalized));
+    assert_eq!(std::fs::read(&normalized_path).unwrap(), normalized_bytes);
+    assert_eq!(repaired.final_category, Some(Category::Hospitality));
+    assert_eq!(repaired.amount_cents, Some(9_999));
+    assert_eq!(repaired.company.as_deref(), Some("人工确认公司"));
+    assert_eq!(repaired.confirmation_status, ConfirmationStatus::Confirmed);
+    assert_eq!(repaired.status(), ItemStatus::Ready);
+
+    // Idempotent: a second pass keeps the recorded file.
+    let again = service.backfill_normalized_pdf(record.id).await.unwrap();
+    assert_eq!(again.normalized_pdf_path, Some(normalized_path_string));
+}
+
+#[tokio::test]
+async fn backfill_rejects_originals_the_extractor_cannot_normalize() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let mut record = sample_item(Uuid::new_v4());
+    record.original_name = "export.zip".to_owned();
+    record.mime_type = "application/zip".to_owned();
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(Vec::new()));
+    let service = RecognitionService::with_paths(repository, paths, extractor);
+
+    let error = service
+        .backfill_normalized_pdf(record.id)
+        .await
+        .expect_err("archive originals can never be normalized");
+
+    assert!(matches!(
+        error,
+        AppError::Validation { ref field, ref message }
+            if field == "normalizedPdf" && message.contains("不支持")
+    ));
+}
+
+#[tokio::test]
+async fn explicit_retry_keeps_manual_values_for_unsupported_formats() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let mut record = sample_item(Uuid::new_v4());
+    record.original_name = "invoice.xlsx".to_owned();
+    repository.insert(&record).await.unwrap();
+    let reviewed = repository
+        .update_fields(
+            record.id,
+            ItemPatch {
+                invoice_date: Some(Some(NaiveDate::from_ymd_opt(2026, 6, 18).unwrap())),
+                suggested_period: Some(Some("2026-06".to_owned())),
+                final_category: Some(Some(Category::Dining)),
+                amount_cents: Some(Some(12_850)),
+                recognition_status: Some(RecognitionStatus::Succeeded),
+                confirmation_status: Some(ConfirmationStatus::Confirmed),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: String::new(),
+        normalized_pdf: None,
+        warnings: vec!["unsupported_for_recognition".to_owned()],
+    })]));
+    let service = RecognitionService::with_paths(repository.clone(), paths, extractor);
+
+    let error = service
+        .retry(record.id)
+        .await
+        .expect_err("an unsupported format must not be retried destructively");
+
+    assert!(matches!(
+        error,
+        AppError::Validation { ref field, .. } if field == "file"
+    ));
+    let persisted = repository.get_by_id(record.id).await.unwrap();
+    assert_eq!(persisted.invoice_date, reviewed.invoice_date);
+    assert_eq!(persisted.amount_cents, Some(12_850));
+    assert_eq!(persisted.confirmation_status, ConfirmationStatus::Confirmed);
+}
+
+#[tokio::test]
 async fn semantically_identical_invoice_formats_mark_the_later_item_duplicate() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let repository = ItemRepository::new(pool);

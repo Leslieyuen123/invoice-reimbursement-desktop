@@ -1197,6 +1197,18 @@ a {
   color: #9bc0aa;
 }
 
+.item-status-note {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(199, 121, 121, 0.12);
+  color: #daa0a0;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .inbox-state-row td {
   height: 150px;
   color: var(--text-tertiary);
@@ -1498,6 +1510,17 @@ a {
 
 .item-editor > section + section {
   border-top: 1px solid var(--border);
+}
+
+.item-normalization-warning {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(199, 121, 121, 0.3);
+  border-radius: var(--control-radius);
+  background: rgba(199, 121, 121, 0.08);
+  color: #daa0a0;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .item-readonly dl {

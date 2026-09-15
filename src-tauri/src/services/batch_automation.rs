@@ -11,9 +11,11 @@ use crate::db::items::ItemRepository;
 use crate::domain::error::{AppError, sanitize_message};
 use crate::infra::files::AppPaths;
 use crate::services::batch_eligibility::is_safe_batch_candidate;
+use crate::services::batch_repair::repair_missing_normalized_pdfs;
 use crate::services::batches::BatchService;
 use crate::services::export::{ExportResult, ExportService};
 use crate::services::operations::AccountOperationCoordinator;
+use crate::services::recognition::RecognitionService;
 use crate::services::sync::{SyncProgress, SyncService, TouchedItemBudget};
 
 const CANDIDATE_PAGE_SIZE: usize = 200;
@@ -34,6 +36,8 @@ pub struct BatchAutomationResult {
     pub imported_count: u32,
     pub assigned_count: u32,
     pub exception_count: u32,
+    /// Normalized PDFs regenerated for batch members that were missing one.
+    pub repaired_count: u32,
     pub export: Option<ExportResult>,
 }
 
@@ -76,6 +80,7 @@ pub struct BatchAutomationService {
     sync: SyncService,
     batches: BatchService,
     exports: ExportService,
+    recognition: RecognitionService,
     account_operations: AccountOperationCoordinator,
     coordinator: BatchAutomationCoordinator,
     paths: AppPaths,
@@ -91,11 +96,13 @@ struct AssignmentPause {
 }
 
 impl BatchAutomationService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pool: SqlitePool,
         sync: SyncService,
         batches: BatchService,
         exports: ExportService,
+        recognition: RecognitionService,
         account_operations: AccountOperationCoordinator,
         coordinator: BatchAutomationCoordinator,
         paths: AppPaths,
@@ -105,6 +112,7 @@ impl BatchAutomationService {
             sync,
             batches,
             exports,
+            recognition,
             account_operations,
             coordinator,
             paths,
@@ -267,7 +275,16 @@ impl BatchAutomationService {
         }
         let assigned_count = u32::try_from(assigned_ids.len()).map_err(|_| count_overflow())?;
         let exception_count = u32::try_from(exception_ids.len()).map_err(|_| count_overflow())?;
-        let resulting_batch = self.batches.get(batch_id).await?;
+        let mut resulting_batch = self.batches.get(batch_id).await?;
+        // A batch member may be missing its normalized PDF (manually confirmed
+        // invoice, replaced attachment, restored backup). Regenerate it before
+        // exporting so retrying the automation can actually fix the batch.
+        let repaired_count =
+            repair_missing_normalized_pdfs(&self.paths, &self.recognition, &resulting_batch.items)
+                .await;
+        if repaired_count != 0 {
+            resulting_batch = self.batches.get(batch_id).await?;
+        }
         let export = if resulting_batch.summary.item_count == 0 {
             None
         } else {
@@ -280,6 +297,7 @@ impl BatchAutomationService {
             imported_count,
             assigned_count,
             exception_count,
+            repaired_count,
             export,
         })
     }

@@ -13,6 +13,7 @@ import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
 import type {
   AppError,
+  BatchCandidateDisabledReason,
   BatchDetailDto,
   CursorDto,
 } from "../../types";
@@ -38,10 +39,18 @@ function errorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
-function disabledCopy(reason: "recognition_failed" | "suspected_duplicate" | null) {
-  if (reason === "recognition_failed") return "识别失败，不能归属";
-  if (reason === "suspected_duplicate") return "疑似重复，不能归属";
-  return null;
+const disabledCopyByReason: Record<BatchCandidateDisabledReason, string> = {
+  recognition_failed: "识别失败，不能归属",
+  suspected_duplicate: "疑似重复，不能归属",
+  not_recognized: "尚未完成识别，不能归属",
+  not_confirmed: "尚未确认，不能归属",
+  missing_normalized_pdf: "缺少归一化 PDF，无法导出，不能归属",
+  missing_original_file: "原件缺失或无法读取，不能归属",
+  incomplete_details: "分类、金额或归属时间不完整，不能归属",
+};
+
+function disabledCopy(reason: BatchCandidateDisabledReason | null) {
+  return reason === null ? null : disabledCopyByReason[reason];
 }
 
 export function AssignItemsDialog({

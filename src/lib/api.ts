@@ -5,6 +5,7 @@ import type {
   BatchAutomationResultDto,
   BatchDetailDto,
   BatchDto,
+  BatchRepairDto,
   DashboardDto,
   ExportResultDto,
   InvoiceItemDto,
@@ -58,6 +59,7 @@ export const API_COMMANDS = {
   retryRecognition: "retry_recognition",
   listBatches: "list_batches",
   getBatch: "get_batch",
+  repairBatchNormalizedPdfs: "repair_batch_normalized_pdfs",
   listBatchCandidates: "list_batch_candidates",
   createMonthBatch: "create_month_batch",
   createCustomBatch: "create_custom_batch",
@@ -118,6 +120,8 @@ export const api = {
     call<BatchDetailDto>(API_COMMANDS.assignItemsToBatch, { batchId, itemIds }),
   removeItemFromBatch: (batchId: string, itemId: string) =>
     call<BatchDetailDto>(API_COMMANDS.removeItemFromBatch, { batchId, itemId }),
+  repairBatchNormalizedPdfs: (batchId: string) =>
+    call<BatchRepairDto>(API_COMMANDS.repairBatchNormalizedPdfs, { batchId }),
   exportBatch: (batchId: string) =>
     call<ExportResultDto>(API_COMMANDS.exportBatch, { batchId }),
   runBatchAutomation: (batchId: string) =>

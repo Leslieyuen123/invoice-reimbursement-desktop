@@ -76,6 +76,7 @@ export interface InvoiceItemDto {
   recognitionStatus: RecognitionStatus;
   confirmationStatus: ConfirmationStatus;
   dedupeStatus: DedupeStatus;
+  hasNormalizedPdf: boolean;
   note: string | null;
   eventTag: string | null;
   projectTag: string | null;
@@ -176,16 +177,36 @@ export interface BatchDetailSummaryDto {
   unconfirmedCount: number;
 }
 
+/** One batch member that currently blocks the export of the whole batch. */
+export interface BatchIssueDto {
+  itemId: string;
+  fileName: string;
+  code: string;
+  message: string;
+  repairable: boolean;
+}
+
 export interface BatchDetailDto {
   batch: BatchDto;
   items: InvoiceItemDto[];
   summary: BatchDetailSummaryDto;
   warnings: string[];
+  issues: BatchIssueDto[];
+}
+
+export interface BatchRepairDto {
+  repairedCount: number;
+  issues: BatchIssueDto[];
 }
 
 export type BatchCandidateDisabledReason =
   | "recognition_failed"
-  | "suspected_duplicate";
+  | "suspected_duplicate"
+  | "not_recognized"
+  | "not_confirmed"
+  | "missing_normalized_pdf"
+  | "missing_original_file"
+  | "incomplete_details";
 
 export interface BatchCandidateDto {
   item: InvoiceItemDto;
@@ -219,6 +240,7 @@ export interface BatchAutomationResultDto {
   importedCount: number;
   assignedCount: number;
   exceptionCount: number;
+  repairedCount: number;
   export: ExportResultDto | null;
 }
 

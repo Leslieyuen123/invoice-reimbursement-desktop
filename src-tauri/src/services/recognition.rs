@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDate};
@@ -12,7 +12,24 @@ use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, derive_item_status,
 };
 use crate::infra::extraction::DocumentExtractor;
-use crate::infra::files::AppPaths;
+use crate::infra::files::{AppPaths, open_contained_regular_file};
+
+/// Original formats the extractor can turn into a normalized PDF.
+///
+/// Office documents and ZIP archives are imported on purpose, but they can
+/// never be part of an export package, so the UI must say so instead of
+/// retrying forever.
+pub fn original_can_be_normalized(original_name: &str) -> bool {
+    Path::new(original_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "pdf" | "jpg" | "jpeg" | "png"
+            )
+        })
+}
 
 const CITY_NAMES: &[&str] = &[
     "北京",
@@ -146,6 +163,18 @@ impl RecognitionService {
                 return Err(extraction_error);
             }
         };
+        if !preserve_manual_confirmation
+            && extracted.normalized_pdf.is_none()
+            && extracted.text.trim().is_empty()
+        {
+            // An explicit retry over a format the extractor cannot read used to
+            // wipe the reviewed date and amount and drop the invoice back to
+            // "awaiting confirmation". Keep the manual values instead.
+            return Err(AppError::validation(
+                "file",
+                "该原件格式不支持自动识别，已保留人工填写的内容",
+            ));
+        }
         let created_normalized = match (
             item.normalized_pdf_path.as_ref(),
             extracted.normalized_pdf.as_deref(),
@@ -243,6 +272,66 @@ impl RecognitionService {
 
     pub async fn retry(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
         self.recognize_item_with_policy(id, false).await
+    }
+
+    /// Persists a normalized PDF for an invoice that never got one.
+    ///
+    /// Recognition only writes the normalized PDF while it runs for a pending
+    /// invoice. Invoices confirmed manually (or whose normalized file went
+    /// missing) stayed "ready for a batch" while the export rejected the whole
+    /// batch with 票据缺少归一化 PDF, and nothing could repair them. This
+    /// backfill writes only `normalized_pdf_path`: reviewed fields, category,
+    /// amount and batch membership stay untouched, and the affected batch is
+    /// moved back to draft so it is exported again.
+    pub async fn backfill_normalized_pdf(&self, id: uuid::Uuid) -> Result<InvoiceItem, AppError> {
+        let item = self.items.get_by_id(id).await?;
+        let Some(paths) = self.paths.clone() else {
+            return Err(AppError::Internal {
+                message: "recognition service has no application paths".to_owned(),
+            });
+        };
+        if item.normalized_pdf_path.as_deref().is_some_and(|path| {
+            open_contained_regular_file(Path::new(path), &paths.normalized, "normalizedPdf").is_ok()
+        }) {
+            return Ok(item);
+        }
+        if !original_can_be_normalized(&item.original_name) {
+            return Err(AppError::validation(
+                "normalizedPdf",
+                "该原件格式不支持生成归一化 PDF，请改用 PDF、JPG 或 PNG 原件，或将其移出批次",
+            ));
+        }
+
+        let source = PathBuf::from(&item.original_path);
+        let extractor = self.extractor.clone();
+        let extracted = tokio::task::spawn_blocking(move || extractor.extract(&source))
+            .await
+            .map_err(|error| AppError::Internal {
+                message: format!("document extraction task failed: {error}"),
+            })
+            .and_then(|result| result)?;
+        let Some(bytes) = extracted.normalized_pdf else {
+            return Err(AppError::validation(
+                "normalizedPdf",
+                "无法从该原件生成归一化 PDF，请更换清晰、完整的原件后重试",
+            ));
+        };
+
+        let destination =
+            tokio::task::spawn_blocking(move || paths.persist_normalized_pdf(id, &bytes))
+                .await
+                .map_err(|error| AppError::Internal {
+                    message: format!("normalized PDF storage task failed: {error}"),
+                })??;
+        self.items
+            .update_fields(
+                id,
+                ItemPatch {
+                    normalized_pdf_path: Some(Some(destination.to_string_lossy().into_owned())),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
     }
 
     async fn persist_recognition_patch(

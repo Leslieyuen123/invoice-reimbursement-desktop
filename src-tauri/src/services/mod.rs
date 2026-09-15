@@ -1,6 +1,7 @@
 pub mod account_saves;
 pub mod batch_automation;
 pub(crate) mod batch_eligibility;
+pub(crate) mod batch_repair;
 pub mod batches;
 pub mod dashboard;
 pub mod export;

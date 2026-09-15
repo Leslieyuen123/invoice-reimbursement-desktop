@@ -27,6 +27,7 @@ use crate::infra::exporters::{
 use crate::infra::files::{
     AppPaths, OpenedContainedFile, open_contained_regular_file, sync_directory,
 };
+use crate::services::batch_eligibility::{batch_issues, describe_issues};
 pub use crate::services::export_recovery::ExportRecoveryReport;
 use crate::services::export_recovery::{
     ExportCommitOutcome, ExportJournal, PendingExportIdentity, write_generation_marker,
@@ -381,6 +382,21 @@ impl ExportService {
             )?;
             total_amount_cents =
                 checked_add_amount_cents(total_amount_cents, amount_cents, "totalAmountCents")?;
+        }
+
+        // Report every invoice that cannot be exported before any staging
+        // directory exists. The bare "票据缺少归一化 PDF" error used to abort a
+        // whole batch without naming the offending invoice, so retrying the
+        // automation could never succeed and the user had no way to find it.
+        let issues = batch_issues(&paths, &items);
+        if let Some(first) = issues.first() {
+            let detail = describe_issues(&issues);
+            if issues.len() == 1 {
+                return Err(AppError::validation(first.blocker.field(), detail));
+            }
+            return Err(AppError::Conflict {
+                message: format!("{} 张票据无法导出：{}", issues.len(), detail),
+            });
         }
 
         let exported_at = Utc::now();

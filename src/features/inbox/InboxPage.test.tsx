@@ -55,6 +55,7 @@ function pendingInvoiceFixture(
     recognitionStatus: "succeeded",
     confirmationStatus: "pending",
     dedupeStatus: "unique",
+    hasNormalizedPdf: true,
     note: null,
     eventTag: null,
     projectTag: null,
@@ -533,6 +534,7 @@ describe("InboxPage", () => {
     const duplicate = pendingInvoiceFixture({
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     const serverItem = {
       ...duplicate,
@@ -904,12 +906,14 @@ describe("InboxPage", () => {
     const first = pendingInvoiceFixture({
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     const second = pendingInvoiceFixture({
       id: "invoice-duplicate-two",
       originalName: "出租车电子发票-副本.pdf",
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     mockCommand("get_dashboard", new Promise(() => undefined));
     mockCommand("list_items", () => {
@@ -936,6 +940,7 @@ describe("InboxPage", () => {
     const duplicate = pendingInvoiceFixture({
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     mockCommand("get_dashboard", new Promise(() => undefined));
     mockCommand("list_items", () => {
@@ -1034,6 +1039,7 @@ describe("InboxPage", () => {
     const duplicate = pendingInvoiceFixture({
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     mockCommand("get_dashboard", new Promise(() => undefined));
     mockCommand("list_items", () => {
@@ -1045,6 +1051,7 @@ describe("InboxPage", () => {
       pendingInvoiceFixture({
         status: "pending_confirmation",
         dedupeStatus: "resolved",
+        hasNormalizedPdf: true,
         updatedAt: "2026-07-15T10:00:00+08:00",
       }),
     );
@@ -1184,6 +1191,7 @@ describe("InboxPage", () => {
     const duplicate = pendingInvoiceFixture({
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     let serverItems = [duplicate];
     mockCommand("get_dashboard", new Promise(() => undefined));
@@ -1226,12 +1234,14 @@ describe("InboxPage", () => {
     const firstDuplicate = pendingInvoiceFixture({
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     const secondDuplicate = pendingInvoiceFixture({
       id: "invoice-duplicate-two",
       originalName: "出租车电子发票-副本.pdf",
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     mockCommand("get_dashboard", new Promise(() => undefined));
     mockCommand("list_items", {
@@ -1296,12 +1306,14 @@ describe("InboxPage", () => {
     const duplicateOne = pendingInvoiceFixture({
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     const duplicateTwo = pendingInvoiceFixture({
       id: "invoice-duplicate-two",
       originalName: "出租车电子发票-副本.pdf",
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     let serverItems = [duplicateOne, duplicateTwo];
     mockCommand("get_dashboard", new Promise(() => undefined));
@@ -1321,6 +1333,7 @@ describe("InboxPage", () => {
       const kept = pendingInvoiceFixture({
         status: "pending_confirmation",
         dedupeStatus: "resolved",
+        hasNormalizedPdf: true,
       });
       serverItems = serverItems.map((item) =>
         item.id === request.itemId ? kept : item,
@@ -1437,6 +1450,7 @@ describe("InboxPage", () => {
         sourceType: "manual_upload",
         status: "suspected_duplicate",
         dedupeStatus: "suspected_duplicate",
+        hasNormalizedPdf: true,
       });
       serverItems.push(imported);
       return [{
