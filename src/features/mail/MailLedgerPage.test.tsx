@@ -160,8 +160,14 @@ describe("MailLedgerPage", () => {
 
     await user.click(screen.getByRole("tab", { name: "全部" }));
     const subject = await screen.findByRole("button", { name: /九月发票/ });
-    // Local time (CST) rather than the stored UTC hour.
-    expect(screen.getByText("2026-09-10 14:35")).toBeInTheDocument();
+    // Rendered in the machine's own time zone, so the expectation is derived
+    // the same way instead of hard-coding one zone (CI runs in UTC).
+    const received = new Date("2026-09-10T06:35:00Z");
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const localTime =
+      `${received.getFullYear()}-${pad(received.getMonth() + 1)}-` +
+      `${pad(received.getDate())} ${pad(received.getHours())}:${pad(received.getMinutes())}`;
+    expect(screen.getByText(localTime)).toBeInTheDocument();
 
     await user.click(subject);
 
