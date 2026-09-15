@@ -1092,14 +1092,30 @@ a {
 
 .inbox-table {
   width: 100%;
-  min-width: 1040px;
+  min-width: 1180px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
 }
 
 .inbox-col-name {
-  width: 250px;
+  width: 300px;
+}
+
+.inbox-col-mail-date {
+  width: 148px;
+}
+
+/* File names identify the invoice, so they wrap instead of being cut. */
+.inbox-name-cell {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.inbox-name-cell button {
+  line-height: 1.35;
+  text-align: left;
 }
 
 .inbox-col-date,

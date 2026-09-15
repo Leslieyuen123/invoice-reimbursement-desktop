@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../lib/api";
 import { formatAmountCents } from "../../lib/amount";
+import { formatLocalDateTime } from "../../lib/datetime";
 import {
   MAX_SAFE_AMOUNT_CENTS,
   type AppError,
@@ -279,9 +280,19 @@ export function ItemDrawer({
                 <dd>{item.sourceType === "email" ? "邮箱" : "手动上传"}</dd>
               </div>
               <div>
-                <dt>抓取时间</dt>
-                <dd>{item.fetchedAt.replace("T", " ").slice(0, 16)}</dd>
+                <dt>邮件收到</dt>
+                <dd>
+                  {item.sourceType === "email"
+                    ? formatLocalDateTime(item.fetchedAt)
+                    : "手动导入"}
+                </dd>
               </div>
+              {item.sourceReceivedDate ? (
+                <div>
+                  <dt>归属日期</dt>
+                  <dd>{item.sourceReceivedDate}</dd>
+                </div>
+              ) : null}
               <div>
                 <dt>识别日期</dt>
                 <dd>{item.invoiceDate ?? "未识别"}</dd>

@@ -1019,7 +1019,9 @@ export function BatchDetailPage() {
                         }
                       />
                     </td>
-                    <td title={item.originalName}>{item.originalName}</td>
+                    <td className="batch-file-cell" title={item.originalName}>
+                      {item.originalName}
+                    </td>
                     <td>{item.invoiceDate ?? "日期待补充"}</td>
                     <td>{categoryLabel(item.finalCategory ?? item.suggestedCategory)}</td>
                     <td>{statusLabels[item.status]}</td>

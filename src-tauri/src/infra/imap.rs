@@ -128,7 +128,28 @@ pub trait ImapGateway: Send + Sync {
         cursor: Option<SyncCursor>,
         range: ImapDateRange,
     ) -> Result<MailboxDelta, AppError>;
+
+    /// Marks the given messages as read (`\Seen`).
+    ///
+    /// This is a convenience side effect, never a correctness requirement: the
+    /// application keeps its own per-mail ledger, so a gateway that cannot flag
+    /// mail (or a mailbox that rejects the update) reports an error that the
+    /// caller only logs.
+    async fn mark_seen(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+        _mailbox: &str,
+        _uids: &[u32],
+    ) -> Result<(), AppError> {
+        Err(AppError::Internal {
+            message: "this mailbox gateway cannot mark messages as seen".to_owned(),
+        })
+    }
 }
+
+/// Largest number of UIDs sent in a single `\Seen` update.
+const MAX_SEEN_UIDS_PER_UPDATE: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImapGatewaySettings {
@@ -204,6 +225,28 @@ impl ImapGateway for NativeTlsImapGateway {
         .map_err(|_| imap_error("IMAP fetch task failed"))?
     }
 
+    async fn mark_seen(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        mailbox: &str,
+        uids: &[u32],
+    ) -> Result<(), AppError> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let config = config.clone();
+        let secret = secret.to_owned();
+        let mailbox = mailbox.to_owned();
+        let uids = uids.to_vec();
+        let settings = self.settings;
+        tokio::task::spawn_blocking(move || {
+            mark_seen_blocking(&config, &secret, &mailbox, &uids, settings)
+        })
+        .await
+        .map_err(|_| imap_error("IMAP seen flag task failed"))?
+    }
+
     async fn fetch_range(
         &self,
         config: &ImapAccountConfig,
@@ -220,6 +263,32 @@ impl ImapGateway for NativeTlsImapGateway {
         .await
         .map_err(|_| imap_error("IMAP fetch task failed"))?
     }
+}
+
+fn mark_seen_blocking(
+    config: &ImapAccountConfig,
+    secret: &str,
+    mailbox: &str,
+    uids: &[u32],
+    settings: ImapGatewaySettings,
+) -> Result<(), AppError> {
+    let mut session = connect(config, secret, settings)?;
+    // `select` (not `examine`) is required: STORE needs a writable mailbox.
+    session
+        .select(mailbox)
+        .map_err(|_| imap_error("IMAP mailbox selection failed"))?;
+    for chunk in uids.chunks(MAX_SEEN_UIDS_PER_UPDATE) {
+        let set = chunk
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .uid_store(&set, "+FLAGS (\\Seen)")
+            .map_err(|_| imap_error("IMAP seen flag update failed"))?;
+    }
+    session.logout().ok();
+    Ok(())
 }
 
 fn fetch_blocking(

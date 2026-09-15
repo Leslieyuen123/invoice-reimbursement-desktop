@@ -52,6 +52,7 @@ function itemFixture(overrides: Partial<InvoiceItemDto> = {}): InvoiceItemDto {
     sourceType: "email",
     sourceAccountId: "account-finance",
     fetchedAt: "2026-07-15T09:45:00+08:00",
+    sourceReceivedDate: null,
     invoiceDate: "2026-07-14",
     suggestedPeriod: "2026-07",
     batchId: null,

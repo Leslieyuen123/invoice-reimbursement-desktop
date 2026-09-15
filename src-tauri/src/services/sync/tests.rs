@@ -337,7 +337,14 @@ async fn touched_item_budget_stops_same_page_import_before_second_side_effect() 
 
     let failure = context
         .service
-        .process_delta(context.account.id, &delta, true, &mut budget)
+        .process_delta(
+            context.account.id,
+            &ImapAccountConfig::from_account(&context.account),
+            "secret",
+            &delta,
+            true,
+            &mut budget,
+        )
         .await
         .unwrap_err();
 

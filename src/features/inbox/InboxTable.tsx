@@ -1,5 +1,6 @@
 import type { InvoiceItemDto } from "../../types";
 import { formatAmountCents } from "../../lib/amount";
+import { formatLocalDateTime } from "../../lib/datetime";
 
 interface InboxTableProps {
   items: InvoiceItemDto[];
@@ -52,8 +53,9 @@ export function InboxTable({
       </colgroup>
       <thead>
         <tr>
-          <th scope="col">原件</th>
-          <th scope="col">开票日期</th>
+          <th scope="col" className="inbox-col-name">原件</th>
+          <th scope="col" className="inbox-col-date">开票日期</th>
+          <th scope="col" className="inbox-col-mail-date">邮件收到</th>
           <th scope="col">建议月份</th>
           <th scope="col">分类</th>
           <th scope="col">金额</th>
@@ -65,7 +67,7 @@ export function InboxTable({
       <tbody>
         {state === "loading" ? (
           <tr className="inbox-state-row">
-            <td colSpan={8}>
+            <td colSpan={9}>
               <div role="status" aria-label="正在加载待处理池">
                 正在加载票据
               </div>
@@ -74,7 +76,7 @@ export function InboxTable({
         ) : null}
         {state === "error" ? (
           <tr className="inbox-state-row">
-            <td colSpan={8}>
+            <td colSpan={9}>
               <div role="alert">
                 <span>{errorMessage ?? "待处理池暂时无法加载"}</span>
                 <button type="button" onClick={onRetry}>
@@ -86,7 +88,7 @@ export function InboxTable({
         ) : null}
         {state === "ready" && items.length === 0 ? (
           <tr className="inbox-state-row">
-            <td colSpan={8}>当前筛选下没有票据</td>
+            <td colSpan={9}>当前筛选下没有票据</td>
           </tr>
         ) : null}
         {items.map((item) => (
@@ -94,7 +96,7 @@ export function InboxTable({
             key={item.id}
             className={selectedItemId === item.id ? "is-selected" : undefined}
           >
-            <td>
+            <td className="inbox-name-cell">
               <button
                 type="button"
                 data-inbox-item-id={item.id}
@@ -104,6 +106,11 @@ export function InboxTable({
               </button>
             </td>
             <td>{item.invoiceDate ?? "未识别"}</td>
+            <td title={item.fetchedAt}>
+              {item.sourceType === "email"
+                ? formatLocalDateTime(item.fetchedAt)
+                : "手动导入"}
+            </td>
             <td>{item.suggestedPeriod ?? "待确认"}</td>
             <td>
               {item.finalCategory || item.suggestedCategory

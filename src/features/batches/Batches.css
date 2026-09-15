@@ -592,7 +592,25 @@
 }
 
 .batch-items-table th:first-child {
-  width: 28%;
+  width: 40px;
+  padding-right: 0;
+  text-align: center;
+}
+
+/* The file column is the second one now that selection leads the table. */
+.batch-items-table th:nth-child(2) {
+  width: 34%;
+}
+
+/* File names carry the invoice identity, so they wrap instead of being cut. */
+.batch-items-table td.batch-file-cell {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  line-height: 1.35;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .batch-items-table th:last-child {
@@ -1151,12 +1169,11 @@
 }
 
 .batch-issues-copy strong {
-  overflow: hidden;
   font-size: 13px;
   font-weight: 500;
   color: var(--text-primary);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .batch-issues-copy small,
@@ -1185,7 +1202,7 @@
 }
 
 .batch-select-column {
-  width: 34px;
+  width: 40px;
   padding-right: 0;
   text-align: center;
 }
@@ -1265,11 +1282,10 @@
 }
 
 .batch-settle-skipped strong {
-  overflow: hidden;
   font-size: 13px;
   font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .batch-settle-skipped small,

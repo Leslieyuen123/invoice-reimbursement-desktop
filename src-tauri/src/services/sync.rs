@@ -3,12 +3,14 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use kuchiki::traits::TendrilSink;
 use mail_parser::{MessageParser, MimeHeaders, PartType};
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::db::accounts::{MailboxAccountRepository, SyncCursor};
+use crate::db::mail_ledger::{MailLedgerRecord, MailLedgerRepository};
 use crate::domain::error::{AppError, sanitize_message};
 use crate::domain::model::{ConfirmationStatus, RecognitionStatus};
 use crate::infra::credentials::{CredentialStore, get_credential};
@@ -17,7 +19,8 @@ use crate::infra::invoice_download::{
     InvoiceLinkDownload, InvoiceLinkDownloader, SecureInvoiceLinkDownloader,
 };
 use crate::services::import::{EmailImportSource, ImportOutcome, ImportService};
-use crate::services::recognition::RecognitionService;
+use crate::services::recognition::{RecognitionService, original_can_be_normalized};
+use crate::services::settings::load_preferences;
 
 const MAX_MESSAGES_PER_SYNC: usize = 1_000;
 const MAX_RANGE_SYNC_PAGES: usize = 64;
@@ -171,6 +174,8 @@ pub struct SyncService {
     accounts: MailboxAccountRepository,
     import: ImportService,
     recognition: RecognitionService,
+    ledger: MailLedgerRepository,
+    pool: SqlitePool,
     link_downloader: Arc<dyn InvoiceLinkDownloader>,
 }
 
@@ -182,12 +187,15 @@ impl SyncService {
         import: ImportService,
         recognition: RecognitionService,
     ) -> Self {
+        let pool = accounts.pool();
         Self {
             gateway,
             credentials,
             accounts,
             import,
             recognition,
+            ledger: MailLedgerRepository::new(pool.clone()),
+            pool,
             link_downloader: Arc::new(SecureInvoiceLinkDownloader),
         }
     }
@@ -396,10 +404,11 @@ impl SyncService {
         validate_delta(&delta, &config.mailbox)?;
         let rescan = cursor.is_some_and(|cursor| cursor.uid_validity != delta.uid_validity);
         let mut budget = TouchedItemBudget::default();
-        let result = Box::pin(self.process_delta(account_id, &delta, rescan, &mut budget))
-            .await
-            .map_err(|failure| failure.error)?
-            .into_result();
+        let result =
+            Box::pin(self.process_delta(account_id, config, secret, &delta, rescan, &mut budget))
+                .await
+                .map_err(|failure| failure.error)?
+                .into_result();
         Ok((
             result,
             SyncCursor {
@@ -454,7 +463,9 @@ impl SyncService {
                     completed,
                 ));
             }
-            match Box::pin(self.process_delta(account_id, &delta, true, budget)).await {
+            match Box::pin(self.process_delta(account_id, config, secret, &delta, true, budget))
+                .await
+            {
                 Ok(page) => {
                     if let Err(error) = completed.merge(page) {
                         return Err(sync_progress_failure(error, completed));
@@ -482,11 +493,17 @@ impl SyncService {
     async fn process_delta(
         &self,
         account_id: Uuid,
+        config: &ImapAccountConfig,
+        secret: &str,
         delta: &MailboxDelta,
         rescan: bool,
         budget: &mut TouchedItemBudget,
     ) -> Result<SyncProgress, SyncProgressFailure> {
         let mut completed = SyncProgress::default();
+        let mark_seen_enabled = load_preferences(&self.pool)
+            .await
+            .map(|preferences| preferences.mark_processed_mail_seen)
+            .unwrap_or(false);
         for rejected in &delta.rejected_messages {
             budget
                 .reserve()
@@ -498,15 +515,69 @@ impl SyncService {
                 .map_err(|error| sync_progress_failure(error, completed.clone()))?;
             track_import_outcome(outcome, &mut completed)
                 .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+            self.record_mail(
+                account_id,
+                delta.uid_validity,
+                &rejected.mailbox,
+                rejected.uid,
+                None,
+                None,
+                None,
+                rejected.received_at,
+                &MailAccumulator {
+                    candidates: 0,
+                    imported: 0,
+                    existing: 0,
+                    failed: 1,
+                    reason: Some(format!("message_rejected:{}", rejected.reason.code())),
+                },
+            )
+            .await
+            .map_err(|error| sync_progress_failure(error, completed.clone()))?;
         }
+        let mut settled_uids = Vec::new();
         for raw_message in &delta.messages {
-            let parsed = parse_invoice_parts(raw_message)
-                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+            let parsed = match parse_invoice_parts(raw_message) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    // The sync still fails, but the mail the user has to look at
+                    // is now recorded instead of only appearing in a log line.
+                    self.record_mail(
+                        account_id,
+                        delta.uid_validity,
+                        &raw_message.mailbox,
+                        raw_message.uid,
+                        None,
+                        None,
+                        None,
+                        raw_message.received_at,
+                        &MailAccumulator {
+                            candidates: 0,
+                            imported: 0,
+                            existing: 0,
+                            failed: 1,
+                            reason: Some("message_parse_failed".to_owned()),
+                        },
+                    )
+                    .await
+                    .map_err(|record_error| {
+                        sync_progress_failure(record_error, completed.clone())
+                    })?;
+                    return Err(sync_progress_failure(error, completed));
+                }
+            };
             let ParsedInvoiceParts {
                 files,
                 links,
                 mut zip_budget,
+                subject,
+                sender,
             } = parsed;
+            let mut accumulator = MailAccumulator {
+                candidates: u32::try_from(files.len().saturating_add(links.len()))
+                    .unwrap_or(u32::MAX),
+                ..MailAccumulator::default()
+            };
             for part in files {
                 budget
                     .reserve()
@@ -530,12 +601,13 @@ impl SyncService {
                     )
                     .await
                     .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+                accumulator.add_import(&outcome);
                 self.track_and_recognize(outcome, &mut completed)
                     .await
                     .map_err(|error| sync_progress_failure(error, completed.clone()))?;
             }
             for link in links {
-                Box::pin(self.process_link(
+                let outcome = Box::pin(self.process_link(
                     account_id,
                     delta.uid_validity,
                     raw_message,
@@ -547,9 +619,107 @@ impl SyncService {
                 ))
                 .await
                 .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+                accumulator.add_link(outcome);
             }
+            if accumulator.is_settled() {
+                settled_uids.push(raw_message.uid);
+            }
+            self.record_mail(
+                account_id,
+                delta.uid_validity,
+                &raw_message.mailbox,
+                raw_message.uid,
+                None,
+                subject,
+                sender,
+                raw_message.received_at,
+                &accumulator,
+            )
+            .await
+            .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+        }
+        if mark_seen_enabled && !settled_uids.is_empty() {
+            self.mark_settled_mail_seen(
+                account_id,
+                config,
+                secret,
+                &config.mailbox,
+                delta.uid_validity,
+                &settled_uids,
+            )
+            .await;
         }
         Ok(completed)
+    }
+
+    /// Writes the ledger row for one scanned mail.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_mail(
+        &self,
+        account_id: Uuid,
+        uid_validity: u32,
+        mailbox: &str,
+        uid: u32,
+        message_id: Option<String>,
+        subject: Option<String>,
+        sender: Option<String>,
+        received_at: DateTime<Utc>,
+        accumulator: &MailAccumulator,
+    ) -> Result<(), AppError> {
+        self.ledger
+            .record(&MailLedgerRecord {
+                account_id,
+                mailbox: mailbox.to_owned(),
+                uid_validity,
+                uid,
+                message_id,
+                subject,
+                sender,
+                received_at,
+                candidate_count: accumulator.candidates,
+                imported_count: accumulator.imported,
+                existing_count: accumulator.existing,
+                failed_count: accumulator.failed,
+                reason: accumulator.reason.clone(),
+            })
+            .await
+    }
+
+    /// Marks settled mail as read.
+    ///
+    /// Failure is only logged: the ledger stays the source of truth and the UI
+    /// compares `marked_seen` against the recorded outcome.
+    async fn mark_settled_mail_seen(
+        &self,
+        account_id: Uuid,
+        config: &ImapAccountConfig,
+        secret: &str,
+        mailbox: &str,
+        uid_validity: u32,
+        uids: &[u32],
+    ) {
+        match self.gateway.mark_seen(config, secret, mailbox, uids).await {
+            Ok(()) => {
+                for uid in uids {
+                    if let Err(error) = self
+                        .ledger
+                        .mark_seen(account_id, mailbox, uid_validity, *uid)
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            uid,
+                            "failed to persist the seen flag in the mail ledger"
+                        );
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                count = uids.len(),
+                "failed to mark processed mail as seen"
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -563,7 +733,7 @@ impl SyncService {
         budget: &mut TouchedItemBudget,
         zip_budget: &mut ZipExpansionBudget,
         completed: &mut SyncProgress,
-    ) -> Result<(), AppError> {
+    ) -> Result<LinkOutcome, AppError> {
         budget.reserve()?;
         let source = EmailImportSource {
             account_id,
@@ -576,12 +746,14 @@ impl SyncService {
             source_received_date: raw_message.source_received_date,
             rescan,
         };
+        let mut ledger = LinkOutcome::default();
         if let Some(existing) = self.import.find_email_part(&source).await?
             && !is_email_link_placeholder(&existing)
         {
             self.track_and_recognize(ImportOutcome::Existing(existing), completed)
                 .await?;
-            return Ok(());
+            ledger.existing = 1;
+            return Ok(ledger);
         }
         let download = match self.link_downloader.download(&link.url).await {
             Ok(download) => download,
@@ -591,7 +763,9 @@ impl SyncService {
                     .import_failed_email_link(&link.url, source)
                     .await?;
                 track_import_outcome(outcome, completed)?;
-                return Ok(());
+                ledger.failed = 1;
+                ledger.reason = Some("link_download_failed".to_owned());
+                return Ok(ledger);
             }
         };
         match download {
@@ -615,6 +789,7 @@ impl SyncService {
                         source,
                     )
                     .await?;
+                account_link_outcome(&mut ledger, &outcome);
                 self.track_and_recognize(outcome, completed).await?;
                 for child in expanded {
                     budget.reserve()?;
@@ -636,6 +811,7 @@ impl SyncService {
                             },
                         )
                         .await?;
+                    account_link_outcome(&mut ledger, &outcome);
                     self.track_and_recognize(outcome, completed).await?;
                 }
             }
@@ -643,7 +819,7 @@ impl SyncService {
                 self.import.discard_email_link_placeholder(&source).await?;
             }
         }
-        Ok(())
+        Ok(ledger)
     }
 
     async fn track_and_recognize(
@@ -660,6 +836,74 @@ impl SyncService {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+/// What one mail produced, used for the mail ledger and the `\Seen` decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LinkOutcome {
+    imported: u32,
+    existing: u32,
+    failed: u32,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MailAccumulator {
+    candidates: u32,
+    imported: u32,
+    existing: u32,
+    failed: u32,
+    reason: Option<String>,
+}
+
+impl MailAccumulator {
+    fn add_link(&mut self, outcome: LinkOutcome) {
+        self.imported = self.imported.saturating_add(outcome.imported);
+        self.existing = self.existing.saturating_add(outcome.existing);
+        self.failed = self.failed.saturating_add(outcome.failed);
+        if let Some(reason) = outcome.reason
+            && self.reason.is_none()
+        {
+            self.reason = Some(reason);
+        }
+    }
+
+    /// Counts an imported invoice, flagging formats that can never be exported.
+    fn add_import(&mut self, outcome: &ImportOutcome) {
+        match outcome {
+            ImportOutcome::New(item) => {
+                self.imported = self.imported.saturating_add(1);
+                if !original_can_be_normalized(&item.original_name) {
+                    self.failed = self.failed.saturating_add(1);
+                    self.reason = Some("unsupported_format".to_owned());
+                }
+            }
+            ImportOutcome::Existing(_) => {
+                self.existing = self.existing.saturating_add(1);
+            }
+        }
+    }
+
+    /// A mail is settled when its invoices are in the library with nothing left
+    /// to fetch, which is what makes marking it read safe.
+    fn is_settled(&self) -> bool {
+        self.failed == 0 && self.imported + self.existing > 0
+    }
+}
+
+fn account_link_outcome(ledger: &mut LinkOutcome, outcome: &ImportOutcome) {
+    match outcome {
+        ImportOutcome::New(item) => {
+            ledger.imported = ledger.imported.saturating_add(1);
+            if !original_can_be_normalized(&item.original_name) {
+                ledger.failed = ledger.failed.saturating_add(1);
+                ledger.reason = Some("unsupported_format".to_owned());
+            }
+        }
+        ImportOutcome::Existing(_) => {
+            ledger.existing = ledger.existing.saturating_add(1);
+        }
     }
 }
 
@@ -719,6 +963,8 @@ struct ParsedInvoiceParts {
     files: Vec<InvoicePart>,
     links: Vec<DownloadLink>,
     zip_budget: ZipExpansionBudget,
+    subject: Option<String>,
+    sender: Option<String>,
 }
 
 fn validate_delta(delta: &MailboxDelta, expected_mailbox: &str) -> Result<(), AppError> {
@@ -853,7 +1099,24 @@ fn parse_invoice_parts_with_zip_budget(
         files,
         links,
         zip_budget,
+        subject: message.subject().map(summarize_header),
+        sender: message
+            .from()
+            .and_then(|address| address.first())
+            .and_then(|address| address.address())
+            .map(summarize_header),
     })
+}
+
+/// Keeps ledger headers short and free of control characters.
+fn summarize_header(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 fn binary_safe_attachment_bytes(

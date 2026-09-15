@@ -2,6 +2,7 @@ pub mod batches;
 pub mod dashboard;
 pub mod export;
 pub mod items;
+pub mod mail;
 pub mod settings;
 pub mod sync;
 
@@ -86,6 +87,8 @@ pub fn invoke_handler<R: tauri::Runtime>()
         items::ipc::review_item,
         items::ipc::resolve_duplicate,
         items::ipc::retry_recognition,
+        mail::ipc::list_mail_ledger,
+        mail::ipc::get_mail_ledger_counts,
         batches::ipc::list_batches,
         batches::ipc::get_batch,
         batches::ipc::repair_batch_normalized_pdfs,

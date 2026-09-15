@@ -63,6 +63,8 @@ export interface InvoiceItemDto {
   sourceType: SourceType;
   sourceAccountId: string | null;
   fetchedAt: string;
+  /** Local date the mail was received; the date batches are keyed on. */
+  sourceReceivedDate: string | null;
   invoiceDate: string | null;
   suggestedPeriod: string | null;
   batchId: string | null;

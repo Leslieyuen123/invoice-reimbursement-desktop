@@ -78,6 +78,12 @@ impl MailboxAccountRepository {
         Self { pool }
     }
 
+    /// The shared application pool, so services built on this repository can
+    /// reach their own tables without another constructor argument.
+    pub(crate) fn pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
+
     pub async fn insert(&self, account: NewMailboxAccount) -> Result<MailboxAccount, AppError> {
         validate_account(&account)?;
         let id = Uuid::new_v4();
