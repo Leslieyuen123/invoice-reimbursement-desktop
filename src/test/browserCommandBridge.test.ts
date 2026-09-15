@@ -45,6 +45,7 @@ function invoiceFixture(
     recognitionStatus: "succeeded",
     confirmationStatus: "confirmed",
     dedupeStatus: "unique",
+    hasNormalizedPdf: true,
     note: null,
     eventTag: null,
     projectTag: null,
@@ -221,6 +222,7 @@ describe("browser command bridge", () => {
       importedCount: 0,
       assignedCount: 1,
       exceptionCount: 1,
+      repairedCount: 0,
       export: {
         directory: "/tmp/invoice-reimbursement/e2e/2026-07",
         itemCount: 1,
@@ -256,6 +258,7 @@ describe("browser command bridge", () => {
       importedCount: 0,
       assignedCount: 0,
       exceptionCount: 0,
+      repairedCount: 0,
       export: null,
     });
   });
@@ -294,6 +297,7 @@ describe("browser command bridge", () => {
       importedCount: 2,
       assignedCount: 1,
       exceptionCount: 1,
+      repairedCount: 0,
       export: {
         directory: "/tmp/invoice-reimbursement/e2e/2026-05",
         itemCount: 1,
@@ -342,7 +346,7 @@ describe("browser command bridge", () => {
     });
   });
 
-  it("persists automation assignments before a later export failure", async () => {
+  it("refuses to assign what the export would reject and keeps the batch exportable", async () => {
     window.history.replaceState({}, "", "/?bridgeReset=1");
     installBrowserCommandBridge();
     const bridge = window.__INVOICE_COMMAND_BRIDGE__;
@@ -389,14 +393,31 @@ describe("browser command bridge", () => {
       year: 2026,
       month: 7,
     });
-    await bridge("assign_items_to_batch", {
-      batchId: batch.id,
-      itemIds: [blocked.id],
+    // An unconfirmed invoice would make the whole batch unexportable, so manual
+    // assignment refuses it instead of failing much later at export.
+    await expect(
+      bridge("assign_items_to_batch", {
+        batchId: batch.id,
+        itemIds: [blocked.id],
+      }),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringContaining("blocked.png"),
     });
 
+    await bridge("assign_items_to_batch", {
+      batchId: batch.id,
+      itemIds: [safe.id],
+    });
     await expect(
-      bridge("run_batch_automation", { batchId: batch.id }),
-    ).rejects.toMatchObject({ code: "conflict" });
+      bridge<BatchAutomationResultDto>("run_batch_automation", {
+        batchId: batch.id,
+      }),
+    ).resolves.toMatchObject({
+      assignedCount: 0,
+      repairedCount: 0,
+      export: { itemCount: 1, totalAmountCents: 12_850 },
+    });
 
     window.history.replaceState({}, "", "/");
     installBrowserCommandBridge();
@@ -406,9 +427,12 @@ describe("browser command bridge", () => {
       restoredBridge<InvoiceItemDto>("get_item", { itemId: safe.id }),
     ).resolves.toMatchObject({ batchId: batch.id });
     await expect(
+      restoredBridge<InvoiceItemDto>("get_item", { itemId: blocked.id }),
+    ).resolves.toMatchObject({ batchId: null });
+    await expect(
       restoredBridge<BatchDetailDto>("get_batch", { batchId: batch.id }),
     ).resolves.toMatchObject({
-      batch: { status: "draft", itemCount: 2, lastExportedAt: null },
+      batch: { status: "exported", itemCount: 1 },
     });
   });
 
@@ -601,6 +625,7 @@ describe("browser command bridge", () => {
           status: "ready",
           recognitionStatus: "failed",
           dedupeStatus: "suspected_duplicate",
+          hasNormalizedPdf: true,
         }),
         invoiceFixture("inside", {
           originalName: "候选-范围内.png",
@@ -643,8 +668,8 @@ describe("browser command bridge", () => {
     ]);
     expect(byId["missing-date"]).toMatchObject({
       outsideBatchRange: true,
-      eligible: true,
-      disabledReason: null,
+      eligible: false,
+      disabledReason: "not_confirmed",
     });
     expect(byId["outside-date"]).toMatchObject({
       outsideBatchRange: true,

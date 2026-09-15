@@ -211,13 +211,36 @@ async fn batch_candidates_use_exact_dates_and_report_assignment_eligibility() {
         (4, None, "succeeded", "unique"),
         (5, Some("2026-07-17"), "succeeded", "unique"),
     ] {
+        // Candidate eligibility now matches the export preflight, so the
+        // fixtures need the recorded files instead of only status columns.
+        let name = format!("{}.pdf", Uuid::from_u128(id));
+        std::fs::write(
+            fixture.state.paths().originals.join(&name),
+            b"%PDF-1.4 original",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.state.paths().normalized.join(&name),
+            b"%PDF-1.4 normalized",
+        )
+        .unwrap();
         sqlx::query(
-            "UPDATE items SET invoice_date = ?, recognition_status = ?, dedupe_status = ? \
+            "UPDATE items SET invoice_date = ?, recognition_status = ?, dedupe_status = ?, \
+                normalized_pdf_path = ?, final_category = 'dining', suggested_period = '2026-07' \
              WHERE id = ?",
         )
         .bind(invoice_date)
         .bind(recognition)
         .bind(dedupe)
+        .bind(
+            fixture
+                .state
+                .paths()
+                .normalized
+                .join(&name)
+                .to_string_lossy()
+                .into_owned(),
+        )
         .bind(Uuid::from_u128(id).to_string())
         .execute(fixture.state.pool())
         .await

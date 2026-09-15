@@ -120,6 +120,11 @@ export function InboxTable({
               <span className="item-status" data-status={item.status}>
                 {statusLabels[item.status]}
               </span>
+              {!item.hasNormalizedPdf ? (
+                <span className="item-status-note" title="导出前需要归一化 PDF">
+                  缺归一化 PDF
+                </span>
+              ) : null}
             </td>
             <td>{item.batchId ?? "未分配"}</td>
           </tr>

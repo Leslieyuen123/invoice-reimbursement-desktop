@@ -65,6 +65,7 @@ function itemFixture(overrides: Partial<InvoiceItemDto> = {}): InvoiceItemDto {
     recognitionStatus: "succeeded",
     confirmationStatus: "confirmed",
     dedupeStatus: "unique",
+    hasNormalizedPdf: true,
     note: null,
     eventTag: null,
     projectTag: null,
@@ -95,6 +96,7 @@ function detailFixture(items: InvoiceItemDto[] = []): BatchDetailDto {
       unconfirmedCount: 0,
     },
     warnings: [],
+    issues: [],
   };
 }
 
@@ -120,6 +122,7 @@ function automationFixture(
     importedCount: 1,
     assignedCount: 1,
     exceptionCount: 0,
+    repairedCount: 0,
     export: {
       directory: "/Users/finance/2026-5",
       itemCount: 1,
@@ -884,6 +887,7 @@ describe("Batch workspace", () => {
       originalName: "疑似重复发票.pdf",
       status: "suspected_duplicate",
       dedupeStatus: "suspected_duplicate",
+      hasNormalizedPdf: true,
     });
     const failed = itemFixture({
       id: "invoice-failed",

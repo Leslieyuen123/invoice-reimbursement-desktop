@@ -39,7 +39,7 @@ fn sample_item(id: u128, period: Option<&str>) -> NewItemRecord {
         id,
         original_name: format!("{id}.pdf"),
         original_path: format!("/tmp/{id}.pdf"),
-        normalized_pdf_path: None,
+        normalized_pdf_path: Some(format!("/tmp/normalized-{id}.pdf")),
         sha256: format!("sha-{id}"),
         mime_type: "application/pdf".to_owned(),
         source_type: SourceType::ManualUpload,
@@ -55,13 +55,13 @@ fn sample_item(id: u128, period: Option<&str>) -> NewItemRecord {
         suggested_period: period.map(str::to_owned),
         batch_id: None,
         suggested_category: Some(Category::Transport),
-        final_category: None,
+        final_category: Some(Category::Transport),
         amount_cents: Some(100),
         currency: "CNY".to_owned(),
         city: None,
         company: None,
         recognition_status: RecognitionStatus::Succeeded,
-        confirmation_status: ConfirmationStatus::Pending,
+        confirmation_status: ConfirmationStatus::Confirmed,
         dedupe_status: DedupeStatus::Unique,
         duplicate_of_id: None,
         note: None,
@@ -500,6 +500,45 @@ async fn batch_candidates_do_not_guess_a_legacy_email_month_from_utc_fetched_at(
 }
 
 #[tokio::test]
+async fn assign_refuses_members_the_export_would_reject() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+    let mut missing_normalized = sample_item(90, Some("2026-02"));
+    missing_normalized.normalized_pdf_path = None;
+    let mut unconfirmed = sample_item(91, Some("2026-02"));
+    unconfirmed.confirmation_status = ConfirmationStatus::Pending;
+    for item in [&missing_normalized, &unconfirmed] {
+        items.insert(item).await.expect("item should insert");
+    }
+
+    let error = service
+        .assign_items(batch.id, &[missing_normalized.id])
+        .await
+        .expect_err("an invoice without a normalized PDF must not join a batch");
+    assert!(matches!(
+        error,
+        AppError::Conflict { ref message }
+            if message.contains("归一化 PDF") && message.contains(&missing_normalized.original_name)
+    ));
+
+    let error = service
+        .assign_items(batch.id, &[unconfirmed.id])
+        .await
+        .expect_err("an unconfirmed invoice must not join a batch");
+    assert!(matches!(error, AppError::Conflict { .. }));
+
+    let detail = service.get(batch.id).await.expect("batch should reload");
+    assert!(detail.items.is_empty());
+}
+
+#[tokio::test]
 async fn assign_is_idempotent_deduplicates_input_and_warns_only_for_outside_dates() {
     let pool = db::connect("sqlite::memory:")
         .await
@@ -795,6 +834,9 @@ async fn summary_counts_total_unconfirmed_and_only_final_categories() {
         item.final_category = final_category;
         item.amount_cents = amount_cents;
         item.confirmation_status = confirmation_status;
+        // Legacy batches can hold members that today's assignment guard would
+        // refuse, and the summary must still count them.
+        item.batch_id = Some(batch.id);
         ids.push(item.id);
         items
             .insert(&item)
@@ -803,9 +845,9 @@ async fn summary_counts_total_unconfirmed_and_only_final_categories() {
     }
 
     let detail = service
-        .assign_items(batch.id, &ids)
+        .get(batch.id)
         .await
-        .expect("summary items should assign");
+        .expect("batch detail should load");
 
     assert_eq!(detail.summary.item_count, 6);
     assert_eq!(detail.summary.total_amount_cents, 1_800);
@@ -832,7 +874,7 @@ async fn summary_reports_amount_overflow_without_panicking() {
         .await
         .expect("batch should create");
     let mut maximum = sample_item(66, Some("2026-02"));
-    maximum.amount_cents = None;
+    maximum.amount_cents = Some(1);
     let mut one = sample_item(67, Some("2026-02"));
     one.amount_cents = Some(1);
     items
@@ -1188,6 +1230,10 @@ async fn recognition_updates_fall_back_the_exported_batch() {
     item.invoice_date = None;
     item.amount_cents = None;
     item.suggested_category = None;
+    item.final_category = None;
+    // An incomplete legacy member: assignment refuses it today, but an export
+    // fallback must still invalidate a batch that already holds it.
+    item.batch_id = Some(batch.id);
     items.insert(&item).await.expect("item should insert");
     batches
         .assign_items(batch.id, &[item.id])
@@ -1320,10 +1366,7 @@ async fn item_review_rolls_back_when_export_fallback_cannot_be_persisted() {
 
     let persisted_item = items.get_by_id(item.id).await.expect("item should reload");
     assert_eq!(persisted_item.amount_cents, original_amount);
-    assert_eq!(
-        persisted_item.confirmation_status,
-        ConfirmationStatus::Pending
-    );
+    assert_eq!(persisted_item.confirmation_status, item.confirmation_status);
     let persisted_batch = BatchRepository::new(pool)
         .get(batch.id)
         .await

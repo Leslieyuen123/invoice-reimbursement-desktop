@@ -12,6 +12,7 @@ import {
   Sparkles,
   SlidersHorizontal,
   Trash2,
+  X,
 } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
@@ -155,6 +156,10 @@ export function BatchDetailPage() {
   const [exportError, setExportError] = useState<string | null>(null);
   const [automationRevealError, setAutomationRevealError] =
     useState<string | null>(null);
+  const [repairPending, setRepairPending] = useState(false);
+  const [repairMessage, setRepairMessage] = useState<string | null>(null);
+  const [repairError, setRepairError] = useState<string | null>(null);
+  const [issueRemovingId, setIssueRemovingId] = useState<string | null>(null);
   const [manualRevealError, setManualRevealError] = useState<string | null>(null);
   const [assignDialogOpen, setAssignDialogOpen] = useState(false);
   const [assignDialogSession, setAssignDialogSession] = useState(0);
@@ -323,7 +328,7 @@ export function BatchDetailPage() {
         if (session !== routeSession.current) return;
         itemIds.push(
           ...page.items
-            .filter((candidate) => candidate.eligible)
+            .filter((candidate) => candidate.eligible && !candidate.outsideBatchRange)
             .map((candidate) => candidate.item.id),
         );
         if (!page.nextCursor) break;
@@ -493,6 +498,49 @@ export function BatchDetailPage() {
     }
   }
 
+  async function removeIssueItem(itemId: string) {
+    const session = routeSession.current;
+    const operationBatchId = batchId;
+    setIssueRemovingId(itemId);
+    setRepairError(null);
+    try {
+      await api.removeItemFromBatch(operationBatchId, itemId);
+      reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
+    } catch (error) {
+      if (session === routeSession.current) {
+        setRepairError(errorMessage(error, "票据移出失败"));
+      }
+    } finally {
+      if (session === routeSession.current) setIssueRemovingId(null);
+    }
+  }
+
+  async function runNormalizedRepair() {
+    const session = routeSession.current;
+    const operationBatchId = batchId;
+    setRepairPending(true);
+    setRepairError(null);
+    setRepairMessage(null);
+    try {
+      const result = await api.repairBatchNormalizedPdfs(operationBatchId);
+      reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
+      if (session !== routeSession.current) return;
+      setRepairMessage(
+        result.issues.length === 0
+          ? `已补齐 ${result.repairedCount} 张票据的归一化 PDF，现在可以导出`
+          : `已补齐 ${result.repairedCount} 张；仍有 ${result.issues.length} 张需要人工处理`,
+      );
+    } catch (error) {
+      if (session === routeSession.current) {
+        setRepairError(errorMessage(error, "归一化 PDF 补齐失败"));
+      }
+    } finally {
+      if (session === routeSession.current) setRepairPending(false);
+    }
+  }
+
   if (batchQuery.isPending) {
     return (
       <div className="batch-detail-page batch-detail-loading" role="status">
@@ -523,6 +571,7 @@ export function BatchDetailPage() {
 
   const detail = batchQuery.data;
   const exportBlocked = detail.summary.unconfirmedCount > 0;
+  const hasExportIssues = detail.issues.length > 0;
   const automationExport = automationFeedback.status === "success"
     ? automationFeedback.result.export
     : null;
@@ -562,7 +611,7 @@ export function BatchDetailPage() {
           <button
             type="button"
             className="button button-primary"
-            disabled={exportBlocked || exportPending}
+            disabled={exportBlocked || hasExportIssues || exportPending}
             onClick={() => void runExport()}
           >
             <FileArchive size={16} strokeWidth={1.7} aria-hidden="true" />
@@ -620,6 +669,9 @@ export function BatchDetailPage() {
               <li>{automationFeedback.result.assignedCount} 张已自动纳入</li>
               <li>{automationFeedback.result.exceptionCount} 个异常项</li>
               <li>{automationFeedback.result.failedAccounts.length} 个邮箱失败</li>
+              {automationFeedback.result.repairedCount > 0 ? (
+                <li>{automationFeedback.result.repairedCount} 张补齐归一化 PDF</li>
+              ) : null}
             </ul>
             {automationExport ? (
               <>
@@ -677,6 +729,62 @@ export function BatchDetailPage() {
           </button>
         </div>
       </section>
+
+      {hasExportIssues ? (
+        <section
+          className="batch-issues"
+          role="alert"
+          aria-labelledby="batch-issues-title"
+        >
+          <div className="batch-automation-title">
+            <CircleAlert size={17} strokeWidth={1.7} aria-hidden="true" />
+            <h2 id="batch-issues-title">
+              有 {detail.issues.length} 张票据阻止导出
+            </h2>
+          </div>
+          <ul className="batch-issues-list">
+            {detail.issues.map((issue) => (
+              <li key={issue.itemId}>
+                <span className="batch-issues-copy">
+                  <strong>{issue.fileName}</strong>
+                  <small>{issue.message}</small>
+                </span>
+                {issue.repairable ? (
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    disabled={repairPending}
+                    onClick={() => void runNormalizedRepair()}
+                  >
+                    <RefreshCw size={15} strokeWidth={1.7} aria-hidden="true" />
+                    {repairPending ? "正在补齐" : "补齐归一化 PDF"}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  disabled={issueRemovingId === issue.itemId}
+                  onClick={() => void removeIssueItem(issue.itemId)}
+                >
+                  <X size={15} strokeWidth={1.7} aria-hidden="true" />
+                  移出批次
+                </button>
+              </li>
+            ))}
+          </ul>
+          <p className="batch-issues-hint">
+            补齐或移出这些票据后即可导出；无法补齐的原件请改用 PDF、JPG 或 PNG 重新导入。
+          </p>
+        </section>
+      ) : null}
+
+      {repairError ? (
+        <div className="batch-inline-error" role="alert">{repairError}</div>
+      ) : null}
+
+      {repairMessage ? (
+        <div className="batch-inline-note" role="status">{repairMessage}</div>
+      ) : null}
 
       <div className="batch-summary-strip">
         <div>

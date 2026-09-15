@@ -5,11 +5,14 @@ import type {
   BatchDetailDto,
   BatchDetailSummaryDto,
   BatchDto,
+  BatchIssueDto,
+  BatchRepairDto,
   Category,
   DashboardDto,
   ExportResultDto,
   InvoiceItemDto,
   ItemFilter,
+  ItemStatus,
   MailboxAccountDto,
   ManualImportOutcomeDto,
   NewBatchInputDto,
@@ -214,7 +217,95 @@ function batchDetail(state: BridgeState, batchId: string): BatchDetailDto {
     unconfirmedCount: summary.unconfirmedCount,
     updatedAt: now,
   });
-  return { batch: { ...batch }, items: items.map((item) => ({ ...item })), summary, warnings: [] };
+  const issues = items
+    .map((item) => exportBlocker(item))
+    .filter((issue): issue is BatchIssueDto => issue !== null);
+  return {
+    batch: { ...batch },
+    items: items.map((item) => ({ ...item })),
+    summary,
+    warnings: [],
+    issues,
+  };
+}
+
+/**
+ * Mirrors `derive_item_status` in `src-tauri/src/domain/model.rs`: the backend
+ * derives the item status from the three status columns instead of trusting a
+ * stored field, so the bridge must do the same.
+ */
+function derivedStatus(item: InvoiceItemDto): ItemStatus {
+  if (item.dedupeStatus === "suspected_duplicate") return "suspected_duplicate";
+  if (item.recognitionStatus === "failed") return "recognition_failed";
+  if (item.recognitionStatus === "pending") return "pending_recognition";
+  if (item.confirmationStatus === "pending") return "pending_confirmation";
+  return "ready";
+}
+
+/**
+ * Mirrors the backend export preflight in
+ * `src-tauri/src/services/batch_eligibility.rs`, so the development bridge
+ * rejects the same batches the real app rejects.
+ */
+function exportBlocker(item: InvoiceItemDto): BatchIssueDto | null {
+  const issue = (code: string, message: string, repairable = false): BatchIssueDto => ({
+    itemId: item.id,
+    fileName: item.originalName,
+    code,
+    message,
+    repairable,
+  });
+  const status = derivedStatus(item);
+  if (status === "suspected_duplicate") {
+    return issue("suspected_duplicate", "票据疑似重复，请先在待处理池处理");
+  }
+  if (status === "recognition_failed") {
+    return issue("recognition_failed", "票据识别失败，请先重新识别或更换原件");
+  }
+  if (status === "pending_recognition") {
+    return issue("not_recognized", "票据尚未完成识别");
+  }
+  if (status === "pending_confirmation") {
+    return issue("not_confirmed", "票据尚未确认");
+  }
+  if (item.finalCategory === null) return issue("missing_category", "票据分类不能为空");
+  if (item.suggestedPeriod === null) {
+    return issue("missing_period", "建议归属时间不能为空");
+  }
+  if (item.amountCents === null) return issue("missing_amount", "票据金额不能为空");
+  if (item.currency !== "CNY") return issue("unsupported_currency", "仅支持人民币票据");
+  if (!item.hasNormalizedPdf) {
+    return issue("missing_normalized_pdf", "票据缺少归一化 PDF", canNormalize(item));
+  }
+  return null;
+}
+
+function canNormalize(item: InvoiceItemDto) {
+  return /\.(pdf|jpe?g|png)$/iu.test(item.originalName);
+}
+
+/** Mirrors `repair_missing_normalized_pdfs` for the development bridge. */
+function repairMissingNormalized(state: BridgeState, items: InvoiceItemDto[]) {
+  let repairedCount = 0;
+  for (const item of items) {
+    const issue = exportBlocker(item);
+    if (issue?.code !== "missing_normalized_pdf" || !issue.repairable) continue;
+    const target = state.items.find((candidate) => candidate.id === item.id);
+    if (!target) continue;
+    Object.assign(target, { hasNormalizedPdf: true, updatedAt: now });
+    repairedCount += 1;
+  }
+  return repairedCount;
+}
+
+function describeIssues(issues: BatchIssueDto[]) {
+  const named = issues
+    .slice(0, 3)
+    .map((issue) => `${issue.fileName}（${issue.message}）`)
+    .join("；");
+  return issues.length > 3
+    ? `${named}；另有 ${issues.length - 3} 张同类问题票据`
+    : named;
 }
 
 function exportBatch(state: BridgeState, batchId: string): ExportResultDto {
@@ -236,6 +327,12 @@ function exportBatch(state: BridgeState, batchId: string): ExportResultDto {
       message: `Batch contains blocked item ${blocked.id}`,
     } satisfies AppError;
   }
+  if (detail.issues.length !== 0) {
+    throw {
+      code: "conflict",
+      message: `${detail.issues.length} 张票据无法导出：${describeIssues(detail.issues)}`,
+    } satisfies AppError;
+  }
   const batch = state.batches.find((candidate) => candidate.id === batchId);
   if (!batch) throw notFound("batch");
   Object.assign(batch, { status: "exported", lastExportedAt: now, updatedAt: now });
@@ -248,7 +345,7 @@ function exportBatch(state: BridgeState, batchId: string): ExportResultDto {
 
 function isSafeAutomationCandidate(item: InvoiceItemDto, batch: BatchDto) {
   return (
-    item.status === "ready" &&
+    derivedStatus(item) === "ready" &&
     item.invoiceDate !== null &&
     item.invoiceDate >= batch.startDate &&
     item.invoiceDate <= batch.endDate &&
@@ -258,7 +355,8 @@ function isSafeAutomationCandidate(item: InvoiceItemDto, batch: BatchDto) {
     Number.isSafeInteger(item.amountCents) &&
     item.amountCents >= 0 &&
     item.currency === "CNY" &&
-    item.suggestedPeriod !== null
+    item.suggestedPeriod !== null &&
+    item.hasNormalizedPdf
   );
 }
 
@@ -291,6 +389,7 @@ function seedAutomationScenario(
       recognitionStatus: "succeeded",
       confirmationStatus: "confirmed",
       dedupeStatus: "unique",
+      hasNormalizedPdf: true,
       note: null,
       eventTag: null,
       projectTag: null,
@@ -317,6 +416,7 @@ function seedAutomationScenario(
       recognitionStatus: "succeeded",
       confirmationStatus: "pending",
       dedupeStatus: "unique",
+      hasNormalizedPdf: true,
       note: null,
       eventTag: null,
       projectTag: null,
@@ -369,6 +469,7 @@ function createItem(state: BridgeState, path: string): InvoiceItemDto {
     recognitionStatus: "succeeded",
     confirmationStatus: "pending",
     dedupeStatus: "unique",
+    hasNormalizedPdf: true,
     note: null,
     eventTag: null,
     projectTag: null,
@@ -501,22 +602,19 @@ function makeHandlers(
             item.invoiceDate <= batch.endDate
           );
         })
-        .map<BatchCandidateDto>((item) => ({
-          item: { ...item },
-          outsideBatchRange:
-            item.invoiceDate === null ||
-            item.invoiceDate < batch.startDate ||
-            item.invoiceDate > batch.endDate,
-          eligible:
-            item.dedupeStatus !== "suspected_duplicate" &&
-            item.recognitionStatus !== "failed",
-          disabledReason:
-            item.dedupeStatus === "suspected_duplicate"
-              ? "suspected_duplicate"
-              : item.recognitionStatus === "failed"
-                ? "recognition_failed"
-                : null,
-        }));
+        .map<BatchCandidateDto>((item) => {
+          const disabledReason = exportBlocker(item)?.code ?? null;
+          return {
+            item: { ...item },
+            outsideBatchRange:
+              item.invoiceDate === null ||
+              item.invoiceDate < batch.startDate ||
+              item.invoiceDate > batch.endDate,
+            eligible: disabledReason === null,
+            disabledReason:
+              disabledReason as BatchCandidateDto["disabledReason"],
+          };
+        });
       return paginate(candidates, arguments_.page, (candidate) => ({
         sortValue: candidate.item.createdAt,
         id: candidate.item.id,
@@ -538,18 +636,22 @@ function makeHandlers(
       if (!Array.isArray(itemIds) || !itemIds.every((id) => typeof id === "string")) {
         throw new Error("Browser command argument itemIds must be a string array");
       }
+      const blocked = itemIds
+        .map((itemId) => {
+          const item = state.items.find((candidate) => candidate.id === itemId);
+          if (!item) throw notFound("item");
+          return exportBlocker(item);
+        })
+        .filter((issue): issue is BatchIssueDto => issue !== null);
+      if (blocked.length !== 0) {
+        throw {
+          code: "conflict",
+          message: `${blocked.length} 张票据无法加入批次：${describeIssues(blocked)}`,
+        } satisfies AppError;
+      }
       const items = itemIds.map((itemId) => {
         const item = state.items.find((candidate) => candidate.id === itemId);
         if (!item) throw notFound("item");
-        if (
-          item.dedupeStatus === "suspected_duplicate" ||
-          item.recognitionStatus === "failed"
-        ) {
-          throw {
-            code: "conflict",
-            message: `Item ${itemId} cannot be assigned to a batch`,
-          } satisfies AppError;
-        }
         return item;
       });
       markBatchDraft(state, batchId);
@@ -619,6 +721,9 @@ function makeHandlers(
         Object.assign(item, { batchId, updatedAt: now });
       }
       const detail = batchDetail(state, batchId);
+      const repairedCount = repairMissingNormalized(state, detail.items);
+      if (repairedCount !== 0) markBatchDraft(state, batchId);
+      const refreshed = repairedCount === 0 ? detail : batchDetail(state, batchId);
       persistState();
       return {
         scannedAccountCount: enabledAccounts.length,
@@ -626,8 +731,21 @@ function makeHandlers(
         importedCount,
         assignedCount: safeCandidates.length,
         exceptionCount: candidates.length - safeCandidates.length,
-        export: detail.items.length === 0 ? null : exportBatch(state, batchId),
+        repairedCount,
+        export:
+          refreshed.items.length === 0 ? null : exportBatch(state, batchId),
       } satisfies BatchAutomationResultDto;
+    }],
+    [API_COMMANDS.repairBatchNormalizedPdfs, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      const detail = batchDetail(state, batchId);
+      const repairedCount = repairMissingNormalized(state, detail.items);
+      if (repairedCount !== 0) markBatchDraft(state, batchId);
+      persistState();
+      return {
+        repairedCount,
+        issues: batchDetail(state, batchId).issues,
+      } satisfies BatchRepairDto;
     }],
     [API_COMMANDS.listMailboxAccounts, () =>
       state.accounts.map((account) => ({ ...account }))],

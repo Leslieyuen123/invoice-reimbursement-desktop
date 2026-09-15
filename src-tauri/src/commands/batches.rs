@@ -7,11 +7,14 @@ use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
 use crate::db::batches::{Batch, BatchPageCursor, BatchSummary};
 use crate::domain::amount::validate_amount_cents;
 use crate::domain::error::AppError;
-use crate::domain::model::{BatchStatus, DedupeStatus, RecognitionStatus};
+use crate::domain::model::BatchStatus;
 use crate::services::batch_automation::{AccountAutomationFailure, BatchAutomationResult};
+use crate::services::batch_eligibility::{BatchBlocker, BatchIssue, batch_issues, export_blocker};
+use crate::services::batch_repair::repair_missing_normalized_pdfs;
 use crate::services::batches::{
     BatchDetail, BatchDetailSummary, BatchService, CategorySummary, NewBatchInput,
 };
+use crate::services::recognition::original_can_be_normalized;
 use crate::state::AppState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -140,6 +143,19 @@ pub struct BatchDetailDto {
     pub items: Vec<crate::commands::items::InvoiceItemDto>,
     pub summary: BatchDetailSummaryDto,
     pub warnings: Vec<String>,
+    /// Batch members that currently block the export, with a repair hint.
+    pub issues: Vec<BatchIssueDto>,
+}
+
+/// One batch member that blocks the export of the whole batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchIssueDto {
+    pub item_id: String,
+    pub file_name: String,
+    pub code: String,
+    pub message: String,
+    pub repairable: bool,
 }
 
 impl TryFrom<BatchDetail> for BatchDetailDto {
@@ -160,8 +176,34 @@ impl TryFrom<BatchDetail> for BatchDetailDto {
                 .collect::<Result<Vec<_>, _>>()?,
             summary: summary.try_into()?,
             warnings,
+            issues: Vec::new(),
         })
     }
+}
+
+/// Builds the batch detail DTO including the export blockers of its members.
+fn detail_dto(state: &AppState, detail: BatchDetail) -> Result<BatchDetailDto, AppError> {
+    let issues = batch_issue_dtos(batch_issues(state.paths(), &detail.items));
+    let mut dto = BatchDetailDto::try_from(detail)?;
+    dto.issues = issues;
+    Ok(dto)
+}
+
+fn batch_issue_dtos(issues: Vec<BatchIssue>) -> Vec<BatchIssueDto> {
+    issues
+        .into_iter()
+        .map(|issue| {
+            let repairable =
+                issue.blocker.is_repairable() && original_can_be_normalized(&issue.file_name);
+            BatchIssueDto {
+                item_id: issue.item_id.to_string(),
+                file_name: issue.file_name,
+                code: issue.blocker.code().to_owned(),
+                message: issue.blocker.message().to_owned(),
+                repairable,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -178,6 +220,11 @@ pub struct NewBatchInputDto {
 pub enum BatchCandidateDisabledReason {
     RecognitionFailed,
     SuspectedDuplicate,
+    NotRecognized,
+    NotConfirmed,
+    MissingNormalizedPdf,
+    MissingOriginalFile,
+    IncompleteDetails,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -215,6 +262,7 @@ pub struct BatchAutomationResultDto {
     pub imported_count: u32,
     pub assigned_count: u32,
     pub exception_count: u32,
+    pub repaired_count: u32,
     pub export: Option<ExportResultDto>,
 }
 
@@ -232,6 +280,7 @@ impl TryFrom<BatchAutomationResult> for BatchAutomationResultDto {
             imported_count: result.imported_count,
             assigned_count: result.assigned_count,
             exception_count: result.exception_count,
+            repaired_count: result.repaired_count,
             export: result.export.map(ExportResultDto::try_from).transpose()?,
         })
     }
@@ -290,13 +339,31 @@ pub async fn list_candidates(
             let outside_batch_range = item
                 .batch_membership_date()
                 .is_none_or(|date| date < batch.start_date || date > batch.end_date);
-            let disabled_reason = if item.dedupe_status == DedupeStatus::SuspectedDuplicate {
-                Some(BatchCandidateDisabledReason::SuspectedDuplicate)
-            } else if item.recognition_status == RecognitionStatus::Failed {
-                Some(BatchCandidateDisabledReason::RecognitionFailed)
-            } else {
-                None
-            };
+            // Candidate eligibility must match what the export accepts, so a
+            // batch can never be made unexportable from the batch detail page.
+            let disabled_reason =
+                export_blocker(state.paths(), &item).map(|blocker| match blocker {
+                    BatchBlocker::SuspectedDuplicate => {
+                        BatchCandidateDisabledReason::SuspectedDuplicate
+                    }
+                    BatchBlocker::RecognitionFailed => {
+                        BatchCandidateDisabledReason::RecognitionFailed
+                    }
+                    BatchBlocker::NotRecognized => BatchCandidateDisabledReason::NotRecognized,
+                    BatchBlocker::NotConfirmed => BatchCandidateDisabledReason::NotConfirmed,
+                    BatchBlocker::MissingNormalizedPdf => {
+                        BatchCandidateDisabledReason::MissingNormalizedPdf
+                    }
+                    BatchBlocker::MissingOriginalFile => {
+                        BatchCandidateDisabledReason::MissingOriginalFile
+                    }
+                    BatchBlocker::MissingCategory
+                    | BatchBlocker::MissingPeriod
+                    | BatchBlocker::MissingAmount
+                    | BatchBlocker::UnsupportedCurrency => {
+                        BatchCandidateDisabledReason::IncompleteDetails
+                    }
+                });
             Ok(BatchCandidateDto {
                 item: crate::commands::items::InvoiceItemDto::try_from(item)?,
                 outside_batch_range,
@@ -325,10 +392,36 @@ fn parse_batch_cursor(cursor: &CursorDto) -> Result<BatchPageCursor, AppError> {
 }
 
 pub async fn get(state: &AppState, id: Uuid) -> Result<BatchDetailDto, AppError> {
-    BatchService::new(state.pool().clone())
-        .get(id)
-        .await?
-        .try_into()
+    let detail = BatchService::new(state.pool().clone()).get(id).await?;
+    detail_dto(state, detail)
+}
+
+/// Regenerates missing normalized PDFs for the batch members that can still be
+/// normalized, so the export is not blocked by an invoice nothing could repair.
+pub async fn repair_normalized_pdfs(
+    state: &AppState,
+    batch_id: Uuid,
+) -> Result<BatchRepairDto, AppError> {
+    let detail = BatchService::new(state.pool().clone())
+        .get(batch_id)
+        .await?;
+    let repaired_count =
+        repair_missing_normalized_pdfs(state.paths(), &state.recognition_service(), &detail.items)
+            .await;
+    let refreshed = BatchService::new(state.pool().clone())
+        .get(batch_id)
+        .await?;
+    Ok(BatchRepairDto {
+        repaired_count,
+        issues: batch_issue_dtos(batch_issues(state.paths(), &refreshed.items)),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRepairDto {
+    pub repaired_count: u32,
+    pub issues: Vec<BatchIssueDto>,
 }
 
 pub async fn create_month(state: &AppState, year: i32, month: u32) -> Result<BatchDto, AppError> {
@@ -360,10 +453,10 @@ pub async fn assign(
     batch_id: Uuid,
     item_ids: Vec<Uuid>,
 ) -> Result<BatchDetailDto, AppError> {
-    BatchService::new(state.pool().clone())
+    let detail = BatchService::new(state.pool().clone())
         .assign_items(batch_id, &item_ids)
-        .await?
-        .try_into()
+        .await?;
+    detail_dto(state, detail)
 }
 
 pub async fn remove(
@@ -371,10 +464,10 @@ pub async fn remove(
     batch_id: Uuid,
     item_id: Uuid,
 ) -> Result<BatchDetailDto, AppError> {
-    BatchService::new(state.pool().clone())
+    let detail = BatchService::new(state.pool().clone())
         .remove_item(batch_id, item_id)
-        .await?
-        .try_into()
+        .await?;
+    detail_dto(state, detail)
 }
 
 pub async fn run_automation(
@@ -393,7 +486,8 @@ pub(crate) mod ipc {
     use uuid::Uuid;
 
     use super::{
-        BatchAutomationResultDto, BatchCandidateDto, BatchDetailDto, BatchDto, NewBatchInputDto,
+        BatchAutomationResultDto, BatchCandidateDto, BatchDetailDto, BatchDto, BatchRepairDto,
+        NewBatchInputDto,
     };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
@@ -413,6 +507,14 @@ pub(crate) mod ipc {
         batch_id: Uuid,
     ) -> Result<BatchDetailDto, AppError> {
         super::get(&state, batch_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn repair_batch_normalized_pdfs(
+        state: State<'_, AppState>,
+        batch_id: Uuid,
+    ) -> Result<BatchRepairDto, AppError> {
+        super::repair_normalized_pdfs(&state, batch_id).await
     }
 
     #[tauri::command(rename_all = "camelCase")]

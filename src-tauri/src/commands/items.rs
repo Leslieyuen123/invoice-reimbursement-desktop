@@ -52,6 +52,11 @@ pub struct InvoiceItemDto {
     pub recognition_status: RecognitionStatus,
     pub confirmation_status: ConfirmationStatus,
     pub dedupe_status: DedupeStatus,
+    /// Whether a normalized PDF is recorded for this invoice.
+    ///
+    /// The export rejects the whole batch when any member lacks one, so the UI
+    /// must be able to show that before the user assigns or exports.
+    pub has_normalized_pdf: bool,
     pub note: Option<String>,
     pub event_tag: Option<String>,
     pub project_tag: Option<String>,
@@ -90,6 +95,7 @@ impl TryFrom<InvoiceItem> for InvoiceItemDto {
             recognition_status: item.recognition_status,
             confirmation_status: item.confirmation_status,
             dedupe_status: item.dedupe_status,
+            has_normalized_pdf: variant == "normalized",
             note: item.note,
             event_tag: item.event_tag,
             project_tag: item.project_tag,
@@ -230,7 +236,7 @@ pub async fn review(
     input: ReviewItemInputDto,
 ) -> Result<InvoiceItemDto, AppError> {
     validate_amount_cents(input.amount_cents, "amountCents")?;
-    state
+    let reviewed = state
         .item_service()
         .review(ItemReview {
             id: input.id,
@@ -244,8 +250,27 @@ pub async fn review(
             event_tag: input.event_tag,
             project_tag: input.project_tag,
         })
-        .await?
-        .try_into()
+        .await?;
+    // Confirming an invoice whose recognition failed used to make it "ready for
+    // a batch" while it had no normalized PDF, which later blocked the export
+    // of the whole batch. Backfill it now; a review must never fail because of
+    // this, the batch detail reports whatever is still missing.
+    let reviewed = match state
+        .recognition_service()
+        .backfill_normalized_pdf(reviewed.id)
+        .await
+    {
+        Ok(item) => item,
+        Err(error) => {
+            tracing::warn!(
+                item_id = %reviewed.id,
+                error = %error,
+                "normalized PDF backfill after review was not possible"
+            );
+            reviewed
+        }
+    };
+    reviewed.try_into()
 }
 
 pub async fn resolve_duplicate(

@@ -12,7 +12,9 @@ use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, NewBatch, RecognitionStatus,
 };
 use crate::infra::files::AppPaths;
-use crate::services::batch_eligibility::is_safe_batch_candidate;
+use crate::services::batch_eligibility::{
+    BatchIssue, db_export_blocker, describe_issues, is_safe_batch_candidate,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewBatchInput {
@@ -221,6 +223,7 @@ impl BatchService {
             }
 
             let mut assignments = Vec::new();
+            let mut blocked: Vec<BatchIssue> = Vec::new();
             for item_id in item_ids {
                 let state = sqlx::query_as::<_, (String, String, Option<String>)>(
                     "SELECT recognition_status, dedupe_status, batch_id FROM items WHERE id = ?",
@@ -245,16 +248,39 @@ impl BatchService {
                         ),
                     });
                 }
-                match current_batch_id {
-                    None => assignments.push((item_id, None)),
-                    Some(current) if current == batch_id.to_string() => {}
-                    Some(current) => assignments.push((
-                        item_id,
+                let previous_batch = match current_batch_id {
+                    None => None,
+                    Some(current) if current == batch_id.to_string() => continue,
+                    Some(current) => {
                         Some(Uuid::parse_str(&current).map_err(|_| AppError::Internal {
                             message: "invalid item batch reference".to_owned(),
-                        })?),
-                    )),
+                        })?)
+                    }
+                };
+                // A batch member without an exportable original or normalized
+                // PDF makes the whole batch unexportable, so manual assignment
+                // must refuse it here instead of failing much later at export.
+                let item = ItemRepository::find_by_id_with_connection(&mut transaction, item_id)
+                    .await?
+                    .ok_or_else(|| item_not_found(item_id))?;
+                if let Some(blocker) = db_export_blocker(&item) {
+                    blocked.push(BatchIssue {
+                        item_id,
+                        file_name: item.original_name.clone(),
+                        blocker,
+                    });
+                    continue;
                 }
+                assignments.push((item_id, previous_batch));
+            }
+            if !blocked.is_empty() {
+                return Err(AppError::Conflict {
+                    message: format!(
+                        "{} 张票据无法加入批次：{}",
+                        blocked.len(),
+                        describe_issues(&blocked)
+                    ),
+                });
             }
 
             let updated_at = Utc::now();

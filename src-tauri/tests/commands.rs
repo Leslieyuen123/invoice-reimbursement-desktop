@@ -304,6 +304,7 @@ fn batch_automation_dto_maps_the_backend_result_without_rewriting_failure_messag
         imported_count: 2,
         assigned_count: 3,
         exception_count: 4,
+        repaired_count: 6,
         export: Some(ExportResult {
             directory: "test-export".into(),
             item_count: 5,
@@ -321,6 +322,7 @@ fn batch_automation_dto_maps_the_backend_result_without_rewriting_failure_messag
     assert_eq!(dto.imported_count, 2);
     assert_eq!(dto.assigned_count, 3);
     assert_eq!(dto.exception_count, 4);
+    assert_eq!(dto.repaired_count, 6);
     assert_eq!(dto.export.unwrap().item_count, 5);
 }
 
@@ -336,6 +338,7 @@ fn batch_automation_dto_serializes_only_safe_camel_case_fields() {
         imported_count: 2,
         assigned_count: 3,
         exception_count: 4,
+        repaired_count: 0,
         export: None,
     };
 
@@ -351,6 +354,7 @@ fn batch_automation_dto_serializes_only_safe_camel_case_fields() {
             "importedCount": 2,
             "assignedCount": 3,
             "exceptionCount": 4,
+            "repairedCount": 0,
             "export": null,
         })
     );
@@ -837,17 +841,69 @@ async fn batch_adapters_use_service_summaries_for_assignment_and_removal() {
     let batch_id = Uuid::parse_str(&batch.id).unwrap();
     assert_eq!(batch.name, "2026 年 8 月报销");
 
-    let assigned = batches::assign(&app.state, batch_id, vec![pending_item_id])
+    // An unconfirmed invoice would make the whole batch unexportable.
+    let refused = batches::assign(&app.state, batch_id, vec![pending_item_id])
+        .await
+        .expect_err("unconfirmed invoices must not join a batch");
+    assert!(matches!(refused, AppError::Conflict { .. }));
+
+    let ready_item_id = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    std::fs::write(
+        app.state.paths().originals.join("ready.pdf"),
+        b"%PDF-1.4 original",
+    )
+    .unwrap();
+    std::fs::write(
+        app.state.paths().normalized.join("ready.pdf"),
+        b"%PDF-1.4 normalized",
+    )
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items (
+            id, original_name, original_path, normalized_pdf_path, sha256, mime_type,
+            source_type, fetched_at, invoice_date, suggested_period, final_category,
+            amount_cents, currency, recognition_status, confirmation_status,
+            dedupe_status, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, 'application/pdf', 'manual_upload', ?, '2026-08-10',
+            '2026-08', 'dining', 12850, 'CNY', 'succeeded', 'confirmed', 'unique', ?, ?)",
+    )
+    .bind(ready_item_id.to_string())
+    .bind("ready.pdf")
+    .bind(
+        app.state
+            .paths()
+            .originals
+            .join("ready.pdf")
+            .to_string_lossy(),
+    )
+    .bind(
+        app.state
+            .paths()
+            .normalized
+            .join("ready.pdf")
+            .to_string_lossy(),
+    )
+    .bind("sha-ready")
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(app.state.pool())
+    .await
+    .expect("ready item should insert");
+
+    let assigned = batches::assign(&app.state, batch_id, vec![ready_item_id])
         .await
         .unwrap();
     assert_eq!(assigned.batch.item_count, 1);
-    assert_eq!(assigned.batch.unconfirmed_count, 1);
-    assert_eq!(assigned.items[0].id, pending_item.id);
+    assert_eq!(assigned.batch.unconfirmed_count, 0);
+    assert_eq!(assigned.items[0].id, ready_item_id.to_string());
+    assert!(assigned.issues.is_empty());
 
     let fetched = batches::get(&app.state, batch_id).await.unwrap();
     assert_eq!(fetched.batch, assigned.batch);
 
-    let removed = batches::remove(&app.state, batch_id, pending_item_id)
+    let removed = batches::remove(&app.state, batch_id, ready_item_id)
         .await
         .unwrap();
     assert_eq!(removed.batch.item_count, 0);

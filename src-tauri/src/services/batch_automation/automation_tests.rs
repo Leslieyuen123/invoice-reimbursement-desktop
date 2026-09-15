@@ -111,6 +111,20 @@ impl DocumentExtractor for AccountBudgetExtractor {
     }
 }
 
+struct NormalizingExtractor;
+
+impl DocumentExtractor for NormalizingExtractor {
+    fn extract(&self, _path: &Path) -> Result<ExtractedDocument, AppError> {
+        Ok(ExtractedDocument {
+            text: "electronic invoice".to_owned(),
+            normalized_pdf: Some(
+                include_bytes!("../../../tests/fixtures/text-invoice.pdf").to_vec(),
+            ),
+            warnings: Vec::new(),
+        })
+    }
+}
+
 fn completed_rejection_scan() -> Vec<Result<MailboxDelta, AppError>> {
     let rejected = RejectedMessage {
         uid: 1,
@@ -467,4 +481,67 @@ async fn current_managed_paths_are_revalidated_after_candidate_scanning() {
         items.get_by_id(current_id).await.unwrap().batch_id,
         Some(batch_id)
     );
+}
+
+#[tokio::test]
+async fn automation_repairs_a_batch_member_that_lost_its_normalized_pdf() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let email = "repair@example.com";
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let state = AppState::with_gateway_and_extractor(
+        pool.clone(),
+        paths.clone(),
+        credentials.clone(),
+        Arc::new(AccountBudgetGateway::empty(email)),
+        Arc::new(NormalizingExtractor),
+    );
+    let account = MailboxAccountRepository::new(pool.clone())
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: email.to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    credentials.set(&account.id.to_string(), "secret").unwrap();
+    let batch = BatchService::new(pool.clone())
+        .create_month(2026, 5)
+        .await
+        .unwrap();
+    let item_id = Uuid::new_v4();
+    let mut record = safe_item(&paths, item_id);
+    record.batch_id = Some(batch.id);
+    // An invoice that was confirmed while it had no normalized PDF: the batch
+    // used to be unexportable forever and "retry automation" could not help.
+    fs::remove_file(record.normalized_pdf_path.clone().unwrap()).unwrap();
+    record.normalized_pdf_path = None;
+    ItemRepository::new(pool.clone())
+        .insert(&record)
+        .await
+        .unwrap();
+
+    let result = state
+        .batch_automation_service()
+        .run(batch.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.repaired_count, 1);
+    let repaired = ItemRepository::new(pool.clone())
+        .get_by_id(item_id)
+        .await
+        .unwrap();
+    let repaired_path = repaired
+        .normalized_pdf_path
+        .expect("repair should record a normalized PDF");
+    assert!(Path::new(&repaired_path).is_file());
+    assert_eq!(repaired.final_category, Some(Category::Dining));
+    assert_eq!(repaired.amount_cents, Some(12_850));
+    assert_eq!(repaired.confirmation_status, ConfirmationStatus::Confirmed);
+    assert!(result.export.is_some());
 }

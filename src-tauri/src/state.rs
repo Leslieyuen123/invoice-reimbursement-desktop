@@ -169,6 +169,7 @@ impl AppState {
             self.sync_service.clone(),
             BatchService::new(self.pool.clone()),
             self.export_service(),
+            self.recognition_service(),
             self.account_operations.clone(),
             self.batch_automation_coordinator.clone(),
             self.paths.clone(),
