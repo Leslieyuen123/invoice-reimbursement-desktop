@@ -332,7 +332,7 @@ fn collect_uncompressed_xref_stream(
     let mut cursor = content_start;
     let mut found_self = false;
     let mut revision_entries = Vec::new();
-    for range in index.chunks_exact(2) {
+    for range in index.as_chunks::<2>().0 {
         let first_object = range[0];
         let count = range[1];
         for object_id in first_object..first_object + count {
@@ -480,16 +480,20 @@ fn validate_xref_index(index: &[usize], size: usize) -> Result<usize, PdfPreflig
     if index.is_empty() || !index.len().is_multiple_of(2) {
         return Err(invalid_pdf_structure());
     }
-    index.chunks_exact(2).try_fold(0_usize, |total, range| {
-        range[0]
-            .checked_add(range[1])
-            .filter(|end| *end <= size)
-            .ok_or_else(invalid_pdf_structure)?;
-        total
-            .checked_add(range[1])
-            .filter(|count| *count <= MAX_XREF_ENTRIES)
-            .ok_or_else(resource_limit)
-    })
+    index
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .try_fold(0_usize, |total, range| {
+            range[0]
+                .checked_add(range[1])
+                .filter(|end| *end <= size)
+                .ok_or_else(invalid_pdf_structure)?;
+            total
+                .checked_add(range[1])
+                .filter(|count| *count <= MAX_XREF_ENTRIES)
+                .ok_or_else(resource_limit)
+        })
 }
 
 fn record_xref_entries(total: &mut usize, count: usize) -> Result<(), PdfPreflightError> {
