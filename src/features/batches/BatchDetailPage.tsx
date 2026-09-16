@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { join } from "@tauri-apps/api/path";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  CalendarRange,
   CheckCheck,
   CircleAlert,
   CircleCheck,
@@ -165,6 +166,11 @@ export function BatchDetailPage() {
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
   const [bulkRemovePending, setBulkRemovePending] = useState(false);
   const [bulkError, setBulkError] = useState<string | null>(null);
+  const [rangeOpen, setRangeOpen] = useState(false);
+  const [rangeStart, setRangeStart] = useState("");
+  const [rangeEnd, setRangeEnd] = useState("");
+  const [rangePending, setRangePending] = useState(false);
+  const [rangeError, setRangeError] = useState<string | null>(null);
   const [settleOpen, setSettleOpen] = useState(false);
   const [settlePending, setSettlePending] = useState(false);
   const [settleError, setSettleError] = useState<string | null>(null);
@@ -582,6 +588,29 @@ export function BatchDetailPage() {
     }
   }
 
+  async function saveRange() {
+    const session = routeSession.current;
+    const operationBatchId = batchId;
+    setRangePending(true);
+    setRangeError(null);
+    try {
+      await api.updateBatchRange(operationBatchId, {
+        startDate: rangeStart,
+        endDate: rangeEnd,
+      });
+      reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
+      if (session !== routeSession.current) return;
+      setRangeOpen(false);
+    } catch (error) {
+      if (session === routeSession.current) {
+        setRangeError(errorMessage(error, "批次范围更新失败"));
+      }
+    } finally {
+      if (session === routeSession.current) setRangePending(false);
+    }
+  }
+
   async function runSettle() {
     const session = routeSession.current;
     const operationBatchId = batchId;
@@ -674,6 +703,19 @@ export function BatchDetailPage() {
           >
             <PackagePlus size={16} strokeWidth={1.7} aria-hidden="true" />
             {recommendPending ? "正在加入" : "加入推荐票据"}
+          </button>
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={() => {
+              setRangeStart(detail.batch.startDate);
+              setRangeEnd(detail.batch.endDate);
+              setRangeError(null);
+              setRangeOpen(true);
+            }}
+          >
+            <CalendarRange size={16} strokeWidth={1.7} aria-hidden="true" />
+            编辑批次范围
           </button>
           <button
             type="button"
@@ -1116,6 +1158,62 @@ export function BatchDetailPage() {
           onAssigned={acceptAssignedDetail}
           onClose={closeAssignDialog}
         />
+      ) : null}
+
+      {rangeOpen ? (
+        <div className="batch-dialog-backdrop" role="presentation">
+          <div
+            className="batch-confirm-dialog batch-range-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="range-dialog-title"
+          >
+            <h2 id="range-dialog-title">编辑批次范围</h2>
+            <p>
+              调整后批次会回到「未导出」，已归属的票据全部保留；日期超出新范围的票据会继续显示提示。
+            </p>
+            <label className="batch-range-field">
+              <span>开始日期</span>
+              <input
+                type="date"
+                value={rangeStart}
+                onChange={(event) => setRangeStart(event.target.value)}
+              />
+            </label>
+            <label className="batch-range-field">
+              <span>结束日期</span>
+              <input
+                type="date"
+                value={rangeEnd}
+                onChange={(event) => setRangeEnd(event.target.value)}
+              />
+            </label>
+            {rangeError ? (
+              <div className="batch-inline-error" role="alert">{rangeError}</div>
+            ) : null}
+            <div className="batch-form-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                aria-disabled={rangePending || undefined}
+                autoFocus
+                onClick={() => {
+                  if (!rangePending) setRangeOpen(false);
+                }}
+              >
+                {rangePending ? "正在保存" : "取消"}
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                disabled={rangePending || !rangeStart || !rangeEnd}
+                onClick={() => void saveRange()}
+              >
+                保存范围
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {settleOpen ? (

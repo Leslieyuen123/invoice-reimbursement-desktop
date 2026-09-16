@@ -9,6 +9,7 @@ import type {
   DashboardDto,
   SettleBatchInputDto,
   SettleBatchOutcomeDto,
+  UpdateBatchRangeInputDto,
   ExportResultDto,
   InvoiceItemDto,
   ItemFilter,
@@ -66,6 +67,7 @@ export const API_COMMANDS = {
   listBatches: "list_batches",
   getBatch: "get_batch",
   repairBatchNormalizedPdfs: "repair_batch_normalized_pdfs",
+  updateBatchRange: "update_batch_range",
   settleBatchItems: "settle_batch_items",
   removeBatchItems: "remove_batch_items",
   listBatchCandidates: "list_batch_candidates",
@@ -132,6 +134,8 @@ export const api = {
     call<BatchDetailDto>(API_COMMANDS.removeItemFromBatch, { batchId, itemId }),
   repairBatchNormalizedPdfs: (batchId: string) =>
     call<BatchRepairDto>(API_COMMANDS.repairBatchNormalizedPdfs, { batchId }),
+  updateBatchRange: (batchId: string, input: UpdateBatchRangeInputDto) =>
+    call<BatchDetailDto>(API_COMMANDS.updateBatchRange, { batchId, input }),
   settleBatchItems: (batchId: string, input: SettleBatchInputDto) =>
     call<SettleBatchOutcomeDto>(API_COMMANDS.settleBatchItems, { batchId, input }),
   removeBatchItems: (batchId: string, itemIds: string[]) =>

@@ -31,6 +31,9 @@ pub struct CategorySummary {
     pub amount_cents: i64,
 }
 
+/// Longest range a single batch may cover, matching the automation limit.
+const MAX_RANGE_DAYS: u32 = 366;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchDetailSummary {
     pub item_count: u64,
@@ -466,6 +469,73 @@ impl BatchService {
         }
         .await;
 
+        finish_unit_transaction(transaction, result).await?;
+        self.get(batch_id).await
+    }
+
+    /// Moves a batch's date range.
+    ///
+    /// Batches are created around a month or a custom range, and a single
+    /// invoice received one day outside it used to leave the user with no option
+    /// but to build a second batch. Members are kept as they are; the batch
+    /// detail already reports the ones the new range excludes.
+    pub async fn update_range(
+        &self,
+        batch_id: Uuid,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<BatchDetail, AppError> {
+        let start_date = parse_date(start_date, "startDate")?;
+        let end_date = parse_date(end_date, "endDate")?;
+        if start_date > end_date {
+            return Err(AppError::validation(
+                "dateRange",
+                "start date must not be after end date",
+            ));
+        }
+        // The automation refuses ranges longer than 366 days, so a batch must
+        // never be saved into a range its own automation cannot process.
+        let inclusive_days = end_date
+            .signed_duration_since(start_date)
+            .num_days()
+            .checked_add(1)
+            .ok_or_else(summary_count_overflow)?;
+        if inclusive_days > i64::from(MAX_RANGE_DAYS) {
+            return Err(AppError::validation(
+                "dateRange",
+                format!("a batch range must not exceed {MAX_RANGE_DAYS} days"),
+            ));
+        }
+
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| database_error("failed to begin batch range update", error))?;
+        let result = async {
+            let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM batches WHERE id = ?")
+                .bind(batch_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|error| database_error("failed to validate batch range update", error))?
+                != 0;
+            if !exists {
+                return Err(batch_not_found(batch_id));
+            }
+            sqlx::query(
+                "UPDATE batches SET start_date = ?, end_date = ?, status = 'draft', updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(start_date.to_string())
+            .bind(end_date.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .bind(batch_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| database_error("failed to update batch range", error))?;
+            Ok(())
+        }
+        .await;
         finish_unit_transaction(transaction, result).await?;
         self.get(batch_id).await
     }

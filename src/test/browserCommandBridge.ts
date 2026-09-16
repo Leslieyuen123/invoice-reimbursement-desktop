@@ -20,6 +20,7 @@ import type {
   MailboxAccountDto,
   SettleBatchInputDto,
   SettleBatchOutcomeDto,
+  UpdateBatchRangeInputDto,
   ManualImportOutcomeDto,
   NewBatchInputDto,
   PageDto,
@@ -854,6 +855,27 @@ function makeHandlers(
         export:
           refreshed.items.length === 0 ? null : exportBatch(state, batchId),
       } satisfies BatchAutomationResultDto;
+    }],
+    [API_COMMANDS.updateBatchRange, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      const input = requiredObject<UpdateBatchRangeInputDto>(arguments_, "input");
+      const batch = state.batches.find((candidate) => candidate.id === batchId);
+      if (!batch) throw notFound("batch");
+      if (input.startDate > input.endDate) {
+        throw {
+          code: "validation",
+          field: "dateRange",
+          message: "start date must not be after end date",
+        } satisfies AppError;
+      }
+      Object.assign(batch, {
+        startDate: input.startDate,
+        endDate: input.endDate,
+        status: "draft",
+        updatedAt: now,
+      });
+      persistState();
+      return batchDetail(state, batchId);
     }],
     [API_COMMANDS.settleBatchItems, (arguments_) => {
       const batchId = requiredString(arguments_, "batchId");

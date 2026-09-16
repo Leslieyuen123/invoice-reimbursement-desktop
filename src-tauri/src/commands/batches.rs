@@ -424,6 +424,25 @@ pub struct BatchRepairDto {
     pub issues: Vec<BatchIssueDto>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateBatchRangeDto {
+    pub start_date: String,
+    pub end_date: String,
+}
+
+/// Moves a batch's date range without rebuilding the batch.
+pub async fn update_range(
+    state: &AppState,
+    batch_id: Uuid,
+    input: UpdateBatchRangeDto,
+) -> Result<BatchDetailDto, AppError> {
+    let detail = BatchService::new(state.pool().clone())
+        .update_range(batch_id, &input.start_date, &input.end_date)
+        .await?;
+    detail_dto(state, detail)
+}
+
 /// Options for the bulk confirm action on the batch detail page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -592,7 +611,7 @@ pub(crate) mod ipc {
 
     use super::{
         BatchAutomationResultDto, BatchCandidateDto, BatchDetailDto, BatchDto, BatchRepairDto,
-        NewBatchInputDto, SettleBatchInputDto, SettleBatchOutcomeDto,
+        NewBatchInputDto, SettleBatchInputDto, SettleBatchOutcomeDto, UpdateBatchRangeDto,
     };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
@@ -612,6 +631,15 @@ pub(crate) mod ipc {
         batch_id: Uuid,
     ) -> Result<BatchDetailDto, AppError> {
         super::get(&state, batch_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn update_batch_range(
+        state: State<'_, AppState>,
+        batch_id: Uuid,
+        input: UpdateBatchRangeDto,
+    ) -> Result<BatchDetailDto, AppError> {
+        super::update_range(&state, batch_id, input).await
     }
 
     #[tauri::command(rename_all = "camelCase")]

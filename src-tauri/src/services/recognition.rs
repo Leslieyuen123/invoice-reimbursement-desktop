@@ -175,6 +175,18 @@ impl RecognitionService {
                 "该原件格式不支持自动识别，已保留人工填写的内容",
             ));
         }
+        // A service without storage paths used to skip normalization silently and
+        // still mark the invoice as recognized, which is exactly how an
+        // unexportable batch is created. Refuse instead of pretending.
+        if item.normalized_pdf_path.is_none()
+            && extracted.normalized_pdf.is_some()
+            && self.paths.is_none()
+        {
+            return Err(AppError::Internal {
+                message: "recognition service has no application paths to store the normalized PDF"
+                    .to_owned(),
+            });
+        }
         let created_normalized = match (
             item.normalized_pdf_path.as_ref(),
             extracted.normalized_pdf.as_deref(),

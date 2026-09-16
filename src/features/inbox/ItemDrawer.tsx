@@ -266,6 +266,41 @@ export function ItemDrawer({
         />
 
         <div className="item-editor">
+          {(() => {
+            const readiness = [
+              { label: "开票日期", ok: item.invoiceDate !== null },
+              { label: "金额", ok: item.amountCents !== null },
+              {
+                label: "分类",
+                ok: (item.finalCategory ?? item.suggestedCategory) !== null,
+              },
+              { label: "归属月份", ok: item.suggestedPeriod !== null },
+              { label: "归一化 PDF", ok: item.hasNormalizedPdf },
+            ];
+            const missing = readiness.filter((entry) => !entry.ok);
+            return (
+              <section
+                className="item-readiness"
+                aria-label="导出就绪检查"
+                data-ready={missing.length === 0 ? "true" : "false"}
+              >
+                <h3>导出就绪检查</h3>
+                <ul>
+                  {readiness.map((entry) => (
+                    <li key={entry.label} data-ok={entry.ok ? "true" : "false"}>
+                      <span aria-hidden="true">{entry.ok ? "✓" : "✗"}</span>
+                      {entry.label}
+                    </li>
+                  ))}
+                </ul>
+                <p>
+                  {missing.length === 0
+                    ? "这张票据可以进入批次并导出。"
+                    : `还缺：${missing.map((entry) => entry.label).join("、")}。`}
+                </p>
+              </section>
+            );
+          })()}
           {!item.hasNormalizedPdf ? (
             <p className="item-normalization-warning" role="status">
               这张票据还没有归一化 PDF，导出时会被拒绝。PDF、JPG、PNG

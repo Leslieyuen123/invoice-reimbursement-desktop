@@ -246,6 +246,47 @@ describe("Batch workspace", () => {
     expect(await screen.findByText(/merged\.pdf/)).toBeInTheDocument();
   });
 
+  it("moves the batch range without rebuilding the batch", async () => {
+    const user = userEvent.setup();
+    let detail = detailFixture([itemFixture()]);
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", () => detail);
+    mockCommand("update_batch_range", (arguments_) => {
+      const input = (arguments_ as { input: { startDate: string; endDate: string } })
+        .input;
+      expect(input).toEqual({
+        startDate: "2026-06-01",
+        endDate: "2026-09-15",
+      });
+      detail = {
+        ...detail,
+        batch: {
+          ...detail.batch,
+          endDate: "2026-09-15",
+          status: "draft",
+        },
+      };
+      return detail;
+    });
+
+    renderAppAt("/batches/batch-summer");
+
+    await user.click(
+      await screen.findByRole("button", { name: "编辑批次范围" }),
+    );
+    const endDate = screen.getByLabelText("结束日期");
+    await user.clear(endDate);
+    await user.type(endDate, "2026-09-15");
+    await user.click(screen.getByRole("button", { name: "保存范围" }));
+
+    await waitFor(() =>
+      expect(commandCalls("update_batch_range")).toHaveLength(1),
+    );
+    expect(
+      await screen.findByText("2026-06-01 至 2026-09-15"),
+    ).toBeInTheDocument();
+  });
+
   it("removes the selected invoices in one bulk call", async () => {
     const user = userEvent.setup();
     const first = itemFixture({ id: "invoice-one", originalName: "一号.pdf" });

@@ -92,6 +92,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
         batches::ipc::list_batches,
         batches::ipc::get_batch,
         batches::ipc::repair_batch_normalized_pdfs,
+        batches::ipc::update_batch_range,
         batches::ipc::settle_batch_items,
         batches::ipc::remove_batch_items,
         batches::ipc::list_batch_candidates,

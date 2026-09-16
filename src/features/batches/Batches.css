@@ -1300,6 +1300,28 @@
   margin: 0;
 }
 
+.batch-range-dialog {
+  display: grid;
+  gap: 12px;
+  width: min(460px, calc(100vw - 32px));
+}
+
+.batch-range-field {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.batch-range-field input {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+  background: var(--control);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .batch-automation-spinner {
     animation: none;

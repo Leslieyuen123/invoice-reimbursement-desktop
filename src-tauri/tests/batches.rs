@@ -743,6 +743,84 @@ async fn settle_can_leave_invoice_dates_and_categories_alone() {
 }
 
 #[tokio::test]
+async fn updating_a_batch_range_keeps_members_and_returns_it_to_draft() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+    let mut inside = sample_item(130, Some("2026-02"));
+    inside.batch_id = Some(batch.id);
+    items.insert(&inside).await.expect("item should insert");
+    mark_exported(&pool, batch.id).await;
+
+    // The invoice the user could not fit before: one day after the old range.
+    let detail = service
+        .update_range(batch.id, "2026-02-01", "2026-03-05")
+        .await
+        .expect("range update should succeed");
+
+    assert_eq!(detail.batch.start_date, date(2026, 2, 1));
+    assert_eq!(detail.batch.end_date, date(2026, 3, 5));
+    assert_eq!(detail.batch.status, BatchStatus::Draft);
+    assert_eq!(detail.items.len(), 1, "members are kept");
+    let persisted = BatchRepository::new(pool)
+        .get(batch.id)
+        .await
+        .expect("batch should reload");
+    assert_eq!(persisted.end_date, date(2026, 3, 5));
+}
+
+#[tokio::test]
+async fn updating_a_batch_range_rejects_unusable_ranges() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+
+    let reversed = service
+        .update_range(batch.id, "2026-03-05", "2026-02-01")
+        .await
+        .expect_err("a reversed range must be rejected");
+    assert!(matches!(
+        reversed,
+        AppError::Validation { ref field, .. } if field == "dateRange"
+    ));
+
+    let too_long = service
+        .update_range(batch.id, "2026-01-01", "2027-06-01")
+        .await
+        .expect_err("a range the automation cannot process must be rejected");
+    assert!(matches!(
+        too_long,
+        AppError::Validation { ref field, .. } if field == "dateRange"
+    ));
+
+    let malformed = service
+        .update_range(batch.id, "2026-2-01", "2026-03-05")
+        .await
+        .expect_err("a non-ISO date must be rejected");
+    assert!(matches!(
+        malformed,
+        AppError::Validation { ref field, .. } if field == "startDate"
+    ));
+
+    let missing = service
+        .update_range(Uuid::from_u128(4321), "2026-02-01", "2026-03-05")
+        .await
+        .expect_err("an unknown batch must be reported");
+    assert!(matches!(missing, AppError::NotFound { ref entity, .. } if entity == "batch"));
+}
+
+#[tokio::test]
 async fn bulk_removal_ignores_foreign_ids_and_drafts_the_batch() {
     let pool = db::connect("sqlite::memory:")
         .await

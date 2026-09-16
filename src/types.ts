@@ -299,6 +299,11 @@ export interface BatchCandidateDto {
   disabledReason: BatchCandidateDisabledReason | null;
 }
 
+export interface UpdateBatchRangeInputDto {
+  startDate: string;
+  endDate: string;
+}
+
 export interface NewBatchInputDto {
   name: string;
   startDate: string;
