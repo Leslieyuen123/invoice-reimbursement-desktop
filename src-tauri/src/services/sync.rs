@@ -26,6 +26,8 @@ const MAX_RANGE_SYNC_PAGES: usize = 64;
 const MAX_TOUCHED_ITEM_IDS: usize = MAX_MESSAGES_PER_SYNC * MAX_RANGE_SYNC_PAGES;
 const MAX_RAW_MESSAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_TOTAL_RAW_BYTES: usize = 200 * 1024 * 1024;
+/// Invoice links read from the QR codes of one mail.
+const MAX_QR_LINKS_PER_MESSAGE: usize = 2;
 /// Encoded size limit for attachments whose extension is not recognized.
 const MAX_UNKNOWN_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PARTS_PER_MESSAGE: usize = 256;
@@ -1137,6 +1139,29 @@ fn parse_invoice_parts_with_zip_budget(
             // a DOCX that reports `application/zip`, must not be expanded.
             let kind = crate::infra::file_signature::detect(&file.bytes);
             if !kind.is_archive() {
+                // An image may carry the invoice link as a QR code instead of the
+                // invoice itself, which used to look like an empty mail.
+                if matches!(
+                    kind,
+                    crate::infra::file_signature::FileKind::Jpeg
+                        | crate::infra::file_signature::FileKind::Png
+                        | crate::infra::file_signature::FileKind::Gif
+                ) {
+                    for url in
+                        crate::infra::qr::decode_qr_urls(&file.bytes, MAX_QR_LINKS_PER_MESSAGE)
+                    {
+                        if links.len() >= MAX_DOWNLOAD_LINKS_PER_MESSAGE
+                            || !seen_links.insert(url.clone())
+                        {
+                            break;
+                        }
+                        links.push(DownloadLink {
+                            part_id: format!("{}.qr", file.part_id),
+                            url,
+                            message_id: file.message_id.clone(),
+                        });
+                    }
+                }
                 files.push(file);
                 continue;
             }

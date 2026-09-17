@@ -76,9 +76,9 @@ fn extract_invoices_at_depth(
 ) -> ArchiveOutcome {
     match file_signature::detect(bytes) {
         FileKind::Zip => extract_from_zip(bytes, budget, passwords, depth),
-        // SevenZip and RAR need a decompressor this build does not ship. They
-        // are reported as unsupported so the mail stays visible instead of
-        // quietly disappearing.
+        FileKind::SevenZip => extract_from_seven_zip(bytes, budget, passwords, depth),
+        // RAR has no pure-Rust decompressor here; it is reported as unsupported
+        // so the mail stays visible instead of quietly disappearing.
         kind => ArchiveOutcome::Unsupported { kind },
     }
 }
@@ -248,6 +248,102 @@ fn extract_from_zip(
         kind: FileKind::Zip,
         entries: entry_count,
         kinds,
+    }
+}
+
+/// Extracts invoices from a 7z archive, trying the mail's passwords in order.
+fn extract_from_seven_zip(
+    bytes: &[u8],
+    budget: &mut ArchiveBudget,
+    passwords: &[String],
+    depth: usize,
+) -> ArchiveOutcome {
+    use sevenz_rust2::{ArchiveReader, Password};
+
+    let mut candidates: Vec<(Password, bool)> = vec![(Password::empty(), false)];
+    candidates.extend(
+        passwords
+            .iter()
+            .map(|password| (Password::from(password.as_str()), true)),
+    );
+    let mut encrypted_only = false;
+    for (password, is_password) in candidates {
+        let Ok(mut reader) = ArchiveReader::new(Cursor::new(bytes), password) else {
+            continue;
+        };
+        let mut entries = Vec::new();
+        let mut kinds = Vec::new();
+        let mut refused = false;
+        let result = reader.for_each_entries(|entry, contents| {
+            if entry.is_directory() {
+                return Ok(true);
+            }
+            let size = entry.size();
+            if size > MAX_ARCHIVE_ENTRY_BYTES || size > budget.remaining_bytes {
+                refused = true;
+                return Ok(false);
+            }
+            let mut buffer = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            contents.read_to_end(&mut buffer)?;
+            budget.remaining_bytes = budget.remaining_bytes.saturating_sub(buffer.len() as u64);
+            let kind = file_signature::detect(&buffer);
+            if kind.is_invoice_document() {
+                entries.push(ArchiveEntry {
+                    name: entry.name().to_owned(),
+                    bytes: buffer,
+                });
+                return Ok(true);
+            }
+            if kind.is_archive() && depth < MAX_ARCHIVE_DEPTH {
+                match extract_invoices_at_depth(&buffer, budget, passwords, depth + 1) {
+                    ArchiveOutcome::Extracted(nested) => entries.extend(nested),
+                    ArchiveOutcome::Refused => {
+                        refused = true;
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+                return Ok(true);
+            }
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+            Ok(true)
+        });
+        if refused {
+            return ArchiveOutcome::Refused;
+        }
+        if !entries.is_empty() {
+            return ArchiveOutcome::Extracted(entries);
+        }
+        match result {
+            Ok(()) => {
+                return ArchiveOutcome::NoInvoiceEntries {
+                    kind: FileKind::SevenZip,
+                    entries: kinds.len(),
+                    kinds,
+                };
+            }
+            Err(_) if is_password => {
+                // A wrong password and a damaged archive look the same here; the
+                // next candidate gets its chance.
+                encrypted_only = true;
+                continue;
+            }
+            Err(_) => {
+                encrypted_only = true;
+                continue;
+            }
+        }
+    }
+    if encrypted_only {
+        ArchiveOutcome::Encrypted {
+            kind: FileKind::SevenZip,
+        }
+    } else {
+        ArchiveOutcome::Unsupported {
+            kind: FileKind::SevenZip,
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 import type { InvoiceItemDto } from "../../types";
 import { formatAmountCents } from "../../lib/amount";
 import { formatLocalDateTime } from "../../lib/datetime";
+import { systemNote } from "../../lib/systemNote";
 
 interface InboxTableProps {
   items: InvoiceItemDto[];
@@ -30,6 +31,19 @@ const statusLabels = {
   suspected_duplicate: "疑似重复",
   ready: "可纳入批次",
 } as const;
+
+/** The machine reason behind a failed import, shown next to the status. */
+function reasonChip(note: string | null) {
+  const reason = systemNote(note);
+  if (!reason) {
+    return null;
+  }
+  return (
+    <span className="item-status-note" data-reason="true" title={reason}>
+      {reason.length > 14 ? `${reason.slice(0, 14)}…` : reason}
+    </span>
+  );
+}
 
 export function InboxTable({
   items,
@@ -127,6 +141,7 @@ export function InboxTable({
               <span className="item-status" data-status={item.status}>
                 {statusLabels[item.status]}
               </span>
+              {reasonChip(item.note)}
               {!item.hasNormalizedPdf ? (
                 <span className="item-status-note" title="导出前需要归一化 PDF">
                   缺归一化 PDF

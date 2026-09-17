@@ -1575,6 +1575,25 @@ a {
   font-size: 12px;
 }
 
+.item-failure-reason {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(199, 121, 121, 0.34);
+  border-radius: var(--control-radius);
+  background: rgba(199, 121, 121, 0.12);
+  color: #e6b3b3;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.item-failure-reason strong {
+  color: #f0c9c9;
+  font-weight: 600;
+}
+
 .item-normalization-warning {
   margin: 0 0 12px;
   padding: 10px 12px;
