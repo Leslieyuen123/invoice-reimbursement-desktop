@@ -97,6 +97,48 @@ describe("DashboardPage", () => {
     expect(screen.getByRole("button", { name: "新建批次" })).toBeEnabled();
   });
 
+  it("reports a clean library after the startup consistency audit", async () => {
+    mockCommand("get_dashboard", dashboardFixture());
+    mockCommand("get_consistency_report", {
+      checkedAt: "2026-07-17T08:00:00Z",
+      itemsChecked: 12,
+      batchesChecked: 2,
+      issues: [],
+    });
+
+    renderAppAt();
+
+    expect(
+      await screen.findByText(
+        "已检查 12 张票据和 2 个批次：原件、归一化 PDF 与批次状态都一致。",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("lists what the consistency audit found and offers a re-check", async () => {
+    mockCommand("get_dashboard", dashboardFixture());
+    mockCommand("get_consistency_report", {
+      checkedAt: "2026-07-17T08:00:00Z",
+      itemsChecked: 12,
+      batchesChecked: 2,
+      issues: [
+        {
+          key: "missing_normalized_pdf",
+          label: "缺少归一化 PDF",
+          count: 3,
+          hint: "PDF、JPG、PNG 原件可在票据详情点击“重新识别”补齐。",
+          samples: ["a.pdf", "b.pdf"],
+        },
+      ],
+    });
+
+    renderAppAt();
+
+    expect(await screen.findByText("缺少归一化 PDF")).toBeInTheDocument();
+    expect(screen.getByText("a.pdf、b.pdf")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新巡检" })).toBeEnabled();
+  });
+
   it("navigates from a queue count to the matching inbox filter", async () => {
     const user = userEvent.setup();
     mockCommand("get_dashboard", dashboardFixture());

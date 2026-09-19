@@ -153,6 +153,21 @@ export interface StorageStatusDto {
   recoveryError: string | null;
 }
 
+export interface ConsistencyIssueDto {
+  key: string;
+  label: string;
+  count: number;
+  hint: string;
+  samples: string[];
+}
+
+export interface ConsistencyReportDto {
+  checkedAt: string;
+  itemsChecked: number;
+  batchesChecked: number;
+  issues: ConsistencyIssueDto[];
+}
+
 export interface ExportDiagnosticsInputDto {
   destination: string | null;
 }

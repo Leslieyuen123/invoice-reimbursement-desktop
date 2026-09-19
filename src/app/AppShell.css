@@ -503,6 +503,48 @@ a {
   line-height: 18px;
 }
 
+.consistency-ok {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--healthy);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.consistency-issues {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.consistency-issue-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--warning);
+  font-size: 13px;
+}
+
+.consistency-issue-heading span {
+  margin-left: auto;
+  color: var(--text-secondary);
+}
+
+.consistency-issues li p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.consistency-samples {
+  color: var(--text-tertiary) !important;
+}
+
 .dashboard-section {
   min-width: 0;
   padding: 20px 0;

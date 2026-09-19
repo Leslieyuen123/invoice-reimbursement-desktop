@@ -1,4 +1,5 @@
 pub mod batches;
+pub mod consistency;
 pub mod dashboard;
 pub mod diagnostics;
 pub mod export;
@@ -82,6 +83,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
     tauri::generate_handler![
         dashboard::ipc::get_dashboard,
         diagnostics::ipc::export_diagnostics,
+        consistency::ipc::get_consistency_report,
         items::ipc::list_items,
         items::ipc::get_item,
         items::ipc::open_item_original,

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  ConsistencyReportDto,
   DiagnosticsBundleDto,
   ExportDiagnosticsInputDto,
   BatchCandidateDto,
@@ -87,6 +88,7 @@ export const API_COMMANDS = {
   savePreferences: "save_preferences",
   getStorageStatus: "get_storage_status",
   exportDiagnostics: "export_diagnostics",
+  getConsistencyReport: "get_consistency_report",
   retryExportRecovery: "retry_export_recovery",
   syncAccountNow: "sync_account_now",
   listMailLedger: "list_mail_ledger",
@@ -161,6 +163,8 @@ export const api = {
   getStorageStatus: () => call<StorageStatusDto>(API_COMMANDS.getStorageStatus),
   exportDiagnostics: (input?: ExportDiagnosticsInputDto) =>
     call<DiagnosticsBundleDto>(API_COMMANDS.exportDiagnostics, { input }),
+  getConsistencyReport: () =>
+    call<ConsistencyReportDto>(API_COMMANDS.getConsistencyReport),
   retryExportRecovery: () =>
     call<StorageStatusDto>(API_COMMANDS.retryExportRecovery),
   syncAccountNow: (accountId: string) =>

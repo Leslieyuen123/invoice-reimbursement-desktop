@@ -28,6 +28,7 @@ import type {
   PreferencesDto,
   ReviewItemInputDto,
   SaveMailboxAccountInputDto,
+  ConsistencyReportDto,
   StorageStatusDto,
   TestMailboxAccountInputDto,
 } from "../types";
@@ -47,6 +48,7 @@ interface BridgeState {
   accounts: MailboxAccountDto[];
   preferences: PreferencesDto;
   storage: StorageStatusDto;
+  consistency: ConsistencyReportDto;
   nextItemId: number;
   nextBatchId: number;
   nextAccountId: number;
@@ -70,6 +72,7 @@ export interface BrowserBridgeSeed {
   accounts?: MailboxAccountDto[];
   preferences?: PreferencesDto;
   storage?: StorageStatusDto;
+  consistency?: ConsistencyReportDto;
   nextItemId?: number;
   nextBatchId?: number;
   nextAccountId?: number;
@@ -174,6 +177,12 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
       availableBytes: 8_589_934_592,
       recoveryError: null,
     },
+    consistency: {
+      checkedAt: now,
+      itemsChecked: 0,
+      batchesChecked: 0,
+      issues: [],
+    },
     nextItemId: 1,
     nextBatchId: 1,
     nextAccountId: 1,
@@ -188,6 +197,7 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
     accounts: seed.accounts?.map((account) => ({ ...account })) ?? defaults.accounts,
     preferences: { ...(seed.preferences ?? defaults.preferences) },
     storage: { ...(seed.storage ?? defaults.storage) },
+    consistency: { ...(seed.consistency ?? defaults.consistency) },
   };
 }
 
@@ -1008,6 +1018,11 @@ function makeHandlers(
       return { ...state.preferences };
     }],
     [API_COMMANDS.getStorageStatus, () => ({ ...state.storage })],
+    [API_COMMANDS.getConsistencyReport, () => ({
+      ...state.consistency,
+      itemsChecked: state.items.length,
+      batchesChecked: state.batches.length,
+    })],
     [API_COMMANDS.exportDiagnostics, () => ({
       path: `${state.storage.exportDirectory}/invoice-diagnostics-20260918-070000.zip`,
       directory: state.storage.exportDirectory,

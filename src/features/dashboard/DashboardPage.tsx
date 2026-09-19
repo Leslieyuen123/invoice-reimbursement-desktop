@@ -7,6 +7,7 @@ import {
   FilePlus2,
   Mail,
   RefreshCw,
+  ShieldCheck,
 } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
@@ -14,6 +15,13 @@ import { Link, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
 import type { AppError, DashboardDto } from "../../types";
+
+function describeError(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return typeof error === "string" && error ? error : "巡检失败";
+}
 
 const queueDefinitions = [
   {
@@ -102,6 +110,11 @@ export function DashboardPage() {
   const dashboardQuery = useQuery({
     queryKey: queryKeys.dashboard,
     queryFn: api.getDashboard,
+  });
+
+  const consistencyQuery = useQuery({
+    queryKey: queryKeys.consistencyReport,
+    queryFn: api.getConsistencyReport,
   });
   const enabledAccounts =
     dashboardQuery.data?.mailboxAccounts.filter((account) => account.enabled) ??
@@ -202,6 +215,51 @@ export function DashboardPage() {
             );
           })}
         </div>
+      </section>
+
+      <section className="dashboard-section" aria-labelledby="consistency-title">
+        <div className="section-heading">
+          <h2 id="consistency-title">数据一致性巡检</h2>
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={consistencyQuery.isFetching}
+            onClick={() => void consistencyQuery.refetch()}
+          >
+            <RefreshCw size={15} aria-hidden="true" />
+            {consistencyQuery.isFetching ? "正在巡检" : "重新巡检"}
+          </button>
+        </div>
+        {consistencyQuery.isPending ? (
+          <p className="dashboard-empty">正在检查原件、归一化 PDF 与批次状态…</p>
+        ) : consistencyQuery.isError ? (
+          <p className="dashboard-empty" role="alert">
+            一致性巡检失败：{describeError(consistencyQuery.error)}
+          </p>
+        ) : consistencyQuery.data.issues.length === 0 ? (
+          <p className="consistency-ok" role="status">
+            <ShieldCheck size={16} aria-hidden="true" />
+            {`已检查 ${consistencyQuery.data.itemsChecked} 张票据和 ${consistencyQuery.data.batchesChecked} 个批次：原件、归一化 PDF 与批次状态都一致。`}
+          </p>
+        ) : (
+          <ul className="consistency-issues">
+            {consistencyQuery.data.issues.map((issue) => (
+              <li key={issue.key} data-issue={issue.key}>
+                <div className="consistency-issue-heading">
+                  <CircleAlert size={16} aria-hidden="true" />
+                  <strong>{issue.label}</strong>
+                  <span>{issue.count}</span>
+                </div>
+                <p>{issue.hint}</p>
+                {issue.samples.length > 0 ? (
+                  <p className="consistency-samples">
+                    {issue.samples.join("、")}
+                  </p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <div className="dashboard-columns">

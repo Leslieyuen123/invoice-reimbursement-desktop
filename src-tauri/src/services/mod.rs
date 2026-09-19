@@ -3,6 +3,7 @@ pub mod batch_automation;
 pub(crate) mod batch_eligibility;
 pub(crate) mod batch_repair;
 pub mod batches;
+pub mod consistency;
 pub mod dashboard;
 pub mod diagnostics;
 pub mod export;
