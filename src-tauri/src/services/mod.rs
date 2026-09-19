@@ -17,3 +17,4 @@ pub mod scheduler;
 pub mod settings;
 pub mod shutdown;
 pub mod sync;
+pub mod sync_progress;

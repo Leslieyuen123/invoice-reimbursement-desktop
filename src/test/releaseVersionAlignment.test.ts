@@ -14,6 +14,8 @@ import pdfBuilder from "../../scripts/build_user_guide_pdfs.py?raw";
 import cargoLock from "../../src-tauri/Cargo.lock?raw";
 import cargoManifest from "../../src-tauri/Cargo.toml?raw";
 import tauriConfigSource from "../../src-tauri/tauri.conf.json?raw";
+import appShell from "../../src/app/AppShell.tsx?raw";
+import viteConfig from "../../vite.config.ts?raw";
 
 // Derived from the sources under test: the guard exists to catch a guide or a
 // manifest that lags behind the released version, not to pin one release here.
@@ -249,6 +251,15 @@ name = "invoice_reimbursement"`;
     );
     expect.soft(pdfBuilder).not.toContain('Paragraph("2026-07-21"');
     expect.soft(pdfBuilder).not.toContain('Paragraph("2026-07-22"');
+  });
+
+  it("shows the packaged version in the shell instead of a literal", () => {
+    expect.soft(appShell).toContain("__APP_VERSION__");
+    expect
+      .soft(appShell)
+      .not.toMatch(/v\d+\.\d+\.\d+/u);
+    expect.soft(viteConfig).toContain("__APP_VERSION__");
+    expect.soft(viteConfig).toContain("package.json");
   });
 
   it("keeps both committed user-guide PDFs aligned with the release", async () => {

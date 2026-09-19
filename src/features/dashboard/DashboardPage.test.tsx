@@ -69,6 +69,12 @@ function dashboardFixture(
   };
 }
 
+function commandCalls(command: string) {
+  return invokeMock.mock.calls
+    .filter(([name]) => name === command)
+    .map(([, arguments_]) => arguments_);
+}
+
 function renderAppAt(path = "/") {
   window.history.replaceState({}, "", path);
   return render(<App />);
@@ -95,6 +101,53 @@ describe("DashboardPage", () => {
     expect(screen.getByRole("link", { name: /最近新增 7/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "立即同步" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "新建批次" })).toBeEnabled();
+  });
+
+  it("shows the running version in the sidebar", async () => {
+    mockCommand("get_dashboard", dashboardFixture());
+
+    renderAppAt();
+
+    expect(
+      await screen.findByText(/^v\d+\.\d+\.\d+$/),
+    ).toBeInTheDocument();
+  });
+
+  it("reports sync progress while a scan runs and can cancel it", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", dashboardFixture());
+    mockCommand("get_consistency_report", {
+      checkedAt: "2026-07-17T08:00:00Z",
+      itemsChecked: 0,
+      batchesChecked: 0,
+      issues: [],
+    });
+    mockCommand("get_sync_progress", [
+      {
+        accountId: "enabled-account",
+        mailbox: "INBOX",
+        processed: 42,
+        imported: 3,
+        failed: 1,
+        startedAt: "2026-07-17T08:00:00Z",
+      },
+    ]);
+    mockCommand("cancel_sync", true);
+
+    renderAppAt();
+
+    expect(await screen.findByText("正在同步")).toBeInTheDocument();
+    expect(
+      screen.getByText("已处理 42 封邮件，导入 3 张，失败 1"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("当前邮箱：INBOX")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "取消同步" }));
+
+    await waitFor(() => expect(commandCalls("cancel_sync")).toHaveLength(1));
+    expect(commandCalls("cancel_sync")[0]).toEqual({
+      accountId: "enabled-account",
+    });
   });
 
   it("reports a clean library after the startup consistency audit", async () => {

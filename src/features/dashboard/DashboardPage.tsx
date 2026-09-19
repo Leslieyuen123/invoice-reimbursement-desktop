@@ -5,6 +5,7 @@ import {
   CircleAlert,
   Clock3,
   FilePlus2,
+  Loader,
   Mail,
   RefreshCw,
   ShieldCheck,
@@ -116,6 +117,20 @@ export function DashboardPage() {
     queryKey: queryKeys.consistencyReport,
     queryFn: api.getConsistencyReport,
   });
+  // A range scan can take minutes; poll while it runs so the page keeps up
+  // without a second transport for events.
+  const syncProgressQuery = useQuery({
+    queryKey: queryKeys.syncProgress,
+    queryFn: api.getSyncProgress,
+    refetchInterval: 1500,
+  });
+  const cancelSyncMutation = useMutation({
+    mutationFn: (accountId: string) => api.cancelSync(accountId),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.syncProgress });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
+    },
+  });
   const enabledAccounts =
     dashboardQuery.data?.mailboxAccounts.filter((account) => account.enabled) ??
     [];
@@ -160,6 +175,13 @@ export function DashboardPage() {
   }
 
   const dashboard = dashboardQuery.data;
+  const activeSyncs = syncProgressQuery.data ?? [];
+  const accountLabel = (accountId: string) => {
+    const account = dashboard?.mailboxAccounts.find(
+      (candidate) => candidate.id === accountId,
+    );
+    return account?.email ?? `账号 ${accountId.slice(0, 8)}`;
+  };
 
   return (
     <div className="dashboard-page">
@@ -216,6 +238,43 @@ export function DashboardPage() {
           })}
         </div>
       </section>
+
+      {activeSyncs.length > 0 ? (
+        <section className="dashboard-section" aria-labelledby="sync-progress-title">
+          <div className="section-heading">
+            <h2 id="sync-progress-title">正在同步</h2>
+            <span>{activeSyncs.length} 个账号</span>
+          </div>
+          <ul className="sync-progress-list">
+            {activeSyncs.map((entry) => (
+              <li key={entry.accountId} data-sync-progress={entry.accountId}>
+                <div className="sync-progress-heading">
+                  <Loader size={15} aria-hidden="true" />
+                  <strong>{accountLabel(entry.accountId)}</strong>
+                  <span>
+                    {`已处理 ${entry.processed} 封邮件，导入 ${entry.imported} 张`}
+                    {entry.failed > 0 ? `，失败 ${entry.failed}` : ""}
+                  </span>
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    disabled={cancelSyncMutation.isPending}
+                    onClick={() => cancelSyncMutation.mutate(entry.accountId)}
+                  >
+                    取消同步
+                  </button>
+                </div>
+                {entry.mailbox ? (
+                  <p className="sync-progress-mailbox">{`当前邮箱：${entry.mailbox}`}</p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          <p className="sync-progress-note">
+            取消只停止本次扫描：已经导入的票据会保留，这次同步会标记为未完成。
+          </p>
+        </section>
+      ) : null}
 
       <section className="dashboard-section" aria-labelledby="consistency-title">
         <div className="section-heading">

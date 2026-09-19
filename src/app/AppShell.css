@@ -142,10 +142,10 @@ a {
 .app-identity {
   display: flex;
   min-width: 0;
-  height: 48px;
+  min-height: 48px;
   align-items: center;
   gap: 10px;
-  padding: 0 8px;
+  padding: 6px 8px;
 }
 
 .app-identity-mark {
@@ -165,11 +165,20 @@ a {
 }
 
 .app-identity-copy strong,
-.app-identity-copy small {
+.app-identity-copy small,
+.app-identity-version {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.app-identity-version {
+  margin-top: 2px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
 }
 
 .app-identity-copy strong {
@@ -501,6 +510,38 @@ a {
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 18px;
+}
+
+.sync-progress-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sync-progress-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.sync-progress-heading strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.sync-progress-heading button {
+  margin-left: auto;
+}
+
+.sync-progress-mailbox,
+.sync-progress-note {
+  margin: 4px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
 }
 
 .consistency-ok {

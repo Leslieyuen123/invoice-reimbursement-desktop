@@ -195,6 +195,8 @@ impl SyncService {
     }
 
     pub async fn run(&self, account_id: Uuid) -> Result<SyncResult, AppError> {
+        // Reported to the UI while it happens, cleared however this returns.
+        let _progress = crate::services::sync_progress::monitor().begin(account_id);
         let run = self.accounts.begin_sync_run(account_id).await?;
         let account = match self.accounts.get(account_id).await {
             Ok(account) => account,
@@ -287,6 +289,7 @@ impl SyncService {
         end_date: NaiveDate,
         budget: &mut TouchedItemBudget,
     ) -> Result<SyncProgress, SyncProgressFailure> {
+        let _progress = crate::services::sync_progress::monitor().begin(account_id);
         if start_date > end_date {
             return Err(SyncProgressFailure::empty(AppError::validation(
                 "dateRange",
@@ -526,6 +529,14 @@ impl SyncService {
         }
         let mut settled_uids = Vec::new();
         for raw_message in &delta.messages {
+            if crate::services::sync_progress::monitor().is_cancelled(account_id) {
+                // Whatever was already imported stays; the run reports that it
+                // did not finish instead of pretending to have scanned it all.
+                return Err(sync_progress_failure(
+                    AppError::validation("sync", "同步已取消"),
+                    completed,
+                ));
+            }
             let parsed = match parse_invoice_parts(raw_message) {
                 Ok(parsed) => parsed,
                 Err(error) => {
@@ -638,6 +649,12 @@ impl SyncService {
             )
             .await
             .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+            crate::services::sync_progress::monitor().tick(
+                account_id,
+                Some(raw_message.mailbox.as_str()),
+                u64::from(accumulator.imported),
+                u64::from(accumulator.failed),
+            );
         }
         if mark_seen_enabled && !settled_uids.is_empty() {
             self.mark_settled_mail_seen(

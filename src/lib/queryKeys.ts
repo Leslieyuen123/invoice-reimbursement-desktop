@@ -13,6 +13,7 @@ export const queryKeys = {
   all: ["invoice-reimbursement"] as const,
   dashboard: ["invoice-reimbursement", "dashboard"] as const,
   consistencyReport: ["invoice-reimbursement", "consistency"] as const,
+  syncProgress: ["invoice-reimbursement", "sync-progress"] as const,
   itemLists,
   items: (filter: ItemFilter, page?: PageRequestDto) =>
     [...itemLists, filter, page] as const,

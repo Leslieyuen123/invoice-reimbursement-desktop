@@ -115,5 +115,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
         settings::ipc::get_storage_status,
         settings::ipc::retry_export_recovery,
         sync::ipc::sync_account_now,
+        sync::ipc::get_sync_progress,
+        sync::ipc::cancel_sync,
     ]
 }

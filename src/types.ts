@@ -153,6 +153,15 @@ export interface StorageStatusDto {
   recoveryError: string | null;
 }
 
+export interface SyncProgressDto {
+  accountId: string;
+  mailbox: string | null;
+  processed: number;
+  imported: number;
+  failed: number;
+  startedAt: string;
+}
+
 export interface ConsistencyIssueDto {
   key: string;
   label: string;

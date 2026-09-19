@@ -29,6 +29,7 @@ import type {
   ReviewItemInputDto,
   SaveMailboxAccountInputDto,
   ConsistencyReportDto,
+  SyncProgressDto,
   StorageStatusDto,
   TestMailboxAccountInputDto,
 } from "../types";
@@ -49,6 +50,7 @@ interface BridgeState {
   preferences: PreferencesDto;
   storage: StorageStatusDto;
   consistency: ConsistencyReportDto;
+  syncProgress: SyncProgressDto[];
   nextItemId: number;
   nextBatchId: number;
   nextAccountId: number;
@@ -73,6 +75,7 @@ export interface BrowserBridgeSeed {
   preferences?: PreferencesDto;
   storage?: StorageStatusDto;
   consistency?: ConsistencyReportDto;
+  syncProgress?: SyncProgressDto[];
   nextItemId?: number;
   nextBatchId?: number;
   nextAccountId?: number;
@@ -183,6 +186,7 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
       batchesChecked: 0,
       issues: [],
     },
+    syncProgress: [],
     nextItemId: 1,
     nextBatchId: 1,
     nextAccountId: 1,
@@ -198,6 +202,7 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
     preferences: { ...(seed.preferences ?? defaults.preferences) },
     storage: { ...(seed.storage ?? defaults.storage) },
     consistency: { ...(seed.consistency ?? defaults.consistency) },
+    syncProgress: seed.syncProgress?.map((entry) => ({ ...entry })) ?? defaults.syncProgress,
   };
 }
 
@@ -1018,6 +1023,15 @@ function makeHandlers(
       return { ...state.preferences };
     }],
     [API_COMMANDS.getStorageStatus, () => ({ ...state.storage })],
+    [API_COMMANDS.getSyncProgress, () => state.syncProgress.map((entry) => ({ ...entry }))],
+    [API_COMMANDS.cancelSync, (arguments_) => {
+      const accountId = requiredString(arguments_, "accountId");
+      const before = state.syncProgress.length;
+      state.syncProgress = state.syncProgress.filter(
+        (entry) => entry.accountId !== accountId,
+      );
+      return state.syncProgress.length !== before;
+    }],
     [API_COMMANDS.getConsistencyReport, () => ({
       ...state.consistency,
       itemsChecked: state.items.length,

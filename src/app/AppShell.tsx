@@ -68,6 +68,7 @@ export function AppShell() {
           <span className="app-identity-copy">
             <strong>发票报销</strong>
             <small>本地工作台</small>
+            <span className="app-identity-version">{`v${__APP_VERSION__}`}</span>
           </span>
         </div>
 
