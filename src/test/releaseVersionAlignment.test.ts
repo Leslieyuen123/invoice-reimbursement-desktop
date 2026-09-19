@@ -279,7 +279,7 @@ name = "invoice_reimbursement"`;
       },
       {
         path: "output/pdf/invoice-reimbursement-quick-start-zh-cn.pdf",
-        pageCount: 4,
+        pageCount: 5,
         identity: "发票报销快速入门",
         distinctContent: ["3. 批次与导出", "更多说明请查看"],
       },
