@@ -226,14 +226,23 @@ name = "invoice_reimbursement"`;
       'dmg_files=("$PWD"/src-tauri/target/release/bundle/dmg/*_aarch64.dmg)',
     );
     expect.soft(prepare).toContain('test "${#dmg_files[@]}" -eq 1');
-    expect.soft(prepare).toContain(`canonical_name="${EXPECTED_DMG}"`);
+    // The name is derived from package.json so a version bump cannot leave the
+    // published artifact behind; the guides below still carry the concrete name.
+    expect.soft(prepare).toContain(
+      `version="$(node -p "require('./package.json').version")"`,
+    );
+    expect
+      .soft(prepare)
+      .toContain('canonical_name="invoice-reimbursement-${version}-macos-arm64.dmg"');
     expect.soft(prepare).toContain('cp "${dmg_files[0]}" "$artifact_dir/$canonical_name"');
     expect.soft(prepare).toContain('shasum -a 256 "$canonical_name" > "$canonical_name.sha256"');
     expect.soft(prepare).toContain('shasum -a 256 -c "$canonical_name.sha256"');
 
-    expect.soft(upload).toContain(`release-artifacts/${EXPECTED_DMG}`);
-    expect.soft(upload).toContain(`release-artifacts/${EXPECTED_DMG}.sha256`);
-    expect.soft(upload).not.toContain("*.dmg");
+    expect.soft(upload).toContain("release-artifacts/*.dmg");
+    expect.soft(upload).toContain("release-artifacts/*.dmg.sha256");
+    expect
+      .soft(upload)
+      .not.toMatch(/invoice-reimbursement-\d+\.\d+\.\d+-macos-arm64\.dmg/u);
   });
 
   it("pins the user-guide generator and renders the current document date", async () => {

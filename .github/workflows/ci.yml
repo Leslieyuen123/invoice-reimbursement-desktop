@@ -226,7 +226,10 @@ jobs:
           test "${#dmg_files[@]}" -eq 1
 
           artifact_dir="$PWD/release-artifacts"
-          canonical_name="invoice-reimbursement-0.2.7-macos-arm64.dmg"
+          # Derived from package.json: a version bump used to need a manual edit
+          # here, and a forgotten edit published the previous version's name.
+          version="$(node -p "require('./package.json').version")"
+          canonical_name="invoice-reimbursement-${version}-macos-arm64.dmg"
           mkdir -p "$artifact_dir"
           cp "${dmg_files[0]}" "$artifact_dir/$canonical_name"
           (
@@ -240,6 +243,6 @@ jobs:
         with:
           name: unsigned-macos-bundle
           path: |
-            release-artifacts/invoice-reimbursement-0.2.7-macos-arm64.dmg
-            release-artifacts/invoice-reimbursement-0.2.7-macos-arm64.dmg.sha256
+            release-artifacts/*.dmg
+            release-artifacts/*.dmg.sha256
           if-no-files-found: error
