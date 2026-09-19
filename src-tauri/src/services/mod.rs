@@ -4,6 +4,7 @@ pub(crate) mod batch_eligibility;
 pub(crate) mod batch_repair;
 pub mod batches;
 pub mod dashboard;
+pub mod diagnostics;
 pub mod export;
 pub(crate) mod export_recovery;
 pub mod import;

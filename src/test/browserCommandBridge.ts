@@ -1008,6 +1008,11 @@ function makeHandlers(
       return { ...state.preferences };
     }],
     [API_COMMANDS.getStorageStatus, () => ({ ...state.storage })],
+    [API_COMMANDS.exportDiagnostics, () => ({
+      path: `${state.storage.exportDirectory}/invoice-diagnostics-20260918-070000.zip`,
+      directory: state.storage.exportDirectory,
+      bytes: 2048,
+    })],
     [API_COMMANDS.retryExportRecovery, () => {
       state.storage.recoveryError = null;
       return { ...state.storage };

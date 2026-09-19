@@ -153,6 +153,16 @@ export interface StorageStatusDto {
   recoveryError: string | null;
 }
 
+export interface ExportDiagnosticsInputDto {
+  destination: string | null;
+}
+
+export interface DiagnosticsBundleDto {
+  path: string;
+  directory: string;
+  bytes: number;
+}
+
 export interface ReviewItemInputDto {
   id: string;
   invoiceDate: string | null;

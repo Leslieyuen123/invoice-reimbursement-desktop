@@ -1,5 +1,6 @@
 pub mod batches;
 pub mod dashboard;
+pub mod diagnostics;
 pub mod export;
 pub mod items;
 pub mod mail;
@@ -80,6 +81,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
 -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         dashboard::ipc::get_dashboard,
+        diagnostics::ipc::export_diagnostics,
         items::ipc::list_items,
         items::ipc::get_item,
         items::ipc::open_item_original,

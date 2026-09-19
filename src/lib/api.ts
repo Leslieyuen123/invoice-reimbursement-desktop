@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  DiagnosticsBundleDto,
+  ExportDiagnosticsInputDto,
   BatchCandidateDto,
   BatchAutomationResultDto,
   BatchDetailDto,
@@ -84,6 +86,7 @@ export const API_COMMANDS = {
   getPreferences: "get_preferences",
   savePreferences: "save_preferences",
   getStorageStatus: "get_storage_status",
+  exportDiagnostics: "export_diagnostics",
   retryExportRecovery: "retry_export_recovery",
   syncAccountNow: "sync_account_now",
   listMailLedger: "list_mail_ledger",
@@ -156,6 +159,8 @@ export const api = {
   savePreferences: (input: PreferencesInputDto) =>
     call<PreferencesDto>(API_COMMANDS.savePreferences, { input }),
   getStorageStatus: () => call<StorageStatusDto>(API_COMMANDS.getStorageStatus),
+  exportDiagnostics: (input?: ExportDiagnosticsInputDto) =>
+    call<DiagnosticsBundleDto>(API_COMMANDS.exportDiagnostics, { input }),
   retryExportRecovery: () =>
     call<StorageStatusDto>(API_COMMANDS.retryExportRecovery),
   syncAccountNow: (accountId: string) =>

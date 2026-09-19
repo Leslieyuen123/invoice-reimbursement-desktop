@@ -316,6 +316,27 @@ describe("Settings page", () => {
     });
   });
 
+  it("exports a diagnostics bundle and reports where it was written", async () => {
+    const user = userEvent.setup();
+    mockSettingsCommands();
+    mockCommand("export_diagnostics", {
+      path: "/Users/person/Downloads/invoice-diagnostics-20260918-070000.zip",
+      directory: "/Users/person/Downloads",
+      bytes: 2048,
+    });
+
+    renderAppAt("/settings");
+
+    await user.click(await screen.findByRole("button", { name: "导出诊断包" }));
+
+    expect(
+      await screen.findByText(
+        "/Users/person/Downloads/invoice-diagnostics-20260918-070000.zip",
+      ),
+    ).toBeInTheDocument();
+    expect(commandCalls("export_diagnostics")).toHaveLength(1);
+  });
+
   it("keeps settings editable when storage status cannot be loaded", async () => {
     const user = userEvent.setup();
     let unavailable = true;
