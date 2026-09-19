@@ -33,6 +33,12 @@
 - [ ] 卸载 `.app` 不误删 `~/Library/Application Support/com.invoice-desk.desktop/`、外部导出目录或钥匙串；单独记录清理数据的人工步骤
 - [ ] 安装包无签名/公证凭据时只标记“本地未签名 smoke”；不得标记签名或公证通过
 
+## 本地签名身份
+
+- [ ] 本地构建使用 `bash scripts/build-signed-app.sh`（或显式传 `APPLE_SIGNING_IDENTITY="Invoice Desk Local Signing"`），构建后用 `codesign -d -r-` 确认要求包含 `certificate root` 而不是 `cdhash`
+- [ ] CI 仍构建 unsigned bundle：不要把签名身份写进 `tauri.conf.json`，否则没有该身份的 CI 会失败
+- [ ] 细节与故障处理见 `docs/operations/local-code-signing.md`
+
 ## 重签与版本对齐（2026-09-18 教训）
 
 - [ ] App 读不到凭据时运行 `bash scripts/reset-keychain-credential.sh`（删除旧条目 + 把授权码放到剪贴板），然后在 App 里重新保存一次邮箱账号；命令行改 ACL 无法修复（`-T` 授权位不足、`-A` 无效）

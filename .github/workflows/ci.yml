@@ -226,7 +226,7 @@ jobs:
           test "${#dmg_files[@]}" -eq 1
 
           artifact_dir="$PWD/release-artifacts"
-          canonical_name="invoice-reimbursement-0.2.5-macos-arm64.dmg"
+          canonical_name="invoice-reimbursement-0.2.6-macos-arm64.dmg"
           mkdir -p "$artifact_dir"
           cp "${dmg_files[0]}" "$artifact_dir/$canonical_name"
           (
@@ -240,6 +240,6 @@ jobs:
         with:
           name: unsigned-macos-bundle
           path: |
-            release-artifacts/invoice-reimbursement-0.2.5-macos-arm64.dmg
-            release-artifacts/invoice-reimbursement-0.2.5-macos-arm64.dmg.sha256
+            release-artifacts/invoice-reimbursement-0.2.6-macos-arm64.dmg
+            release-artifacts/invoice-reimbursement-0.2.6-macos-arm64.dmg.sha256
           if-no-files-found: error
