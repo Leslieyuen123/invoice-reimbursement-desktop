@@ -35,7 +35,7 @@
 
 ## 重签与版本对齐（2026-09-18 教训）
 
-- [ ] 覆盖安装新构建后运行 `bash scripts/trust-keychain-item.sh`（读取凭据并用当前 App 重建信任），然后确认下一次同步无弹窗成功
+- [ ] App 读不到凭据时运行 `bash scripts/reset-keychain-credential.sh`（删除旧条目 + 把授权码放到剪贴板），然后在 App 里重新保存一次邮箱账号；命令行改 ACL 无法修复（`-T` 授权位不足、`-A` 无效）
 - [ ] 覆盖安装新构建后，确认 App 仍能读取钥匙串凭据：ad-hoc 重新签名会改变 cdhash，旧构建写入的钥匙串条目不再信任新构建，macOS 会弹授权框；App 的凭据读取有 20 秒超时，超时后会把该账号置为 suspended 并停止自动同步
 - [ ] 出现 `读取邮箱凭据超时` 时，先在 App 里重新保存一次邮箱账号（由 App 自己重建条目），再确认下一次同步在无弹窗的情况下成功
 - [ ] 同步失败后确认 `sync_retry_states` 已被清除（suspended 状态下调度器不会重试），并核对 `mail_runs` 最新一条为 succeeded
