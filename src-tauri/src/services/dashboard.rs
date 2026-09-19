@@ -12,6 +12,8 @@ pub struct DashboardCounts {
     pub pending_confirmation: u64,
     pub recognition_failed: u64,
     pub suspected_duplicate: u64,
+    /// Mails whose invoices were only partly extracted, or not at all.
+    pub mail_needs_attention: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +40,7 @@ impl DashboardService {
     #[doc(hidden)]
     pub async fn load_at(&self, now: DateTime<Utc>) -> Result<DashboardSnapshot, AppError> {
         let recent_cutoff = recent_item_cutoff(now).to_rfc3339();
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
             "SELECT
                 SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),
                 SUM(CASE
@@ -50,7 +52,9 @@ impl DashboardService {
                     WHEN recognition_status = 'failed'
                      AND dedupe_status != 'suspected_duplicate'
                     THEN 1 ELSE 0 END),
-                SUM(CASE WHEN dedupe_status = 'suspected_duplicate' THEN 1 ELSE 0 END)
+                SUM(CASE WHEN dedupe_status = 'suspected_duplicate' THEN 1 ELSE 0 END),
+                (SELECT COUNT(*) FROM mail_ledger
+                  WHERE outcome IN ('partial', 'failed'))
              FROM items",
         )
         .bind(recent_cutoff)
@@ -72,6 +76,7 @@ impl DashboardService {
                 pending_confirmation: count(row.1)?,
                 recognition_failed: count(row.2)?,
                 suspected_duplicate: count(row.3)?,
+                mail_needs_attention: count(row.4)?,
             },
             recent_batches,
         })

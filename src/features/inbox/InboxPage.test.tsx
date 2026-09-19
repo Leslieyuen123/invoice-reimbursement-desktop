@@ -42,6 +42,7 @@ function pendingInvoiceFixture(
     sourceType: "email",
     sourceAccountId: "account-finance",
     fetchedAt: "2026-07-15T09:45:00+08:00",
+    sourceReceivedDate: null,
     invoiceDate: "2026-07-14",
     suggestedPeriod: "2026-07",
     batchId: null,
@@ -1431,6 +1432,30 @@ describe("InboxPage", () => {
     expect(screen.getByRole("columnheader", { name: "批次" })).toBeInTheDocument();
   });
 
+  it("lists what still blocks an export in the item drawer", async () => {
+    const user = userEvent.setup();
+    const incomplete = pendingInvoiceFixture({
+      id: "invoice-incomplete",
+      originalName: "缺字段.pdf",
+      amountCents: null,
+      finalCategory: null,
+      suggestedCategory: null,
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => ({ items: [incomplete], nextCursor: null }));
+
+    renderAppAt("/inbox");
+    await user.click(await screen.findByRole("button", { name: "缺字段.pdf" }));
+
+    const checklist = await screen.findByRole("region", {
+      name: "导出就绪检查",
+    });
+    expect(checklist).toHaveAttribute("data-ready", "false");
+    expect(within(checklist).getByText(/还缺：/)).toHaveTextContent("金额");
+    expect(within(checklist).getByText(/还缺：/)).toHaveTextContent("归一化 PDF");
+  });
+
   it("opens the suspected-duplicate filter after importing a duplicate", async () => {
     const user = userEvent.setup();
     const serverItems: InvoiceItemDto[] = [];
@@ -1464,13 +1489,15 @@ describe("InboxPage", () => {
     await screen.findByText("当前筛选下没有票据");
     await user.click(screen.getByRole("button", { name: "选择文件" }));
 
+    // `history.pushState` is visible before React commits the tab state, so the
+    // URL and the rendered tab have to be awaited together.
     await waitFor(() => {
       expect(window.location.search).toBe("?status=suspected_duplicate");
+      expect(screen.getByRole("tab", { name: "疑似重复" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     });
-    expect(screen.getByRole("tab", { name: "疑似重复" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
     expect(await screen.findByText("重复票据.pdf")).toBeInTheDocument();
   });
 });

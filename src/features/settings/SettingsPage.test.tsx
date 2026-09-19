@@ -65,6 +65,7 @@ function mockSettingsCommands() {
     backgroundSyncEnabled: true,
     exportDirectory: "exports",
     batchDirectoryPattern: "{batchName}-{timestamp}",
+    markProcessedMailSeen: true,
   });
   mockCommand("get_storage_status", storageFixture);
 }
@@ -75,6 +76,25 @@ describe("Settings page", () => {
     resetMockApi();
     openMock.mockReset();
     openUrlMock.mockReset();
+  });
+
+  it("saves the mail read-marking preference with the runtime settings", async () => {
+    const user = userEvent.setup();
+    mockSettingsCommands();
+    renderAppAt("/settings");
+
+    const toggle = await screen.findByRole("switch", {
+      name: "发票全部提取完成后标记邮件为已读",
+    });
+    expect(toggle).toBeChecked();
+
+    await user.click(toggle);
+    await user.click(screen.getByRole("button", { name: "保存运行设置" }));
+
+    await waitFor(() => expect(commandCalls("save_preferences")).toHaveLength(1));
+    expect(commandCalls("save_preferences")[0]).toMatchObject({
+      markProcessedMailSeen: false,
+    });
   });
 
   it("tests a Gmail connection before saving the exact account fields", async () => {
@@ -273,6 +293,7 @@ describe("Settings page", () => {
       backgroundSyncEnabled: false,
       exportDirectory: "/Users/person/Reimbursement Exports",
       batchDirectoryPattern: "{batchName}-{timestamp}",
+      markProcessedMailSeen: true,
     });
 
     renderAppAt("/settings");
@@ -291,7 +312,29 @@ describe("Settings page", () => {
       backgroundSyncEnabled: false,
       exportDirectory: "/Users/person/Reimbursement Exports",
       batchDirectoryPattern: "{batchName}-{timestamp}",
+      markProcessedMailSeen: true,
     });
+  });
+
+  it("exports a diagnostics bundle and reports where it was written", async () => {
+    const user = userEvent.setup();
+    mockSettingsCommands();
+    mockCommand("export_diagnostics", {
+      path: "/Users/person/Downloads/invoice-diagnostics-20260918-070000.zip",
+      directory: "/Users/person/Downloads",
+      bytes: 2048,
+    });
+
+    renderAppAt("/settings");
+
+    await user.click(await screen.findByRole("button", { name: "导出诊断包" }));
+
+    expect(
+      await screen.findByText(
+        "/Users/person/Downloads/invoice-diagnostics-20260918-070000.zip",
+      ),
+    ).toBeInTheDocument();
+    expect(commandCalls("export_diagnostics")).toHaveLength(1);
   });
 
   it("keeps settings editable when storage status cannot be loaded", async () => {
@@ -417,6 +460,7 @@ describe("Settings page", () => {
       pendingConfirmationCount: 0,
       recognitionFailedCount: 0,
       suspectedDuplicateCount: 0,
+      mailNeedsAttentionCount: 0,
       recentBatches: [],
     });
     renderAppAt("/");
@@ -448,6 +492,7 @@ describe("Settings page", () => {
         pendingConfirmationCount: 0,
         recognitionFailedCount: 0,
         suspectedDuplicateCount: 0,
+        mailNeedsAttentionCount: 0,
         recentBatches: [],
       }));
 
@@ -492,6 +537,7 @@ describe("Settings page", () => {
       pendingConfirmationCount: 0,
       recognitionFailedCount: 0,
       suspectedDuplicateCount: 0,
+      mailNeedsAttentionCount: 0,
       recentBatches: [],
     });
 
@@ -520,6 +566,7 @@ describe("Settings page", () => {
       pendingConfirmationCount: 0,
       recognitionFailedCount: 0,
       suspectedDuplicateCount: 0,
+      mailNeedsAttentionCount: 0,
       recentBatches: [],
     }));
     mockCommand("list_mailbox_accounts", () =>
@@ -532,6 +579,7 @@ describe("Settings page", () => {
       backgroundSyncEnabled: true,
       exportDirectory: "exports",
       batchDirectoryPattern: "{batchName}-{timestamp}",
+      markProcessedMailSeen: true,
     });
     mockCommand("get_storage_status", storageFixture);
 

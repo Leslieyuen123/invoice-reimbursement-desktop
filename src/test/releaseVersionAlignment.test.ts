@@ -14,10 +14,15 @@ import pdfBuilder from "../../scripts/build_user_guide_pdfs.py?raw";
 import cargoLock from "../../src-tauri/Cargo.lock?raw";
 import cargoManifest from "../../src-tauri/Cargo.toml?raw";
 import tauriConfigSource from "../../src-tauri/tauri.conf.json?raw";
+import appShell from "../../src/app/AppShell.tsx?raw";
+import viteConfig from "../../vite.config.ts?raw";
 
-const EXPECTED_VERSION = "0.2.4";
-const EXPECTED_DMG = "invoice-reimbursement-0.2.4-macos-arm64.dmg";
-const EXPECTED_DOCUMENT_DATE = "2026-09-15";
+// Derived from the sources under test: the guard exists to catch a guide or a
+// manifest that lags behind the released version, not to pin one release here.
+const EXPECTED_VERSION = (JSON.parse(packageSource) as { version: string }).version;
+const EXPECTED_DMG = `invoice-reimbursement-${EXPECTED_VERSION}-macos-arm64.dmg`;
+const EXPECTED_DOCUMENT_DATE =
+  pdfBuilder.match(/DOCUMENT_DATE = "([^"]+)"/u)?.[1] ?? "";
 const REPO_ROOT = process.cwd();
 const STANDARD_FONT_DATA_URL =
   join(REPO_ROOT, "node_modules/pdfjs-dist/standard_fonts") + sep;
@@ -133,7 +138,7 @@ name = "invoice_reimbursement"`;
     expect(cargoManifestPackageVersion(manifest)).toBe(EXPECTED_VERSION);
   });
 
-  it("keeps every release-facing source at v0.2.4", () => {
+  it(`keeps every release-facing source at v${EXPECTED_VERSION}`, () => {
     const packageJson = JSON.parse(packageSource) as { version: string };
     const packageLock = JSON.parse(packageLockSource) as {
       version: string;
@@ -221,14 +226,23 @@ name = "invoice_reimbursement"`;
       'dmg_files=("$PWD"/src-tauri/target/release/bundle/dmg/*_aarch64.dmg)',
     );
     expect.soft(prepare).toContain('test "${#dmg_files[@]}" -eq 1');
-    expect.soft(prepare).toContain(`canonical_name="${EXPECTED_DMG}"`);
+    // The name is derived from package.json so a version bump cannot leave the
+    // published artifact behind; the guides below still carry the concrete name.
+    expect.soft(prepare).toContain(
+      `version="$(node -p "require('./package.json').version")"`,
+    );
+    expect
+      .soft(prepare)
+      .toContain('canonical_name="invoice-reimbursement-${version}-macos-arm64.dmg"');
     expect.soft(prepare).toContain('cp "${dmg_files[0]}" "$artifact_dir/$canonical_name"');
     expect.soft(prepare).toContain('shasum -a 256 "$canonical_name" > "$canonical_name.sha256"');
     expect.soft(prepare).toContain('shasum -a 256 -c "$canonical_name.sha256"');
 
-    expect.soft(upload).toContain(`release-artifacts/${EXPECTED_DMG}`);
-    expect.soft(upload).toContain(`release-artifacts/${EXPECTED_DMG}.sha256`);
-    expect.soft(upload).not.toContain("*.dmg");
+    expect.soft(upload).toContain("release-artifacts/*.dmg");
+    expect.soft(upload).toContain("release-artifacts/*.dmg.sha256");
+    expect
+      .soft(upload)
+      .not.toMatch(/invoice-reimbursement-\d+\.\d+\.\d+-macos-arm64\.dmg/u);
   });
 
   it("pins the user-guide generator and renders the current document date", async () => {
@@ -248,6 +262,15 @@ name = "invoice_reimbursement"`;
     expect.soft(pdfBuilder).not.toContain('Paragraph("2026-07-22"');
   });
 
+  it("shows the packaged version in the shell instead of a literal", () => {
+    expect.soft(appShell).toContain("__APP_VERSION__");
+    expect
+      .soft(appShell)
+      .not.toMatch(/v\d+\.\d+\.\d+/u);
+    expect.soft(viteConfig).toContain("__APP_VERSION__");
+    expect.soft(viteConfig).toContain("package.json");
+  });
+
   it("keeps both committed user-guide PDFs aligned with the release", async () => {
     const normalizedReleaseConcepts = [
       "HTTPS",
@@ -259,13 +282,13 @@ name = "invoice_reimbursement"`;
     const guides = [
       {
         path: "output/pdf/invoice-reimbursement-user-manual-zh-cn.pdf",
-        pageCount: 18,
+        pageCount: 20,
         identity: "发票报销完整用户手册",
         distinctContent: ["9. 导出报销材料", "附录 C：导出文件对照表"],
       },
       {
         path: "output/pdf/invoice-reimbursement-quick-start-zh-cn.pdf",
-        pageCount: 3,
+        pageCount: 5,
         identity: "发票报销快速入门",
         distinctContent: ["3. 批次与导出", "更多说明请查看"],
       },

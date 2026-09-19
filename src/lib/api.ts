@@ -1,16 +1,27 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  SyncProgressDto,
+  ConsistencyReportDto,
+  DiagnosticsBundleDto,
+  ExportDiagnosticsInputDto,
   BatchCandidateDto,
   BatchAutomationResultDto,
   BatchDetailDto,
   BatchDto,
   BatchRepairDto,
   DashboardDto,
+  SettleBatchInputDto,
+  SettleBatchOutcomeDto,
+  UpdateBatchRangeInputDto,
   ExportResultDto,
   InvoiceItemDto,
   ItemFilter,
   MailboxAccountDto,
+  MailLedgerCountsDto,
+  MailLedgerFilter,
+  MailLedgerPageDto,
+  MailLedgerPageRequestDto,
   ManualImportOutcomeDto,
   NewBatchInputDto,
   PageDto,
@@ -60,6 +71,9 @@ export const API_COMMANDS = {
   listBatches: "list_batches",
   getBatch: "get_batch",
   repairBatchNormalizedPdfs: "repair_batch_normalized_pdfs",
+  updateBatchRange: "update_batch_range",
+  settleBatchItems: "settle_batch_items",
+  removeBatchItems: "remove_batch_items",
   listBatchCandidates: "list_batch_candidates",
   createMonthBatch: "create_month_batch",
   createCustomBatch: "create_custom_batch",
@@ -74,8 +88,14 @@ export const API_COMMANDS = {
   getPreferences: "get_preferences",
   savePreferences: "save_preferences",
   getStorageStatus: "get_storage_status",
+  exportDiagnostics: "export_diagnostics",
+  getConsistencyReport: "get_consistency_report",
+  getSyncProgress: "get_sync_progress",
+  cancelSync: "cancel_sync",
   retryExportRecovery: "retry_export_recovery",
   syncAccountNow: "sync_account_now",
+  listMailLedger: "list_mail_ledger",
+  getMailLedgerCounts: "get_mail_ledger_counts",
 } as const;
 
 export function apiCommandNames() {
@@ -122,6 +142,12 @@ export const api = {
     call<BatchDetailDto>(API_COMMANDS.removeItemFromBatch, { batchId, itemId }),
   repairBatchNormalizedPdfs: (batchId: string) =>
     call<BatchRepairDto>(API_COMMANDS.repairBatchNormalizedPdfs, { batchId }),
+  updateBatchRange: (batchId: string, input: UpdateBatchRangeInputDto) =>
+    call<BatchDetailDto>(API_COMMANDS.updateBatchRange, { batchId, input }),
+  settleBatchItems: (batchId: string, input: SettleBatchInputDto) =>
+    call<SettleBatchOutcomeDto>(API_COMMANDS.settleBatchItems, { batchId, input }),
+  removeBatchItems: (batchId: string, itemIds: string[]) =>
+    call<BatchDetailDto>(API_COMMANDS.removeBatchItems, { batchId, itemIds }),
   exportBatch: (batchId: string) =>
     call<ExportResultDto>(API_COMMANDS.exportBatch, { batchId }),
   runBatchAutomation: (batchId: string) =>
@@ -138,8 +164,19 @@ export const api = {
   savePreferences: (input: PreferencesInputDto) =>
     call<PreferencesDto>(API_COMMANDS.savePreferences, { input }),
   getStorageStatus: () => call<StorageStatusDto>(API_COMMANDS.getStorageStatus),
+  exportDiagnostics: (input?: ExportDiagnosticsInputDto) =>
+    call<DiagnosticsBundleDto>(API_COMMANDS.exportDiagnostics, { input }),
+  getConsistencyReport: () =>
+    call<ConsistencyReportDto>(API_COMMANDS.getConsistencyReport),
+  getSyncProgress: () => call<SyncProgressDto[]>(API_COMMANDS.getSyncProgress),
+  cancelSync: (accountId: string) =>
+    call<boolean>(API_COMMANDS.cancelSync, { accountId }),
   retryExportRecovery: () =>
     call<StorageStatusDto>(API_COMMANDS.retryExportRecovery),
   syncAccountNow: (accountId: string) =>
     call<void>(API_COMMANDS.syncAccountNow, { accountId }),
+  listMailLedger: (filter: MailLedgerFilter, page?: MailLedgerPageRequestDto) =>
+    call<MailLedgerPageDto>(API_COMMANDS.listMailLedger, { filter, page }),
+  getMailLedgerCounts: () =>
+    call<MailLedgerCountsDto>(API_COMMANDS.getMailLedgerCounts),
 };

@@ -8,6 +8,7 @@ use crate::domain::error::AppError;
 pub mod accounts;
 pub mod batches;
 pub mod items;
+pub mod mail_ledger;
 
 pub async fn connect(database_url: &str) -> Result<SqlitePool, AppError> {
     let is_memory = is_memory_database_url(database_url);

@@ -1,6 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, FolderOpen, HardDrive, Mail, Plus, Save } from "lucide-react";
+import {
+  AlertTriangle,
+  FileDown,
+  FolderOpen,
+  HardDrive,
+  Mail,
+  Plus,
+  Save,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
@@ -8,6 +16,13 @@ import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
 import { MailboxAccountForm } from "./MailboxAccountForm";
 import "./SettingsPage.css";
+
+function describeError(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return typeof error === "string" && error ? error : "导出诊断包失败";
+}
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
@@ -25,12 +40,14 @@ export function SettingsPage() {
     queryFn: api.getStorageStatus,
   });
   const [backgroundSyncEnabled, setBackgroundSyncEnabled] = useState(true);
+  const [markProcessedMailSeen, setMarkProcessedMailSeen] = useState(true);
   const [exportDirectory, setExportDirectory] = useState("exports");
   const [isAddingAccount, setIsAddingAccount] = useState(false);
 
   useEffect(() => {
     if (preferencesQuery.data) {
       setBackgroundSyncEnabled(preferencesQuery.data.backgroundSyncEnabled);
+      setMarkProcessedMailSeen(preferencesQuery.data.markProcessedMailSeen);
       setExportDirectory(preferencesQuery.data.exportDirectory);
     }
   }, [preferencesQuery.data]);
@@ -47,6 +64,7 @@ export function SettingsPage() {
         backgroundSyncEnabled,
         exportDirectory,
         batchDirectoryPattern: "{batchName}-{timestamp}",
+        markProcessedMailSeen,
       }),
     onSuccess: async () => {
       await Promise.all([
@@ -60,6 +78,9 @@ export function SettingsPage() {
     onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.storageStatus });
     },
+  });
+  const diagnosticsMutation = useMutation({
+    mutationFn: () => api.exportDiagnostics(),
   });
 
   const isPending = accountsQuery.isPending || preferencesQuery.isPending;
@@ -208,6 +229,16 @@ export function SettingsPage() {
             <span>后台自动同步</span>
           </label>
 
+          <label className="settings-switch settings-runtime-switch">
+            <input
+              type="checkbox"
+              role="switch"
+              checked={markProcessedMailSeen}
+              onChange={(event) => setMarkProcessedMailSeen(event.target.checked)}
+            />
+            <span>发票全部提取完成后标记邮件为已读</span>
+          </label>
+
           <div className="settings-storage-row">
             <span>本地数据目录</span>
             <code>{storage?.localDataDirectory ?? storageStatusFallback}</code>
@@ -228,6 +259,36 @@ export function SettingsPage() {
                 : `${formatBytes(storage.availableBytes)} 可用`}
             </strong>
           </div>
+
+          <div className="settings-diagnostics">
+            <div>
+              <span>排查问题用</span>
+              <p className="settings-diagnostics-hint">
+                导出一个压缩包：版本、数据库计数、最近同步记录、邮件台账摘要和一致性统计。
+                不含授权码、邮箱完整地址和发票内容。
+              </p>
+            </div>
+            <button
+              className="button button-secondary"
+              type="button"
+              disabled={diagnosticsMutation.isPending}
+              onClick={() => diagnosticsMutation.mutate()}
+            >
+              <FileDown size={15} aria-hidden="true" />
+              {diagnosticsMutation.isPending ? "正在导出诊断包" : "导出诊断包"}
+            </button>
+          </div>
+          {diagnosticsMutation.isSuccess ? (
+            <p className="settings-diagnostics-result" role="status">
+              诊断包已保存：<code>{diagnosticsMutation.data.path}</code>
+            </p>
+          ) : null}
+          {diagnosticsMutation.isError ? (
+            <p className="settings-load-error settings-storage-alert" role="alert">
+              <AlertTriangle size={16} aria-hidden="true" />
+              <span>{describeError(diagnosticsMutation.error)}</span>
+            </p>
+          ) : null}
 
           <label className="settings-field settings-export-field">
             <span>之后的导出目录</span>

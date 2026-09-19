@@ -1,8 +1,11 @@
+pub(crate) mod archive;
 pub mod credentials;
 pub(crate) mod exporters;
 pub mod extraction;
+pub mod file_signature;
 pub mod files;
 pub mod imap;
 pub mod invoice_download;
 pub(crate) mod pdf_preflight;
 pub(crate) mod pdf_resources;
+pub(crate) mod qr;

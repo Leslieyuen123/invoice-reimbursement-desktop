@@ -142,10 +142,10 @@ a {
 .app-identity {
   display: flex;
   min-width: 0;
-  height: 48px;
+  min-height: 48px;
   align-items: center;
   gap: 10px;
-  padding: 0 8px;
+  padding: 6px 8px;
 }
 
 .app-identity-mark {
@@ -165,11 +165,20 @@ a {
 }
 
 .app-identity-copy strong,
-.app-identity-copy small {
+.app-identity-copy small,
+.app-identity-version {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.app-identity-version {
+  margin-top: 2px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
 }
 
 .app-identity-copy strong {
@@ -501,6 +510,80 @@ a {
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 18px;
+}
+
+.sync-progress-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sync-progress-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.sync-progress-heading strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.sync-progress-heading button {
+  margin-left: auto;
+}
+
+.sync-progress-mailbox,
+.sync-progress-note {
+  margin: 4px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.consistency-ok {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--healthy);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.consistency-issues {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.consistency-issue-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--warning);
+  font-size: 13px;
+}
+
+.consistency-issue-heading span {
+  margin-left: auto;
+  color: var(--text-secondary);
+}
+
+.consistency-issues li p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.consistency-samples {
+  color: var(--text-tertiary) !important;
 }
 
 .dashboard-section {
@@ -1092,14 +1175,30 @@ a {
 
 .inbox-table {
   width: 100%;
-  min-width: 1040px;
+  min-width: 1180px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
 }
 
 .inbox-col-name {
-  width: 250px;
+  width: 300px;
+}
+
+.inbox-col-mail-date {
+  width: 148px;
+}
+
+/* File names identify the invoice, so they wrap instead of being cut. */
+.inbox-name-cell {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.inbox-name-cell button {
+  line-height: 1.35;
+  text-align: left;
 }
 
 .inbox-col-date,
@@ -1510,6 +1609,72 @@ a {
 
 .item-editor > section + section {
   border-top: 1px solid var(--border);
+}
+
+.item-readiness {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.item-readiness h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.item-readiness ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.item-readiness li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+}
+
+.item-readiness li[data-ok="true"] span {
+  color: #9bc0aa;
+}
+
+.item-readiness li[data-ok="false"] {
+  color: #daa0a0;
+}
+
+.item-readiness p {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.item-failure-reason {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(199, 121, 121, 0.34);
+  border-radius: var(--control-radius);
+  background: rgba(199, 121, 121, 0.12);
+  color: #e6b3b3;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.item-failure-reason strong {
+  color: #f0c9c9;
+  font-weight: 600;
 }
 
 .item-normalization-warning {

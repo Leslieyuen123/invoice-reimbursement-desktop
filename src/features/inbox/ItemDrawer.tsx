@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../lib/api";
 import { formatAmountCents } from "../../lib/amount";
+import { formatLocalDateTime } from "../../lib/datetime";
+import { isSystemNote, systemNote } from "../../lib/systemNote";
 import {
   MAX_SAFE_AMOUNT_CENTS,
   type AppError,
@@ -85,7 +87,11 @@ export function ItemDrawer({
   const [amount, setAmount] = useState(() => initialAmount(item));
   const [city, setCity] = useState(item.city ?? "");
   const [company, setCompany] = useState(item.company ?? "");
-  const [note, setNote] = useState(item.note ?? "");
+  // The backend writes machine reasons such as "识别失败：…" into the same
+  // column the user types remarks into. Show those as a reason, and keep the
+  // remark box for the user so saving an unrelated field cannot turn the
+  // system reason into a user remark.
+  const [note, setNote] = useState(isSystemNote(item.note) ? "" : (item.note ?? ""));
   const [eventTag, setEventTag] = useState(item.eventTag ?? "");
   const [projectTag, setProjectTag] = useState(item.projectTag ?? "");
   const [amountError, setAmountError] = useState<string | null>(null);
@@ -190,7 +196,7 @@ export function ItemDrawer({
         amountCents: parsedAmount.cents,
         city: optional(city),
         company: optional(company),
-        note: optional(note),
+        note: optional(note) ?? (isSystemNote(item.note) ? item.note : null),
         eventTag: optional(eventTag),
         projectTag: optional(projectTag),
       });
@@ -205,6 +211,8 @@ export function ItemDrawer({
       setSaving(false);
     }
   }
+
+  const failureReason = systemNote(item.note);
 
   async function retryRecognition() {
     setSaveError(null);
@@ -265,6 +273,47 @@ export function ItemDrawer({
         />
 
         <div className="item-editor">
+          {(() => {
+            const readiness = [
+              { label: "开票日期", ok: item.invoiceDate !== null },
+              { label: "金额", ok: item.amountCents !== null },
+              {
+                label: "分类",
+                ok: (item.finalCategory ?? item.suggestedCategory) !== null,
+              },
+              { label: "归属月份", ok: item.suggestedPeriod !== null },
+              { label: "归一化 PDF", ok: item.hasNormalizedPdf },
+            ];
+            const missing = readiness.filter((entry) => !entry.ok);
+            return (
+              <section
+                className="item-readiness"
+                aria-label="导出就绪检查"
+                data-ready={missing.length === 0 ? "true" : "false"}
+              >
+                <h3>导出就绪检查</h3>
+                <ul>
+                  {readiness.map((entry) => (
+                    <li key={entry.label} data-ok={entry.ok ? "true" : "false"}>
+                      <span aria-hidden="true">{entry.ok ? "✓" : "✗"}</span>
+                      {entry.label}
+                    </li>
+                  ))}
+                </ul>
+                <p>
+                  {missing.length === 0
+                    ? "这张票据可以进入批次并导出。"
+                    : `还缺：${missing.map((entry) => entry.label).join("、")}。`}
+                </p>
+              </section>
+            );
+          })()}
+          {failureReason ? (
+            <p className="item-failure-reason" role="alert">
+              <strong>失败原因</strong>
+              <span>{failureReason}</span>
+            </p>
+          ) : null}
           {!item.hasNormalizedPdf ? (
             <p className="item-normalization-warning" role="status">
               这张票据还没有归一化 PDF，导出时会被拒绝。PDF、JPG、PNG
@@ -279,9 +328,19 @@ export function ItemDrawer({
                 <dd>{item.sourceType === "email" ? "邮箱" : "手动上传"}</dd>
               </div>
               <div>
-                <dt>抓取时间</dt>
-                <dd>{item.fetchedAt.replace("T", " ").slice(0, 16)}</dd>
+                <dt>邮件收到</dt>
+                <dd>
+                  {item.sourceType === "email"
+                    ? formatLocalDateTime(item.fetchedAt)
+                    : "手动导入"}
+                </dd>
               </div>
+              {item.sourceReceivedDate ? (
+                <div>
+                  <dt>归属日期</dt>
+                  <dd>{item.sourceReceivedDate}</dd>
+                </div>
+              ) : null}
               <div>
                 <dt>识别日期</dt>
                 <dd>{item.invoiceDate ?? "未识别"}</dd>
