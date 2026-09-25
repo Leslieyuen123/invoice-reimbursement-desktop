@@ -176,7 +176,10 @@ async fn shutdown_timeout_aborts_pending_operations_and_marks_running_syncs_inte
     let report = app
         .state
         .begin_application_shutdown(None)
-        .wait(Duration::from_millis(20))
+        // Long enough that a loaded CI runner still finishes marking the running
+        // sync runs interrupted: this waits for the shutdown task, not for a
+        // wall clock measurement of the machine.
+        .wait(Duration::from_secs(2))
         .await;
 
     assert!(report.timed_out);
@@ -229,7 +232,10 @@ async fn forced_shutdown_retains_an_earlier_tracked_operation_error() {
     let report = app
         .state
         .begin_application_shutdown(None)
-        .wait(Duration::from_millis(20))
+        // Long enough that a loaded CI runner still finishes marking the running
+        // sync runs interrupted: this waits for the shutdown task, not for a
+        // wall clock measurement of the machine.
+        .wait(Duration::from_secs(2))
         .await;
 
     assert!(report.timed_out);
@@ -295,7 +301,10 @@ async fn shutdown_timeout_aborts_a_permanently_blocked_scheduler_runner() {
     let report = app
         .state
         .begin_application_shutdown(Some(handle))
-        .wait(Duration::from_millis(20))
+        // Long enough that a loaded CI runner still finishes marking the running
+        // sync runs interrupted: this waits for the shutdown task, not for a
+        // wall clock measurement of the machine.
+        .wait(Duration::from_secs(2))
         .await;
 
     assert!(report.timed_out);

@@ -73,9 +73,42 @@ pub struct MailboxAccountRepository {
     pool: SqlitePool,
 }
 
+/// Message written when a run is closed because the process died mid-sync.
+pub(crate) const STALE_SYNC_RUN_MESSAGE: &str = "stale_sync_run_interrupted";
+/// A run younger than this may still be in flight in another process.
+const STALE_SYNC_RUN_AFTER_MINUTES: i64 = 30;
+
+/// Close runs that a crash left `running`.
+///
+/// The graceful shutdown path marks in-flight runs as interrupted, but a crash
+/// or a forced quit leaves the row `running` forever: the dashboard then shows a
+/// sync that died hours ago, and the new progress card would look stuck. Called
+/// once at startup.
+pub(crate) async fn interrupt_stale_sync_runs(pool: &SqlitePool) -> Result<u64, AppError> {
+    let now = Utc::now();
+    let cutoff = (now - chrono::Duration::minutes(STALE_SYNC_RUN_AFTER_MINUTES)).to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE sync_runs SET finished_at = ?, status = 'failed', error_message = ? \
+         WHERE status = 'running' AND started_at < ?",
+    )
+    .bind(now.to_rfc3339())
+    .bind(STALE_SYNC_RUN_MESSAGE)
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .map_err(|error| map_database_error("failed to clear abandoned sync runs", error))?;
+    Ok(result.rows_affected())
+}
+
 impl MailboxAccountRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// The shared application pool, so services built on this repository can
+    /// reach their own tables without another constructor argument.
+    pub(crate) fn pool(&self) -> SqlitePool {
+        self.pool.clone()
     }
 
     pub async fn insert(&self, account: NewMailboxAccount) -> Result<MailboxAccount, AppError> {
@@ -968,5 +1001,70 @@ pub(crate) fn map_database_error(context: &str, error: sqlx::Error) -> AppError 
 fn internal_error(context: &str, error: impl std::fmt::Display) -> AppError {
     AppError::Internal {
         message: format!("{context}: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod stale_run_tests {
+    use super::*;
+    use crate::db;
+
+    async fn seed_running_run(pool: &SqlitePool, started_at: &str) -> Uuid {
+        let account_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO mailbox_accounts (id, provider, email, imap_host, imap_port, enabled, \
+             sync_interval_minutes, created_at, updated_at) \
+             VALUES (?, 'qq', 'a@b.cn', 'imap.qq.com', 993, 1, 15, ?, ?)",
+        )
+        .bind(account_id.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO sync_runs (id, account_id, started_at, status) \
+             VALUES (?, ?, ?, 'running')",
+        )
+        .bind(run_id.to_string())
+        .bind(account_id.to_string())
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        run_id
+    }
+
+    #[tokio::test]
+    async fn a_run_that_may_still_be_in_flight_is_left_alone() {
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let run_id = seed_running_run(&pool, &Utc::now().to_rfc3339()).await;
+
+        assert_eq!(interrupt_stale_sync_runs(&pool).await.unwrap(), 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM sync_runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+    }
+
+    #[tokio::test]
+    async fn a_run_a_crash_left_behind_stops_looking_live() {
+        let pool = db::connect("sqlite::memory:").await.unwrap();
+        let started = (Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        let run_id = seed_running_run(&pool, &started).await;
+
+        assert_eq!(interrupt_stale_sync_runs(&pool).await.unwrap(), 1);
+        let (status, message): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_message FROM sync_runs WHERE id = ?")
+                .bind(run_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(message.as_deref(), Some(STALE_SYNC_RUN_MESSAGE));
     }
 }

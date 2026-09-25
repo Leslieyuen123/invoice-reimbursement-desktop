@@ -1433,12 +1433,14 @@ async fn preferences_have_stable_defaults_and_roundtrip_as_json() {
     assert_eq!(defaults.batch_directory_pattern, "{batchName}-{timestamp}");
     assert_eq!(service.preferences().await.unwrap(), defaults);
     let expected = Preferences {
+        mark_processed_mail_seen: true,
         background_sync_enabled: false,
         export_directory: "/tmp/invoice-exports".to_owned(),
         batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
     };
     let saved = service
         .save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: expected.background_sync_enabled,
             export_directory: expected.export_directory.clone(),
             batch_directory_pattern: expected.batch_directory_pattern.clone(),
@@ -1463,9 +1465,16 @@ async fn preferences_have_stable_defaults_and_roundtrip_as_json() {
             "backgroundSyncEnabled": false,
             "exportDirectory": "/tmp/invoice-exports",
             "batchDirectoryPattern": "{batchName}-{timestamp}",
+            "markProcessedMailSeen": true,
         })
     );
     assert_eq!(serde_json::from_str::<Preferences>(&raw).unwrap(), expected);
+
+    // Preferences written before read-marking existed must still load, with the
+    // new option enabled rather than rejected.
+    let legacy = r#"{"backgroundSyncEnabled":true,"exportDirectory":"exports","batchDirectoryPattern":"{batchName}-{timestamp}"}"#;
+    let restored = serde_json::from_str::<Preferences>(legacy).unwrap();
+    assert!(restored.mark_processed_mail_seen);
 }
 
 #[tokio::test]
@@ -1512,6 +1521,7 @@ async fn saving_preferences_maps_sqlite_busy_as_retryable_database_error() {
 
     let error = service
         .save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: false,
             export_directory: "/tmp/invoice-exports".to_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
@@ -1536,6 +1546,7 @@ async fn invalid_preferences_are_rejected_without_overwriting_saved_values() {
     let service = settings_service(pool.clone());
     let original = service
         .save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: true,
             export_directory: "/tmp/exports".to_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
@@ -1545,6 +1556,7 @@ async fn invalid_preferences_are_rejected_without_overwriting_saved_values() {
 
     let blank_error = service
         .save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: false,
             export_directory: "  ".to_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
@@ -1553,6 +1565,7 @@ async fn invalid_preferences_are_rejected_without_overwriting_saved_values() {
         .unwrap_err();
     let pattern_error = service
         .save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: false,
             export_directory: "/tmp/new".to_owned(),
             batch_directory_pattern: "../escape".to_owned(),
@@ -1592,6 +1605,7 @@ async fn export_directory_cannot_change_while_recovery_work_is_pending() {
 
     let error = service
         .save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: true,
             export_directory: "/tmp/different-root".to_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
@@ -1635,6 +1649,7 @@ async fn background_sync_disabled_prevents_new_scheduled_runs() {
     insert_account(&accounts, "background-off@example.com", true).await;
     settings_service(pool.clone())
         .save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: false,
             export_directory: "exports".to_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
@@ -1677,6 +1692,7 @@ async fn disabling_background_sync_during_tick_allows_current_run_but_starts_no_
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
         state.settings_service().save_preferences(PreferencesInput {
+            mark_processed_mail_seen: true,
             background_sync_enabled: false,
             export_directory: "exports".to_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
@@ -1722,6 +1738,7 @@ async fn disabling_background_sync_linearizes_before_runner_start() {
         let _ = attempting.send(());
         settings
             .save_preferences(PreferencesInput {
+                mark_processed_mail_seen: true,
                 background_sync_enabled: false,
                 export_directory: "exports".to_owned(),
                 batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),

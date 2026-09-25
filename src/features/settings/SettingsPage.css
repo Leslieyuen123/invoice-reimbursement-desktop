@@ -323,3 +323,31 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.settings-diagnostics {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+
+.settings-diagnostics-hint {
+  margin: 4px 0 0;
+  max-width: 46ch;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-diagnostics-result {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.settings-diagnostics-result code {
+  color: var(--text-primary);
+  word-break: break-all;
+}

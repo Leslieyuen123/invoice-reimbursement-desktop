@@ -33,6 +33,26 @@
 - [ ] 卸载 `.app` 不误删 `~/Library/Application Support/com.invoice-desk.desktop/`、外部导出目录或钥匙串；单独记录清理数据的人工步骤
 - [ ] 安装包无签名/公证凭据时只标记“本地未签名 smoke”；不得标记签名或公证通过
 
+## 证书信任（一次性，换机器需重做）
+
+- [ ] `security find-identity -v -p codesigning` 显示 `1 valid identities found`（0 表示证书未被信任，此时重建后 App 读凭据会弹窗并超时）
+- [ ] 未信任时按 `docs/operations/local-code-signing.md` 在「钥匙串访问」里把 `Invoice Desk Local Signing` 设为「始终信任」
+
+## 本地签名身份
+
+- [ ] 本地构建使用 `bash scripts/build-signed-app.sh`（或显式传 `APPLE_SIGNING_IDENTITY="Invoice Desk Local Signing"`），构建后用 `codesign -d -r-` 确认要求包含 `certificate root` 而不是 `cdhash`
+- [ ] CI 仍构建 unsigned bundle：不要把签名身份写进 `tauri.conf.json`，否则没有该身份的 CI 会失败
+- [ ] 细节与故障处理见 `docs/operations/local-code-signing.md`
+
+## 重签与版本对齐（2026-09-18 教训）
+
+- [ ] App 读不到凭据时运行 `bash scripts/reset-keychain-credential.sh`（删除旧条目 + 把授权码放到剪贴板），然后在 App 里重新保存一次邮箱账号；命令行改 ACL 无法修复（`-T` 授权位不足、`-A` 无效）
+- [ ] 覆盖安装新构建后，确认 App 仍能读取钥匙串凭据：ad-hoc 重新签名会改变 cdhash，旧构建写入的钥匙串条目不再信任新构建，macOS 会弹授权框；App 的凭据读取有 20 秒超时，超时后会把该账号置为 suspended 并停止自动同步
+- [ ] 出现 `读取邮箱凭据超时` 时，先在 App 里重新保存一次邮箱账号（由 App 自己重建条目），再确认下一次同步在无弹窗的情况下成功
+- [ ] 同步失败后确认 `sync_retry_states` 已被清除（suspended 状态下调度器不会重试），并核对 `mail_runs` 最新一条为 succeeded
+- [ ] `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`Cargo.lock`、`tauri.conf.json`、CI 的 canonical DMG 名、两份用户指南 Markdown 与 PDF 的版本号/文档日期必须一致；`src/test/releaseVersionAlignment.test.ts` 会守护这组一致性（版本号取自 package.json，文档日期取自 PDF 生成脚本）
+- [ ] 重建指南 PDF 时确认 `scripts/build_user_guide_pdfs.py` 的 `DOCUMENT_DATE` 与 Markdown 中的日期一致，否则 PDF 内会同时出现两个日期
+
 ## QQ 与 Gmail 实机协议
 
 - [ ] QQ 邮箱首次授权、连接测试和首轮抓取成功

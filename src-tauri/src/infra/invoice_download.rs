@@ -9,6 +9,9 @@ use tokio::net::lookup_host;
 use url::{Host, Url};
 
 use crate::domain::error::AppError;
+use kuchiki::traits::TendrilSink;
+
+use crate::infra::file_signature::{self, FileKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadedInvoice {
@@ -31,6 +34,8 @@ pub trait InvoiceLinkDownloader: Send + Sync {
 pub const MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
+/// Portal pages tried before a link is reported as unusable.
+const MAX_PAGE_LINK_ATTEMPTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = "invoice-reimbursement-desktop/0.2";
@@ -59,6 +64,11 @@ impl InvoiceLinkDownloader for SecureInvoiceLinkDownloader {
 
         let fetched = fetch_get(&source, MAX_DOWNLOAD_BYTES).await?;
         if let Ok(invoice) = classify_download(&fetched.final_url, &fetched.bytes) {
+            return Ok(InvoiceLinkDownload::Downloaded(invoice));
+        }
+        // Many portals answer with an HTML page that merely links to the file,
+        // so the page is followed before the link is declared unsupported.
+        if let Some(invoice) = download_from_portal_page(&fetched).await {
             return Ok(InvoiceLinkDownload::Downloaded(invoice));
         }
         if !is_nuonuo_landing(&fetched.final_url) {
@@ -284,6 +294,78 @@ fn parse_nuonuo_pdf_url(body: &[u8]) -> Result<Url, AppError> {
     Ok(url)
 }
 
+/// Follows the direct file links of a portal page, newest attempt first.
+///
+/// Only links that resolve to HTTPS and whose content carries a known file
+/// signature are accepted, and at most [`MAX_PAGE_LINK_ATTEMPTS`] are tried so a
+/// hostile page cannot turn one mail into unbounded traffic.
+async fn download_from_portal_page(fetched: &FetchedBody) -> Option<DownloadedInvoice> {
+    if file_signature::detect(&fetched.bytes) != FileKind::Html {
+        return None;
+    }
+    for candidate in direct_links(&fetched.bytes, &fetched.final_url) {
+        let Ok(next) = fetch_get(&candidate, MAX_DOWNLOAD_BYTES).await else {
+            continue;
+        };
+        if let Ok(invoice) = classify_download(&next.final_url, &next.bytes) {
+            return Some(invoice);
+        }
+    }
+    None
+}
+
+/// Direct file links found on a page, most invoice-like first.
+fn direct_links(bytes: &[u8], base: &Url) -> Vec<Url> {
+    let document = kuchiki::parse_html().one(String::from_utf8_lossy(bytes).into_owned());
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    let selectors = [
+        "a[href]",
+        "iframe[src]",
+        "embed[src]",
+        "object[data]",
+        "img[src]",
+    ];
+    for selector in selectors {
+        let Ok(nodes) = document.select(selector) else {
+            continue;
+        };
+        for node in nodes {
+            let attributes = node.attributes.borrow();
+            let Some(value) = ["href", "src", "data"]
+                .iter()
+                .find_map(|name| attributes.get(*name))
+            else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() || value.starts_with('#') || value.starts_with("data:") {
+                continue;
+            }
+            let Ok(resolved) = base.join(value) else {
+                continue;
+            };
+            if resolved == *base || validate_source_url(&resolved).is_err() {
+                continue;
+            }
+            let path = resolved.path().to_ascii_lowercase();
+            if [".pdf", ".jpg", ".jpeg", ".png", ".zip"]
+                .iter()
+                .any(|extension| path.ends_with(extension))
+            {
+                if !preferred.contains(&resolved) {
+                    preferred.push(resolved);
+                }
+            } else if !fallback.contains(&resolved) {
+                fallback.push(resolved);
+            }
+        }
+    }
+    preferred.extend(fallback);
+    preferred.truncate(MAX_PAGE_LINK_ATTEMPTS);
+    preferred
+}
+
 fn validate_success_status(status: reqwest::StatusCode) -> Result<(), AppError> {
     if status.is_success() {
         return Ok(());
@@ -397,18 +479,10 @@ fn is_ignored_source(url: &Url) -> bool {
 }
 
 fn classify_download(url: &Url, bytes: &[u8]) -> Result<DownloadedInvoice, AppError> {
-    let (extension, mime_type) = if bytes.starts_with(b"%PDF-") {
-        ("pdf", "application/pdf")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        ("jpg", "image/jpeg")
-    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
-        ("png", "image/png")
-    } else if [b"PK\x03\x04".as_slice(), b"PK\x05\x06", b"PK\x07\x08"]
-        .iter()
-        .any(|signature| bytes.starts_with(signature))
-    {
-        ("zip", "application/zip")
-    } else {
+    // Content decides the type: a portal that answers with an HTML error page
+    // must not be stored as an invoice, whatever its URL suggests.
+    let kind = file_signature::detect(bytes);
+    let Some((extension, mime_type)) = kind.invoice_identity() else {
         return Err(unsupported_download_body());
     };
     let file_name = download_file_name(url, extension);

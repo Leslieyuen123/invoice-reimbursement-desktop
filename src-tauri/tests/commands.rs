@@ -562,6 +562,7 @@ async fn export_recovery_error_is_scoped_to_the_root_that_failed() {
             background_sync_enabled: true,
             export_directory: replacement_root.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -602,6 +603,7 @@ async fn saving_unrelated_preferences_does_not_hide_a_recovery_failure() {
             background_sync_enabled: !preferences.background_sync_enabled,
             export_directory: preferences.export_directory,
             batch_directory_pattern: preferences.batch_directory_pattern,
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -647,6 +649,7 @@ async fn successful_recovery_clears_only_the_repaired_export_root_failure() {
             background_sync_enabled: true,
             export_directory: root_b.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -666,6 +669,7 @@ async fn successful_recovery_clears_only_the_repaired_export_root_failure() {
             background_sync_enabled: true,
             export_directory: root_a.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -932,6 +936,7 @@ async fn settings_adapters_preserve_account_saga_and_preferences() {
             background_sync_enabled: false,
             export_directory: chosen_exports.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await

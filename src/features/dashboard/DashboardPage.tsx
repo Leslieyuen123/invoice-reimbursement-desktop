@@ -5,8 +5,10 @@ import {
   CircleAlert,
   Clock3,
   FilePlus2,
+  Loader,
   Mail,
   RefreshCw,
+  ShieldCheck,
 } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
@@ -14,6 +16,13 @@ import { Link, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
 import type { AppError, DashboardDto } from "../../types";
+
+function describeError(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return typeof error === "string" && error ? error : "巡检失败";
+}
 
 const queueDefinitions = [
   {
@@ -35,6 +44,11 @@ const queueDefinitions = [
     label: "疑似重复",
     count: (dashboard: DashboardDto) => dashboard.suspectedDuplicateCount,
     to: "/inbox?status=suspected_duplicate",
+  },
+  {
+    label: "邮件待关注",
+    count: (dashboard: DashboardDto) => dashboard.mailNeedsAttentionCount,
+    to: "/mail",
   },
 ] as const;
 
@@ -98,6 +112,25 @@ export function DashboardPage() {
     queryKey: queryKeys.dashboard,
     queryFn: api.getDashboard,
   });
+
+  const consistencyQuery = useQuery({
+    queryKey: queryKeys.consistencyReport,
+    queryFn: api.getConsistencyReport,
+  });
+  // A range scan can take minutes; poll while it runs so the page keeps up
+  // without a second transport for events.
+  const syncProgressQuery = useQuery({
+    queryKey: queryKeys.syncProgress,
+    queryFn: api.getSyncProgress,
+    refetchInterval: 1500,
+  });
+  const cancelSyncMutation = useMutation({
+    mutationFn: (accountId: string) => api.cancelSync(accountId),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.syncProgress });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
+    },
+  });
   const enabledAccounts =
     dashboardQuery.data?.mailboxAccounts.filter((account) => account.enabled) ??
     [];
@@ -142,6 +175,13 @@ export function DashboardPage() {
   }
 
   const dashboard = dashboardQuery.data;
+  const activeSyncs = syncProgressQuery.data ?? [];
+  const accountLabel = (accountId: string) => {
+    const account = dashboard?.mailboxAccounts.find(
+      (candidate) => candidate.id === accountId,
+    );
+    return account?.email ?? `账号 ${accountId.slice(0, 8)}`;
+  };
 
   return (
     <div className="dashboard-page">
@@ -197,6 +237,88 @@ export function DashboardPage() {
             );
           })}
         </div>
+      </section>
+
+      {activeSyncs.length > 0 ? (
+        <section className="dashboard-section" aria-labelledby="sync-progress-title">
+          <div className="section-heading">
+            <h2 id="sync-progress-title">正在同步</h2>
+            <span>{activeSyncs.length} 个账号</span>
+          </div>
+          <ul className="sync-progress-list">
+            {activeSyncs.map((entry) => (
+              <li key={entry.accountId} data-sync-progress={entry.accountId}>
+                <div className="sync-progress-heading">
+                  <Loader size={15} aria-hidden="true" />
+                  <strong>{accountLabel(entry.accountId)}</strong>
+                  <span>
+                    {`已处理 ${entry.processed} 封邮件，导入 ${entry.imported} 张`}
+                    {entry.failed > 0 ? `，失败 ${entry.failed}` : ""}
+                  </span>
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    disabled={cancelSyncMutation.isPending}
+                    onClick={() => cancelSyncMutation.mutate(entry.accountId)}
+                  >
+                    取消同步
+                  </button>
+                </div>
+                {entry.mailbox ? (
+                  <p className="sync-progress-mailbox">{`当前邮箱：${entry.mailbox}`}</p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          <p className="sync-progress-note">
+            取消只停止本次扫描：已经导入的票据会保留，这次同步会标记为未完成。
+          </p>
+        </section>
+      ) : null}
+
+      <section className="dashboard-section" aria-labelledby="consistency-title">
+        <div className="section-heading">
+          <h2 id="consistency-title">数据一致性巡检</h2>
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={consistencyQuery.isFetching}
+            onClick={() => void consistencyQuery.refetch()}
+          >
+            <RefreshCw size={15} aria-hidden="true" />
+            {consistencyQuery.isFetching ? "正在巡检" : "重新巡检"}
+          </button>
+        </div>
+        {consistencyQuery.isPending ? (
+          <p className="dashboard-empty">正在检查原件、归一化 PDF 与批次状态…</p>
+        ) : consistencyQuery.isError ? (
+          <p className="dashboard-empty" role="alert">
+            一致性巡检失败：{describeError(consistencyQuery.error)}
+          </p>
+        ) : consistencyQuery.data.issues.length === 0 ? (
+          <p className="consistency-ok" role="status">
+            <ShieldCheck size={16} aria-hidden="true" />
+            {`已检查 ${consistencyQuery.data.itemsChecked} 张票据和 ${consistencyQuery.data.batchesChecked} 个批次：原件、归一化 PDF 与批次状态都一致。`}
+          </p>
+        ) : (
+          <ul className="consistency-issues">
+            {consistencyQuery.data.issues.map((issue) => (
+              <li key={issue.key} data-issue={issue.key}>
+                <div className="consistency-issue-heading">
+                  <CircleAlert size={16} aria-hidden="true" />
+                  <strong>{issue.label}</strong>
+                  <span>{issue.count}</span>
+                </div>
+                <p>{issue.hint}</p>
+                {issue.samples.length > 0 ? (
+                  <p className="consistency-samples">
+                    {issue.samples.join("、")}
+                  </p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <div className="dashboard-columns">

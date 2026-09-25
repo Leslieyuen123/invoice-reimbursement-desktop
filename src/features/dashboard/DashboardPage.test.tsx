@@ -48,6 +48,7 @@ function dashboardFixture(
     pendingConfirmationCount: 4,
     recognitionFailedCount: 1,
     suspectedDuplicateCount: 2,
+    mailNeedsAttentionCount: 0,
     recentBatches: [
       {
         id: "batch-july",
@@ -66,6 +67,12 @@ function dashboardFixture(
     ],
     ...overrides,
   };
+}
+
+function commandCalls(command: string) {
+  return invokeMock.mock.calls
+    .filter(([name]) => name === command)
+    .map(([, arguments_]) => arguments_);
 }
 
 function renderAppAt(path = "/") {
@@ -94,6 +101,95 @@ describe("DashboardPage", () => {
     expect(screen.getByRole("link", { name: /最近新增 7/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "立即同步" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "新建批次" })).toBeEnabled();
+  });
+
+  it("shows the running version in the sidebar", async () => {
+    mockCommand("get_dashboard", dashboardFixture());
+
+    renderAppAt();
+
+    expect(
+      await screen.findByText(/^v\d+\.\d+\.\d+$/),
+    ).toBeInTheDocument();
+  });
+
+  it("reports sync progress while a scan runs and can cancel it", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", dashboardFixture());
+    mockCommand("get_consistency_report", {
+      checkedAt: "2026-07-17T08:00:00Z",
+      itemsChecked: 0,
+      batchesChecked: 0,
+      issues: [],
+    });
+    mockCommand("get_sync_progress", [
+      {
+        accountId: "enabled-account",
+        mailbox: "INBOX",
+        processed: 42,
+        imported: 3,
+        failed: 1,
+        startedAt: "2026-07-17T08:00:00Z",
+      },
+    ]);
+    mockCommand("cancel_sync", true);
+
+    renderAppAt();
+
+    expect(await screen.findByText("正在同步")).toBeInTheDocument();
+    expect(
+      screen.getByText("已处理 42 封邮件，导入 3 张，失败 1"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("当前邮箱：INBOX")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "取消同步" }));
+
+    await waitFor(() => expect(commandCalls("cancel_sync")).toHaveLength(1));
+    expect(commandCalls("cancel_sync")[0]).toEqual({
+      accountId: "enabled-account",
+    });
+  });
+
+  it("reports a clean library after the startup consistency audit", async () => {
+    mockCommand("get_dashboard", dashboardFixture());
+    mockCommand("get_consistency_report", {
+      checkedAt: "2026-07-17T08:00:00Z",
+      itemsChecked: 12,
+      batchesChecked: 2,
+      issues: [],
+    });
+
+    renderAppAt();
+
+    expect(
+      await screen.findByText(
+        "已检查 12 张票据和 2 个批次：原件、归一化 PDF 与批次状态都一致。",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("lists what the consistency audit found and offers a re-check", async () => {
+    mockCommand("get_dashboard", dashboardFixture());
+    mockCommand("get_consistency_report", {
+      checkedAt: "2026-07-17T08:00:00Z",
+      itemsChecked: 12,
+      batchesChecked: 2,
+      issues: [
+        {
+          key: "missing_normalized_pdf",
+          label: "缺少归一化 PDF",
+          count: 3,
+          hint: "PDF、JPG、PNG 原件可在票据详情点击“重新识别”补齐。",
+          samples: ["a.pdf", "b.pdf"],
+        },
+      ],
+    });
+
+    renderAppAt();
+
+    expect(await screen.findByText("缺少归一化 PDF")).toBeInTheDocument();
+    expect(screen.getByText("a.pdf、b.pdf")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新巡检" })).toBeEnabled();
   });
 
   it("navigates from a queue count to the matching inbox filter", async () => {
@@ -179,6 +275,7 @@ describe("DashboardPage", () => {
         pendingConfirmationCount: 0,
         recognitionFailedCount: 0,
         suspectedDuplicateCount: 0,
+        mailNeedsAttentionCount: 0,
         recentBatches: [],
       }),
     );

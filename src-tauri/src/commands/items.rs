@@ -21,6 +21,10 @@ pub use crate::services::preview::{PreviewPayload, PreviewRangePayload, PreviewV
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ItemFilterDto {
     pub status: Option<ItemStatus>,
+    /// Source mailbox identity, used by the mail ledger to list one mail's
+    /// invoices.
+    pub source_account_id: Option<String>,
+    pub source_uid: Option<i64>,
     #[serde(default)]
     pub recent: bool,
     pub suggested_period: Option<String>,
@@ -39,6 +43,8 @@ pub struct InvoiceItemDto {
     pub source_type: SourceType,
     pub source_account_id: Option<String>,
     pub fetched_at: String,
+    /// Local date the mail was received; the date batches are keyed on.
+    pub source_received_date: Option<String>,
     pub invoice_date: Option<String>,
     pub suggested_period: Option<String>,
     pub batch_id: Option<String>,
@@ -82,6 +88,7 @@ impl TryFrom<InvoiceItem> for InvoiceItemDto {
             source_type: item.source_type,
             source_account_id: item.source_account_id.map(|id| id.to_string()),
             fetched_at: item.fetched_at.to_rfc3339(),
+            source_received_date: item.source_received_date.map(|date| date.to_string()),
             invoice_date: item.invoice_date.map(|date| date.to_string()),
             suggested_period: item.suggested_period,
             batch_id: item.batch_id.map(|id| id.to_string()),
@@ -480,6 +487,14 @@ impl TryFrom<(ItemFilterDto, DateTime<Utc>)> for ItemFilter {
     fn try_from((filter, now): (ItemFilterDto, DateTime<Utc>)) -> Result<Self, Self::Error> {
         Ok(Self {
             status: filter.status,
+            source_account_id: filter
+                .source_account_id
+                .map(|id| {
+                    Uuid::parse_str(&id)
+                        .map_err(|_| AppError::validation("sourceAccountId", "invalid account ID"))
+                })
+                .transpose()?,
+            source_uid: filter.source_uid,
             created_after: filter
                 .recent
                 .then(|| crate::services::dashboard::recent_item_cutoff(now)),

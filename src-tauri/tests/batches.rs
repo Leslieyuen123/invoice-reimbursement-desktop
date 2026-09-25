@@ -4,11 +4,12 @@ use invoice_reimbursement::db::batches::{Batch, BatchRepository};
 use invoice_reimbursement::db::items::{ItemPatch, ItemRepository, NewItemRecord};
 use invoice_reimbursement::domain::error::AppError;
 use invoice_reimbursement::domain::model::{
-    BatchStatus, Category, ConfirmationStatus, DedupeStatus, RecognitionStatus, SourceType,
+    BatchStatus, Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus,
+    SourceType,
 };
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use invoice_reimbursement::infra::files::AppPaths;
-use invoice_reimbursement::services::batches::{BatchService, NewBatchInput};
+use invoice_reimbursement::services::batches::{BatchService, NewBatchInput, SettleBatchInput};
 use invoice_reimbursement::services::items::{ItemReview, ItemService};
 use invoice_reimbursement::services::recognition::RecognitionService;
 use sqlx::SqlitePool;
@@ -536,6 +537,336 @@ async fn assign_refuses_members_the_export_would_reject() {
 
     let detail = service.get(batch.id).await.expect("batch should reload");
     assert!(detail.items.is_empty());
+}
+
+#[tokio::test]
+async fn settle_confirms_derivable_items_and_reports_every_skip() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+
+    // (a) email invoice: the missing invoice date can come from the mail date.
+    let mut derivable = email_item(
+        100,
+        Utc.with_ymd_and_hms(2026, 2, 10, 3, 0, 0)
+            .single()
+            .expect("valid time"),
+        None,
+    );
+    derivable.confirmation_status = ConfirmationStatus::Pending;
+    derivable.suggested_category = Some(Category::Transport);
+    derivable.final_category = None;
+    derivable.suggested_period = None;
+    derivable.amount_cents = Some(100);
+
+    // (b) reviewed category missing but the default category can fill it in.
+    let mut no_category = sample_item(101, Some("2026-02"));
+    no_category.confirmation_status = ConfirmationStatus::Pending;
+    no_category.suggested_category = None;
+    no_category.final_category = None;
+
+    // (c..h) every reason the bulk confirm must refuse to guess.
+    let mut no_amount = sample_item(102, Some("2026-02"));
+    no_amount.confirmation_status = ConfirmationStatus::Pending;
+    no_amount.amount_cents = None;
+
+    let mut archive = sample_item(103, Some("2026-02"));
+    archive.confirmation_status = ConfirmationStatus::Pending;
+    archive.original_name = "invoice-archive.zip".to_owned();
+    archive.mime_type = "application/zip".to_owned();
+    archive.normalized_pdf_path = None;
+
+    let mut failed = sample_item(104, Some("2026-02"));
+    failed.confirmation_status = ConfirmationStatus::Pending;
+    failed.recognition_status = RecognitionStatus::Failed;
+
+    let mut duplicate = sample_item(105, Some("2026-02"));
+    duplicate.confirmation_status = ConfirmationStatus::Pending;
+
+    let mut no_date = sample_item(106, Some("2026-02"));
+    no_date.confirmation_status = ConfirmationStatus::Pending;
+    no_date.source_type = SourceType::ManualUpload;
+    no_date.source_received_date = None;
+    no_date.invoice_date = None;
+
+    let mut outside = sample_item(107, Some("2026-03"));
+    outside.confirmation_status = ConfirmationStatus::Pending;
+    outside.invoice_date = Some(date(2026, 3, 5));
+
+    for item in [
+        &derivable,
+        &no_category,
+        &no_amount,
+        &archive,
+        &failed,
+        &duplicate,
+        &no_date,
+        &outside,
+    ] {
+        items
+            .insert(item)
+            .await
+            .expect("fixture item should insert");
+    }
+    // Membership and duplicate state are written directly: this is the legacy
+    // state a batch can already hold, which the bulk confirm has to cope with.
+    for item in [
+        &derivable,
+        &no_category,
+        &no_amount,
+        &archive,
+        &failed,
+        &duplicate,
+        &no_date,
+        &outside,
+    ] {
+        sqlx::query("UPDATE items SET batch_id = ? WHERE id = ?")
+            .bind(batch.id.to_string())
+            .bind(item.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("fixture membership should update");
+    }
+    sqlx::query("UPDATE items SET dedupe_status = 'suspected_duplicate' WHERE id = ?")
+        .bind(duplicate.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("duplicate fixture should update");
+
+    let outcome = service
+        .settle_items(
+            batch.id,
+            SettleBatchInput {
+                fill_invoice_date_from_received: true,
+                apply_suggested_category: true,
+                default_category: Some(Category::Hospitality),
+            },
+        )
+        .await
+        .expect("bulk confirm should run");
+
+    assert_eq!(outcome.confirmed_count, 2);
+    assert_eq!(outcome.filled_invoice_date_count, 1);
+    assert_eq!(outcome.applied_category_count, 2);
+    let mut codes: Vec<&str> = outcome
+        .skipped
+        .iter()
+        .map(|skipped| skipped.code.as_str())
+        .collect();
+    codes.sort_unstable();
+    assert_eq!(
+        codes,
+        vec![
+            "missing_amount",
+            "missing_invoice_date",
+            "outside_date_range",
+            "recognition_failed",
+            "suspected_duplicate",
+            "unsupported_format",
+        ]
+    );
+
+    let confirmed = items
+        .get_by_id(derivable.id)
+        .await
+        .expect("item should reload");
+    assert_eq!(confirmed.status(), ItemStatus::Ready);
+    assert_eq!(confirmed.invoice_date, Some(date(2026, 2, 10)));
+    assert_eq!(confirmed.suggested_period.as_deref(), Some("2026-02"));
+    assert_eq!(confirmed.final_category, Some(Category::Transport));
+    let defaulted = items
+        .get_by_id(no_category.id)
+        .await
+        .expect("item should reload");
+    assert_eq!(defaulted.final_category, Some(Category::Hospitality));
+    let untouched = items
+        .get_by_id(no_amount.id)
+        .await
+        .expect("item should reload");
+    assert_eq!(untouched.confirmation_status, ConfirmationStatus::Pending);
+}
+
+#[tokio::test]
+async fn settle_can_leave_invoice_dates_and_categories_alone() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+    let mut item = email_item(
+        110,
+        Utc.with_ymd_and_hms(2026, 2, 10, 3, 0, 0)
+            .single()
+            .expect("valid time"),
+        None,
+    );
+    item.confirmation_status = ConfirmationStatus::Pending;
+    item.suggested_category = Some(Category::Transport);
+    item.final_category = None;
+    items
+        .insert(&item)
+        .await
+        .expect("fixture item should insert");
+    sqlx::query("UPDATE items SET batch_id = ? WHERE id = ?")
+        .bind(batch.id.to_string())
+        .bind(item.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("fixture membership should update");
+
+    let outcome = service
+        .settle_items(batch.id, SettleBatchInput::default())
+        .await
+        .expect("bulk confirm should run");
+
+    assert_eq!(outcome.confirmed_count, 0);
+    assert_eq!(outcome.skipped.len(), 1);
+    assert_eq!(outcome.skipped[0].code, "missing_invoice_date");
+    assert_eq!(
+        items
+            .get_by_id(item.id)
+            .await
+            .expect("item should reload")
+            .confirmation_status,
+        ConfirmationStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn updating_a_batch_range_keeps_members_and_returns_it_to_draft() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+    let mut inside = sample_item(130, Some("2026-02"));
+    inside.batch_id = Some(batch.id);
+    items.insert(&inside).await.expect("item should insert");
+    mark_exported(&pool, batch.id).await;
+
+    // The invoice the user could not fit before: one day after the old range.
+    let detail = service
+        .update_range(batch.id, "2026-02-01", "2026-03-05")
+        .await
+        .expect("range update should succeed");
+
+    assert_eq!(detail.batch.start_date, date(2026, 2, 1));
+    assert_eq!(detail.batch.end_date, date(2026, 3, 5));
+    assert_eq!(detail.batch.status, BatchStatus::Draft);
+    assert_eq!(detail.items.len(), 1, "members are kept");
+    let persisted = BatchRepository::new(pool)
+        .get(batch.id)
+        .await
+        .expect("batch should reload");
+    assert_eq!(persisted.end_date, date(2026, 3, 5));
+}
+
+#[tokio::test]
+async fn updating_a_batch_range_rejects_unusable_ranges() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+
+    let reversed = service
+        .update_range(batch.id, "2026-03-05", "2026-02-01")
+        .await
+        .expect_err("a reversed range must be rejected");
+    assert!(matches!(
+        reversed,
+        AppError::Validation { ref field, .. } if field == "dateRange"
+    ));
+
+    let too_long = service
+        .update_range(batch.id, "2026-01-01", "2027-06-01")
+        .await
+        .expect_err("a range the automation cannot process must be rejected");
+    assert!(matches!(
+        too_long,
+        AppError::Validation { ref field, .. } if field == "dateRange"
+    ));
+
+    let malformed = service
+        .update_range(batch.id, "2026-2-01", "2026-03-05")
+        .await
+        .expect_err("a non-ISO date must be rejected");
+    assert!(matches!(
+        malformed,
+        AppError::Validation { ref field, .. } if field == "startDate"
+    ));
+
+    let missing = service
+        .update_range(Uuid::from_u128(4321), "2026-02-01", "2026-03-05")
+        .await
+        .expect_err("an unknown batch must be reported");
+    assert!(matches!(missing, AppError::NotFound { ref entity, .. } if entity == "batch"));
+}
+
+#[tokio::test]
+async fn bulk_removal_ignores_foreign_ids_and_drafts_the_batch() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let batch = service
+        .create_month(2026, 2)
+        .await
+        .expect("batch should create");
+    let other = service
+        .create_month(2026, 3)
+        .await
+        .expect("other batch should create");
+    for id in [120, 121] {
+        let mut item = sample_item(id, Some("2026-02"));
+        item.batch_id = Some(batch.id);
+        items.insert(&item).await.expect("item should insert");
+    }
+    let mut foreign = sample_item(122, Some("2026-03"));
+    foreign.batch_id = Some(other.id);
+    items
+        .insert(&foreign)
+        .await
+        .expect("foreign item should insert");
+    mark_exported(&pool, batch.id).await;
+
+    let (detail, removed) = service
+        .remove_items(
+            batch.id,
+            &[Uuid::from_u128(120), Uuid::from_u128(121), foreign.id],
+        )
+        .await
+        .expect("bulk removal should run");
+
+    assert_eq!(removed, 2);
+    assert!(detail.items.is_empty());
+    assert_eq!(detail.batch.status, BatchStatus::Draft);
+    assert_eq!(
+        items
+            .get_by_id(foreign.id)
+            .await
+            .expect("foreign item should remain")
+            .batch_id,
+        Some(other.id)
+    );
 }
 
 #[tokio::test]

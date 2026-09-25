@@ -13,7 +13,14 @@ import type {
   InvoiceItemDto,
   ItemFilter,
   ItemStatus,
+  MailLedgerCountsDto,
+  MailLedgerEntryDto,
+  MailLedgerFilter,
+  MailLedgerPageDto,
   MailboxAccountDto,
+  SettleBatchInputDto,
+  SettleBatchOutcomeDto,
+  UpdateBatchRangeInputDto,
   ManualImportOutcomeDto,
   NewBatchInputDto,
   PageDto,
@@ -21,6 +28,8 @@ import type {
   PreferencesDto,
   ReviewItemInputDto,
   SaveMailboxAccountInputDto,
+  ConsistencyReportDto,
+  SyncProgressDto,
   StorageStatusDto,
   TestMailboxAccountInputDto,
 } from "../types";
@@ -35,10 +44,13 @@ export type BrowserCommandBridge = <T>(
 
 interface BridgeState {
   items: InvoiceItemDto[];
+  mailLedger: MailLedgerEntryDto[];
   batches: BatchDto[];
   accounts: MailboxAccountDto[];
   preferences: PreferencesDto;
   storage: StorageStatusDto;
+  consistency: ConsistencyReportDto;
+  syncProgress: SyncProgressDto[];
   nextItemId: number;
   nextBatchId: number;
   nextAccountId: number;
@@ -57,10 +69,13 @@ interface BrowserBridgeOptions {
 
 export interface BrowserBridgeSeed {
   items?: InvoiceItemDto[];
+  mailLedger?: MailLedgerEntryDto[];
   batches?: BatchDto[];
   accounts?: MailboxAccountDto[];
   preferences?: PreferencesDto;
   storage?: StorageStatusDto;
+  consistency?: ConsistencyReportDto;
+  syncProgress?: SyncProgressDto[];
   nextItemId?: number;
   nextBatchId?: number;
   nextAccountId?: number;
@@ -150,12 +165,14 @@ function paginate<T>(
 function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
   const defaults: BridgeState = {
     items: [],
+    mailLedger: [],
     batches: [],
     accounts: [],
     preferences: {
       backgroundSyncEnabled: true,
       exportDirectory: "/tmp/invoice-reimbursement/e2e",
       batchDirectoryPattern: "{batchName}-{timestamp}",
+      markProcessedMailSeen: true,
     },
     storage: {
       localDataDirectory: "/tmp/invoice-reimbursement/e2e/data",
@@ -163,6 +180,13 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
       availableBytes: 8_589_934_592,
       recoveryError: null,
     },
+    consistency: {
+      checkedAt: now,
+      itemsChecked: 0,
+      batchesChecked: 0,
+      issues: [],
+    },
+    syncProgress: [],
     nextItemId: 1,
     nextBatchId: 1,
     nextAccountId: 1,
@@ -171,10 +195,14 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
     ...defaults,
     ...seed,
     items: seed.items?.map((item) => ({ ...item })) ?? defaults.items,
+    mailLedger:
+      seed.mailLedger?.map((entry) => ({ ...entry })) ?? defaults.mailLedger,
     batches: seed.batches?.map((batch) => ({ ...batch })) ?? defaults.batches,
     accounts: seed.accounts?.map((account) => ({ ...account })) ?? defaults.accounts,
     preferences: { ...(seed.preferences ?? defaults.preferences) },
     storage: { ...(seed.storage ?? defaults.storage) },
+    consistency: { ...(seed.consistency ?? defaults.consistency) },
+    syncProgress: seed.syncProgress?.map((entry) => ({ ...entry })) ?? defaults.syncProgress,
   };
 }
 
@@ -284,6 +312,107 @@ function canNormalize(item: InvoiceItemDto) {
   return /\.(pdf|jpe?g|png)$/iu.test(item.originalName);
 }
 
+/** Mirrors `BatchService::settle_items` for the development bridge. */
+function settleBatchItems(
+  state: BridgeState,
+  batchId: string,
+  input: SettleBatchInputDto,
+) {
+  const detail = batchDetail(state, batchId);
+  const skipped: SettleBatchOutcomeDto["skipped"] = [];
+  let confirmedCount = 0;
+  let filledInvoiceDateCount = 0;
+  let appliedCategoryCount = 0;
+  for (const item of detail.items) {
+    if (item.confirmationStatus === "confirmed") continue;
+    const skip = (code: string, message: string) =>
+      skipped.push({ itemId: item.id, fileName: item.originalName, code, message });
+    if (item.dedupeStatus === "suspected_duplicate") {
+      skip("suspected_duplicate", "疑似重复，需先处理重复");
+      continue;
+    }
+    if (item.recognitionStatus === "failed") {
+      skip("recognition_failed", "识别失败，需重新识别或更换原件");
+      continue;
+    }
+    if (item.recognitionStatus === "pending") {
+      skip("not_recognized", "尚未完成识别");
+      continue;
+    }
+    if (item.amountCents === null) {
+      skip("missing_amount", "缺少金额，必须对照原件人工填写");
+      continue;
+    }
+    const derivedDate =
+      item.invoiceDate ??
+      (input.fillInvoiceDateFromReceived && item.sourceType === "email"
+        ? mailReceivedDate(item)
+        : null);
+    if (derivedDate === null) {
+      skip("missing_invoice_date", "缺少开票日期，且无法从邮件日期推导");
+      continue;
+    }
+    const period = item.suggestedPeriod ?? derivedDate.slice(0, 7);
+    const category =
+      item.finalCategory ??
+      (input.applySuggestedCategory ? item.suggestedCategory : null) ??
+      input.defaultCategory;
+    if (category === null) {
+      skip("missing_category", "缺少分类，且没有可采用的建议分类");
+      continue;
+    }
+    if (!item.hasNormalizedPdf && !/\\.(pdf|jpe?g|png)$/iu.test(item.originalName)) {
+      skip(
+        "unsupported_format",
+        "原件格式不支持生成归一化 PDF，请改用 PDF/JPG/PNG 或移出批次",
+      );
+      continue;
+    }
+    // Mirrors `batch_membership_date`: email invoices belong to the mail month,
+    // manual uploads to their invoice date.
+    const membershipDate =
+      item.sourceType === "email" ? mailReceivedDate(item) : derivedDate;
+    if (
+      membershipDate < detail.batch.startDate ||
+      membershipDate > detail.batch.endDate
+    ) {
+      skip("outside_date_range", "票据日期不在批次范围内");
+      continue;
+    }
+    const target = state.items.find((candidate) => candidate.id === item.id);
+    if (!target) continue;
+    if (item.invoiceDate === null) filledInvoiceDateCount += 1;
+    if (item.finalCategory !== category) appliedCategoryCount += 1;
+    Object.assign(target, {
+      invoiceDate: derivedDate,
+      suggestedPeriod: period,
+      finalCategory: category,
+      recognitionStatus: "succeeded",
+      confirmationStatus: "confirmed",
+      updatedAt: now,
+    });
+    // The backend derives `status` from the three status columns.
+    target.status = derivedStatus(target);
+    confirmedCount += 1;
+  }
+  if (confirmedCount !== 0) markBatchDraft(state, batchId);
+  const repairedCount = repairMissingNormalized(state, batchDetail(state, batchId).items);
+  const refreshed = batchDetail(state, batchId);
+  return {
+    confirmedCount,
+    filledInvoiceDateCount,
+    appliedCategoryCount,
+    repairedCount,
+    skipped,
+    issues: refreshed.issues,
+  } satisfies SettleBatchOutcomeDto;
+}
+
+/** The received date is the invoice date fallback for email invoices. */
+function mailReceivedDate(item: InvoiceItemDto) {
+  return item.fetchedAt.slice(0, 10);
+}
+
 /** Mirrors `repair_missing_normalized_pdfs` for the development bridge. */
 function repairMissingNormalized(state: BridgeState, items: InvoiceItemDto[]) {
   let repairedCount = 0;
@@ -376,6 +505,7 @@ function seedAutomationScenario(
       sourceType: "email",
       sourceAccountId: accountId,
       fetchedAt: now,
+      sourceReceivedDate: null,
       invoiceDate: batch.startDate,
       suggestedPeriod: period,
       batchId: null,
@@ -403,6 +533,7 @@ function seedAutomationScenario(
       sourceType: "email",
       sourceAccountId: accountId,
       fetchedAt: now,
+      sourceReceivedDate: null,
       invoiceDate: batch.startDate,
       suggestedPeriod: period,
       batchId: null,
@@ -456,6 +587,7 @@ function createItem(state: BridgeState, path: string): InvoiceItemDto {
     sourceType: "manual_upload",
     sourceAccountId: null,
     fetchedAt: now,
+    sourceReceivedDate: null,
     invoiceDate: "2026-07-15",
     suggestedPeriod: "2026-07",
     batchId: null,
@@ -494,6 +626,9 @@ function dashboard(state: BridgeState): DashboardDto {
     ).length,
     suspectedDuplicateCount: state.items.filter(
       (item) => item.status === "suspected_duplicate",
+    ).length,
+    mailNeedsAttentionCount: state.mailLedger.filter(
+      (entry) => entry.outcome === "partial" || entry.outcome === "failed",
     ).length,
     recentBatches: state.batches.slice(0, 5).map((batch) => ({ ...batch })),
   };
@@ -736,6 +871,55 @@ function makeHandlers(
           refreshed.items.length === 0 ? null : exportBatch(state, batchId),
       } satisfies BatchAutomationResultDto;
     }],
+    [API_COMMANDS.updateBatchRange, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      const input = requiredObject<UpdateBatchRangeInputDto>(arguments_, "input");
+      const batch = state.batches.find((candidate) => candidate.id === batchId);
+      if (!batch) throw notFound("batch");
+      if (input.startDate > input.endDate) {
+        throw {
+          code: "validation",
+          field: "dateRange",
+          message: "start date must not be after end date",
+        } satisfies AppError;
+      }
+      Object.assign(batch, {
+        startDate: input.startDate,
+        endDate: input.endDate,
+        status: "draft",
+        updatedAt: now,
+      });
+      persistState();
+      return batchDetail(state, batchId);
+    }],
+    [API_COMMANDS.settleBatchItems, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      const input = requiredObject<SettleBatchInputDto>(arguments_, "input");
+      const outcome = settleBatchItems(state, batchId, {
+        fillInvoiceDateFromReceived: input.fillInvoiceDateFromReceived === true,
+        applySuggestedCategory: input.applySuggestedCategory === true,
+        defaultCategory: input.defaultCategory ?? null,
+      });
+      persistState();
+      return outcome;
+    }],
+    [API_COMMANDS.removeBatchItems, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      batchDetail(state, batchId);
+      const itemIds = arguments_.itemIds;
+      if (!Array.isArray(itemIds) || !itemIds.every((id) => typeof id === "string")) {
+        throw new Error("Browser command argument itemIds must be a string array");
+      }
+      markBatchDraft(state, batchId);
+      for (const itemId of itemIds) {
+        const item = state.items.find((candidate) => candidate.id === itemId);
+        if (item?.batchId === batchId) {
+          Object.assign(item, { batchId: null, updatedAt: now });
+        }
+      }
+      persistState();
+      return batchDetail(state, batchId);
+    }],
     [API_COMMANDS.repairBatchNormalizedPdfs, (arguments_) => {
       const batchId = requiredString(arguments_, "batchId");
       const detail = batchDetail(state, batchId);
@@ -746,6 +930,50 @@ function makeHandlers(
         repairedCount,
         issues: batchDetail(state, batchId).issues,
       } satisfies BatchRepairDto;
+    }],
+    [API_COMMANDS.listMailLedger, (arguments_) => {
+      const filter = (arguments_.filter ?? {}) as MailLedgerFilter;
+      const query = filter.query?.trim().toLocaleLowerCase("zh-CN");
+      const matching = state.mailLedger
+        .filter((entry) => {
+          if (filter.needsAttention && !["partial", "failed"].includes(entry.outcome)) {
+            return false;
+          }
+          if (filter.outcome && entry.outcome !== filter.outcome) return false;
+          if (filter.accountId && entry.accountId !== filter.accountId) return false;
+          if (!query) return true;
+          return [entry.subject, entry.sender]
+            .filter((value): value is string => Boolean(value))
+            .some((value) => value.toLocaleLowerCase("zh-CN").includes(query));
+        })
+        .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt));
+      const cursor = (arguments_.page as { cursor?: { receivedAt: string } } | undefined)
+        ?.cursor;
+      const remaining = cursor
+        ? matching.filter((entry) => entry.receivedAt < cursor.receivedAt)
+        : matching;
+      const pageSize =
+        (arguments_.page as { pageSize?: number } | undefined)?.pageSize ?? 50;
+      const items = remaining.slice(0, pageSize);
+      const last = items.at(-1);
+      return {
+        items: items.map((entry) => ({ ...entry })),
+        nextCursor:
+          remaining.length > items.length && last
+            ? { receivedAt: last.receivedAt, uid: last.uid, accountId: last.accountId }
+            : null,
+      } satisfies MailLedgerPageDto;
+    }],
+    [API_COMMANDS.getMailLedgerCounts, () => {
+      const count = (outcome: string) =>
+        state.mailLedger.filter((entry) => entry.outcome === outcome).length;
+      return {
+        imported: count("imported"),
+        partial: count("partial"),
+        failed: count("failed"),
+        ignored: count("ignored"),
+        needsAttention: count("partial") + count("failed"),
+      } satisfies MailLedgerCountsDto;
     }],
     [API_COMMANDS.listMailboxAccounts, () =>
       state.accounts.map((account) => ({ ...account }))],
@@ -795,6 +1023,25 @@ function makeHandlers(
       return { ...state.preferences };
     }],
     [API_COMMANDS.getStorageStatus, () => ({ ...state.storage })],
+    [API_COMMANDS.getSyncProgress, () => state.syncProgress.map((entry) => ({ ...entry }))],
+    [API_COMMANDS.cancelSync, (arguments_) => {
+      const accountId = requiredString(arguments_, "accountId");
+      const before = state.syncProgress.length;
+      state.syncProgress = state.syncProgress.filter(
+        (entry) => entry.accountId !== accountId,
+      );
+      return state.syncProgress.length !== before;
+    }],
+    [API_COMMANDS.getConsistencyReport, () => ({
+      ...state.consistency,
+      itemsChecked: state.items.length,
+      batchesChecked: state.batches.length,
+    })],
+    [API_COMMANDS.exportDiagnostics, () => ({
+      path: `${state.storage.exportDirectory}/invoice-diagnostics-20260918-070000.zip`,
+      directory: state.storage.exportDirectory,
+      bytes: 2048,
+    })],
     [API_COMMANDS.retryExportRecovery, () => {
       state.storage.recoveryError = null;
       return { ...state.storage };

@@ -147,6 +147,10 @@ impl RecognitionService {
                 self.persist_recognition_patch(
                     id,
                     ItemPatch {
+                        note: reason_note(
+                            &item.note,
+                            &extraction_failure_note(&item.original_name, &extraction_error),
+                        ),
                         invoice_date: Some(None),
                         suggested_period: Some(None),
                         suggested_category: Some(None),
@@ -175,6 +179,18 @@ impl RecognitionService {
                 "该原件格式不支持自动识别，已保留人工填写的内容",
             ));
         }
+        // A service without storage paths used to skip normalization silently and
+        // still mark the invoice as recognized, which is exactly how an
+        // unexportable batch is created. Refuse instead of pretending.
+        if item.normalized_pdf_path.is_none()
+            && extracted.normalized_pdf.is_some()
+            && self.paths.is_none()
+        {
+            return Err(AppError::Internal {
+                message: "recognition service has no application paths to store the normalized PDF"
+                    .to_owned(),
+            });
+        }
         let created_normalized = match (
             item.normalized_pdf_path.as_ref(),
             extracted.normalized_pdf.as_deref(),
@@ -193,6 +209,11 @@ impl RecognitionService {
             }
             _ => None,
         };
+        let unsupported_note = extracted
+            .warnings
+            .iter()
+            .any(|warning| warning == "unsupported_for_recognition")
+            .then(|| unsupported_format_note(&item.original_name));
         let recognized =
             recognize_with_warnings(&extracted.text, received_date, &extracted.warnings);
         let semantic_fingerprint = semantic_invoice_fingerprint(
@@ -224,6 +245,12 @@ impl RecognitionService {
                     company: Some(recognized.company),
                     recognition_status: Some(recognized.recognition_status),
                     confirmation_status: Some(recognized.confirmation_status),
+                    note: match unsupported_note {
+                        // A readable document clears whatever a previous attempt
+                        // left behind, so a stale reason is never shown again.
+                        None => is_recognition_note(item.note.as_deref()).then_some(None),
+                        Some(reason) => reason_note(&item.note, &reason),
+                    },
                     ..ItemPatch::default()
                 },
                 preserve_manual_confirmation,
@@ -360,6 +387,69 @@ impl RecognitionOutcome {
 
 pub fn recognize(text: &str, received_date: NaiveDate) -> RecognitionOutcome {
     recognize_with_warnings(text, received_date, &[])
+}
+
+/// Prefix shared by every reason this module writes into `items.note`.
+const RECOGNITION_NOTE_PREFIX: &str = "识别失败：";
+
+/// Whether a note was written by this pipeline instead of typed by the user.
+fn is_recognition_note(note: Option<&str>) -> bool {
+    note.is_some_and(|note| note.trim_start().starts_with(RECOGNITION_NOTE_PREFIX))
+}
+
+/// Build a note update for a failed attempt.
+///
+/// The item drawer exposes `note` as a free-text remark, so a remark the user
+/// typed is never overwritten; only an empty note or an older reason from this
+/// pipeline is replaced.
+fn reason_note(existing: &Option<String>, reason: &str) -> Option<Option<String>> {
+    let trimmed = existing.as_deref().map(str::trim);
+    if trimmed.is_some_and(|text| !text.is_empty()) && !is_recognition_note(existing.as_deref()) {
+        return None;
+    }
+    let note = format!("{RECOGNITION_NOTE_PREFIX}{reason}");
+    (existing.as_deref() != Some(note.as_str())).then_some(Some(note))
+}
+
+fn original_extension(name: &str) -> String {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
+        .unwrap_or_else(|| "（无扩展名）".to_owned())
+}
+
+/// Reason for a format the extractor accepts as a file but cannot read.
+///
+/// Word, Excel and archive originals used to come back as "recognized but
+/// awaiting confirmation" with no text and no normalized PDF, so they looked
+/// healthy in the inbox while being impossible to export. Say so instead.
+fn unsupported_format_note(original_name: &str) -> String {
+    format!(
+        "原件格式 {} 不支持自动识别，也无法生成归一化 PDF；请人工填写日期与金额并改用 PDF/JPG/PNG 原件，或将其移出批次",
+        original_extension(original_name)
+    )
+}
+
+/// Reason for an extractor error, in terms a user can act on.
+fn extraction_failure_note(original_name: &str, error: &AppError) -> String {
+    let detail = error.to_string();
+    let detail = detail.trim();
+    let explained = if detail.contains("exceeds extraction resource limits") {
+        "文件过于复杂或超出处理上限"
+    } else if detail.contains("unsupported") {
+        "该格式不支持自动识别"
+    } else if detail.contains("password") || detail.contains("encrypt") {
+        "文件已加密，需要先解除密码"
+    } else if detail.is_empty() {
+        "读取失败"
+    } else {
+        "文件损坏或不是有效的发票文件"
+    };
+    format!(
+        "原件格式 {} {explained}；请改用 PDF/JPG/PNG 原件，或人工录入后移出待处理队列",
+        original_extension(original_name)
+    )
 }
 
 pub fn recognize_with_warnings(
@@ -1020,4 +1110,77 @@ fn scored_category(text: &str) -> Option<Category> {
     }
 
     (best_score >= 2 && !tied).then_some(best).flatten()
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_note_receives_the_failure_reason() {
+        let note = reason_note(&None, "原件格式 .docx 不支持自动识别")
+            .expect("failing recognition must explain itself");
+        assert!(
+            note.expect("reason is present")
+                .starts_with(RECOGNITION_NOTE_PREFIX)
+        );
+    }
+
+    #[test]
+    fn a_user_remark_is_never_overwritten() {
+        let existing = Some("张三的餐费".to_owned());
+        assert_eq!(
+            reason_note(&existing, "原件格式 .docx 不支持自动识别"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_previous_reason_is_replaced_by_the_new_one() {
+        let existing = Some(format!("{RECOGNITION_NOTE_PREFIX}旧的原因"));
+        let note = reason_note(&existing, "新的原因").expect("stale reasons are refreshed");
+        assert_eq!(note, Some(format!("{RECOGNITION_NOTE_PREFIX}新的原因")));
+    }
+
+    #[test]
+    fn an_unchanged_reason_writes_nothing() {
+        let existing = Some(format!("{RECOGNITION_NOTE_PREFIX}同样的原因"));
+        assert_eq!(reason_note(&existing, "同样的原因"), None);
+    }
+
+    #[test]
+    fn only_our_own_notes_are_recognized() {
+        assert!(is_recognition_note(Some("  识别失败：x")));
+        assert!(!is_recognition_note(Some("invoice link download failed")));
+        assert!(!is_recognition_note(None));
+    }
+
+    #[test]
+    fn unsupported_formats_name_the_extension() {
+        let note = unsupported_format_note("发票.DOCX");
+        assert!(note.contains(".docx"), "{note}");
+        assert!(note.contains("PDF"));
+    }
+
+    #[test]
+    fn a_damaged_document_is_explained_without_leaking_details() {
+        let error = AppError::External {
+            service: "document_extractor".to_owned(),
+            retryable: false,
+            message: "Unable to read document.".to_owned(),
+        };
+        let note = extraction_failure_note("scan.pdf", &error);
+        assert!(note.contains(".pdf"), "{note}");
+        assert!(!note.contains("Unable to read"), "{note}");
+    }
+
+    #[test]
+    fn resource_limits_are_explained() {
+        let error = AppError::External {
+            service: "document_extractor".to_owned(),
+            retryable: false,
+            message: "Document exceeds extraction resource limits.".to_owned(),
+        };
+        assert!(extraction_failure_note("big.pdf", &error).contains("超出处理上限"));
+    }
 }

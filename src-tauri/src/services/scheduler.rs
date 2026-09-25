@@ -60,13 +60,13 @@ impl ManualClock {
     }
 
     pub fn set(&self, now: DateTime<Utc>) {
-        *self.now.write().expect("manual clock lock poisoned") = now;
+        *self.now.write().unwrap_or_else(|error| error.into_inner()) = now;
     }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> DateTime<Utc> {
-        *self.now.read().expect("manual clock lock poisoned")
+        *self.now.read().unwrap_or_else(|error| error.into_inner())
     }
 }
 
@@ -487,7 +487,7 @@ struct TaskRegistryState {
 
 impl TaskRegistry {
     fn push(&self, task: JoinHandle<()>) {
-        let mut state = self.state.lock().expect("scheduler task lock poisoned");
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.closed {
             task.abort();
         } else {
@@ -497,7 +497,7 @@ impl TaskRegistry {
 
     async fn reap_finished(&self) -> Result<(), AppError> {
         let finished = {
-            let mut state = self.state.lock().expect("scheduler task lock poisoned");
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let mut finished = Vec::new();
             let mut index = 0;
             while index < state.tasks.len() {
@@ -513,7 +513,7 @@ impl TaskRegistry {
         if result.is_err() {
             self.state
                 .lock()
-                .expect("scheduler task lock poisoned")
+                .unwrap_or_else(|error| error.into_inner())
                 .child_failed = true;
         }
         result
@@ -521,7 +521,7 @@ impl TaskRegistry {
 
     async fn wait_all(&self) -> Result<(), AppError> {
         let (tasks, previous_failure) = {
-            let mut state = self.state.lock().expect("scheduler task lock poisoned");
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.closed = true;
             let previous_failure = std::mem::take(&mut state.child_failed);
             (std::mem::take(&mut state.tasks), previous_failure)
@@ -536,7 +536,7 @@ impl TaskRegistry {
 
     fn abort_all(&self) {
         let tasks = {
-            let mut state = self.state.lock().expect("scheduler task lock poisoned");
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.closed = true;
             std::mem::take(&mut state.tasks)
         };
@@ -765,7 +765,7 @@ mod tests {
                 if registry
                     .state
                     .lock()
-                    .expect("scheduler task lock poisoned")
+                    .unwrap_or_else(|error| error.into_inner())
                     .tasks
                     .iter()
                     .all(JoinHandle::is_finished)
@@ -816,7 +816,7 @@ mod tests {
                 if registry
                     .state
                     .lock()
-                    .expect("scheduler task lock poisoned")
+                    .unwrap_or_else(|error| error.into_inner())
                     .tasks
                     .is_empty()
                 {

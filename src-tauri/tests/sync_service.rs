@@ -11,7 +11,9 @@ use invoice_reimbursement::db::accounts::{
     MailboxAccountRepository, MailboxProvider, NewMailboxAccount, SyncCursor, SyncRun,
 };
 use invoice_reimbursement::db::items::{ItemFilter, ItemPatch, ItemRepository};
+use invoice_reimbursement::db::mail_ledger::{MailLedgerFilter, MailLedgerRepository};
 use invoice_reimbursement::domain::error::AppError;
+use invoice_reimbursement::domain::model::MailOutcome;
 use invoice_reimbursement::domain::model::{ConfirmationStatus, RecognitionStatus};
 use invoice_reimbursement::infra::credentials::{CredentialStore, MemoryCredentialStore};
 use invoice_reimbursement::infra::extraction::{DocumentExtractor, ExtractedDocument};
@@ -2205,6 +2207,67 @@ async fn damaged_document_is_marked_failed_while_later_parts_continue_with_prove
 }
 
 #[tokio::test]
+async fn an_unsupported_attachment_is_recorded_instead_of_wedging_the_mailbox() {
+    // Before this, one attachment whose extension the importer refuses failed
+    // the whole run, left the cursor behind, and every later sync died on the
+    // same mail: the mailbox silently stopped importing.
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "unsupported-part@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 71,
+            highest_uid: 102,
+            messages: vec![
+                raw_message(
+                    101,
+                    include_bytes!("fixtures/mail/unsupported-attachment.eml"),
+                ),
+                raw_message(102, include_bytes!("fixtures/mail/attachment.eml")),
+            ],
+        })])),
+        credentials,
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+
+    // The later mail still imported, and the unusable one is on the ledger.
+    assert!(result.imported_count >= 1, "{result:?}");
+    let failed_ledger_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mail_ledger WHERE outcome = 'failed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        failed_ledger_rows, 1,
+        "the rejected attachment must be visible in the ledger"
+    );
+}
+
+#[tokio::test]
 async fn empty_email_attachment_is_retained_as_failed_while_later_mail_continues() {
     let directory = tempfile::tempdir().unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();
@@ -3115,6 +3178,173 @@ async fn email_filename_is_a_sanitized_cross_platform_basename_and_url_stays_int
     let error = service.import_manual(&manual_url).await.unwrap_err();
     assert!(matches!(error, AppError::Validation { ref field, .. } if field == "file"));
     assert_eq!(count_files(&paths.originals), 1);
+}
+
+/// Records the mails the sync asks the mailbox to mark as read.
+struct SeenTrackingGateway {
+    deltas: Mutex<VecDeque<Result<MailboxDelta, AppError>>>,
+    seen: Mutex<Vec<(String, Vec<u32>)>>,
+}
+
+#[async_trait]
+impl ImapGateway for SeenTrackingGateway {
+    async fn test_connection(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn fetch_since(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+        _cursor: Option<SyncCursor>,
+    ) -> Result<MailboxDelta, AppError> {
+        self.deltas
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("seen tracking gateway delta")
+    }
+
+    async fn fetch_range(
+        &self,
+        config: &ImapAccountConfig,
+        secret: &str,
+        cursor: Option<SyncCursor>,
+        _range: ImapDateRange,
+    ) -> Result<MailboxDelta, AppError> {
+        self.fetch_since(config, secret, cursor).await
+    }
+
+    async fn mark_seen(
+        &self,
+        _config: &ImapAccountConfig,
+        _secret: &str,
+        mailbox: &str,
+        uids: &[u32],
+    ) -> Result<(), AppError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((mailbox.to_owned(), uids.to_vec()));
+        Ok(())
+    }
+}
+
+impl SeenTrackingGateway {
+    fn new(messages: Vec<RawMessage>) -> Self {
+        let uid_validity = 9;
+        let highest_uid = messages
+            .iter()
+            .map(|message| message.uid)
+            .max()
+            .unwrap_or(0);
+        Self {
+            deltas: Mutex::new(
+                vec![
+                    Ok(MailboxDelta {
+                        rejected_messages: vec![],
+                        uid_validity,
+                        highest_uid,
+                        messages,
+                    }),
+                    Ok(MailboxDelta {
+                        rejected_messages: vec![],
+                        uid_validity,
+                        highest_uid,
+                        messages: vec![],
+                    }),
+                ]
+                .into(),
+            ),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<(String, Vec<u32>)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[tokio::test]
+async fn sync_records_scanned_mail_and_marks_settled_mail_seen() {
+    let context = RangeTestContext::new("ledger@example.com", "auth-code").await;
+    let gateway = Arc::new(SeenTrackingGateway::new(vec![raw_message(
+        501,
+        include_bytes!("fixtures/mail/attachment.eml"),
+    )]));
+    let service = context.service(gateway.clone());
+    let start = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+
+    service
+        .run_range(context.account_id, start, end)
+        .await
+        .expect("sync should succeed");
+
+    let ledger = MailLedgerRepository::new(context.pool.clone())
+        .list_page(&MailLedgerFilter::default(), None, 10)
+        .await
+        .expect("ledger should load");
+    assert_eq!(ledger.entries.len(), 1);
+    let entry = &ledger.entries[0];
+    assert_eq!(entry.uid, 501);
+    assert_eq!(entry.candidate_count, 1);
+    assert_eq!(entry.imported_count, 1);
+    assert_eq!(entry.failed_count, 0);
+    assert_eq!(entry.outcome, MailOutcome::Imported);
+    assert!(
+        entry.subject.is_some(),
+        "the mail subject should be recorded"
+    );
+    assert!(
+        entry.marked_seen,
+        "a fully extracted mail should be recorded as marked read"
+    );
+    assert_eq!(
+        gateway.seen(),
+        vec![("INBOX".to_owned(), vec![501])],
+        "the settled mail should be the only one flagged"
+    );
+}
+
+#[tokio::test]
+async fn sync_leaves_mail_unread_while_marking_it_read_is_disabled() {
+    let context = RangeTestContext::new("ledger-off@example.com", "auth-code").await;
+    sqlx::query(
+        "INSERT INTO settings (key, value_json, updated_at) VALUES ('preferences', ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+    )
+    .bind(r#"{"backgroundSyncEnabled":true,"exportDirectory":"exports","batchDirectoryPattern":"{batchName}-{timestamp}","markProcessedMailSeen":false}"#)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&context.pool)
+    .await
+    .expect("preferences should save");
+
+    let gateway = Arc::new(SeenTrackingGateway::new(vec![raw_message(
+        601,
+        include_bytes!("fixtures/mail/attachment.eml"),
+    )]));
+    let service = context.service(gateway.clone());
+    let start = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+
+    service
+        .run_range(context.account_id, start, end)
+        .await
+        .expect("sync should succeed");
+
+    assert!(gateway.seen().is_empty(), "marking read is disabled");
+    let ledger = MailLedgerRepository::new(context.pool.clone())
+        .list_page(&MailLedgerFilter::default(), None, 10)
+        .await
+        .expect("ledger should load");
+    assert_eq!(ledger.entries.len(), 1);
+    assert_eq!(ledger.entries[0].outcome, MailOutcome::Imported);
+    assert!(!ledger.entries[0].marked_seen);
 }
 
 fn raw_message(uid: u32, raw: &[u8]) -> RawMessage {

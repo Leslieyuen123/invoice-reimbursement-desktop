@@ -63,6 +63,8 @@ export interface InvoiceItemDto {
   sourceType: SourceType;
   sourceAccountId: string | null;
   fetchedAt: string;
+  /** Local date the mail was received; the date batches are keyed on. */
+  sourceReceivedDate: string | null;
   invoiceDate: string | null;
   suggestedPeriod: string | null;
   batchId: string | null;
@@ -119,11 +121,15 @@ export interface DashboardDto {
   pendingConfirmationCount: number;
   recognitionFailedCount: number;
   suspectedDuplicateCount: number;
+  /** Mails whose invoices still need attention (partial or failed extraction). */
+  mailNeedsAttentionCount: number;
   recentBatches: BatchDto[];
 }
 
 export interface ItemFilter {
   status?: ItemStatus;
+  sourceAccountId?: string;
+  sourceUid?: number;
   recent?: boolean;
   suggestedPeriod?: string;
   category?: Category;
@@ -136,6 +142,8 @@ export interface PreferencesDto {
   backgroundSyncEnabled: boolean;
   exportDirectory: string;
   batchDirectoryPattern: string;
+  /** Mark a mail as read once every invoice from it is in the library. */
+  markProcessedMailSeen: boolean;
 }
 
 export interface StorageStatusDto {
@@ -143,6 +151,40 @@ export interface StorageStatusDto {
   exportDirectory: string;
   availableBytes: number | null;
   recoveryError: string | null;
+}
+
+export interface SyncProgressDto {
+  accountId: string;
+  mailbox: string | null;
+  processed: number;
+  imported: number;
+  failed: number;
+  startedAt: string;
+}
+
+export interface ConsistencyIssueDto {
+  key: string;
+  label: string;
+  count: number;
+  hint: string;
+  samples: string[];
+}
+
+export interface ConsistencyReportDto {
+  checkedAt: string;
+  itemsChecked: number;
+  batchesChecked: number;
+  issues: ConsistencyIssueDto[];
+}
+
+export interface ExportDiagnosticsInputDto {
+  destination: string | null;
+}
+
+export interface DiagnosticsBundleDto {
+  path: string;
+  directory: string;
+  bytes: number;
 }
 
 export interface ReviewItemInputDto {
@@ -194,8 +236,84 @@ export interface BatchDetailDto {
   issues: BatchIssueDto[];
 }
 
+/** How one scanned mail ended up in the invoice library. */
+export type MailOutcome = "imported" | "partial" | "failed" | "ignored";
+
+export interface MailLedgerEntryDto {
+  accountId: string;
+  mailbox: string;
+  uid: number;
+  subject: string | null;
+  sender: string | null;
+  receivedAt: string;
+  processedAt: string;
+  candidateCount: number;
+  importedCount: number;
+  existingCount: number;
+  failedCount: number;
+  outcome: MailOutcome;
+  reason: string | null;
+  markedSeen: boolean;
+  /** Invoices are in the library but the mailbox still shows the mail unread. */
+  seenMismatch: boolean;
+}
+
+export interface MailLedgerCountsDto {
+  imported: number;
+  partial: number;
+  failed: number;
+  ignored: number;
+  needsAttention: number;
+}
+
+export interface MailLedgerCursorDto {
+  receivedAt: string;
+  uid: number;
+  accountId: string;
+}
+
+export interface MailLedgerPageDto {
+  items: MailLedgerEntryDto[];
+  nextCursor: MailLedgerCursorDto | null;
+}
+
+export interface MailLedgerFilter {
+  outcome?: MailOutcome;
+  needsAttention?: boolean;
+  accountId?: string;
+  query?: string;
+}
+
+export interface MailLedgerPageRequestDto {
+  cursor?: MailLedgerCursorDto;
+  pageSize?: number;
+}
+
 export interface BatchRepairDto {
   repairedCount: number;
+  issues: BatchIssueDto[];
+}
+
+/** One invoice the bulk confirm could not settle, with a stable reason code. */
+export interface SkippedBatchItemDto {
+  itemId: string;
+  fileName: string;
+  code: string;
+  message: string;
+}
+
+export interface SettleBatchInputDto {
+  fillInvoiceDateFromReceived: boolean;
+  applySuggestedCategory: boolean;
+  defaultCategory: Category | null;
+}
+
+export interface SettleBatchOutcomeDto {
+  confirmedCount: number;
+  filledInvoiceDateCount: number;
+  appliedCategoryCount: number;
+  repairedCount: number;
+  skipped: SkippedBatchItemDto[];
   issues: BatchIssueDto[];
 }
 
@@ -213,6 +331,11 @@ export interface BatchCandidateDto {
   outsideBatchRange: boolean;
   eligible: boolean;
   disabledReason: BatchCandidateDisabledReason | null;
+}
+
+export interface UpdateBatchRangeInputDto {
+  startDate: string;
+  endDate: string;
 }
 
 export interface NewBatchInputDto {

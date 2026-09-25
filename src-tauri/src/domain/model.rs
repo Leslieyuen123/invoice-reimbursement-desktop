@@ -66,6 +66,37 @@ pub enum DedupeStatus {
     Resolved,
 }
 
+/// How one scanned mail ended up in the invoice library.
+///
+/// `Partial` and `Failed` mean the user still has something to do in the
+/// mailbox, which is why the ledger exposes them instead of only counting
+/// imported invoices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum MailOutcome {
+    Imported,
+    Partial,
+    Failed,
+    Ignored,
+}
+
+impl MailOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Imported => "imported",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Ignored => "ignored",
+        }
+    }
+
+    /// Whether the user should look at this mail again.
+    pub const fn needs_attention(self) -> bool {
+        matches!(self, Self::Partial | Self::Failed)
+    }
+}
+
 pub fn derive_item_status(
     recognition_status: RecognitionStatus,
     confirmation_status: ConfirmationStatus,

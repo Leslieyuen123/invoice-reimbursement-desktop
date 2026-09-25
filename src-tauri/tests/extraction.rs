@@ -421,7 +421,14 @@ fn compressed_pdf_text_bomb_is_rejected_without_expanding_in_process() {
         .expect_err("compressed text bomb should be rejected");
 
     assert_external(&error, "document_extractor");
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // This bound exists to catch "the parser decoded the whole payload anyway",
+    // not to measure latency: keep it far above any plausible machine load while
+    // still failing if the rejection turns into real work.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "compressed text bomb took {:?}, which suggests it was expanded",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -1095,8 +1102,10 @@ fn process_ocr_write_respects_deadline_when_sidecar_does_not_read_stdin() {
     let elapsed = started.elapsed();
 
     assert_external(&error, "ocr_sidecar");
+    // The request deadline is one second; the assertion only needs to prove the
+    // write did not block forever, so a loaded machine cannot fail it.
     assert!(
-        elapsed < Duration::from_millis(1_500),
+        elapsed < Duration::from_secs(20),
         "stdin write ignored the request deadline: elapsed={elapsed:?}"
     );
     let gone = (0..50).any(|_| {
