@@ -32,6 +32,27 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
 >
 > 另外：给证书添加系统信任（`security add-trusted-cert -p codeSign`）需要图形授权，本机未执行。`security find-identity -v -p codesigning` 因此显示 0 个有效身份，但 `codesign --sign "Invoice Desk Local Signing"` 仍可正常签名，且签名要求稳定——这正是钥匙串需要的东西。代价：Gatekeeper 对外分发时仍视为未签名（与 ad-hoc 相比没有变差）。
 
+## 让证书被系统信任（必做一次）
+
+只导入证书还不够：2026-09-25 实测，未信任时每次重建后 App 读取钥匙串凭据都会弹授权框并 20 秒超时（同步被暂停）。把证书设为信任后，重建的 App 读取凭据不再需要确认（验证：信任后安装的 0.2.8 首次同步直接读到凭据，`securityd` 无 prompt 记录）。
+
+做法（只影响当前用户，不是系统级）：
+
+1. 打开「钥匙串访问」→ 左侧「登录」钥匙串 → 分类「证书」
+2. 找到 `Invoice Desk Local Signing` → 双击 → 展开「信任」
+3. 把「使用此证书时」改为「**始终信任**」→ 关闭窗口时输入登录密码
+
+验证：
+
+```bash
+security find-identity -v -p codesigning
+# 期望：1 valid identities found（未信任时是 0）
+security find-certificate -c "Invoice Desk Local Signing" -p > /tmp/c.pem
+security verify-cert -c /tmp/c.pem -p codeSign   # 期望 certificate verification successful
+```
+
+> 注意：给证书加系统信任（`security add-trusted-cert -d`，需要管理员）会走 System keychain、影响所有用户，本机未采用；用户域信任已足够。
+
 ## 构建
 
 ```bash

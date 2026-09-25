@@ -1,7 +1,7 @@
 # 发票报销完整用户手册
 
 > 文档版本：1.2
-> 适用 App 版本：v0.2.8
+> 适用 App 版本：v0.2.9
 > 更新日期：2026-09-19
 
 ## 关于本手册
@@ -26,27 +26,27 @@
 |---|---|
 | Mac 芯片 | Apple Silicon，即 M1、M2、M3、M4 或更新芯片 |
 | macOS | macOS 11 或更高版本 |
-| App 版本 | v0.2.8 |
-| 安装包 | `invoice-reimbursement-0.2.8-macos-arm64.dmg` |
+| App 版本 | v0.2.9 |
+| 安装包 | `invoice-reimbursement-0.2.9-macos-arm64.dmg` |
 | 邮箱 | Gmail 或 QQ 邮箱 |
 
 当前安装包不支持 Intel Mac。如果你不确定芯片类型，打开 macOS 左上角苹果菜单，选择“关于本机”查看“芯片”。
 
 ### 1.2 当前分享版的安全提醒
 
-v0.2.8 是用于本地分享的 Apple Silicon macOS 安装包。App 采用 ad-hoc（临时）签名并启用了 Hardened Runtime，但未使用 Apple Developer ID 签名，也未经过 Apple 公证。macOS 第一次打开时可能会阻止运行。
+v0.2.9 是用于本地分享的 Apple Silicon macOS 安装包。App 采用 ad-hoc（临时）签名并启用了 Hardened Runtime，但未使用 Apple Developer ID 签名，也未经过 Apple 公证。macOS 第一次打开时可能会阻止运行。
 
 - 只从你信任的分享者处获取安装包。
 - 不要为了运行本 App 关闭 Gatekeeper 或 macOS 的整体安全保护。
-- 分享者应同时提供校验文件 `invoice-reimbursement-0.2.8-macos-arm64.dmg.sha256`。
+- 分享者应同时提供校验文件 `invoice-reimbursement-0.2.9-macos-arm64.dmg.sha256`。
 
 将 DMG 和校验文件放在同一目录。熟悉终端的用户可以进入该目录并执行：
 
 ~~~bash
-shasum -a 256 -c invoice-reimbursement-0.2.8-macos-arm64.dmg.sha256
+shasum -a 256 -c invoice-reimbursement-0.2.9-macos-arm64.dmg.sha256
 ~~~
 
-校验成功时，输出应包含 `invoice-reimbursement-0.2.8-macos-arm64.dmg: OK`。校验失败时不要安装，应重新从可信分享者处获取 DMG 和校验文件。
+校验成功时，输出应包含 `invoice-reimbursement-0.2.9-macos-arm64.dmg: OK`。校验失败时不要安装，应重新从可信分享者处获取 DMG 和校验文件。
 
 ### 1.3 本地优先与数据边界
 
@@ -85,7 +85,7 @@ shasum -a 256 -c invoice-reimbursement-0.2.8-macos-arm64.dmg.sha256
 
 ## 3. 认识发票报销 App
 
-左侧边栏顶部显示当前版本号（形如 `v0.2.8`），用来确认这台 Mac 上实际运行的是哪个版本；排查问题时请以它为准。
+左侧边栏顶部显示当前版本号（形如 `v0.2.9`），用来确认这台 Mac 上实际运行的是哪个版本；排查问题时请以它为准。
 
 | 页面 | 主要用途 | 最常用的操作 |
 |---|---|---|
@@ -227,6 +227,8 @@ App 会将新票据保存到本地，计算文件摘要，尝试读取发票内�
 | 需关注 | 需要你看一眼的邮件，等于“部分提取 + 未提取 + 标记失败” |
 
 顶部标签会显示每类的数量，展开一行会列出这封邮件带来的票据，以及失败原因（链接下载失败、压缩包已加密、格式不支持等）。搜索框可以按主题或发件人查找。
+
+邮件里如果有一个 App 无法保存的附件（例如 `.ofd` 这类不支持的扩展名），**不会中断整次同步**：该附件会作为失败项记入台账（在「需关注」里可以看到原因），同一封邮件和后续邮件的其他发票仍会正常导入。以前这种情况会中断整次同步，导致该邮箱一直停在原地、后续邮件进不来。
 
 台账包含两类记录：
 
@@ -616,4 +618,4 @@ App 主数据目录为：
 
 ---
 
-本手册对应《发票报销》v0.2.8，更新日期为 2026-09-19。如果界面按钮、支持邮箱或导出结构在新版本中发生变化，请以新版本随附手册为准。
+本手册对应《发票报销》v0.2.9，更新日期为 2026-09-19。如果界面按钮、支持邮箱或导出结构在新版本中发生变化，请以新版本随附手册为准。

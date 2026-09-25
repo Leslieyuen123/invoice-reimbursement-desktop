@@ -33,6 +33,11 @@
 - [ ] 卸载 `.app` 不误删 `~/Library/Application Support/com.invoice-desk.desktop/`、外部导出目录或钥匙串；单独记录清理数据的人工步骤
 - [ ] 安装包无签名/公证凭据时只标记“本地未签名 smoke”；不得标记签名或公证通过
 
+## 证书信任（一次性，换机器需重做）
+
+- [ ] `security find-identity -v -p codesigning` 显示 `1 valid identities found`（0 表示证书未被信任，此时重建后 App 读凭据会弹窗并超时）
+- [ ] 未信任时按 `docs/operations/local-code-signing.md` 在「钥匙串访问」里把 `Invoice Desk Local Signing` 设为「始终信任」
+
 ## 本地签名身份
 
 - [ ] 本地构建使用 `bash scripts/build-signed-app.sh`（或显式传 `APPLE_SIGNING_IDENTITY="Invoice Desk Local Signing"`），构建后用 `codesign -d -r-` 确认要求包含 `certificate root` 而不是 `cdhash`

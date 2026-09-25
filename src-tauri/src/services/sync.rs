@@ -610,8 +610,22 @@ impl SyncService {
                             rescan,
                         },
                     )
-                    .await
-                    .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+                    .await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // One attachment the importer cannot store must not stop
+                        // the mailbox: it used to fail the run, leave the cursor
+                        // behind and wedge every later sync on the same mail.
+                        // Record it on the mail instead and keep scanning.
+                        accumulator.failed = accumulator.failed.saturating_add(1);
+                        if accumulator.reason.is_none() {
+                            accumulator.reason =
+                                Some(format!("attachment_import_failed:{}", reason_token(&error)));
+                        }
+                        continue;
+                    }
+                };
                 accumulator.add_import(&outcome);
                 self.track_and_recognize(outcome, &mut completed)
                     .await
@@ -866,6 +880,13 @@ struct LinkOutcome {
     existing: u32,
     failed: u32,
     reason: Option<String>,
+}
+
+/// A short, stable token for a per-mail failure reason in the ledger.
+fn reason_token(error: &AppError) -> String {
+    let text = error.to_string();
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    cleaned.chars().take(120).collect()
 }
 
 #[derive(Debug, Clone, Default)]

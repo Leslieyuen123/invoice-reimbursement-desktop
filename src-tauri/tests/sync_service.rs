@@ -2207,6 +2207,67 @@ async fn damaged_document_is_marked_failed_while_later_parts_continue_with_prove
 }
 
 #[tokio::test]
+async fn an_unsupported_attachment_is_recorded_instead_of_wedging_the_mailbox() {
+    // Before this, one attachment whose extension the importer refuses failed
+    // the whole run, left the cursor behind, and every later sync died on the
+    // same mail: the mailbox silently stopped importing.
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let accounts = MailboxAccountRepository::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let account = accounts
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: "unsupported-part@example.com".to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    credentials
+        .set(&account.id.to_string(), "password")
+        .unwrap();
+    let service = SyncService::new(
+        Arc::new(FakeImapGateway::new(vec![Ok(MailboxDelta {
+            rejected_messages: vec![],
+            uid_validity: 71,
+            highest_uid: 102,
+            messages: vec![
+                raw_message(
+                    101,
+                    include_bytes!("fixtures/mail/unsupported-attachment.eml"),
+                ),
+                raw_message(102, include_bytes!("fixtures/mail/attachment.eml")),
+            ],
+        })])),
+        credentials,
+        accounts.clone(),
+        ImportService::new(
+            items.clone(),
+            AppPaths::create(directory.path().join("storage")).unwrap(),
+        ),
+        RecognitionService::new(items.clone(), Arc::new(FakeExtractor)),
+    );
+
+    let result = service.run(account.id).await.unwrap();
+
+    // The later mail still imported, and the unusable one is on the ledger.
+    assert!(result.imported_count >= 1, "{result:?}");
+    let failed_ledger_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mail_ledger WHERE outcome = 'failed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        failed_ledger_rows, 1,
+        "the rejected attachment must be visible in the ledger"
+    );
+}
+
+#[tokio::test]
 async fn empty_email_attachment_is_retained_as_failed_while_later_mail_continues() {
     let directory = tempfile::tempdir().unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();

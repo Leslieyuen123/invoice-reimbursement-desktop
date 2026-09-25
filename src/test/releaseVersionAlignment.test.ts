@@ -282,7 +282,7 @@ name = "invoice_reimbursement"`;
     const guides = [
       {
         path: "output/pdf/invoice-reimbursement-user-manual-zh-cn.pdf",
-        pageCount: 20,
+        pageCount: 21,
         identity: "发票报销完整用户手册",
         distinctContent: ["9. 导出报销材料", "附录 C：导出文件对照表"],
       },

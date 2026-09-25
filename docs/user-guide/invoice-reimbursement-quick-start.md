@@ -1,6 +1,6 @@
 # 发票报销快速入门
 
-> 适用版本：v0.2.8
+> 适用版本：v0.2.9
 > 适用电脑：Apple Silicon Mac（M1 或更新芯片）
 > 适用系统：macOS 11 或更高版本
 > 更新日期：2026-09-19
@@ -11,11 +11,11 @@
 
 ![从邮箱发票到报销材料的工作流](assets/workflow.png)
 
-当前版本号显示在 App 左上角（侧边栏顶部，形如 `v0.2.8`），可随时确认自己用的是哪个版本。
+当前版本号显示在 App 左上角（侧边栏顶部，形如 `v0.2.9`），可随时确认自己用的是哪个版本。
 
 ## 1. 安装与绑定
 
-1. 从分享者处获取 `invoice-reimbursement-0.2.8-macos-arm64.dmg`，打开后将《发票报销》拖入“应用程序”。
+1. 从分享者处获取 `invoice-reimbursement-0.2.9-macos-arm64.dmg`，打开后将《发票报销》拖入“应用程序”。
 2. 第一次打开时，如果 macOS 阻止运行，在 Finder 中右键点击 App，选择“打开”，再次确认“打开”。也可在“系统设置 -> 隐私与安全性”中选择“仍要打开”。
 3. 进入 App 的“设置”页，选择 Gmail 或 QQ 邮箱。
 4. 输入邮箱地址和应用专用密码或授权码。这不是你平时登录邮箱的密码。
@@ -83,8 +83,8 @@
 - **导出失败**：已纳入票据仍保留在批次中。恢复可写的导出目录或外接盘后重试，不要手动删除临时文件。
 - **关闭窗口后找不到 App**：主窗口只是被隐藏。在 macOS 菜单栏找到《发票报销》图标，选择“显示发票报销”。
 
-**安全与校验：** 当前分享版采用 ad-hoc（临时）签名并启用了 Hardened Runtime，未使用 Apple Developer ID 签名，也未经过 Apple 公证。只从可信分享者处获取安装包，不要关闭 Gatekeeper。分享者应同时提供 `invoice-reimbursement-0.2.8-macos-arm64.dmg.sha256`；将它和 DMG 放在同一目录，在终端运行 `shasum -a 256 -c invoice-reimbursement-0.2.8-macos-arm64.dmg.sha256`，结果应显示 `OK`。
+**安全与校验：** 当前分享版采用 ad-hoc（临时）签名并启用了 Hardened Runtime，未使用 Apple Developer ID 签名，也未经过 Apple 公证。只从可信分享者处获取安装包，不要关闭 Gatekeeper。分享者应同时提供 `invoice-reimbursement-0.2.9-macos-arm64.dmg.sha256`；将它和 DMG 放在同一目录，在终端运行 `shasum -a 256 -c invoice-reimbursement-0.2.9-macos-arm64.dmg.sha256`，结果应显示 `OK`。
 
 更多说明请查看《发票报销完整用户手册》。
 
-本快速入门对应《发票报销》v0.2.8，更新日期为 2026-09-19。请以当前版本随附文档为准。
+本快速入门对应《发票报销》v0.2.9，更新日期为 2026-09-19。请以当前版本随附文档为准。
