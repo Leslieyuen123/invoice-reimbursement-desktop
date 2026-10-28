@@ -392,7 +392,26 @@ impl SyncService {
         secret: &str,
         cursor: Option<SyncCursor>,
     ) -> Result<(SyncResult, SyncCursor), AppError> {
-        let delta = self.gateway.fetch_since(config, secret, cursor).await?;
+        // One body fetch timing out used to abort the whole run (and with it a
+        // batch's automation, reported as "所有已启用邮箱同步失败"). Retry the
+        // same page a couple of times first; login/configuration errors are not
+        // retryable and still fail immediately.
+        let delta = {
+            let mut attempt = 0_u32;
+            loop {
+                attempt += 1;
+                match self.gateway.fetch_since(config, secret, cursor).await {
+                    Ok(delta) => break delta,
+                    Err(error) if attempt < 3 && is_transient_imap_failure(&error) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            400 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
         validate_delta(&delta, &config.mailbox)?;
         let rescan = cursor.is_some_and(|cursor| cursor.uid_validity != delta.uid_validity);
         let mut budget = TouchedItemBudget::default();
@@ -430,11 +449,26 @@ impl SyncService {
                 ));
             }
             page_count += 1;
-            let delta = self
-                .gateway
-                .fetch_range(config, secret, cursor, range)
-                .await
-                .map_err(|error| sync_progress_failure(error, completed.clone()))?;
+            let mut attempt = 0_u32;
+            let delta = loop {
+                attempt += 1;
+                match self
+                    .gateway
+                    .fetch_range(config, secret, cursor, range)
+                    .await
+                {
+                    Ok(delta) => break delta,
+                    Err(error) if attempt < 3 && is_transient_imap_failure(&error) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            400 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                    Err(error) => {
+                        return Err(sync_progress_failure(error, completed.clone()));
+                    }
+                }
+            };
             validate_delta(&delta, &config.mailbox)
                 .map_err(|error| sync_progress_failure(error, completed.clone()))?;
             let next_cursor = SyncCursor {
@@ -880,6 +914,18 @@ struct LinkOutcome {
     existing: u32,
     failed: u32,
     reason: Option<String>,
+}
+
+/// A body fetch timing out mid-scan is worth retrying; a login or configuration
+/// error is not.
+fn is_transient_imap_failure(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::External {
+            retryable: true,
+            ..
+        }
+    )
 }
 
 /// A short, stable token for a per-mail failure reason in the ledger.

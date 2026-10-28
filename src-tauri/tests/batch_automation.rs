@@ -72,12 +72,18 @@ impl ImapGateway for FakeRangeGateway {
             .lock()
             .unwrap()
             .push((config.email.clone(), cursor, range));
-        self.responses
-            .lock()
-            .unwrap()
+        let mut responses = self.responses.lock().unwrap();
+        let queue = responses
             .get_mut(&config.email)
-            .and_then(VecDeque::pop_front)
-            .expect("fake range response should be queued")
+            .expect("fake range response should be queued");
+        match queue.front() {
+            // A queued failure repeats until the test queues a good page: the
+            // sync retries the same page before giving up, which is the point of
+            // `fetch_with_retry`.
+            Some(Err(error)) => Err(error.clone()),
+            Some(Ok(_)) => queue.pop_front().expect("front was present"),
+            None => panic!("fake range response should be queued"),
+        }
     }
 }
 

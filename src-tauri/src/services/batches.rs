@@ -110,10 +110,21 @@ pub struct SettleBatchOutcome {
 ///
 /// Unlike [`SettleBatchInput`] this has no category choices: an invoice with no
 /// category is filed under "其他" because that is the user's standing rule.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoverableSettleInput {
     /// Use the mail received date when an invoice date could not be read.
     pub fill_invoice_date_from_received: bool,
+}
+
+impl Default for RecoverableSettleInput {
+    /// Fills the date by default: 334 of the user's invoices carry an amount but
+    /// no readable invoice date, and the mail received date is the only signal
+    /// left. The outcome reports how many dates were filled.
+    fn default() -> Self {
+        Self {
+            fill_invoice_date_from_received: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
