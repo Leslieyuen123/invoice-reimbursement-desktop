@@ -10,7 +10,7 @@ import zlib
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 WORKER = Path(__file__).with_name("main.py")
@@ -275,7 +275,11 @@ def test_oversized_image_headers_are_rejected_before_load_and_worker_continues(
     valid = tmp_path / "valid.png"
     Image.new("RGB", (2, 2), "white").save(valid)
     calls = []
-    monkeypatch.setattr(worker, "recognize_image", lambda image: calls.append(image) or "ok")
+    monkeypatch.setattr(
+        worker,
+        "recognize_image",
+        lambda image: calls.append(image) or "价税合计 ¥128.50",
+    )
 
     responses = [
         worker.handle_line(json.dumps({"path": str(path)}))
@@ -291,22 +295,26 @@ def test_oversized_image_headers_are_rejected_before_load_and_worker_continues(
     assert len(calls) == 1
 
 
-def test_image_ocr_receives_a_checked_numpy_array(
+def test_image_ocr_receives_the_prepared_grayscale_array(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import numpy as np
-
     path = tmp_path / "small.png"
     Image.new("RGBA", (3, 2), (10, 20, 30, 40)).save(path)
     received = []
-    monkeypatch.setattr(worker, "recognize_image", lambda image: received.append(image) or "ok")
+    monkeypatch.setattr(
+        worker,
+        "recognize_image",
+        lambda image: received.append(image) or "价税合计 ¥128.50",
+    )
 
     text = worker.recognize_path(str(path))
 
-    assert text == "ok"
+    assert text == "价税合计 ¥128.50"
     assert len(received) == 1
-    assert isinstance(received[0], np.ndarray)
-    assert received[0].shape == (2, 3, 3)
+    assert received[0].ndim == 2
+    assert received[0].dtype.name == "uint8"
+    # A 3x2 page is below the upscale threshold and is capped at 2x.
+    assert received[0].shape == (4, 6)
 
 
 def test_pdf_page_count_is_rejected_before_any_page_is_opened(
@@ -361,6 +369,148 @@ def test_pdf_total_rendered_pixels_are_checked_before_any_render(
     assert not any(page.rendered for page in pages)
     assert all(page.closed for page in pages)
     assert document.closed
+
+
+def test_preprocessing_upscales_small_pages_with_lanczos_grayscale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = worker.prepare_image(Image.new("RGB", (900, 600), "white"))
+
+    assert prepared.ndim == 2
+    assert prepared.dtype.name == "uint8"
+    # Short side 600 is below 1200 and the 2x cap keeps the page at 1200.
+    assert prepared.shape == (1200, 1800)
+
+
+def test_preprocessing_keeps_large_pages_at_their_own_resolution() -> None:
+    prepared = worker.prepare_image(Image.new("RGB", (2_000, 1_400), "white"))
+
+    assert prepared.shape == (1_400, 2_000)
+
+
+def test_upscale_factor_stays_inside_the_document_budget() -> None:
+    assert worker.upscale_factor(1_000, 1_000) == pytest.approx(1.6)
+    assert worker.upscale_factor(2_000, 1_400) == 1.0
+    # A page that is already taller than the dimension budget must not grow.
+    assert worker.upscale_factor(700, 30_000) == 1.0
+    factor = worker.upscale_factor(1_100, 19_900)
+    assert 1_100 * factor <= worker.MAX_IMAGE_DIMENSION
+    assert 19_900 * factor <= worker.MAX_IMAGE_DIMENSION
+    assert (1_100 * factor) * (19_900 * factor) <= worker.MAX_IMAGE_PIXELS
+
+
+def test_adaptive_binarization_applies_to_clean_documents_only() -> None:
+    import numpy as np
+
+    clean = Image.new("L", (400, 200), 255)
+    draw = ImageDraw.Draw(clean)
+    for top in range(20, 180, 20):
+        draw.rectangle((20, top, 380, top + 6), fill=0)
+    gradient = Image.frombytes(
+        "L", (400, 200), bytes(x % 256 for _ in range(200) for x in range(400))
+    )
+
+    clean_page = worker.prepare_image(clean.convert("RGB"))
+    photo_page = worker.prepare_image(gradient.convert("RGB"))
+
+    assert set(np.unique(clean_page).tolist()) <= {0, 255}
+    assert len(np.unique(photo_page)) > 16
+
+
+def test_dark_screenshots_are_inverted_before_recognition() -> None:
+    dark = Image.new("L", (400, 200), 20)
+    draw = ImageDraw.Draw(dark)
+    draw.rectangle((40, 60, 360, 90), fill=235)
+
+    assert worker.invert_dark_background(worker._grayscale_array(dark)).mean() > 200
+    assert worker.prepare_image(dark.convert("RGB")).mean() > 127
+
+
+def test_light_screenshots_are_not_inverted() -> None:
+    light = Image.new("L", (400, 200), 240)
+
+    gray = worker._grayscale_array(light)
+    assert worker.invert_dark_background(gray) is gray
+
+
+def test_raster_falls_back_to_raw_pixels_when_no_amount_was_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "invoice.png"
+    Image.new("RGB", (900, 600), "white").save(path)
+    calls = []
+
+    def fake_recognize(image):
+        calls.append(image.ndim)
+        if image.ndim == 2:
+            return "北京 发票号码 202607140001"
+        return "价税合计（小写）￥648.00"
+
+    monkeypatch.setattr(worker, "recognize_image", fake_recognize)
+
+    assert worker.recognize_path(str(path)) == "价税合计（小写）￥648.00"
+    assert calls == [2, 3]
+
+
+def test_raster_skips_the_raw_fallback_when_the_prepared_text_has_an_amount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "invoice.png"
+    Image.new("RGB", (900, 600), "white").save(path)
+    calls = []
+
+    def fake_recognize(image):
+        calls.append(image.ndim)
+        return "北京 价税合计 648.00"
+
+    monkeypatch.setattr(worker, "recognize_image", fake_recognize)
+
+    assert worker.recognize_path(str(path)) == "北京 价税合计 648.00"
+    assert calls == [2]
+
+
+def test_better_recognition_text_keeps_the_richer_page() -> None:
+    assert (
+        worker.better_recognition_text(
+            "发票号码 202607140001\n北京", "价税合计（小写）￥648.00"
+        )
+        == "价税合计（小写）￥648.00"
+    )
+    assert (
+        worker.better_recognition_text(
+            "价税合计（小写）￥648.00", "发票号码 202607140001"
+        )
+        == "价税合计（小写）￥648.00"
+    )
+    assert (
+        worker.better_recognition_text("北京 合计 1.00", "北京 发票号码")
+        == "北京 合计 1.00"
+    )
+
+
+def test_probable_amount_rejects_rates_and_counts() -> None:
+    assert worker.has_probable_amount("价税合计（小写） 648.00")
+    assert worker.has_probable_amount("￥ 1,648.00")
+    assert worker.has_probable_amount("RMB 648.00")
+    assert not worker.has_probable_amount("税率 1% 数量 18")
+
+
+def test_pdf_pages_use_only_the_prepared_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = RenderingFakePdfPage(Image.new("RGB", (900, 600), "white"))
+    document = FakePdfDocument([page])
+    install_fake_pdfium(monkeypatch, document)
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "recognize_image",
+        lambda image: calls.append(image.ndim) or "北京 发票号码",
+    )
+
+    assert worker.recognize_pdf(Path("one-page.pdf")) == "北京 发票号码"
+    assert calls == [2]
+    assert page.closed
 
 
 def png_header(width: int, height: int) -> bytes:
@@ -426,6 +576,36 @@ class FakePdfPage:
         self.opened = True
         assert self.text_page is not None
         return self.text_page
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RenderingFakePdfPage:
+    def __init__(self, image: Image.Image) -> None:
+        self.image = image
+        self.closed = False
+
+    def get_size(self) -> tuple[float, float]:
+        return (
+            self.image.width / worker.PDF_RENDER_SCALE,
+            self.image.height / worker.PDF_RENDER_SCALE,
+        )
+
+    def render(self, **_kwargs) -> "FakeBitmap":
+        return FakeBitmap(self.image)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeBitmap:
+    def __init__(self, image: Image.Image) -> None:
+        self.image = image
+        self.closed = False
+
+    def to_pil(self) -> Image.Image:
+        return self.image.copy()
 
     def close(self) -> None:
         self.closed = True

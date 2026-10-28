@@ -216,6 +216,15 @@ impl RecognitionService {
             .then(|| unsupported_format_note(&item.original_name));
         let recognized =
             recognize_with_warnings(&extracted.text, received_date, &extracted.warnings);
+        // A readable document that still has no amount needs a reason the user
+        // can see: otherwise it looks like the OCR read nothing at all.
+        let failure_note = unsupported_note.or_else(|| {
+            recognized
+                .warnings
+                .iter()
+                .any(|warning| warning == OCR_TEXT_WITHOUT_AMOUNT)
+                .then(|| amount_not_parsed_note(&item.original_name))
+        });
         let semantic_fingerprint = semantic_invoice_fingerprint(
             &extracted.text,
             recognized.amount_cents,
@@ -245,7 +254,7 @@ impl RecognitionService {
                     company: Some(recognized.company),
                     recognition_status: Some(recognized.recognition_status),
                     confirmation_status: Some(recognized.confirmation_status),
-                    note: match unsupported_note {
+                    note: match failure_note {
                         // A readable document clears whatever a previous attempt
                         // left behind, so a stale reason is never shown again.
                         None => is_recognition_note(item.note.as_deref()).then_some(None),
@@ -431,6 +440,17 @@ fn unsupported_format_note(original_name: &str) -> String {
     )
 }
 
+/// Reason for a readable original whose total amount still could not be parsed.
+///
+/// The literal marker is part of the note so the same string can be searched in
+/// logs and shown to the user without a second lookup.
+fn amount_not_parsed_note(original_name: &str) -> String {
+    format!(
+        "已从原件格式 {} 识别到文字，但没有解析出金额（{OCR_TEXT_WITHOUT_AMOUNT}）；请人工核对金额，或更换更清晰的原件后重新识别",
+        original_extension(original_name)
+    )
+}
+
 /// Reason for an extractor error, in terms a user can act on.
 fn extraction_failure_note(original_name: &str, error: &AppError) -> String {
     let detail = error.to_string();
@@ -472,6 +492,15 @@ pub fn recognize_with_warnings(
             None
         }
     };
+    // "The OCR read nothing" and "the OCR read text but no total" must not look
+    // the same to the UI: the first is a recognition problem, the second one is
+    // a layout/parse problem the user can still repair by filling the amount in.
+    if amount_cents.is_none()
+        && !warnings.iter().any(|warning| warning == "invalid_amount")
+        && text.chars().any(|character| !character.is_whitespace())
+    {
+        warnings.push(OCR_TEXT_WITHOUT_AMOUNT.to_owned());
+    }
     // The user's rule: when none of the four real categories matches, the
     // invoice is classified as "其他" instead of being left without a category
     // (which kept it out of every reimbursement batch).
@@ -977,51 +1006,198 @@ fn is_known_flattened_invoice_template(text: &str) -> bool {
             .all(|signal| compact.contains(signal))
 }
 
+/// Stable marker for "the OCR returned text, but no total amount could be
+/// parsed from it".
+///
+/// The item note keeps this literal token, so the UI can tell "the OCR read
+/// nothing at all" (empty text) from "the OCR read text and the amount needs a
+/// human". It never changes the automatic confirmation rule: an invoice without
+/// an amount was pending before this marker existed and stays pending.
+pub const OCR_TEXT_WITHOUT_AMOUNT: &str = "ocr_text_without_amount";
+
+/// Labels that name the invoice total outright, in priority order.
+const STRONG_AMOUNT_LABELS: &[&str] = &[
+    "合计金额",
+    "金额合计",
+    "合 计 金 额",
+    "应付金额",
+    "实付金额",
+    "行程费用合计",
+    "总金额",
+    "小写金额",
+    "小写",
+];
+
+/// The bare `合计` row of the item table. Only trusted when the number that
+/// follows really looks like money.
+const WEAK_AMOUNT_LABELS: &[&str] = &["合计", "合 计"];
+
+/// Markers an amount can be prefixed with. OCR often separates `¥` from the
+/// digits, so the whitespace between them is stripped before parsing.
+const AMOUNT_CURRENCY_MARKERS: &[&str] = &["人民币", "RMB", "CNY", "¥", "￥"];
+
+/// Units that follow counts and rates, never a total amount.
+const NON_AMOUNT_UNITS: &[&str] = &[
+    "个", "件", "张", "项", "天", "人", "次", "台", "份", "套", "箱", "包", "盒", "瓶", "条", "块",
+    "米", "千克", "公斤", "克", "斤", "吨", "度", "小时", "分钟", "年", "月", "日", "%", "％",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AmountLabelStrength {
+    Strong,
+    Weak,
+}
+
+enum AmountCandidate {
+    /// The label was followed by a valid amount.
+    Parsed(i64),
+    /// The label was followed by something number-like but malformed.
+    Malformed,
+    /// The label was followed by a rate or a count instead of money.
+    NotMoney,
+    /// The label was followed by no number at all.
+    Empty,
+    /// No amount label exists in the text at all.
+    Absent,
+}
+
+/// Value of a labelled invoice total in cents.
+///
+/// Labels are searched in priority order: the `价税合计` row first, then the
+/// other total labels, then the bare `合计` row. A token that cannot be an
+/// amount (`税率 1%`, `数量 18 个`) is ignored instead of being read as money,
+/// while a malformed amount (`1,23.45`, `12.345`, `-1.00`) still reports
+/// `invalid_amount` as before.
 fn labeled_amount(text: &str) -> Result<Option<i64>, ()> {
-    let Some(after_label) = ["价税合计（小写）", "价税合计(小写)"]
-        .into_iter()
-        .find_map(|label| text.split_once(label).map(|(_, value)| value))
-        .or_else(|| {
-            text.split_once("价税合计").map(|(_, value)| {
-                value
-                    .find("小写")
-                    .filter(|index| value[..*index].chars().count() <= 48)
-                    .map(|index| &value[index + "小写".len()..])
-                    .unwrap_or(value)
-            })
-        })
-        .or_else(|| text.split_once("合计").map(|(_, value)| value))
-    else {
-        return Ok(None);
+    let normalized = normalize_amount_text(text);
+    let text = normalized.as_str();
+    match amount_candidate(text) {
+        AmountCandidate::Parsed(cents) => Ok(Some(cents)),
+        AmountCandidate::Malformed => Err(()),
+        // A total row whose number is a rate, a count, or missing entirely:
+        // fall back to the largest currency marked value like before.
+        AmountCandidate::NotMoney | AmountCandidate::Empty => Ok(max_currency_amount(text)),
+        // No total label at all: never guess from an unrelated currency value
+        // such as the tax amount of the item table.
+        AmountCandidate::Absent => Ok(None),
+    }
+}
+
+fn amount_candidate(text: &str) -> AmountCandidate {
+    if let Some((_, tail)) = text.split_once("价税合计") {
+        return amount_after_label(small_amount_tail(tail), AmountLabelStrength::Strong);
+    }
+    if let Some(tail) = first_label_tail(text, STRONG_AMOUNT_LABELS) {
+        return amount_after_label(tail, AmountLabelStrength::Strong);
+    }
+    if let Some(tail) = first_label_tail(text, WEAK_AMOUNT_LABELS) {
+        return amount_after_label(tail, AmountLabelStrength::Weak);
+    }
+    AmountCandidate::Absent
+}
+
+/// Tail of the `价税合计` row: the uppercase total is skipped when the lowercase
+/// row follows it, and a `金额` suffix (`价税合计金额`) is not part of the value.
+fn small_amount_tail(tail: &str) -> &str {
+    let tail = match tail.find("小写") {
+        Some(index) if tail[..index].chars().count() <= 48 => &tail[index + "小写".len()..],
+        _ => tail,
     };
-    let value = after_label
-        .trim_start_matches(['：', ':', '）', ')', '（', '('])
-        .trim_start()
-        .trim_start_matches("RMB")
-        .trim_start()
-        .trim_start_matches(['¥', '￥'])
-        .trim_start();
+    tail.strip_prefix("金额").unwrap_or(tail)
+}
+
+fn first_label_tail<'a>(text: &'a str, labels: &[&str]) -> Option<&'a str> {
+    labels
+        .iter()
+        .find_map(|label| text.split_once(label).map(|(_, tail)| tail))
+}
+
+fn amount_after_label(after_label: &str, strength: AmountLabelStrength) -> AmountCandidate {
+    let value = strip_amount_prefix(after_label);
     let token: String = value
+        .text
         .chars()
         .take_while(|character| {
             character.is_ascii_digit() || matches!(*character, '.' | ',' | '-' | '+')
         })
         .collect();
-    if let Some(amount) = parse_amount_cents(&token) {
-        return Ok(Some(amount));
-    }
     if token.is_empty() {
-        return Ok(max_currency_amount(text));
+        return AmountCandidate::Empty;
     }
-    Err(())
+    // The token only contains ASCII characters, so its length in bytes is also
+    // the offset of the characters that follow it.
+    let rest = &value.text[token.len()..];
+    let Some(cents) = parse_amount_cents(&token) else {
+        return AmountCandidate::Malformed;
+    };
+    if is_non_amount_suffix(rest) {
+        return AmountCandidate::NotMoney;
+    }
+    if strength == AmountLabelStrength::Weak
+        && !weak_amount_is_credible(&token, value.has_currency_marker, rest)
+    {
+        return AmountCandidate::NotMoney;
+    }
+    AmountCandidate::Parsed(cents)
+}
+
+struct AmountValue<'a> {
+    text: &'a str,
+    has_currency_marker: bool,
+}
+
+/// Strips separators and currency markers that sit between a label and its
+/// value, remembering whether one of them was a currency marker.
+fn strip_amount_prefix(value: &str) -> AmountValue<'_> {
+    let mut rest = value;
+    let mut has_currency_marker = false;
+    loop {
+        let trimmed = rest.trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '：' | ':' | '）' | ')' | '（' | '(' | '|')
+        });
+        let mut next = trimmed;
+        for marker in AMOUNT_CURRENCY_MARKERS {
+            if let Some(remainder) = next.strip_prefix(marker) {
+                has_currency_marker = true;
+                next = remainder;
+                break;
+            }
+        }
+        if next.len() == trimmed.len() {
+            return AmountValue {
+                text: next.trim_start(),
+                has_currency_marker,
+            };
+        }
+        rest = next;
+    }
+}
+
+/// Whether the characters right after a number prove that it is not money.
+fn is_non_amount_suffix(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    rest.starts_with(['%', '％']) || NON_AMOUNT_UNITS.iter().any(|unit| rest.starts_with(unit))
+}
+
+/// A bare `合计` row is only trusted when the number itself looks like money:
+/// two decimals, a currency marker, or an explicit `元`/`圆` suffix. Otherwise
+/// `合计 18` (a count) and `合计 1` (a rate) are indistinguishable from money.
+fn weak_amount_is_credible(token: &str, has_currency_marker: bool, rest: &str) -> bool {
+    let two_decimals = token
+        .split_once('.')
+        .is_some_and(|(_, fraction)| fraction.len() == 2);
+    let followed_by_yuan = rest.trim_start().starts_with(['元', '圆']);
+    two_decimals || has_currency_marker || followed_by_yuan
 }
 
 fn max_currency_amount(text: &str) -> Option<i64> {
     text.char_indices()
-        .filter_map(|(index, marker)| {
-            matches!(marker, '¥' | '￥')
-                .then(|| &text[index + marker.len_utf8()..])
-                .and_then(parse_amount_prefix)
+        .filter_map(|(index, _character)| {
+            AMOUNT_CURRENCY_MARKERS
+                .iter()
+                .find(|marker| text[index..].starts_with(**marker))
+                .and_then(|marker| parse_amount_prefix(&text[index + marker.len()..]))
         })
         .max()
 }
@@ -1033,6 +1209,43 @@ fn parse_amount_prefix(value: &str) -> Option<i64> {
         .take_while(|character| character.is_ascii_digit() || matches!(*character, '.' | ','))
         .collect();
     parse_amount_cents(&token)
+}
+
+/// Maps the full width digits and separators OCR returns into the ASCII forms
+/// the amount grammar understands. A full width sentence period between two
+/// digits is a misread decimal point, so it becomes one as well.
+fn normalize_amount_text(text: &str) -> String {
+    let characters: Vec<char> = text
+        .chars()
+        .map(|character| match character {
+            '\u{FF10}'..='\u{FF19}' => {
+                let offset = u32::from(character) - u32::from('\u{FF10}');
+                char::from_digit(offset, 10).unwrap_or(character)
+            }
+            '\u{FF0C}' => ',',
+            '\u{FF0E}' => '.',
+            '\u{FF0B}' => '+',
+            '\u{FF0D}' | '\u{2212}' => '-',
+            '\u{FF05}' => '%',
+            '\u{3000}' => ' ',
+            _ => character,
+        })
+        .collect();
+    characters
+        .iter()
+        .enumerate()
+        .map(|(index, character)| {
+            let surrounded_by_digits = index > 0
+                && index + 1 < characters.len()
+                && characters[index - 1].is_ascii_digit()
+                && characters[index + 1].is_ascii_digit();
+            if *character == '。' && surrounded_by_digits {
+                '.'
+            } else {
+                *character
+            }
+        })
+        .collect()
 }
 
 fn parse_amount_cents(token: &str) -> Option<i64> {
@@ -1215,5 +1428,100 @@ mod note_tests {
         assert!(note.contains("已加密"), "{note}");
         assert!(!note.contains("超出处理上限"), "{note}");
         assert!(!note.contains("暂不支持的结构"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod amount_tests {
+    use super::*;
+
+    fn cents(text: &str) -> Option<i64> {
+        labeled_amount(text).expect("a valid amount must not be reported as invalid")
+    }
+
+    #[test]
+    fn lowercase_total_labels_are_supported() {
+        for (text, expected) in [
+            ("价税合计（小写）¥648.00", 64_800),
+            ("价税合计(小写)：￥648.00", 64_800),
+            ("价税合计 (小写)\n￥1014.00", 101_400),
+            ("价税合计金额：648.00", 64_800),
+            ("合计金额 ¥1,234.56", 123_456),
+            ("金额合计：￥1,234.56", 123_456),
+            ("小写：648.00", 64_800),
+            ("应付金额 648.00元", 64_800),
+            ("行程费用合计 ￥1014.00", 101_400),
+        ] {
+            assert_eq!(cents(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn full_width_digits_and_separators_are_normalized() {
+        for (text, expected) in [
+            ("价税合计（小写）￥６４８．００", 64_800),
+            ("价税合计（小写）￥１，２３４．５６", 123_456),
+            ("合计金额 ６４８．００", 64_800),
+            ("价税合计（小写）648。00", 64_800),
+        ] {
+            assert_eq!(cents(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn currency_markers_tolerate_whitespace_and_thousands_grouping() {
+        for (text, expected) in [
+            ("价税合计（小写）¥ 648.00", 64_800),
+            ("价税合计（小写） ￥  1,234.56", 123_456),
+            ("价税合计（小写）RMB 1,234.56", 123_456),
+            ("价税合计（小写）人民币 1,234.56", 123_456),
+            ("价税合计（小写）CNY 648.00", 64_800),
+        ] {
+            assert_eq!(cents(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn rates_and_counts_are_not_read_as_the_total() {
+        for text in [
+            "税率 1% 数量 18",
+            "税率 1% 合计 1",
+            "合计 18 个",
+            "合计 1%",
+            "价税合计（小写）1%",
+            "数量 18 单价 6.42 合计",
+        ] {
+            assert_eq!(cents(text), None, "{text}");
+        }
+        assert_eq!(cents("税额 ¥6.42 税率 1% 数量 18"), None);
+    }
+
+    #[test]
+    fn malformed_amounts_still_report_invalid() {
+        for text in [
+            "价税合计 ￥1,23.45",
+            "价税合计 ￥12.345",
+            "价税合计 ￥-1.00",
+            "价税合计 ￥92233720368547758.08",
+        ] {
+            assert!(
+                labeled_amount(text).is_err(),
+                "malformed amount accepted: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_full_total_row_wins_over_the_item_table_rows() {
+        for (text, expected) in [
+            ("税额 ￥9.99 合计 ￥100.00 价税合计 ￥200.00", 20_000),
+            (
+                "价税合计（大写）壹佰捌拾壹圆叁角陆分\n（小写）¥181.36",
+                18_136,
+            ),
+            ("合计 ￥100.00\n价税合计（小写）￥1,234.56", 123_456),
+        ] {
+            assert_eq!(cents(text), Some(expected), "{text}");
+        }
     }
 }

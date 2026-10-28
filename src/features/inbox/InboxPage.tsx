@@ -1,9 +1,18 @@
 import {
   type InfiniteData,
   useInfiniteQuery,
+  useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { Check, RotateCcw, Search, TriangleAlert, X } from "lucide-react";
+import {
+  ArchiveX,
+  Check,
+  QrCode,
+  RotateCcw,
+  Search,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
@@ -12,12 +21,14 @@ import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
 import { isRecentItem } from "../../lib/recent";
 import type {
+  ArchiveNonInvoiceReportDto,
   Category,
   InvoiceItemDto,
   ItemFilter,
   ItemStatus,
   ManualImportOutcomeDto,
   PageDto,
+  QrRecoveryReportDto,
   RecoverableSettleOutcomeDto,
   RetryFailedRecognitionsReportDto,
   SourceType,
@@ -68,6 +79,16 @@ function recoverableReportText(report: RecoverableSettleOutcomeDto) {
       ? `，补齐归一化 PDF ${report.repairedCount} 张`
       : "";
   return `已确认 ${report.confirmedCount} 张，${skipped}${repaired}`;
+}
+
+function qrRecoveryReportText(report: QrRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  return `已补救 ${report.recognized} 张（检查 ${report.examined} 张、解码 ${report.decoded} 张、下载 ${report.downloaded} 张），${skipped}`;
 }
 
 function statusFromSearch(value: string | null): ItemStatus | undefined {
@@ -169,6 +190,14 @@ export function InboxPage() {
   const [recoverableReport, setRecoverableReport] =
     useState<RecoverableSettleOutcomeDto | null>(null);
   const [recoverableError, setRecoverableError] = useState<string | null>(null);
+  const [recoveringQr, setRecoveringQr] = useState(false);
+  const [qrRecoveryReport, setQrRecoveryReport] =
+    useState<QrRecoveryReportDto | null>(null);
+  const [qrRecoveryError, setQrRecoveryError] = useState<string | null>(null);
+  const [archivingNonInvoice, setArchivingNonInvoice] = useState(false);
+  const [archiveReport, setArchiveReport] =
+    useState<ArchiveNonInvoiceReportDto | null>(null);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
   const status = statusFromSearch(searchParams.get("status"));
   const recent = searchParams.get("scope") === "recent";
   const batchId = searchParams.get("batchId")?.trim() || undefined;
@@ -184,6 +213,14 @@ export function InboxPage() {
     }),
     [batchId, category, query, recent, sourceType, status, suggestedPeriod],
   );
+  // The non-invoice banner only matters on the two queue tabs it can clean up.
+  const nonInvoiceSummary = useQuery({
+    queryKey: queryKeys.nonInvoiceSummary,
+    queryFn: () => api.getNonInvoiceSummary(),
+    enabled:
+      status === "recognition_failed" || status === "pending_confirmation",
+    retry: false,
+  });
   const itemsQuery = useInfiniteQuery({
     queryKey: queryKeys.items(filter),
     initialPageParam: undefined as
@@ -383,6 +420,40 @@ export function InboxPage() {
     }
   }
 
+  async function recoverQrInvoices() {
+    setRecoveringQr(true);
+    setQrRecoveryError(null);
+    try {
+      const report = await api.recoverQrInvoices();
+      setQrRecoveryReport(report);
+      invalidateItemLists();
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.nonInvoiceSummary,
+      });
+    } catch (error) {
+      setQrRecoveryError(errorMessage(error, "补救二维码票据失败，请稍后再试"));
+    } finally {
+      setRecoveringQr(false);
+    }
+  }
+
+  async function archiveNonInvoiceFiles() {
+    setArchivingNonInvoice(true);
+    setArchiveError(null);
+    try {
+      const report = await api.archiveNonInvoiceItems();
+      setArchiveReport(report);
+      invalidateItemLists();
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.nonInvoiceSummary,
+      });
+    } catch (error) {
+      setArchiveError(errorMessage(error, "移出非发票文件失败，请稍后再试"));
+    } finally {
+      setArchivingNonInvoice(false);
+    }
+  }
+
   function fileName(path: string) {
     return path.split(/[\\/]/).pop() ?? path;
   }
@@ -495,6 +566,57 @@ export function InboxPage() {
           {recoverableError ? (
             <span role="alert">{recoverableError}</span>
           ) : null}
+        </div>
+      ) : null}
+
+      {status === "recognition_failed" ||
+      status === "pending_confirmation" ? (
+        <div
+          className="inbox-active-filters"
+          role="group"
+          aria-label="二维码补救与非发票文件"
+        >
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={recoveringQr}
+            onClick={() => void recoverQrInvoices()}
+          >
+            <QrCode size={15} strokeWidth={1.8} aria-hidden="true" />
+            {recoveringQr ? "正在补救…" : "补救二维码票据"}
+          </button>
+          {qrRecoveryReport ? (
+            <span role="status">{qrRecoveryReportText(qrRecoveryReport)}</span>
+          ) : null}
+          {qrRecoveryError ? (
+            <span role="alert">{qrRecoveryError}</span>
+          ) : null}
+          {nonInvoiceSummary.data &&
+          nonInvoiceSummary.data.markableCount > 0 ? (
+            <button
+              className="button button-secondary"
+              type="button"
+              disabled={archivingNonInvoice}
+              onClick={() => void archiveNonInvoiceFiles()}
+            >
+              <ArchiveX size={15} strokeWidth={1.8} aria-hidden="true" />
+              {archivingNonInvoice
+                ? "正在移出…"
+                : `${nonInvoiceSummary.data.markableCount} 个非发票文件 → 移出队列`}
+            </button>
+          ) : null}
+          {nonInvoiceSummary.data &&
+          nonInvoiceSummary.data.markableCount > 0 ? (
+            <span role="status">
+              这些 Word/Excel/压缩包文件无法识别为发票，移出后仍可在「全部」查看
+            </span>
+          ) : null}
+          {archiveReport ? (
+            <span role="status">
+              {`已移出 ${archiveReport.archivedCount} 个非发票文件（仍可在「全部」查看）`}
+            </span>
+          ) : null}
+          {archiveError ? <span role="alert">{archiveError}</span> : null}
         </div>
       ) : null}
 

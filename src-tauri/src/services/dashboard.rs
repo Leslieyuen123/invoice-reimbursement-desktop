@@ -47,10 +47,12 @@ impl DashboardService {
                     WHEN recognition_status = 'succeeded'
                      AND confirmation_status = 'pending'
                      AND dedupe_status != 'suspected_duplicate'
+                     AND non_invoice_reason IS NULL
                     THEN 1 ELSE 0 END),
                 SUM(CASE
                     WHEN recognition_status = 'failed'
                      AND dedupe_status != 'suspected_duplicate'
+                     AND non_invoice_reason IS NULL
                     THEN 1 ELSE 0 END),
                 SUM(CASE WHEN dedupe_status = 'suspected_duplicate' THEN 1 ELSE 0 END),
                 (SELECT COUNT(*) FROM mail_ledger

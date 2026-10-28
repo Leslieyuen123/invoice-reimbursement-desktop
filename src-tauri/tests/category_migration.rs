@@ -232,7 +232,20 @@ async fn migration_0016_rebuilds_items_without_losing_rows_links_or_indices() {
     let before_indexes = item_indexes(&pool).await;
     let before_foreign_keys = item_foreign_keys(&pool).await;
 
-    current
+    // Only through 0016: the point of this test is that the rebuild itself
+    // changes nothing. Later migrations (0017 adds `items.non_invoice_reason`)
+    // are expected to extend the schema and have their own coverage.
+    let through_0016 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            current
+                .iter()
+                .take_while(|migration| migration.version <= 16)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0016
         .run(&pool)
         .await
         .expect("migration 0016 must apply to a populated database");
@@ -384,8 +397,15 @@ async fn real_library_copy_survives_migration_0016() {
     );
     assert_eq!(item_fingerprint(&pool).await, before_items);
     assert_eq!(semantic_identity_fingerprint(&pool).await, before_semantics);
-    assert_eq!(item_columns(&pool).await, before_columns);
-    assert_eq!(item_indexes(&pool).await, before_indexes);
+    // Migrations after 0016 extend the schema on purpose (0017 adds
+    // `items.non_invoice_reason` and its index); everything else must be
+    // byte-for-byte the pre-migration schema.
+    let mut after_columns = item_columns(&pool).await;
+    after_columns.retain(|(name, _, _, _, _)| name != "non_invoice_reason");
+    assert_eq!(after_columns, before_columns);
+    let mut after_indexes = item_indexes(&pool).await;
+    after_indexes.retain(|(name, _)| name != "idx_items_non_invoice_reason");
+    assert_eq!(after_indexes, before_indexes);
     assert_eq!(item_foreign_keys(&pool).await, before_foreign_keys);
     let applied: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 16 AND success = 1",

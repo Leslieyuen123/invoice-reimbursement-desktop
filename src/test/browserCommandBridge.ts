@@ -1,5 +1,6 @@
 import type {
   AppError,
+  ArchiveNonInvoiceReportDto,
   BatchAutomationResultDto,
   BatchCandidateDto,
   BatchDetailDto,
@@ -18,6 +19,8 @@ import type {
   MailLedgerFilter,
   MailLedgerPageDto,
   MailboxAccountDto,
+  NonInvoiceSummaryDto,
+  QrRecoveryReportDto,
   SettleBatchInputDto,
   SettleBatchOutcomeDto,
   UpdateBatchRangeInputDto,
@@ -313,6 +316,49 @@ function exportBlocker(item: InvoiceItemDto): BatchIssueDto | null {
 
 function canNormalize(item: InvoiceItemDto) {
   return /\.(pdf|jpe?g|png)$/iu.test(item.originalName);
+}
+
+const NON_INVOICE_NAME = /\.(doc|docx|xls|xlsx|zip)$/iu;
+const QR_IMAGE_NAME = /\.(jpe?g|png)$/iu;
+
+/** Mirrors the backend's dismissable non-invoice file predicate. */
+function isMarkableNonInvoice(item: InvoiceItemDto) {
+  return (
+    !item.nonInvoiceReason &&
+    item.batchId === null &&
+    item.dedupeStatus !== "suspected_duplicate" &&
+    NON_INVOICE_NAME.test(item.originalName) &&
+    (item.amountCents === null || item.recognitionStatus === "failed")
+  );
+}
+
+/** Mirrors the backend's QR rescue candidate predicate. */
+function isQrRescueCandidate(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus !== "suspected_duplicate" &&
+    !item.nonInvoiceReason &&
+    QR_IMAGE_NAME.test(item.originalName)
+  );
+}
+
+/**
+ * The development bridge cannot decode QR codes, so it reports the honest
+ * "no QR code" skip: the result line and the reload path stay exercised.
+ */
+function qrRecoveryReport(examined: number): QrRecoveryReportDto {
+  return {
+    examined,
+    decoded: 0,
+    downloaded: 0,
+    recognized: 0,
+    skipped: examined,
+    skippedBreakdown:
+      examined > 0
+        ? [{ code: "no_qr_code", label: "没有二维码", count: examined }]
+        : [],
+  };
 }
 
 /** Mirrors `BatchService::settle_items` for the development bridge. */
@@ -650,10 +696,21 @@ function seedAutomationScenario(
   return imported.length;
 }
 
+function isQueueStatus(status: ItemStatus | undefined) {
+  return (
+    status === "pending_recognition" ||
+    status === "pending_confirmation" ||
+    status === "recognition_failed" ||
+    status === "ready"
+  );
+}
+
 function itemMatches(item: InvoiceItemDto, filter: ItemFilter) {
   const query = filter.query?.trim().toLocaleLowerCase("zh-CN");
   return (
     (!filter.status || item.status === filter.status) &&
+    // Dismissed non-invoice files leave the queue views but stay in "全部".
+    (!isQueueStatus(filter.status) || !item.nonInvoiceReason) &&
     (!filter.recent || isRecentItem(item.createdAt, Date.parse(now))) &&
     (!filter.suggestedPeriod || item.suggestedPeriod === filter.suggestedPeriod) &&
     (!filter.category || item.finalCategory === filter.category) &&
@@ -707,10 +764,10 @@ function dashboard(state: BridgeState): DashboardDto {
       isRecentItem(item.createdAt, Date.parse(now)),
     ).length,
     pendingConfirmationCount: state.items.filter(
-      (item) => item.status === "pending_confirmation",
+      (item) => item.status === "pending_confirmation" && !item.nonInvoiceReason,
     ).length,
     recognitionFailedCount: state.items.filter(
-      (item) => item.status === "recognition_failed",
+      (item) => item.status === "recognition_failed" && !item.nonInvoiceReason,
     ).length,
     suspectedDuplicateCount: state.items.filter(
       (item) => item.status === "suspected_duplicate",
@@ -824,6 +881,45 @@ function makeHandlers(
     [API_COMMANDS.settleRecoverableItems, () => {
       const report = settleRecoverableItems(state);
       persistState();
+      return report;
+    }],
+    [API_COMMANDS.recoverQrInvoices, () => {
+      const examined = state.items.filter(isQrRescueCandidate).length;
+      return qrRecoveryReport(examined);
+    }],
+    [API_COMMANDS.recoverQrInvoice, (arguments_) => {
+      const item = state.items.find(
+        (candidate) => candidate.id === requiredString(arguments_, "itemId"),
+      );
+      if (!item) throw notFound("item");
+      if (!isQrRescueCandidate(item)) {
+        throw {
+          code: "validation",
+          field: "item",
+          message:
+            "该票据不是可补救的二维码图片票据（需要 JPG/PNG 原件、尚未填写金额、不在批次中）",
+        } satisfies AppError;
+      }
+      return qrRecoveryReport(1);
+    }],
+    [API_COMMANDS.getNonInvoiceSummary, () => {
+      const summary: NonInvoiceSummaryDto = {
+        markableCount: state.items.filter(isMarkableNonInvoice).length,
+        markedCount: state.items.filter((item) => Boolean(item.nonInvoiceReason))
+          .length,
+      };
+      return summary;
+    }],
+    [API_COMMANDS.archiveNonInvoiceItems, () => {
+      let archivedCount = 0;
+      for (const item of state.items) {
+        if (!isMarkableNonInvoice(item)) continue;
+        item.nonInvoiceReason = "document_not_invoice";
+        item.updatedAt = now;
+        archivedCount += 1;
+      }
+      persistState();
+      const report: ArchiveNonInvoiceReportDto = { archivedCount };
       return report;
     }],
     [API_COMMANDS.listBatches, (arguments_) =>

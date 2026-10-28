@@ -14,8 +14,15 @@ const ITEM_COLUMNS: &str = "id, original_name, original_path, normalized_pdf_pat
     source_message_id, source_part_id, fetched_at, source_received_date, invoice_date, \
     suggested_period, batch_id, suggested_category, final_category, amount_cents, currency, city, \
     company, recognition_status, confirmation_status, dedupe_status, duplicate_of_id, note, \
-    event_tag, project_tag, created_at, updated_at";
+    event_tag, project_tag, non_invoice_reason, created_at, updated_at";
 const MAX_PAGE_SIZE: usize = 200;
+
+/// Persistent mark for an original no export can ever use (Word, Excel, archive).
+///
+/// The value is stored in `items.non_invoice_reason`, so the UI and the count
+/// queries can tell a dismissed office document apart from a real invoice that
+/// merely lacks data.
+pub const NON_INVOICE_DOCUMENT_REASON: &str = "document_not_invoice";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceItem {
@@ -50,6 +57,11 @@ pub struct InvoiceItem {
     pub note: Option<String>,
     pub event_tag: Option<String>,
     pub project_tag: Option<String>,
+    /// Why this row was dismissed as a non-invoice file; `None` for real invoices.
+    ///
+    /// Rows carrying a reason stay in the library ("全部") but leave the work
+    /// queue, its counters and the bulk-confirm statistics.
+    pub non_invoice_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -866,6 +878,7 @@ impl ItemRepository {
              WHERE confirmation_status = 'pending' \
                AND recognition_status = 'succeeded' \
                AND dedupe_status = 'unique' \
+               AND non_invoice_reason IS NULL \
              ORDER BY created_at DESC, id DESC"
         );
         let rows = sqlx::query_as::<_, DbItemRow>(&query)
@@ -873,6 +886,196 @@ impl ItemRepository {
             .await
             .map_err(|error| map_database_error("failed to list pending items", error))?;
         rows.into_iter().map(InvoiceItem::try_from).collect()
+    }
+
+    /// Invoices the QR rescue may still repair: image originals without an amount.
+    ///
+    /// The action itself is idempotent because the replacement rewrites the
+    /// original to `.pdf`, so a rescued invoice never matches this query again.
+    /// Batch members, suspected duplicates and dismissed non-invoice files are
+    /// deliberately excluded: their files must not be swapped behind the user's
+    /// back.
+    pub(crate) async fn list_qr_recovery_candidates(
+        &self,
+        cursor: Option<ItemPageCursor>,
+        page_size: usize,
+    ) -> Result<ItemPage, AppError> {
+        validate_page_size(page_size)?;
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
+        query.push(ITEM_COLUMNS).push(" FROM items WHERE ");
+        push_qr_recovery_criteria(&mut query);
+        if let Some(cursor) = cursor {
+            let created_at = cursor.created_at.to_rfc3339();
+            query
+                .push(" AND (created_at < ")
+                .push_bind(created_at.clone())
+                .push(" OR (created_at = ")
+                .push_bind(created_at)
+                .push(" AND id < ")
+                .push_bind(cursor.id.to_string())
+                .push("))");
+        }
+        let fetch_limit = page_size.checked_add(1).ok_or_else(|| AppError::Internal {
+            message: "item page size overflow".to_owned(),
+        })?;
+        query
+            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(
+                i64::try_from(fetch_limit)
+                    .map_err(|_| AppError::validation("pageSize", "page size is too large"))?,
+            );
+        let rows = query
+            .build_query_as::<DbItemRow>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to list QR recovery candidates", error))?;
+        let has_next = rows.len() > page_size;
+        let mut rows = rows;
+        rows.truncate(page_size);
+        let items = rows
+            .into_iter()
+            .map(InvoiceItem::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = has_next.then(|| {
+            let last = items.last().expect("nonempty page must have a cursor row");
+            ItemPageCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }
+        });
+        Ok(ItemPage { items, next_cursor })
+    }
+
+    /// Marks every office document / archive that can never become an invoice.
+    ///
+    /// Only files with a missing amount or a failed recognition are marked: an
+    /// office document that somehow carries a readable amount stays in the
+    /// queue so the user can still decide about it. Batch members and suspected
+    /// duplicates are left alone, and an already-marked row is never rewritten
+    /// (so the counter matches what one run changed).
+    pub(crate) async fn mark_non_invoice_documents(&self, reason: &str) -> Result<u64, AppError> {
+        if reason.trim().is_empty() {
+            return Err(AppError::Internal {
+                message: "a non-invoice mark requires a reason".to_owned(),
+            });
+        }
+        let mut query = QueryBuilder::<Sqlite>::new("UPDATE items SET non_invoice_reason = ");
+        query
+            .push_bind(reason)
+            .push(", updated_at = ")
+            .push_bind(Utc::now().to_rfc3339())
+            .push(" WHERE ");
+        push_non_invoice_document_criteria(&mut query);
+        let result =
+            query.build().execute(&self.pool).await.map_err(|error| {
+                map_database_error("failed to mark non-invoice documents", error)
+            })?;
+        Ok(result.rows_affected())
+    }
+
+    /// Office documents / archives a dismissal would mark right now.
+    pub(crate) async fn count_non_invoice_candidates(&self) -> Result<u64, AppError> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM items WHERE ");
+        push_non_invoice_document_criteria(&mut query);
+        let count = query
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to count non-invoice candidates", error))?;
+        u64::try_from(count).map_err(|_| AppError::Internal {
+            message: "non-invoice candidate count was invalid".to_owned(),
+        })
+    }
+
+    /// Already dismissed non-invoice files (still visible in "全部").
+    pub(crate) async fn count_marked_non_invoice(&self) -> Result<u64, AppError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM items WHERE non_invoice_reason IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| internal_error("failed to count marked non-invoice items", error))?;
+        u64::try_from(count).map_err(|_| AppError::Internal {
+            message: "marked non-invoice count was invalid".to_owned(),
+        })
+    }
+
+    /// Swaps an image original for the invoice PDF downloaded from its QR link.
+    ///
+    /// This mirrors [`Self::replace_failed_email_attachment`] (staged file,
+    /// transactional metadata swap, dedupe recomputation), but for a library
+    /// invoice the user asked to repair. User-authored fields (remark, tags) are
+    /// preserved; only data the download invalidates is reset, so the following
+    /// recognition run starts from a clean slate.
+    pub(crate) async fn replace_image_original_for_qr_recovery(
+        &self,
+        id: Uuid,
+        replacement: EmailFileReplacement,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        if replacement.original_name.trim().is_empty()
+            || replacement.original_path.trim().is_empty()
+            || replacement.sha256.trim().is_empty()
+            || replacement.mime_type.trim().is_empty()
+        {
+            return Err(AppError::Internal {
+                message: "QR recovery replacement metadata is incomplete".to_owned(),
+            });
+        }
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| {
+                map_database_error("failed to begin QR recovery replacement", error)
+            })?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if !is_qr_recovery_replacement_target(&item) {
+                return Ok(None);
+            }
+            let canonical_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM items \
+                 WHERE id != ? AND sha256 = ? AND duplicate_of_id IS NULL \
+                 ORDER BY CASE WHEN dedupe_status = 'unique' THEN 0 ELSE 1 END, \
+                          created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(id.to_string())
+            .bind(&replacement.sha256)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to deduplicate QR replacement", error))?
+            .map(|value| parse_uuid(&value, "id"))
+            .transpose()?;
+            let (dedupe_status, duplicate_of_id) = match canonical_id {
+                Some(canonical_id) => ("suspected_duplicate", Some(canonical_id)),
+                None => ("unique", None),
+            };
+            sqlx::query(
+                "UPDATE items SET \
+                    original_name = ?, original_path = ?, normalized_pdf_path = NULL, \
+                    sha256 = ?, mime_type = ?, invoice_date = NULL, suggested_period = NULL, \
+                    suggested_category = NULL, final_category = NULL, amount_cents = NULL, \
+                    city = NULL, company = NULL, recognition_status = 'pending', \
+                    confirmation_status = 'pending', dedupe_status = ?, duplicate_of_id = ?, \
+                    note = CASE WHEN note LIKE '识别失败：%' THEN NULL ELSE note END, \
+                    non_invoice_reason = NULL, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(replacement.original_name)
+            .bind(replacement.original_path)
+            .bind(replacement.sha256)
+            .bind(replacement.mime_type)
+            .bind(dedupe_status)
+            .bind(duplicate_of_id.map(|value| value.to_string()))
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_database_error("failed to replace image original", error))?;
+            get_with_connection(&mut transaction, id).await.map(Some)
+        }
+        .await;
+        finish_transaction(transaction, result).await
     }
 
     pub async fn update_fields(&self, id: Uuid, patch: ItemPatch) -> Result<InvoiceItem, AppError> {
@@ -1368,6 +1571,65 @@ fn is_replaceable_failed_email_attachment(item: &InvoiceItem) -> bool {
         && item.batch_id.is_none()
 }
 
+/// Whether an invoice is a valid target for the QR rescue replacement.
+///
+/// The same predicate the candidate query encodes: an image original outside a
+/// batch, without an amount, not a suspected duplicate and not already dismissed
+/// as a non-invoice file.
+fn is_qr_recovery_replacement_target(item: &InvoiceItem) -> bool {
+    item.amount_cents.is_none()
+        && item.batch_id.is_none()
+        && item.dedupe_status != DedupeStatus::SuspectedDuplicate
+        && item.non_invoice_reason.is_none()
+        && is_image_original_name(&item.original_name)
+}
+
+/// Whether an original file name has an image extension the QR rescue reads.
+pub(crate) fn is_image_original_name(original_name: &str) -> bool {
+    std::path::Path::new(original_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png"
+            )
+        })
+}
+
+/// Extensions treated as "not an invoice file" by the dismissal action.
+///
+/// ZIP archives are included because the import pipeline expands an archive
+/// into its members; an item that is still a `.zip` has no invoice inside it.
+const NON_INVOICE_EXTENSIONS: [&str; 5] = ["doc", "docx", "xls", "xlsx", "zip"];
+
+fn push_qr_recovery_criteria(query: &mut QueryBuilder<'_, Sqlite>) {
+    query.push(
+        "amount_cents IS NULL AND batch_id IS NULL \
+         AND dedupe_status != 'suspected_duplicate' AND non_invoice_reason IS NULL \
+         AND (LOWER(original_name) LIKE '%.jpg' \
+              OR LOWER(original_name) LIKE '%.jpeg' \
+              OR LOWER(original_name) LIKE '%.png')",
+    );
+}
+
+fn push_non_invoice_document_criteria(query: &mut QueryBuilder<'_, Sqlite>) {
+    query.push(
+        "non_invoice_reason IS NULL AND batch_id IS NULL \
+         AND dedupe_status != 'suspected_duplicate' \
+         AND (amount_cents IS NULL OR recognition_status = 'failed') AND (",
+    );
+    for (index, extension) in NON_INVOICE_EXTENSIONS.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("LOWER(original_name) LIKE ")
+            .push_bind(format!("%.{extension}"));
+    }
+    query.push(")");
+}
+
 fn validate_page_size(page_size: usize) -> Result<(), AppError> {
     if page_size == 0 || page_size > MAX_PAGE_SIZE {
         return Err(AppError::validation(
@@ -1392,18 +1654,21 @@ fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
             ItemStatus::RecognitionFailed => {
                 query.push(
                     " AND dedupe_status != 'suspected_duplicate' \
+                     AND non_invoice_reason IS NULL \
                      AND recognition_status = 'failed'",
                 );
             }
             ItemStatus::PendingRecognition => {
                 query.push(
                     " AND dedupe_status != 'suspected_duplicate' \
+                     AND non_invoice_reason IS NULL \
                      AND recognition_status = 'pending'",
                 );
             }
             ItemStatus::PendingConfirmation => {
                 query.push(
                     " AND dedupe_status != 'suspected_duplicate' \
+                     AND non_invoice_reason IS NULL \
                      AND recognition_status = 'succeeded' \
                      AND confirmation_status = 'pending'",
                 );
@@ -1411,6 +1676,7 @@ fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
             ItemStatus::Ready => {
                 query.push(
                     " AND dedupe_status != 'suspected_duplicate' \
+                     AND non_invoice_reason IS NULL \
                      AND recognition_status = 'succeeded' \
                      AND confirmation_status = 'confirmed'",
                 );
@@ -1799,6 +2065,7 @@ struct DbItemRow {
     note: Option<String>,
     event_tag: Option<String>,
     project_tag: Option<String>,
+    non_invoice_reason: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -1842,6 +2109,7 @@ impl TryFrom<DbItemRow> for InvoiceItem {
             note: row.note,
             event_tag: row.event_tag,
             project_tag: row.project_tag,
+            non_invoice_reason: row.non_invoice_reason,
             created_at: parse_datetime(&row.created_at, "created_at")?,
             updated_at: parse_datetime(&row.updated_at, "updated_at")?,
         })

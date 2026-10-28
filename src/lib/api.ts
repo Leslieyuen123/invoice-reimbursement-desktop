@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   SyncProgressDto,
+  ArchiveNonInvoiceReportDto,
   ConsistencyReportDto,
   DiagnosticsBundleDto,
   ExportDiagnosticsInputDto,
@@ -11,6 +12,8 @@ import type {
   BatchDto,
   BatchRepairDto,
   DashboardDto,
+  NonInvoiceSummaryDto,
+  QrRecoveryReportDto,
   SettleBatchInputDto,
   SettleBatchOutcomeDto,
   UpdateBatchRangeInputDto,
@@ -72,6 +75,10 @@ export const API_COMMANDS = {
   retryRecognition: "retry_recognition",
   retryFailedRecognitions: "retry_failed_recognitions",
   settleRecoverableItems: "settle_recoverable_items",
+  recoverQrInvoices: "recover_qr_invoices",
+  recoverQrInvoice: "recover_qr_invoice",
+  archiveNonInvoiceItems: "archive_non_invoice_items",
+  getNonInvoiceSummary: "get_non_invoice_summary",
   listBatches: "list_batches",
   getBatch: "get_batch",
   repairBatchNormalizedPdfs: "repair_batch_normalized_pdfs",
@@ -129,6 +136,14 @@ export const api = {
     ),
   settleRecoverableItems: () =>
     call<RecoverableSettleOutcomeDto>(API_COMMANDS.settleRecoverableItems),
+  recoverQrInvoices: (limit?: number) =>
+    call<QrRecoveryReportDto>(API_COMMANDS.recoverQrInvoices, { limit }),
+  recoverQrInvoice: (itemId: string) =>
+    call<QrRecoveryReportDto>(API_COMMANDS.recoverQrInvoice, { itemId }),
+  archiveNonInvoiceItems: () =>
+    call<ArchiveNonInvoiceReportDto>(API_COMMANDS.archiveNonInvoiceItems),
+  getNonInvoiceSummary: () =>
+    call<NonInvoiceSummaryDto>(API_COMMANDS.getNonInvoiceSummary),
   listBatches: (page?: PageRequestDto) =>
     call<PageDto<BatchDto>>(API_COMMANDS.listBatches, { page }),
   getBatch: (batchId: string) =>

@@ -12,6 +12,7 @@ pub mod import;
 pub mod items;
 pub(crate) mod operations;
 pub mod preview;
+pub mod qr_recovery;
 pub mod recognition;
 pub mod scheduler;
 pub mod settings;

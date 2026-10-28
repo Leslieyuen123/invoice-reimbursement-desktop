@@ -83,6 +83,11 @@ export interface InvoiceItemDto {
   note: string | null;
   eventTag: string | null;
   projectTag: string | null;
+  /**
+   * Set when the user dismissed the file as "not an invoice" (Word, Excel or an
+   * archive). Dismissed files stay in "全部" but leave the work queue.
+   */
+  nonInvoiceReason?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -430,4 +435,41 @@ export interface RecoverableSettleOutcomeDto {
   appliedCategoryCount: number;
   repairedCount: number;
   skippedBreakdown: RecoverableSettleSkipDto[];
+}
+
+/** One skip-reason bucket of the QR rescue run. */
+export interface QrRecoverySkipDto {
+  /** Stable machine-readable code, e.g. `no_qr_code`. */
+  code: string;
+  /** Chinese explanation shown in the result line. */
+  label: string;
+  count: number;
+}
+
+/** What one "补救二维码票据" run changed. */
+export interface QrRecoveryReportDto {
+  /** Stored image invoices the run looked at. */
+  examined: number;
+  /** Invoices whose stored image carried an HTTPS QR link. */
+  decoded: number;
+  /** Invoices whose original was replaced by the downloaded invoice. */
+  downloaded: number;
+  /** Invoices that ended recognized after the replacement. */
+  recognized: number;
+  /** Invoices that could not be rescued; see `skippedBreakdown`. */
+  skipped: number;
+  skippedBreakdown: QrRecoverySkipDto[];
+}
+
+/** What one "移出非发票文件" run changed. */
+export interface ArchiveNonInvoiceReportDto {
+  archivedCount: number;
+}
+
+/** Counts behind the inbox "N 个非发票文件 → 移出队列" banner. */
+export interface NonInvoiceSummaryDto {
+  /** Office documents / archives a dismissal would mark right now. */
+  markableCount: number;
+  /** Already dismissed files (still visible in "全部"). */
+  markedCount: number;
 }

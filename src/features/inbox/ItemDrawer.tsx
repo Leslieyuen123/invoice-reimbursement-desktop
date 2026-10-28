@@ -1,4 +1,4 @@
-import { Check, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, QrCode, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../lib/api";
@@ -10,6 +10,7 @@ import {
   type AppError,
   type Category,
   type InvoiceItemDto,
+  type QrRecoveryReportDto,
 } from "../../types";
 import { ItemPreview } from "./ItemPreview";
 
@@ -72,6 +73,29 @@ function messageFromError(error: unknown) {
   return "保存失败，请重试";
 }
 
+/**
+ * Mirrors the backend QR rescue scope: an image original outside a batch with
+ * no amount is the only shape that can be repaired by following its QR link.
+ */
+function canRescueQrInvoice(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus !== "suspected_duplicate" &&
+    /\.(jpe?g|png)$/iu.test(item.originalName)
+  );
+}
+
+function qrRecoveryReportText(report: QrRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  return `已补救 ${report.recognized} 张，${skipped}`;
+}
+
 export function ItemDrawer({
   item,
   onClose,
@@ -100,6 +124,10 @@ export function ItemDrawer({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [rescuingQr, setRescuingQr] = useState(false);
+  const [qrRecoveryReport, setQrRecoveryReport] =
+    useState<QrRecoveryReportDto | null>(null);
+  const [qrRecoveryError, setQrRecoveryError] = useState<string | null>(null);
   const [resolvingDuplicate, setResolvingDuplicate] = useState<
     "keep" | "delete" | null
   >(null);
@@ -227,6 +255,23 @@ export function ItemDrawer({
     }
   }
 
+  async function rescueQrInvoice() {
+    setSaveError(null);
+    setQrRecoveryError(null);
+    setRescuingQr(true);
+    try {
+      const report = await api.recoverQrInvoice(item.id);
+      setQrRecoveryReport(report);
+      // A downloaded original means the row changed; reload it so the read-only
+      // section (and the parent list) show the recognized values.
+      if (report.downloaded > 0) onSaved(await api.getItem(item.id));
+    } catch (error) {
+      setQrRecoveryError(messageFromError(error));
+    } finally {
+      setRescuingQr(false);
+    }
+  }
+
   async function resolveDuplicate(keep: boolean) {
     setSaveError(null);
     setResolvingDuplicate(keep ? "keep" : "delete");
@@ -316,6 +361,17 @@ export function ItemDrawer({
             <p className="item-failure-reason" role="alert">
               <strong>失败原因</strong>
               <span>{failureReason}</span>
+            </p>
+          ) : null}
+          {qrRecoveryError ? (
+            <p className="item-failure-reason" role="alert">
+              <strong>二维码补救</strong>
+              <span>{qrRecoveryError}</span>
+            </p>
+          ) : null}
+          {qrRecoveryReport ? (
+            <p className="item-normalization-warning" role="status">
+              {qrRecoveryReportText(qrRecoveryReport)}
             </p>
           ) : null}
           {!item.hasNormalizedPdf ? (
@@ -505,6 +561,22 @@ export function ItemDrawer({
               {resolvingDuplicate === "delete" ? "删除中" : "删除重复"}
             </button>
           </div>
+        ) : null}
+        {canRescueQrInvoice(item) ? (
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={
+              rescuingQr ||
+              retrying ||
+              saving ||
+              resolvingDuplicate !== null
+            }
+            onClick={() => void rescueQrInvoice()}
+          >
+            <QrCode size={16} strokeWidth={1.7} aria-hidden="true" />
+            {rescuingQr ? "补救中" : "补救二维码"}
+          </button>
         ) : null}
         <button
           className="button button-secondary"

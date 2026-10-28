@@ -7,7 +7,9 @@ use uuid::Uuid;
 use std::collections::BTreeMap;
 
 use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
-use crate::db::items::{InvoiceItem, ItemFilter, ItemPageCursor, ItemRepository};
+use crate::db::items::{
+    InvoiceItem, ItemFilter, ItemPageCursor, ItemRepository, NON_INVOICE_DOCUMENT_REASON,
+};
 use crate::domain::amount::{validate_amount_cents, validate_optional_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{
@@ -17,6 +19,7 @@ use crate::infra::files::open_contained_regular_file;
 use crate::services::batch_repair::repair_missing_normalized_pdfs;
 use crate::services::batches::{BatchService, RecoverableSettleInput};
 use crate::services::items::ItemReview;
+use crate::services::qr_recovery::{self, QrRecoveryReport};
 use crate::services::recognition::original_can_be_normalized;
 use crate::state::AppState;
 
@@ -401,6 +404,133 @@ pub async fn retry_failed_recognitions(
     Ok(report)
 }
 
+/// One skip-reason bucket of a QR rescue run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QrRecoverySkipDto {
+    pub code: String,
+    pub label: String,
+    pub count: u32,
+}
+
+/// What one "补救二维码票据" run changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QrRecoveryReportDto {
+    /// Image invoices the run looked at.
+    pub examined: u32,
+    /// Invoices whose stored image carried an HTTPS QR link.
+    pub decoded: u32,
+    /// Invoices whose stored image was replaced by the downloaded invoice.
+    pub downloaded: u32,
+    /// Invoices that ended recognized after the replacement.
+    pub recognized: u32,
+    /// Invoices that could not be rescued; see `skippedBreakdown`.
+    pub skipped: u32,
+    /// Skip reasons grouped by stable code, deterministic by code.
+    pub skipped_breakdown: Vec<QrRecoverySkipDto>,
+}
+
+fn qr_skip_label(code: &str) -> &'static str {
+    match code {
+        qr_recovery::QR_SKIP_NO_CODE => "没有二维码",
+        qr_recovery::QR_SKIP_NOT_INVOICE_LINK => "不是发票链接",
+        qr_recovery::QR_SKIP_DOWNLOAD_FAILED => "下载失败",
+        qr_recovery::QR_SKIP_UNREADABLE_ORIGINAL => "原件无法读取",
+        qr_recovery::QR_SKIP_REPLACEMENT_FAILED => "替换原件失败",
+        qr_recovery::QR_SKIP_ITEM_CHANGED => "票据在补救时被修改",
+        qr_recovery::QR_SKIP_RECOGNITION_FAILED => "重新识别失败",
+        _ => "其他原因",
+    }
+}
+
+fn qr_recovery_dto(report: QrRecoveryReport) -> QrRecoveryReportDto {
+    QrRecoveryReportDto {
+        examined: report.examined,
+        decoded: report.decoded,
+        downloaded: report.downloaded,
+        recognized: report.recognized,
+        skipped: report.skipped,
+        skipped_breakdown: report
+            .skip_reasons
+            .into_iter()
+            .map(|entry| QrRecoverySkipDto {
+                label: qr_skip_label(&entry.code).to_owned(),
+                code: entry.code,
+                count: entry.count,
+            })
+            .collect(),
+    }
+}
+
+/// Rescues every stored image invoice whose QR code links to the real file.
+///
+/// Recognition cannot rescue these invoices on its own: the image simply has no
+/// amount. This decodes the QR code of the stored original, follows the link
+/// through the same download pipeline new mail uses, replaces the original and
+/// re-runs recognition. `limit` caps one run; the whole eligible set is
+/// processed when it is `None`, and invoices left out by the cap are not
+/// counted as examined.
+pub async fn recover_qr_invoices(
+    state: &AppState,
+    limit: Option<u32>,
+) -> Result<QrRecoveryReportDto, AppError> {
+    let report = state.qr_recovery_service().recover_all(limit).await?;
+    Ok(qr_recovery_dto(report))
+}
+
+/// Rescues one stored image invoice the user picked in the drawer.
+pub async fn recover_qr_invoice(
+    state: &AppState,
+    item_id: Uuid,
+) -> Result<QrRecoveryReportDto, AppError> {
+    let report = state.qr_recovery_service().recover_item(item_id).await?;
+    Ok(qr_recovery_dto(report))
+}
+
+/// What one "把非发票文件移出待处理队列" run changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveNonInvoiceReportDto {
+    pub archived_count: u32,
+}
+
+/// Dismisses every office document / archive that can never be an invoice.
+///
+/// The files stay in the library ("全部") and on disk; only their queue views,
+/// the pending/failed counters and the bulk-confirm statistics stop counting
+/// them. The mark is persistent, so a dismissed file never comes back into the
+/// queue by itself.
+pub async fn archive_non_invoice_items(
+    state: &AppState,
+) -> Result<ArchiveNonInvoiceReportDto, AppError> {
+    let repository = ItemRepository::new(state.pool().clone());
+    let archived = repository
+        .mark_non_invoice_documents(NON_INVOICE_DOCUMENT_REASON)
+        .await?;
+    Ok(ArchiveNonInvoiceReportDto {
+        archived_count: u32::try_from(archived).unwrap_or(u32::MAX),
+    })
+}
+
+/// Counts behind the inbox "N 个非发票文件 → 移出队列" banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NonInvoiceSummaryDto {
+    /// Office documents / archives the dismissal would mark right now.
+    pub markable_count: u64,
+    /// Already dismissed files (still visible in "全部").
+    pub marked_count: u64,
+}
+
+pub async fn non_invoice_summary(state: &AppState) -> Result<NonInvoiceSummaryDto, AppError> {
+    let repository = ItemRepository::new(state.pool().clone());
+    Ok(NonInvoiceSummaryDto {
+        markable_count: repository.count_non_invoice_candidates().await?,
+        marked_count: repository.count_marked_non_invoice().await?,
+    })
+}
+
 /// One bucket of invoices a bulk recoverable confirmation had to skip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -720,7 +850,8 @@ pub(crate) mod ipc {
     use uuid::Uuid;
 
     use super::{
-        InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto, RecoverableSettleOutcomeDto,
+        ArchiveNonInvoiceReportDto, InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto,
+        NonInvoiceSummaryDto, QrRecoveryReportDto, RecoverableSettleOutcomeDto,
         RetryFailedRecognitionsReport, ReviewItemInputDto,
     };
     use crate::commands::{PageDto, PageRequestDto};
@@ -798,5 +929,35 @@ pub(crate) mod ipc {
         state: State<'_, AppState>,
     ) -> Result<RecoverableSettleOutcomeDto, AppError> {
         super::settle_recoverable_items(&state).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_qr_invoices(
+        state: State<'_, AppState>,
+        limit: Option<u32>,
+    ) -> Result<QrRecoveryReportDto, AppError> {
+        super::recover_qr_invoices(&state, limit).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_qr_invoice(
+        state: State<'_, AppState>,
+        item_id: Uuid,
+    ) -> Result<QrRecoveryReportDto, AppError> {
+        super::recover_qr_invoice(&state, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn archive_non_invoice_items(
+        state: State<'_, AppState>,
+    ) -> Result<ArchiveNonInvoiceReportDto, AppError> {
+        super::archive_non_invoice_items(&state).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn get_non_invoice_summary(
+        state: State<'_, AppState>,
+    ) -> Result<NonInvoiceSummaryDto, AppError> {
+        super::non_invoice_summary(&state).await
     }
 }

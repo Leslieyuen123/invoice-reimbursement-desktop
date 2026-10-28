@@ -1348,6 +1348,124 @@ describe("InboxPage", () => {
     expect(commandCalls("retry_failed_recognitions")).toEqual([]);
   });
 
+  it("rescues QR invoices from the pending pool and explains every skip", async () => {
+    const user = userEvent.setup();
+    const qrItem = pendingInvoiceFixture({
+      originalName: "二维码发票.png",
+      amountCents: null,
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [qrItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_qr_invoices", {
+      examined: 2,
+      decoded: 2,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 1,
+      skippedBreakdown: [
+        { code: "download_failed", label: "下载失败", count: 1 },
+      ],
+    });
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await screen.findByText("二维码发票.png");
+    const qrButton = screen.getByRole("button", { name: "补救二维码票据" });
+    await user.click(qrButton);
+
+    await waitFor(() => {
+      expect(commandCalls("recover_qr_invoices")).toHaveLength(1);
+    });
+    expect(await screen.findByText(/已补救 1 张/)).toHaveTextContent(
+      "已补救 1 张（检查 2 张、解码 2 张、下载 1 张），跳过 1 张（下载失败 1 张）",
+    );
+  });
+
+  it("dismisses non-invoice files out of the pending queue", async () => {
+    const user = userEvent.setup();
+    let markableCount = 3;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture({ amountCents: null })],
+      nextCursor: null,
+    });
+    mockCommand("get_non_invoice_summary", () => ({
+      markableCount,
+      markedCount: 0,
+    }));
+    mockCommand("archive_non_invoice_items", () => {
+      markableCount = 0;
+      return { archivedCount: 3 };
+    });
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await screen.findByText("出租车电子发票.pdf");
+    const dismiss = await screen.findByRole("button", {
+      name: "3 个非发票文件 → 移出队列",
+    });
+    expect(
+      screen.getByText(
+        "这些 Word/Excel/压缩包文件无法识别为发票，移出后仍可在「全部」查看",
+      ),
+    ).toBeInTheDocument();
+    await user.click(dismiss);
+
+    await waitFor(() => {
+      expect(commandCalls("archive_non_invoice_items")).toHaveLength(1);
+    });
+    expect(
+      await screen.findByText(
+        "已移出 3 个非发票文件（仍可在「全部」查看）",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("rescues a single QR invoice from the drawer", async () => {
+    const user = userEvent.setup();
+    const qrItem = pendingInvoiceFixture({
+      originalName: "二维码发票.png",
+      amountCents: null,
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [qrItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_qr_invoice", {
+      examined: 1,
+      decoded: 1,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 0,
+      skippedBreakdown: [],
+    });
+    mockCommand(
+      "get_item",
+      pendingInvoiceFixture({
+        originalName: "portal-invoice.pdf",
+        amountCents: 12_850,
+        hasNormalizedPdf: true,
+      }),
+    );
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await user.click(await screen.findByText("二维码发票.png"));
+    await user.click(screen.getByRole("button", { name: "补救二维码" }));
+
+    await waitFor(() => {
+      expect(commandCalls("recover_qr_invoice")).toEqual([
+        { itemId: "invoice-taxi" },
+      ]);
+    });
+    expect(await screen.findByText("已补救 1 张，跳过 0 张")).toBeInTheDocument();
+  });
+
   it("keeps or deletes suspected duplicates from the drawer", async () => {
     const user = userEvent.setup();
     const duplicateOne = pendingInvoiceFixture({

@@ -19,6 +19,7 @@ export const queryKeys = {
     [...itemLists, filter, page] as const,
   item: (itemId: string) =>
     ["invoice-reimbursement", "items", "detail", itemId] as const,
+  nonInvoiceSummary: ["invoice-reimbursement", "items", "non-invoice"] as const,
   batchLists,
   batches: (page?: PageRequestDto) =>
     [...batchLists, page] as const,
