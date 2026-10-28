@@ -18,6 +18,7 @@ import type {
   ItemStatus,
   ManualImportOutcomeDto,
   PageDto,
+  RetryFailedRecognitionsReportDto,
   SourceType,
 } from "../../types";
 import { InboxTable } from "./InboxTable";
@@ -42,7 +43,7 @@ const statusTabs: Array<{ value?: ItemStatus; label: string }> = [
   { value: "ready", label: "可纳入批次" },
 ];
 
-function errorMessage(error: unknown) {
+function errorMessage(error: unknown, fallback = "待处理池暂时无法加载") {
   if (
     typeof error === "object" &&
     error !== null &&
@@ -51,7 +52,7 @@ function errorMessage(error: unknown) {
   ) {
     return error.message;
   }
-  return "待处理池暂时无法加载";
+  return fallback;
 }
 
 function statusFromSearch(value: string | null): ItemStatus | undefined {
@@ -145,6 +146,10 @@ export function InboxPage() {
     ManualImportOutcomeDto[]
   >([]);
   const [importingPaths, setImportingPaths] = useState<string[]>([]);
+  const [retryingFailed, setRetryingFailed] = useState(false);
+  const [retryFailedReport, setRetryFailedReport] =
+    useState<RetryFailedRecognitionsReportDto | null>(null);
+  const [retryFailedError, setRetryFailedError] = useState<string | null>(null);
   const status = statusFromSearch(searchParams.get("status"));
   const recent = searchParams.get("scope") === "recent";
   const batchId = searchParams.get("batchId")?.trim() || undefined;
@@ -331,6 +336,20 @@ export function InboxPage() {
     [searchParams],
   );
 
+  async function retryAllFailedRecognitions() {
+    setRetryingFailed(true);
+    setRetryFailedError(null);
+    try {
+      const report = await api.retryFailedRecognitions();
+      setRetryFailedReport(report);
+      invalidateItemLists();
+    } catch (error) {
+      setRetryFailedError(errorMessage(error, "批量重试失败，请稍后再试"));
+    } finally {
+      setRetryingFailed(false);
+    }
+  }
+
   function fileName(path: string) {
     return path.split(/[\\/]/).pop() ?? path;
   }
@@ -397,6 +416,30 @@ export function InboxPage() {
           </button>
         ))}
       </div>
+
+      {status === "recognition_failed" ? (
+        <div
+          className="inbox-active-filters"
+          role="group"
+          aria-label="批量重试识别失败"
+        >
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={retryingFailed || items.length === 0}
+            onClick={() => void retryAllFailedRecognitions()}
+          >
+            <RotateCcw size={15} strokeWidth={1.8} aria-hidden="true" />
+            {retryingFailed ? "正在重试…" : "重试全部识别失败"}
+          </button>
+          {retryFailedReport ? (
+            <span role="status">
+              {`已尝试 ${retryFailedReport.attempted} 张，恢复 ${retryFailedReport.recovered} 张，仍失败 ${retryFailedReport.stillFailed} 张，跳过 ${retryFailedReport.skipped} 张`}
+            </span>
+          ) : null}
+          {retryFailedError ? <span role="alert">{retryFailedError}</span> : null}
+        </div>
+      ) : null}
 
       {recent ? (
         <div className="inbox-active-filters" aria-label="活动筛选">

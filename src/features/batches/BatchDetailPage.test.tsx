@@ -463,6 +463,7 @@ describe("Batch workspace", () => {
     await act(async () => {
       automation.resolve(
         automationFixture({
+          movedFromOtherBatchesCount: 1,
           exceptionCount: 2,
           failedAccounts: [
             {
@@ -486,6 +487,7 @@ describe("Batch workspace", () => {
     expect(completionStatus).toHaveAttribute("aria-live", "polite");
     expect(screen.getByText("1 张新导入")).toBeInTheDocument();
     expect(screen.getByText("1 张已自动纳入")).toBeInTheDocument();
+    expect(screen.getByText("1 张从其他批次移入")).toBeInTheDocument();
     expect(screen.getByText("2 个异常项")).toBeInTheDocument();
     expect(screen.getByText("1 个邮箱失败")).toBeInTheDocument();
     expect(
@@ -1087,7 +1089,7 @@ describe("Batch workspace", () => {
     expect(within(dialog).getByRole("checkbox", { name: "识别失败发票.pdf" })).toBeDisabled();
     expect(within(dialog).getByText("识别失败，不能归属")).toBeInTheDocument();
 
-    await user.type(within(dialog).getByLabelText("搜索未归属票据"), "苏州");
+    await user.type(within(dialog).getByLabelText("搜索票据"), "苏州");
     await user.click(within(dialog).getByRole("button", { name: "搜索" }));
     expect(await within(dialog).findByText("苏州酒店发票.pdf")).toBeInTheDocument();
     expect(within(dialog).getByText("日期超出批次范围")).toBeInTheDocument();
@@ -1126,6 +1128,59 @@ describe("Batch workspace", () => {
       "日期超出批次范围；疑似重复，不能归属",
     );
     expect(screen.getByText("日期超出批次范围；疑似重复，不能归属")).toBeInTheDocument();
+  });
+
+  it("warns that an invoice owned by another batch will be moved on assignment", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(
+      itemFixture({
+        id: "invoice-reanchored",
+        originalName: "旧批次发票.pdf",
+        batchId: "batch-previous",
+      }),
+    );
+    mockDetail(detailFixture(), [candidate]);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    const checkbox = await within(dialog).findByRole("checkbox", {
+      name: "旧批次发票.pdf",
+    });
+
+    expect(checkbox).toBeEnabled();
+    expect(checkbox).toHaveAccessibleDescription(
+      "已在其他批次，归属后将移入本批次",
+    );
+    expect(
+      within(dialog).getByText("已在其他批次，归属后将移入本批次"),
+    ).toBeInTheDocument();
+  });
+
+  it("reports invoices moved in from another batch after a manual assignment", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(
+      itemFixture({ id: "invoice-moved", batchId: "batch-previous" }),
+    );
+    mockDetail(detailFixture(), [candidate]);
+    mockCommand("assign_items_to_batch", {
+      ...detailFixture([{ ...candidate.item, batchId: "batch-summer" }]),
+      movedFromOtherBatchesCount: 1,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(dialog).findByRole("checkbox", {
+        name: "高铁电子发票.pdf",
+      }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "归属所选票据" }));
+
+    expect(
+      await screen.findByText("已从其他批次移入 1 张票据"),
+    ).toBeInTheDocument();
   });
 
   it("does not let an earlier dialog session replace reopened candidate results", async () => {
@@ -1257,7 +1312,7 @@ describe("Batch workspace", () => {
     });
 
     expect(
-      await within(secondDialog).findByText("当前日期范围内没有未归属票据"),
+      await within(secondDialog).findByText("当前日期范围内没有可归属票据"),
     ).toBeInTheDocument();
     expect(within(secondDialog).queryByText("高铁电子发票.pdf")).not.toBeInTheDocument();
     expect(commandCalls("list_batch_candidates")).toHaveLength(3);

@@ -437,6 +437,8 @@ fn extraction_failure_note(original_name: &str, error: &AppError) -> String {
     let detail = detail.trim();
     let explained = if detail.contains("exceeds extraction resource limits") {
         "文件过于复杂或超出处理上限"
+    } else if detail.contains("PDF uses an unsupported structure") {
+        "PDF 使用了暂不支持的结构（如加密或特殊压缩），请另存为标准 PDF 后重试"
     } else if detail.contains("unsupported") {
         "该格式不支持自动识别"
     } else if detail.contains("password") || detail.contains("encrypt") {
@@ -1182,5 +1184,33 @@ mod note_tests {
             message: "Document exceeds extraction resource limits.".to_owned(),
         };
         assert!(extraction_failure_note("big.pdf", &error).contains("超出处理上限"));
+    }
+
+    #[test]
+    fn unsupported_pdf_structures_are_not_reported_as_resource_limits() {
+        let error = AppError::External {
+            service: "document_extractor".to_owned(),
+            retryable: false,
+            message: "PDF uses an unsupported structure.".to_owned(),
+        };
+        let note = extraction_failure_note("special.pdf", &error);
+
+        assert!(note.contains("暂不支持的结构"), "{note}");
+        assert!(!note.contains("超出处理上限"), "{note}");
+        assert!(!note.contains("该格式不支持"), "{note}");
+    }
+
+    #[test]
+    fn encrypted_pdfs_ask_the_user_to_unlock_the_file() {
+        let error = AppError::External {
+            service: "document_extractor".to_owned(),
+            retryable: false,
+            message: "Document is encrypted; unlock the PDF before importing.".to_owned(),
+        };
+        let note = extraction_failure_note("locked.pdf", &error);
+
+        assert!(note.contains("已加密"), "{note}");
+        assert!(!note.contains("超出处理上限"), "{note}");
+        assert!(!note.contains("暂不支持的结构"), "{note}");
     }
 }

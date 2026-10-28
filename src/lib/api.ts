@@ -29,6 +29,7 @@ import type {
   PreferencesDto,
   PreferencesInputDto,
   ReviewItemInputDto,
+  RetryFailedRecognitionsReportDto,
   SaveMailboxAccountInputDto,
   StorageStatusDto,
   TestMailboxAccountInputDto,
@@ -68,6 +69,7 @@ export const API_COMMANDS = {
   reviewItem: "review_item",
   resolveDuplicate: "resolve_duplicate",
   retryRecognition: "retry_recognition",
+  retryFailedRecognitions: "retry_failed_recognitions",
   listBatches: "list_batches",
   getBatch: "get_batch",
   repairBatchNormalizedPdfs: "repair_batch_normalized_pdfs",
@@ -118,6 +120,11 @@ export const api = {
     call<InvoiceItemDto | null>(API_COMMANDS.resolveDuplicate, { itemId, keep }),
   retryRecognition: (itemId: string) =>
     call<InvoiceItemDto>(API_COMMANDS.retryRecognition, { itemId }),
+  retryFailedRecognitions: (limit?: number) =>
+    call<RetryFailedRecognitionsReportDto>(
+      API_COMMANDS.retryFailedRecognitions,
+      { limit },
+    ),
   listBatches: (page?: PageRequestDto) =>
     call<PageDto<BatchDto>>(API_COMMANDS.listBatches, { page }),
   getBatch: (batchId: string) =>

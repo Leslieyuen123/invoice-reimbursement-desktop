@@ -730,8 +730,15 @@ impl ItemRepository {
         rows.into_iter().map(InvoiceItem::try_from).collect()
     }
 
+    /// Candidate invoices for a date-range batch.
+    ///
+    /// A batch re-anchors its date range: every invoice whose batch membership
+    /// date falls inside the range is a candidate, including invoices currently
+    /// owned by *another* batch (they are moved over on assignment). The batch
+    /// itself is excluded so its own members never show up as candidates.
     pub async fn list_batch_candidates(
         &self,
+        batch_id: Uuid,
         start_date: NaiveDate,
         end_date: NaiveDate,
         search: Option<String>,
@@ -740,22 +747,24 @@ impl ItemRepository {
     ) -> Result<ItemPage, AppError> {
         validate_page_size(page_size)?;
         let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
-        query
-            .push(ITEM_COLUMNS)
-            .push(" FROM items WHERE batch_id IS NULL");
+        query.push(ITEM_COLUMNS).push(" FROM items WHERE 1 = 1");
         if let Some(search) = search {
+            // Search may surface unassigned invoices outside the range so a
+            // user can still pull them in manually, but never another batch's
+            // out-of-range invoice: re-anchoring must not move those.
+            query
+                .push(" AND (batch_id IS NULL OR (batch_id <> ")
+                .push_bind(batch_id.to_string())
+                .push(" AND ");
+            push_batch_membership_range(&mut query, start_date, end_date);
+            query.push("))");
             push_item_search_filter(&mut query, search);
         } else {
             query
-                .push(" AND ((source_type = 'email' AND source_received_date >= ")
-                .push_bind(start_date.to_string())
-                .push(" AND source_received_date <= ")
-                .push_bind(end_date.to_string())
-                .push(") OR (source_type = 'manual_upload' AND invoice_date >= ")
-                .push_bind(start_date.to_string())
-                .push(" AND invoice_date <= ")
-                .push_bind(end_date.to_string())
-                .push("))");
+                .push(" AND (batch_id IS NULL OR batch_id <> ")
+                .push_bind(batch_id.to_string())
+                .push(") AND ");
+            push_batch_membership_range(&mut query, start_date, end_date);
         }
         if let Some(cursor) = cursor {
             let created_at = cursor.created_at.to_rfc3339();
@@ -1414,6 +1423,28 @@ fn push_item_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: ItemFilter) {
     if let Some(search) = filter.query {
         push_item_search_filter(query, search);
     }
+}
+
+/// Restricts a query to invoices whose batch membership date is in the range.
+///
+/// This mirrors [`InvoiceItem::batch_membership_date`]: mail invoices use the
+/// IMAP received date, manually uploaded invoices use the invoice date. An
+/// invoice without that date cannot be anchored to a range.
+fn push_batch_membership_range(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) {
+    query
+        .push("((source_type = 'email' AND source_received_date >= ")
+        .push_bind(start_date.to_string())
+        .push(" AND source_received_date <= ")
+        .push_bind(end_date.to_string())
+        .push(") OR (source_type = 'manual_upload' AND invoice_date >= ")
+        .push_bind(start_date.to_string())
+        .push(" AND invoice_date <= ")
+        .push_bind(end_date.to_string())
+        .push("))");
 }
 
 fn push_item_search_filter(query: &mut QueryBuilder<'_, Sqlite>, search: String) {

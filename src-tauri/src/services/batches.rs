@@ -51,6 +51,20 @@ pub struct BatchDetail {
     pub items: Vec<InvoiceItem>,
     pub summary: BatchDetailSummary,
     pub warnings: Vec<String>,
+    /// Invoices a single operation moved into this batch from other batches.
+    ///
+    /// Batch membership is a single-owner relationship, so this is an operation
+    /// report rather than stored state: a plain reload sees the moved invoices
+    /// as ordinary members and reports zero.
+    pub moved_from_other_batches_count: u32,
+}
+
+/// Result of one automation assignment pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AutomationAssignmentOutcome {
+    pub assigned_ids: Vec<Uuid>,
+    /// How many of `assigned_ids` were taken away from another batch.
+    pub moved_from_other_batches_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +227,14 @@ impl BatchService {
             .await?;
         let query = normalize_candidate_query(query)?;
         let page = ItemRepository::new(self.pool.clone())
-            .list_batch_candidates(batch.start_date, batch.end_date, query, cursor, page_size)
+            .list_batch_candidates(
+                batch_id,
+                batch.start_date,
+                batch.end_date,
+                query,
+                cursor,
+                page_size,
+            )
             .await?;
         Ok(BatchCandidatePage {
             batch,
@@ -324,6 +345,13 @@ impl BatchService {
                     .await
                     .map_err(|error| database_error("failed to assign item", error))?;
             }
+            let moved_from_other_batches_count = u32::try_from(
+                assignments
+                    .iter()
+                    .filter(|(_, previous_batch)| previous_batch.is_some())
+                    .count(),
+            )
+            .map_err(|_| summary_count_overflow())?;
             if !assignments.is_empty() {
                 let mut affected_batches = assignments
                     .iter()
@@ -344,20 +372,30 @@ impl BatchService {
                     validate_summary_total(&mut transaction, affected_batch_id).await?;
                 }
             }
-            Ok(())
+            Ok(moved_from_other_batches_count)
         }
         .await;
 
-        finish_unit_transaction(transaction, result).await?;
-        self.get(batch_id).await
+        let moved_from_other_batches_count = finish_bulk_transaction(transaction, result).await?;
+        let mut detail = self.get(batch_id).await?;
+        detail.moved_from_other_batches_count = moved_from_other_batches_count;
+        Ok(detail)
     }
 
+    /// Claims every eligible invoice whose batch membership date falls inside
+    /// the batch range, moving it out of any other batch.
+    ///
+    /// This is the range re-anchoring rule: a new 4–20 batch takes over the
+    /// invoices an earlier 14–20 batch already holds instead of leaving them
+    /// behind. Invoices outside the range are never touched. Every move happens
+    /// inside one `BEGIN IMMEDIATE` transaction, the source batches fall back to
+    /// `draft`, and the caller learns how many invoices actually changed hands.
     pub(crate) async fn assign_unassigned_items(
         &self,
         batch_id: Uuid,
         paths: &AppPaths,
         item_ids: &[Uuid],
-    ) -> Result<Vec<Uuid>, AppError> {
+    ) -> Result<AutomationAssignmentOutcome, AppError> {
         let mut seen = HashSet::with_capacity(item_ids.len());
         let item_ids = item_ids
             .iter()
@@ -374,33 +412,57 @@ impl BatchService {
             let batch = BatchRepository::get_with_connection(&mut transaction, batch_id).await?;
 
             let updated_at = Utc::now().to_rfc3339();
-            let mut assigned_ids = Vec::new();
+            let mut outcome = AutomationAssignmentOutcome::default();
+            let mut source_batches = Vec::new();
             for item_id in item_ids {
                 let Some(item) =
                     ItemRepository::find_by_id_with_connection(&mut transaction, item_id).await?
                 else {
                     continue;
                 };
-                if item.batch_id.is_some()
+                if item.batch_id == Some(batch_id)
                     || !is_safe_batch_candidate(paths, &item, batch.start_date, batch.end_date)
                 {
                     continue;
                 }
-                let result = sqlx::query(
+                let affected = sqlx::query(
                     "UPDATE items SET batch_id = ?, updated_at = ? \
-                     WHERE id = ? AND batch_id IS NULL",
+                     WHERE id = ? AND (batch_id IS NULL OR batch_id <> ?)",
                 )
                 .bind(batch_id.to_string())
                 .bind(&updated_at)
                 .bind(item_id.to_string())
+                .bind(batch_id.to_string())
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| database_error("failed to assign automation item", error))?;
-                if result.rows_affected() == 1 {
-                    assigned_ids.push(item_id);
+                .map_err(|error| database_error("failed to assign automation item", error))?
+                .rows_affected();
+                if affected != 1 {
+                    continue;
                 }
+                if let Some(previous_batch) = item.batch_id {
+                    source_batches.push(previous_batch);
+                    outcome.moved_from_other_batches_count = outcome
+                        .moved_from_other_batches_count
+                        .checked_add(1)
+                        .ok_or_else(summary_count_overflow)?;
+                }
+                outcome.assigned_ids.push(item_id);
             }
-            if !assigned_ids.is_empty() {
+            source_batches.sort_unstable();
+            source_batches.dedup();
+            if !outcome.assigned_ids.is_empty() {
+                for source_batch in source_batches {
+                    sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
+                        .bind(&updated_at)
+                        .bind(source_batch.to_string())
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|error| {
+                            database_error("failed to refresh re-anchored source batch", error)
+                        })?;
+                    validate_summary_total(&mut transaction, source_batch).await?;
+                }
                 sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
                     .bind(&updated_at)
                     .bind(batch_id.to_string())
@@ -409,7 +471,7 @@ impl BatchService {
                     .map_err(|error| database_error("failed to refresh automation batch", error))?;
                 validate_summary_total(&mut transaction, batch_id).await?;
             }
-            Ok(assigned_ids)
+            Ok(outcome)
         }
         .await;
 
@@ -777,6 +839,7 @@ impl BatchService {
             items,
             summary,
             warnings,
+            moved_from_other_batches_count: 0,
         })
     }
 }
@@ -883,13 +946,13 @@ async fn finish_unit_transaction(
 
 async fn finish_automation_assignment(
     transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
-    result: Result<Vec<Uuid>, AppError>,
-) -> Result<Vec<Uuid>, AppError> {
+    result: Result<AutomationAssignmentOutcome, AppError>,
+) -> Result<AutomationAssignmentOutcome, AppError> {
     match result {
-        Ok(assigned_ids) => transaction
+        Ok(outcome) => transaction
             .commit()
             .await
-            .map(|()| assigned_ids)
+            .map(|()| outcome)
             .map_err(|error| database_error("failed to commit automation assignment", error)),
         Err(error) => match transaction.rollback().await {
             Ok(()) => Err(error),

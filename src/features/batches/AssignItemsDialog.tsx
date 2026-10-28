@@ -159,7 +159,9 @@ export function AssignItemsDialog({
         <header className="batch-dialog-header">
           <div>
             <h2 id="assign-dialog-title">调整票据归属</h2>
-            <p>默认显示批次日期范围内尚未归属的票据。</p>
+            <p>
+              默认显示批次日期范围内可归属的票据；已在其他批次的票据也会列出，归属后会移入本批次。
+            </p>
           </div>
           <button
             type="button"
@@ -173,7 +175,7 @@ export function AssignItemsDialog({
 
         <form className="batch-candidate-search" onSubmit={submitSearch}>
           <label>
-            <span>搜索未归属票据</span>
+            <span>搜索票据</span>
             <div>
               <Search size={15} strokeWidth={1.7} aria-hidden="true" />
               <input
@@ -203,13 +205,16 @@ export function AssignItemsDialog({
             </div>
           ) : candidatesQuery.data.items.length === 0 ? (
             <div className="batch-candidate-state">
-              {query ? "没有匹配的未归属票据" : "当前日期范围内没有未归属票据"}
+              {query ? "没有匹配的票据" : "当前日期范围内没有可归属票据"}
             </div>
           ) : (
             candidatesQuery.data.items.map((candidate) => {
               const item = candidate.item;
               const reason = disabledCopy(candidate.disabledReason);
               const warnings = [
+                item.batchId !== null
+                  ? "已在其他批次，归属后将移入本批次"
+                  : null,
                 candidate.outsideBatchRange ? "日期超出批次范围" : null,
                 reason,
               ].filter((warning): warning is string => warning !== null);

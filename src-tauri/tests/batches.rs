@@ -327,8 +327,14 @@ async fn batch_candidates_match_email_by_received_date_and_manual_uploads_by_inv
     let mut manual_with_july_invoice = sample_item(104, Some("2026-07"));
     manual_with_july_invoice.fetched_at = august_received;
     manual_with_july_invoice.invoice_date = Some(date(2026, 7, 31));
+    // A member of another batch whose membership date falls in the range is a
+    // candidate again: assigning it re-anchors it into this batch.
     let mut already_assigned = email_item(105, august_received, Some(date(2026, 8, 10)));
     already_assigned.batch_id = Some(other_batch.id);
+    // Another batch's invoice outside the range must never be offered, because
+    // re-anchoring is not allowed to move it.
+    let mut assigned_outside_range = email_item(108, july_received, Some(date(2026, 8, 1)));
+    assigned_outside_range.batch_id = Some(other_batch.id);
 
     for item in [
         &email_with_july_invoice,
@@ -339,6 +345,7 @@ async fn batch_candidates_match_email_by_received_date_and_manual_uploads_by_inv
         &manual_with_august_invoice,
         &manual_with_july_invoice,
         &already_assigned,
+        &assigned_outside_range,
     ] {
         items
             .insert(item)
@@ -363,7 +370,55 @@ async fn batch_candidates_match_email_by_received_date_and_manual_uploads_by_inv
             email_without_invoice_date.id,
             email_received_at_month_end.id,
             manual_with_august_invoice.id,
+            already_assigned.id,
         ])
+    );
+}
+
+#[tokio::test]
+async fn batch_candidate_search_offers_in_range_invoices_of_other_batches_only() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool);
+    let august = service
+        .create_month(2026, 8)
+        .await
+        .expect("August batch should create");
+    let september = service
+        .create_month(2026, 9)
+        .await
+        .expect("September batch should create");
+    let august_received = Utc.with_ymd_and_hms(2026, 8, 15, 8, 0, 0).single().unwrap();
+    let july_received = Utc.with_ymd_and_hms(2026, 7, 20, 8, 0, 0).single().unwrap();
+    let mut last_month_owned = email_item(200, august_received, Some(date(2026, 8, 10)));
+    last_month_owned.original_name = "finance.pdf".to_owned();
+    last_month_owned.batch_id = Some(september.id);
+    let mut out_of_range_owned = email_item(201, july_received, Some(date(2026, 8, 1)));
+    out_of_range_owned.original_name = "finance.pdf".to_owned();
+    out_of_range_owned.batch_id = Some(september.id);
+    let mut unassigned_outside = sample_item(202, Some("2026-07"));
+    unassigned_outside.original_name = "finance.pdf".to_owned();
+    unassigned_outside.invoice_date = Some(date(2026, 7, 15));
+    for item in [&last_month_owned, &out_of_range_owned, &unassigned_outside] {
+        items
+            .insert(item)
+            .await
+            .expect("search fixture should insert");
+    }
+
+    let page = service
+        .list_candidates(august.id, Some("finance".to_owned()), None, 20)
+        .await
+        .expect("candidate search should load");
+
+    assert_eq!(
+        page.items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([last_month_owned.id, unassigned_outside.id])
     );
 }
 
@@ -1005,6 +1060,7 @@ async fn assign_moves_items_from_another_batch_and_falls_back_both_exported_batc
 
     assert_eq!(detail.batch.id, new_batch.id);
     assert_eq!(detail.items.len(), 2);
+    assert_eq!(detail.moved_from_other_batches_count, 1);
     assert!(
         detail
             .items
@@ -1024,6 +1080,83 @@ async fn assign_moves_items_from_another_batch_and_falls_back_both_exported_batc
     assert_eq!(persisted_new.status, BatchStatus::Draft);
     assert!(persisted_old.last_exported_at.is_some());
     assert!(persisted_new.last_exported_at.is_some());
+}
+
+#[tokio::test]
+async fn widening_the_range_takes_over_the_older_batch_members_without_double_counting() {
+    let pool = db::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database should connect");
+    let service = BatchService::new(pool.clone());
+    let items = ItemRepository::new(pool.clone());
+    let narrow = service
+        .create(NewBatchInput {
+            name: "14-20".to_owned(),
+            start_date: "2026-05-14".to_owned(),
+            end_date: "2026-05-20".to_owned(),
+            note: None,
+        })
+        .await
+        .expect("narrow batch should create");
+    let wide = service
+        .create(NewBatchInput {
+            name: "4-20".to_owned(),
+            start_date: "2026-05-04".to_owned(),
+            end_date: "2026-05-20".to_owned(),
+            note: None,
+        })
+        .await
+        .expect("wide batch should create");
+    let mut first = sample_item(50, Some("2026-05"));
+    first.invoice_date = Some(date(2026, 5, 15));
+    first.batch_id = Some(narrow.id);
+    let mut second = sample_item(51, Some("2026-05"));
+    second.invoice_date = Some(date(2026, 5, 18));
+    second.batch_id = Some(narrow.id);
+    for item in [&first, &second] {
+        items.insert(item).await.expect("item should insert");
+    }
+    mark_exported(&pool, narrow.id).await;
+
+    let candidates = service
+        .list_candidates(wide.id, None, None, 20)
+        .await
+        .expect("wide batch candidates should load");
+    assert_eq!(
+        candidates
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([first.id, second.id])
+    );
+
+    let detail = service
+        .assign_items(wide.id, &[first.id, second.id])
+        .await
+        .expect("re-anchoring assignment should move both members");
+
+    assert_eq!(detail.moved_from_other_batches_count, 2);
+    assert_eq!(detail.summary.item_count, 2);
+    assert_eq!(
+        detail
+            .items
+            .iter()
+            .map(|item| item.batch_id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([Some(wide.id)])
+    );
+    let narrow_detail = service
+        .get(narrow.id)
+        .await
+        .expect("narrow batch should reload");
+    assert!(narrow_detail.items.is_empty());
+    assert_eq!(narrow_detail.batch.status, BatchStatus::Draft);
+    assert_eq!(narrow_detail.summary.total_amount_cents, 0);
+    assert_eq!(
+        detail.summary.total_amount_cents,
+        first.amount_cents.unwrap() + second.amount_cents.unwrap()
+    );
 }
 
 #[tokio::test]

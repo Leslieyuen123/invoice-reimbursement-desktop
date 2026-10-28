@@ -140,6 +140,17 @@ function automationErrorMessage(error: unknown) {
   return sanitizeAutomationErrorMessage(error.message) || AUTOMATION_ERROR_FALLBACK;
 }
 
+/**
+ * User-visible report for invoices re-anchored from another batch.
+ *
+ * Batch membership is single-owner, so the operation response carries the
+ * count; a later reload sees the invoices as ordinary members.
+ */
+function movedFromOtherBatchesReport(count: number | undefined) {
+  const moved = count ?? 0;
+  return moved === 0 ? null : `已从其他批次移入 ${moved} 张票据`;
+}
+
 export function BatchDetailPage() {
   const { batchId = "" } = useParams();
   const location = useLocation();
@@ -154,6 +165,7 @@ export function BatchDetailPage() {
     useState<AutomationFeedback>({ status: "idle" });
   const [recommendPending, setRecommendPending] = useState(false);
   const [recommendError, setRecommendError] = useState<string | null>(null);
+  const [assignReport, setAssignReport] = useState<string | null>(null);
   const [exportPending, setExportPending] = useState(false);
   const [exportResult, setExportResult] = useState<ExportResultDto | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -218,6 +230,7 @@ export function BatchDetailPage() {
     setAutomationFeedback({ status: "idle" });
     setRecommendPending(false);
     setRecommendError(null);
+    setAssignReport(null);
     setExportPending(false);
     setExportResult(null);
     setExportError(null);
@@ -362,10 +375,11 @@ export function BatchDetailPage() {
         setRecommendError("当前日期范围内没有可加入的推荐票据");
         return;
       }
-      await api.assignItemsToBatch(operationBatchId, itemIds);
+      const assigned = await api.assignItemsToBatch(operationBatchId, itemIds);
       reconcileBatchDetail(operationBatchId);
       advanceBatchContentRevision(operationBatchId);
       if (session !== routeSession.current) return;
+      setAssignReport(movedFromOtherBatchesReport(assigned.movedFromOtherBatchesCount));
     } catch (error) {
       if (session === routeSession.current) {
         setRecommendError(errorMessage(error, "推荐票据加入失败"));
@@ -447,8 +461,9 @@ export function BatchDetailPage() {
     queueMicrotask(() => opener?.focus());
   }
 
-  function acceptAssignedDetail(_detail: BatchDetailDto, sessionId: number) {
+  function acceptAssignedDetail(detail: BatchDetailDto, sessionId: number) {
     if (sessionId !== assignDialogSession) return;
+    setAssignReport(movedFromOtherBatchesReport(detail.movedFromOtherBatchesCount));
     closeAssignDialog();
   }
 
@@ -747,6 +762,10 @@ export function BatchDetailPage() {
         <div className="batch-inline-error" role="alert">{recommendError}</div>
       ) : null}
 
+      {assignReport ? (
+        <div className="batch-inline-note" role="status">{assignReport}</div>
+      ) : null}
+
       <section
         className={`batch-automation-strip is-${automationFeedback.status}`}
         aria-labelledby="batch-automation-title"
@@ -757,7 +776,9 @@ export function BatchDetailPage() {
               <Sparkles size={17} strokeWidth={1.7} aria-hidden="true" />
               <h2 id="batch-automation-title">自动处理</h2>
             </div>
-            <p>同步该日期范围的邮箱票据，纳入安全项并生成报销包。</p>
+            <p>
+              同步该日期范围的邮箱票据，把区间内的票据重新锚定到本批次（包括其他批次中的票据），并生成报销包。
+            </p>
           </div>
         ) : automationFeedback.status === "pending" ? (
           <div
@@ -790,6 +811,11 @@ export function BatchDetailPage() {
             <ul className="batch-automation-counts">
               <li>{automationFeedback.result.importedCount} 张新导入</li>
               <li>{automationFeedback.result.assignedCount} 张已自动纳入</li>
+              {(automationFeedback.result.movedFromOtherBatchesCount ?? 0) > 0 ? (
+                <li>
+                  {automationFeedback.result.movedFromOtherBatchesCount} 张从其他批次移入
+                </li>
+              ) : null}
               <li>{automationFeedback.result.exceptionCount} 个异常项</li>
               <li>{automationFeedback.result.failedAccounts.length} 个邮箱失败</li>
               {automationFeedback.result.repairedCount > 0 ? (

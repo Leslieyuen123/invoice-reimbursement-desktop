@@ -264,7 +264,7 @@ async fn exhausted_touched_budget_stops_before_starting_the_next_account() {
 }
 
 #[tokio::test]
-async fn stale_safe_candidates_are_skipped_and_counted_as_exceptions() {
+async fn stale_safe_candidates_are_revalidated_and_in_range_owners_are_reclaimed() {
     let directory = tempfile::tempdir().unwrap();
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let paths = AppPaths::create(directory.path().join("storage")).unwrap();
@@ -336,15 +336,29 @@ async fn stale_safe_candidates_are_skipped_and_counted_as_exceptions() {
     pause.release.notify_one();
 
     let result = automation.await.unwrap().unwrap();
-    assert_eq!(result.assigned_count, 0);
-    assert_eq!(result.exception_count, 4);
-    assert!(result.export.is_none());
+    // The three invoices that became unsafe after the scan are exceptions.
+    assert_eq!(result.assigned_count, 1);
+    assert_eq!(result.moved_from_other_batches_count, 1);
+    assert_eq!(result.exception_count, 3);
+    assert_eq!(
+        result.export.as_ref().map(|export| export.item_count),
+        Some(1)
+    );
     for id in [date_id, currency_id, amount_id] {
         assert!(items.get_by_id(id).await.unwrap().batch_id.is_none());
     }
+    // The manual owner is still re-anchored: the batch owns the range it covers.
     assert_eq!(
         items.get_by_id(owner_id).await.unwrap().batch_id,
-        Some(manual_batch.id)
+        Some(batch.id)
+    );
+    assert!(
+        BatchService::new(pool.clone())
+            .get(manual_batch.id)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
     );
 }
 

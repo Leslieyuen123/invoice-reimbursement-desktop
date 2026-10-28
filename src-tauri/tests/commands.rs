@@ -269,6 +269,7 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "review_item",
             "resolve_duplicate",
             "retry_recognition",
+            "retry_failed_recognitions",
             "list_batches",
             "get_batch",
             "list_batch_candidates",
@@ -303,6 +304,7 @@ fn batch_automation_dto_maps_the_backend_result_without_rewriting_failure_messag
         }],
         imported_count: 2,
         assigned_count: 3,
+        moved_from_other_batches_count: 1,
         exception_count: 4,
         repaired_count: 6,
         export: Some(ExportResult {
@@ -321,6 +323,7 @@ fn batch_automation_dto_maps_the_backend_result_without_rewriting_failure_messag
     assert_eq!(dto.failed_accounts[0].message, "backend-safe failure");
     assert_eq!(dto.imported_count, 2);
     assert_eq!(dto.assigned_count, 3);
+    assert_eq!(dto.moved_from_other_batches_count, 1);
     assert_eq!(dto.exception_count, 4);
     assert_eq!(dto.repaired_count, 6);
     assert_eq!(dto.export.unwrap().item_count, 5);
@@ -337,6 +340,7 @@ fn batch_automation_dto_serializes_only_safe_camel_case_fields() {
         }],
         imported_count: 2,
         assigned_count: 3,
+        moved_from_other_batches_count: 1,
         exception_count: 4,
         repaired_count: 0,
         export: None,
@@ -353,6 +357,7 @@ fn batch_automation_dto_serializes_only_safe_camel_case_fields() {
             }],
             "importedCount": 2,
             "assignedCount": 3,
+            "movedFromOtherBatchesCount": 1,
             "exceptionCount": 4,
             "repairedCount": 0,
             "export": null,

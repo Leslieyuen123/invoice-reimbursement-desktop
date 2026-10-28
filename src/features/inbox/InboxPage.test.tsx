@@ -1302,6 +1302,52 @@ describe("InboxPage", () => {
     });
   });
 
+  it("retries every recognizable recognition failure in one go", async () => {
+    const user = userEvent.setup();
+    const failedItem = pendingInvoiceFixture({
+      status: "recognition_failed",
+      recognitionStatus: "failed",
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [failedItem], nextCursor: null });
+    mockCommand("retry_failed_recognitions", {
+      attempted: 3,
+      recovered: 2,
+      stillFailed: 1,
+      skipped: 4,
+    });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await screen.findByText("出租车电子发票.pdf");
+    const button = screen.getByRole("button", {
+      name: "重试全部识别失败",
+    });
+    expect(button).toBeEnabled();
+    await user.click(button);
+
+    await waitFor(() => {
+      expect(commandCalls("retry_failed_recognitions")).toHaveLength(1);
+    });
+    expect(commandCalls("retry_failed_recognitions")[0].limit).toBeUndefined();
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "已尝试 3 张，恢复 2 张，仍失败 1 张，跳过 4 张",
+    );
+  });
+
+  it("disables the bulk retry when the failed queue is empty", async () => {
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [], nextCursor: null });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    const button = await screen.findByRole("button", {
+      name: "重试全部识别失败",
+    });
+
+    expect(button).toBeDisabled();
+    expect(commandCalls("retry_failed_recognitions")).toEqual([]);
+  });
+
   it("keeps or deletes suspected duplicates from the drawer", async () => {
     const user = userEvent.setup();
     const duplicateOne = pendingInvoiceFixture({

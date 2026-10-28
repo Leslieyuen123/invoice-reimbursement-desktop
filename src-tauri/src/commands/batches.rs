@@ -145,6 +145,10 @@ pub struct BatchDetailDto {
     pub warnings: Vec<String>,
     /// Batch members that currently block the export, with a repair hint.
     pub issues: Vec<BatchIssueDto>,
+    /// Invoices this operation pulled in from another batch (range re-anchor).
+    ///
+    /// This is an operation report, not stored state: a plain reload reports 0.
+    pub moved_from_other_batches_count: u32,
 }
 
 /// One batch member that blocks the export of the whole batch.
@@ -167,6 +171,7 @@ impl TryFrom<BatchDetail> for BatchDetailDto {
             items,
             summary,
             warnings,
+            moved_from_other_batches_count,
         } = detail;
         Ok(Self {
             batch: BatchDto::try_from((batch, summary.clone()))?,
@@ -177,6 +182,7 @@ impl TryFrom<BatchDetail> for BatchDetailDto {
             summary: summary.try_into()?,
             warnings,
             issues: Vec::new(),
+            moved_from_other_batches_count,
         })
     }
 }
@@ -261,6 +267,8 @@ pub struct BatchAutomationResultDto {
     pub failed_accounts: Vec<AccountAutomationFailureDto>,
     pub imported_count: u32,
     pub assigned_count: u32,
+    /// Batch members this run took over from another batch (range re-anchor).
+    pub moved_from_other_batches_count: u32,
     pub exception_count: u32,
     pub repaired_count: u32,
     pub export: Option<ExportResultDto>,
@@ -279,6 +287,7 @@ impl TryFrom<BatchAutomationResult> for BatchAutomationResultDto {
                 .collect(),
             imported_count: result.imported_count,
             assigned_count: result.assigned_count,
+            moved_from_other_batches_count: result.moved_from_other_batches_count,
             exception_count: result.exception_count,
             repaired_count: result.repaired_count,
             export: result.export.map(ExportResultDto::try_from).transpose()?,

@@ -13,6 +13,7 @@ use crate::domain::model::{
 };
 use crate::infra::files::open_contained_regular_file;
 use crate::services::items::ItemReview;
+use crate::services::recognition::original_can_be_normalized;
 use crate::state::AppState;
 
 pub use crate::services::preview::{PreviewPayload, PreviewRangePayload, PreviewVariant};
@@ -297,6 +298,105 @@ pub async fn retry_recognition(state: &AppState, id: Uuid) -> Result<InvoiceItem
     state.recognition_service().retry(id).await?.try_into()
 }
 
+/// What one bulk retry of the failed recognitions changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryFailedRecognitionsReport {
+    /// Failed invoices the recognizer was actually run on.
+    pub attempted: u32,
+    /// Invoices whose recognition succeeded in this run.
+    pub recovered: u32,
+    /// Invoices that failed (or could not even be read) again.
+    pub still_failed: u32,
+    /// Failed invoices that were left untouched: link placeholders and other
+    /// originals the extractor can never normalize, plus the ones an explicit
+    /// `limit` left out of this run.
+    pub skipped: u32,
+}
+
+/// The repository never returns more than this many invoices per page.
+const FAILED_RETRY_PAGE_SIZE: usize = 200;
+
+/// Re-runs recognition for every invoice currently in the "识别失败" queue.
+///
+/// Recognition is what writes `normalized_pdf_path`, the derived fields and the
+/// failure reason back onto the invoice, so this reuses
+/// `RecognitionService::recognize_item` instead of duplicating the pipeline.
+/// Every invoice is recognized and committed on its own: one broken file never
+/// aborts the run, and the command returns a report the UI can show. Link
+/// placeholders (`.url`) and other originals the extractor cannot normalize
+/// (`recognition::original_can_be_normalized`) are counted as skipped instead
+/// of being retried forever.
+///
+/// `limit` caps how many invoices one run may attempt; the whole failed queue is
+/// processed when it is `None`. Invoices left out by the cap are reported as
+/// skipped too, so `attempted + skipped` always accounts for the queue.
+pub async fn retry_failed_recognitions(
+    state: &AppState,
+    limit: Option<u32>,
+) -> Result<RetryFailedRecognitionsReport, AppError> {
+    if limit == Some(0) {
+        return Err(AppError::validation("limit", "limit must be at least 1"));
+    }
+    // Suspected duplicates are shown in their own inbox tab, but their
+    // recognition still failed; a successful retry is what makes keeping them
+    // useful again, so they are part of the queue.
+    let mut failed = Vec::new();
+    for status in [
+        ItemStatus::RecognitionFailed,
+        ItemStatus::SuspectedDuplicate,
+    ] {
+        let filter = ItemFilter {
+            status: Some(status),
+            ..ItemFilter::default()
+        };
+        let mut cursor = None;
+        loop {
+            let page = state
+                .item_service()
+                .list_page(filter.clone(), cursor, FAILED_RETRY_PAGE_SIZE)
+                .await?;
+            failed.extend(
+                page.items
+                    .into_iter()
+                    .filter(|item| item.recognition_status == RecognitionStatus::Failed),
+            );
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+
+    let mut remaining_budget = limit.map_or(usize::MAX, |limit| limit as usize);
+    let mut report = RetryFailedRecognitionsReport::default();
+    for item in failed {
+        if remaining_budget == 0 || !original_can_be_normalized(&item.original_name) {
+            report.skipped = report.skipped.saturating_add(1);
+            continue;
+        }
+        remaining_budget -= 1;
+        report.attempted = report.attempted.saturating_add(1);
+        match state.recognition_service().recognize_item(item.id).await {
+            Ok(recognized) if recognized.recognition_status == RecognitionStatus::Succeeded => {
+                report.recovered = report.recovered.saturating_add(1);
+            }
+            Ok(_) => {
+                report.still_failed = report.still_failed.saturating_add(1);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    item_id = %item.id,
+                    error = %error,
+                    "bulk recognition retry failed for item"
+                );
+                report.still_failed = report.still_failed.saturating_add(1);
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginalOpenTarget {
     LocalPath(PathBuf),
@@ -533,7 +633,10 @@ pub(crate) mod ipc {
     use tauri::State;
     use uuid::Uuid;
 
-    use super::{InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto, ReviewItemInputDto};
+    use super::{
+        InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto, RetryFailedRecognitionsReport,
+        ReviewItemInputDto,
+    };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
     use crate::state::AppState;
@@ -594,5 +697,13 @@ pub(crate) mod ipc {
         item_id: Uuid,
     ) -> Result<InvoiceItemDto, AppError> {
         super::retry_recognition(&state, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn retry_failed_recognitions(
+        state: State<'_, AppState>,
+        limit: Option<u32>,
+    ) -> Result<RetryFailedRecognitionsReport, AppError> {
+        super::retry_failed_recognitions(&state, limit).await
     }
 }

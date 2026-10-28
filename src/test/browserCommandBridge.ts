@@ -27,6 +27,7 @@ import type {
   PageRequestDto,
   PreferencesDto,
   ReviewItemInputDto,
+  RetryFailedRecognitionsReportDto,
   SaveMailboxAccountInputDto,
   ConsistencyReportDto,
   SyncProgressDto,
@@ -708,6 +709,30 @@ function makeHandlers(
       markBatchDraft(state, item.batchId);
       Object.assign(item, { recognitionStatus: "succeeded", status: "pending_confirmation", updatedAt: now });
       return { ...item };
+    }],
+    [API_COMMANDS.retryFailedRecognitions, () => {
+      const report: RetryFailedRecognitionsReportDto = {
+        attempted: 0,
+        recovered: 0,
+        stillFailed: 0,
+        skipped: 0,
+      };
+      for (const item of state.items) {
+        if (item.recognitionStatus !== "failed") continue;
+        if (!canNormalize(item)) {
+          report.skipped += 1;
+          continue;
+        }
+        report.attempted += 1;
+        markBatchDraft(state, item.batchId);
+        Object.assign(item, {
+          recognitionStatus: "succeeded",
+          status: "pending_confirmation",
+          updatedAt: now,
+        });
+        report.recovered += 1;
+      }
+      return report;
     }],
     [API_COMMANDS.listBatches, (arguments_) =>
       paginate(

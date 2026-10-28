@@ -161,15 +161,23 @@ fn bounded_stream_size(stream: &Stream, limit: u64) -> Result<u64, PdfResourceEr
         }
         Err(_) => return Err(unsupported_stream_filter()),
     };
-    if filters.len() != 1 {
-        return Err(unsupported_stream_filter());
-    }
-    match filters[0] {
-        b"FlateDecode" | b"Fl" => bounded_flate_size(&stream.content, limit),
+    match filters.as_slice() {
+        [b"FlateDecode"] | [b"Fl"] => bounded_flate_size(&stream.content, limit),
+        // E-invoice scanners commonly wrap JPEG images in Flate: the allocation
+        // that matters is the bounded Flate expansion, and the JPEG bytes after
+        // it are opaque to the load/save path, so count that expanded size.
+        [b"FlateDecode", b"DCTDecode"] | [b"Fl", b"DCT"] => {
+            bounded_flate_size(&stream.content, limit)
+        }
         // These codecs remain opaque in lopdf's load/renumber/save path. The validator never
         // calls lopdf's content decoders for them, so their stored bytes are the allocation bound.
-        b"DCTDecode" | b"DCT" | b"JPXDecode" | b"CCITTFaxDecode" | b"CCF" | b"JBIG2Decode"
-        | b"Crypt" => bounded_opaque_size(stream.content.len(), limit),
+        [b"DCTDecode"]
+        | [b"DCT"]
+        | [b"JPXDecode"]
+        | [b"CCITTFaxDecode"]
+        | [b"CCF"]
+        | [b"JBIG2Decode"]
+        | [b"Crypt"] => bounded_opaque_size(stream.content.len(), limit),
         // lopdf's LZW and ASCII85 helpers allocate complete output buffers. Fail closed until a
         // bounded streaming implementation is available for these filters.
         _ => Err(unsupported_stream_filter()),
@@ -293,6 +301,31 @@ mod tests {
                 .unwrap_err();
 
         assert!(matches!(error, PdfResourceError::Unsupported(_)));
+    }
+
+    #[test]
+    fn flate_wrapped_jpeg_stream_is_counted_by_its_expanded_size() {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &[0_u8; 17]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut document = pdf_with_pages(1);
+        document.add_object(Stream::new(
+            dictionary! {
+                "Filter" => vec![Object::from("FlateDecode"), Object::from("DCTDecode")]
+            },
+            compressed,
+        ));
+        let mut limits = pdf_limits(10);
+
+        limits.max_decoded_stream_bytes_per_item = 16;
+        let error = validate_pdf_resources(&document, &mut PdfResourceUsage::default(), limits)
+            .unwrap_err();
+        assert!(matches!(error, PdfResourceError::ResourceLimit(_)));
+
+        let mut limits = pdf_limits(10);
+        limits.max_decoded_stream_bytes_per_item = 17;
+        validate_pdf_resources(&document, &mut PdfResourceUsage::default(), limits).unwrap();
     }
 
     fn pdf_limits(max_pages_per_item: usize) -> PdfResourceLimits {

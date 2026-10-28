@@ -1,15 +1,23 @@
 //! Tests for `pdf_preflight`, kept out of the production file.
+use std::fmt::Write as _;
 use std::io::Write;
 
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use lopdf::{Document, Object, dictionary};
 
 use super::{
     MAX_XREF_ENTRIES, PdfPreflightError, RawLexer, RawToken, reject_unsafe_object_dictionary,
-    reset_header_parse_offsets, take_header_parse_offsets, validate_pdf_structure_with_limit,
+    reset_header_parse_offsets, take_header_parse_offsets, validate_pdf_input_structure_with_limit,
+    validate_pdf_structure_with_limit,
 };
 
 fn validate_pdf_structure(bytes: &[u8]) -> Result<(), PdfPreflightError> {
     validate_pdf_structure_with_limit(bytes, MAX_XREF_ENTRIES)
+}
+
+fn validate_pdf_input_structure(bytes: &[u8]) -> Result<(), PdfPreflightError> {
+    validate_pdf_input_structure_with_limit(bytes, MAX_XREF_ENTRIES)
 }
 
 #[test]
@@ -589,4 +597,344 @@ fn write_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, offset: usize,
     entries.push(entry_type);
     entries.extend_from_slice(&(offset as u32).to_be_bytes());
     entries.extend_from_slice(&generation.to_be_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Input preflight: standard object streams and cross-reference streams
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct ObjectStreamPdfConfig {
+    xref_compressed: bool,
+    png_predictor: bool,
+    unsupported_filter: bool,
+    corrupt_container: bool,
+    corrupt_index: bool,
+    omit_contained_object: bool,
+    bad_normal_offset: bool,
+    omit_self_entry: bool,
+    bad_self_offset: bool,
+    corrupt_xref_content: bool,
+}
+
+impl Default for ObjectStreamPdfConfig {
+    fn default() -> Self {
+        Self {
+            xref_compressed: true,
+            png_predictor: true,
+            unsupported_filter: false,
+            corrupt_container: false,
+            corrupt_index: false,
+            omit_contained_object: false,
+            bad_normal_offset: false,
+            omit_self_entry: false,
+            bad_self_offset: false,
+            corrupt_xref_content: false,
+        }
+    }
+}
+
+#[test]
+fn accepts_compressed_xref_stream_with_object_stream() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig::default());
+
+    validate_pdf_input_structure(&bytes).unwrap();
+
+    let loaded = Document::load_mem(&bytes).unwrap();
+    assert_eq!(loaded.get_pages().len(), 1);
+    assert!(loaded.objects.values().any(|object| {
+        object
+            .as_stream()
+            .is_ok_and(|stream| stream.dict.has_type(b"ObjStm"))
+    }));
+}
+
+#[test]
+fn accepts_uncompressed_xref_stream_with_object_stream() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        xref_compressed: false,
+        png_predictor: false,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    validate_pdf_input_structure(&bytes).unwrap();
+}
+
+#[test]
+fn input_preflight_still_enforces_the_active_object_budget() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig::default());
+
+    assert_eq!(
+        validate_pdf_input_structure_with_limit(&bytes, 2),
+        Err(PdfPreflightError::ResourceLimit)
+    );
+}
+
+#[test]
+fn rejects_compressed_object_entry_with_out_of_range_container() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        corrupt_container: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Invalid)
+    );
+}
+
+#[test]
+fn rejects_object_stream_index_that_disagrees_with_the_xref() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        corrupt_index: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Invalid)
+    );
+}
+
+#[test]
+fn rejects_object_stream_objects_the_xref_does_not_account_for() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        omit_contained_object: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Invalid)
+    );
+}
+
+#[test]
+fn rejects_normal_xref_entries_with_out_of_range_offsets() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        bad_normal_offset: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Invalid)
+    );
+}
+
+#[test]
+fn accepts_xref_stream_without_its_own_entry() {
+    // Real generators routinely leave the cross-reference stream out of the
+    // table (or mark it free); the loader never needs that entry.
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        omit_self_entry: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    validate_pdf_input_structure(&bytes).unwrap();
+}
+
+#[test]
+fn rejects_xref_stream_self_entry_that_points_somewhere_else() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        bad_self_offset: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Invalid)
+    );
+}
+
+#[test]
+fn rejects_unsupported_xref_stream_filters_as_unsupported() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        unsupported_filter: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Unsupported)
+    );
+}
+
+#[test]
+fn rejects_corrupt_compressed_xref_stream() {
+    let bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig {
+        corrupt_xref_content: true,
+        ..ObjectStreamPdfConfig::default()
+    });
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Invalid)
+    );
+}
+
+#[test]
+fn classifies_encrypted_trailers_as_encrypted() {
+    let bytes = classic_pdf(b"null", b"/Encrypt 4 0 R");
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Encrypted)
+    );
+}
+
+#[test]
+fn input_preflight_still_requires_a_terminal_eof_marker() {
+    let mut bytes = synthetic_object_stream_pdf(ObjectStreamPdfConfig::default());
+    let eof = bytes
+        .windows(b"%%EOF".len())
+        .position(|window| window == b"%%EOF")
+        .unwrap();
+    bytes.truncate(eof);
+
+    assert_eq!(
+        validate_pdf_input_structure(&bytes),
+        Err(PdfPreflightError::Invalid)
+    );
+}
+
+fn synthetic_object_stream_pdf(config: ObjectStreamPdfConfig) -> Vec<u8> {
+    let contained_bodies: [&[u8]; 3] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+    ];
+    let mut object_stream_index = String::new();
+    let mut object_stream_contents = Vec::new();
+    for (position, body) in contained_bodies.iter().enumerate() {
+        write!(
+            &mut object_stream_index,
+            "{} {} ",
+            position + 1,
+            object_stream_contents.len()
+        )
+        .unwrap();
+        object_stream_contents.extend_from_slice(body);
+        assert_eq!(object_stream_contents.last(), Some(&b'>'));
+        object_stream_contents.push(b' ');
+    }
+    let first = object_stream_index.len();
+    let mut object_stream_decoded = object_stream_index.into_bytes();
+    object_stream_decoded.extend_from_slice(&object_stream_contents);
+    let object_stream_compressed = zlib(&object_stream_decoded);
+
+    let content_stream = b"BT (Invoice 128.50) Tj ET";
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = [0_usize; 7];
+
+    offsets[4] = bytes.len();
+    bytes.extend_from_slice(b"4 0 obj\n<< /Length ");
+    write!(&mut bytes, "{}", content_stream.len()).unwrap();
+    bytes.extend_from_slice(b" >>\nstream\n");
+    bytes.extend_from_slice(content_stream);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    offsets[5] = bytes.len();
+    bytes.extend_from_slice(b"5 0 obj\n<< /Type /ObjStm /N 3 /First ");
+    write!(&mut bytes, "{first}").unwrap();
+    bytes.extend_from_slice(b" /Filter /FlateDecode /Length ");
+    write!(&mut bytes, "{}", object_stream_compressed.len()).unwrap();
+    bytes.extend_from_slice(b" >>\nstream\n");
+    bytes.extend_from_slice(&object_stream_compressed);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    offsets[6] = bytes.len();
+    let table = synthetic_object_stream_xref_table(&offsets, config);
+    let (encoded_table, decode_parms) = if config.png_predictor {
+        (
+            encode_png_up_rows(&table, 7),
+            b"/DecodeParms << /Columns 7 /Predictor 12 >>".as_slice(),
+        )
+    } else {
+        (table, b"".as_slice())
+    };
+    let stored_table = if config.corrupt_xref_content {
+        b"not a zlib stream".to_vec()
+    } else if config.xref_compressed {
+        zlib(&encoded_table)
+    } else {
+        encoded_table
+    };
+
+    bytes.extend_from_slice(b"6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 4 2] /Index [0 7]");
+    if config.xref_compressed {
+        bytes.extend_from_slice(b" /Filter ");
+        if config.unsupported_filter {
+            bytes.extend_from_slice(b"/LZWDecode");
+        } else {
+            bytes.extend_from_slice(b"/FlateDecode");
+        }
+        bytes.extend_from_slice(decode_parms);
+    }
+    bytes.extend_from_slice(b" /Length ");
+    write!(&mut bytes, "{}", stored_table.len()).unwrap();
+    bytes.extend_from_slice(b" >>\nstream\n");
+    bytes.extend_from_slice(&stored_table);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    write!(&mut bytes, "startxref\n{}\n%%EOF\n", offsets[6]).unwrap();
+    bytes
+}
+
+fn synthetic_object_stream_xref_table(
+    offsets: &[usize; 7],
+    config: ObjectStreamPdfConfig,
+) -> Vec<u8> {
+    let mut table = Vec::new();
+    let mut push = |entry_type: u8, field_two: u32, field_three: u16| {
+        table.push(entry_type);
+        table.extend_from_slice(&field_two.to_be_bytes());
+        table.extend_from_slice(&field_three.to_be_bytes());
+    };
+    push(0, 0, 65535);
+    let container = if config.corrupt_container { 99 } else { 5 };
+    push(2, container, 0);
+    push(2, 5, if config.corrupt_index { 0 } else { 1 });
+    if config.omit_contained_object {
+        push(0, 0, 0);
+    } else {
+        push(2, 5, 2);
+    }
+    push(
+        1,
+        if config.bad_normal_offset {
+            u32::MAX
+        } else {
+            offsets[4] as u32
+        },
+        0,
+    );
+    push(1, offsets[5] as u32, 0);
+    if config.omit_self_entry {
+        push(0, 0, 0);
+    } else if config.bad_self_offset {
+        push(1, offsets[5] as u32, 0);
+    } else {
+        push(1, offsets[6] as u32, 0);
+    }
+    table
+}
+
+fn encode_png_up_rows(table: &[u8], columns: usize) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(table.len() + table.len() / columns);
+    let mut previous = vec![0_u8; columns];
+    for row in table.chunks_exact(columns) {
+        encoded.push(2);
+        for (index, byte) in row.iter().enumerate() {
+            encoded.push(byte.wrapping_sub(previous[index]));
+        }
+        previous.copy_from_slice(row);
+    }
+    encoded
+}
+
+fn zlib(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
 }

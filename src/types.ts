@@ -234,6 +234,12 @@ export interface BatchDetailDto {
   summary: BatchDetailSummaryDto;
   warnings: string[];
   issues: BatchIssueDto[];
+  /**
+   * Invoices this operation pulled in from another batch (range re-anchor).
+   *
+   * An operation report rather than stored state: a plain reload reports 0.
+   */
+  movedFromOtherBatchesCount?: number;
 }
 
 /** How one scanned mail ended up in the invoice library. */
@@ -362,6 +368,8 @@ export interface BatchAutomationResultDto {
   failedAccounts: AccountAutomationFailureDto[];
   importedCount: number;
   assignedCount: number;
+  /** Batch members this run took over from another batch (range re-anchor). */
+  movedFromOtherBatchesCount?: number;
   exceptionCount: number;
   repairedCount: number;
   export: ExportResultDto | null;
@@ -390,3 +398,15 @@ export interface TestMailboxAccountInputDto {
 export type PreferencesInputDto = PreferencesDto;
 
 export type BatchSummaryDto = BatchDto;
+
+/** What one bulk retry over the failed recognitions changed. */
+export interface RetryFailedRecognitionsReportDto {
+  /** Failed invoices the recognizer was run on in this batch. */
+  attempted: number;
+  /** Invoices whose recognition succeeded again. */
+  recovered: number;
+  /** Invoices that failed (or could not be read) again. */
+  stillFailed: number;
+  /** Placeholders (`.url`) and anything else that cannot be re-recognized. */
+  skipped: number;
+}

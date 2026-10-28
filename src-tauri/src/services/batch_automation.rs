@@ -12,7 +12,7 @@ use crate::domain::error::{AppError, sanitize_message};
 use crate::infra::files::AppPaths;
 use crate::services::batch_eligibility::is_safe_batch_candidate;
 use crate::services::batch_repair::repair_missing_normalized_pdfs;
-use crate::services::batches::BatchService;
+use crate::services::batches::{AutomationAssignmentOutcome, BatchService};
 use crate::services::export::{ExportResult, ExportService};
 use crate::services::operations::AccountOperationCoordinator;
 use crate::services::recognition::RecognitionService;
@@ -35,6 +35,8 @@ pub struct BatchAutomationResult {
     pub failed_accounts: Vec<AccountAutomationFailure>,
     pub imported_count: u32,
     pub assigned_count: u32,
+    /// Batch members this run took over from another batch (range re-anchor).
+    pub moved_from_other_batches_count: u32,
     pub exception_count: u32,
     /// Normalized PDFs regenerated for batch members that were missing one.
     pub repaired_count: u32,
@@ -252,13 +254,15 @@ impl BatchAutomationService {
             pause.release.notified().await;
         }
 
-        let assigned_ids = if safe_ids.is_empty() {
-            Vec::new()
+        let assignment = if safe_ids.is_empty() {
+            AutomationAssignmentOutcome::default()
         } else {
             self.batches
                 .assign_unassigned_items(batch_id, &self.paths, &safe_ids)
                 .await?
         };
+        let assigned_ids = assignment.assigned_ids;
+        let moved_from_other_batches_count = assignment.moved_from_other_batches_count;
         let assigned_id_set = assigned_ids.iter().copied().collect::<HashSet<_>>();
         let skipped_safe_ids = safe_ids
             .iter()
@@ -296,6 +300,7 @@ impl BatchAutomationService {
             failed_accounts,
             imported_count,
             assigned_count,
+            moved_from_other_batches_count,
             exception_count,
             repaired_count,
             export,
