@@ -34,6 +34,7 @@ function emptyBatchDetail(batch: BatchDto): BatchDetailDto {
       dining: emptyCategory,
       accommodation: emptyCategory,
       hospitality: emptyCategory,
+      other: emptyCategory,
       unconfirmedCount: 0,
     },
     warnings: [],

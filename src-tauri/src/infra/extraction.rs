@@ -15,7 +15,7 @@ use printpdf::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::infra::pdf_preflight::{PdfPreflightError, validate_pdf_structure_with_limit};
+use crate::infra::pdf_preflight::{PdfPreflightError, validate_pdf_input_structure_with_limit};
 use crate::infra::pdf_resources::{
     DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM, DEFAULT_PDF_OBJECTS_PER_ITEM,
     DEFAULT_PDF_PAGES_PER_ITEM, PdfResourceError, PdfResourceLimits, PdfResourceUsage,
@@ -638,12 +638,15 @@ impl DocumentExtractor for LocalExtractor {
 impl LocalExtractor {
     fn extract_pdf(&self, path: &Path) -> Result<ExtractedDocument, AppError> {
         let bytes = fs::read(path).map_err(|_| document_error())?;
-        validate_pdf_structure_with_limit(&bytes, DEFAULT_PDF_OBJECTS_PER_ITEM).map_err(
+        // Real invoices use the standard PDF 1.5+ object streams and
+        // cross-reference streams; the input preflight accepts them while still
+        // enforcing the resource budget before lopdf decodes anything.
+        validate_pdf_input_structure_with_limit(&bytes, DEFAULT_PDF_OBJECTS_PER_ITEM).map_err(
             |error| match error {
                 PdfPreflightError::Invalid => document_error(),
-                PdfPreflightError::Unsupported | PdfPreflightError::ResourceLimit => {
-                    resource_limit_error()
-                }
+                PdfPreflightError::Unsupported => unsupported_pdf_error(),
+                PdfPreflightError::Encrypted => encrypted_pdf_error(),
+                PdfPreflightError::ResourceLimit => resource_limit_error(),
             },
         )?;
         let mut document = lopdf::Document::load_mem(&bytes).map_err(|_| document_error())?;
@@ -655,9 +658,8 @@ impl LocalExtractor {
         validate_pdf_resources(&document, &mut PdfResourceUsage::default(), resource_limits)
             .map_err(|error| match error {
                 PdfResourceError::Invalid(_) => document_error(),
-                PdfResourceError::Unsupported(_) | PdfResourceError::ResourceLimit(_) => {
-                    resource_limit_error()
-                }
+                PdfResourceError::Unsupported(_) => unsupported_pdf_error(),
+                PdfResourceError::ResourceLimit(_) => resource_limit_error(),
             })?;
         document.renumber_objects();
         document.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
@@ -866,6 +868,24 @@ fn document_error() -> AppError {
         service: "document_extractor".to_owned(),
         retryable: false,
         message: "Unable to read document.".to_owned(),
+    }
+}
+
+/// Unsupported PDF structures (encryption aside) must not read as a resource
+/// limit: the document is intact, the importer simply cannot read it safely.
+fn unsupported_pdf_error() -> AppError {
+    AppError::External {
+        service: "document_extractor".to_owned(),
+        retryable: false,
+        message: "PDF uses an unsupported structure.".to_owned(),
+    }
+}
+
+fn encrypted_pdf_error() -> AppError {
+    AppError::External {
+        service: "document_extractor".to_owned(),
+        retryable: false,
+        message: "Document is encrypted; unlock the PDF before importing.".to_owned(),
     }
 }
 

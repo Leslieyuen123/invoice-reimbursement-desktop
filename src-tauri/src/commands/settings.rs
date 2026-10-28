@@ -139,6 +139,9 @@ pub struct PreferencesInputDto {
     pub background_sync_enabled: bool,
     pub export_directory: String,
     pub batch_directory_pattern: String,
+    /// Older callers predate mail-read marking; treat silence as "enabled".
+    #[serde(default = "crate::services::settings::default_mark_processed_mail_seen")]
+    pub mark_processed_mail_seen: bool,
 }
 
 pub async fn list_accounts(state: &AppState) -> Result<Vec<MailboxAccountDto>, AppError> {
@@ -194,6 +197,7 @@ pub async fn save_preferences(
             background_sync_enabled: input.background_sync_enabled,
             export_directory: input.export_directory,
             batch_directory_pattern: input.batch_directory_pattern,
+            mark_processed_mail_seen: input.mark_processed_mail_seen,
         })
         .await
 }

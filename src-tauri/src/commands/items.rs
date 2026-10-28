@@ -4,15 +4,24 @@ use std::io::Read;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use std::collections::BTreeMap;
+
 use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
-use crate::db::items::{InvoiceItem, ItemFilter, ItemPageCursor};
+use crate::db::items::{
+    InvoiceItem, ItemFilter, ItemPageCursor, ItemRepository, NON_INVOICE_DOCUMENT_REASON,
+};
 use crate::domain::amount::{validate_amount_cents, validate_optional_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, SourceType,
 };
 use crate::infra::files::open_contained_regular_file;
+use crate::services::batch_repair::repair_missing_normalized_pdfs;
+use crate::services::batches::{BatchService, RecoverableSettleInput};
 use crate::services::items::ItemReview;
+use crate::services::link_recovery::{self, LinkRecoveryReport};
+use crate::services::qr_recovery::{self, QrRecoveryReport};
+use crate::services::recognition::original_can_be_normalized;
 use crate::state::AppState;
 
 pub use crate::services::preview::{PreviewPayload, PreviewRangePayload, PreviewVariant};
@@ -21,6 +30,10 @@ pub use crate::services::preview::{PreviewPayload, PreviewRangePayload, PreviewV
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ItemFilterDto {
     pub status: Option<ItemStatus>,
+    /// Source mailbox identity, used by the mail ledger to list one mail's
+    /// invoices.
+    pub source_account_id: Option<String>,
+    pub source_uid: Option<i64>,
     #[serde(default)]
     pub recent: bool,
     pub suggested_period: Option<String>,
@@ -39,6 +52,8 @@ pub struct InvoiceItemDto {
     pub source_type: SourceType,
     pub source_account_id: Option<String>,
     pub fetched_at: String,
+    /// Local date the mail was received; the date batches are keyed on.
+    pub source_received_date: Option<String>,
     pub invoice_date: Option<String>,
     pub suggested_period: Option<String>,
     pub batch_id: Option<String>,
@@ -82,6 +97,7 @@ impl TryFrom<InvoiceItem> for InvoiceItemDto {
             source_type: item.source_type,
             source_account_id: item.source_account_id.map(|id| id.to_string()),
             fetched_at: item.fetched_at.to_rfc3339(),
+            source_received_date: item.source_received_date.map(|date| date.to_string()),
             invoice_date: item.invoice_date.map(|date| date.to_string()),
             suggested_period: item.suggested_period,
             batch_id: item.batch_id.map(|id| id.to_string()),
@@ -290,6 +306,404 @@ pub async fn retry_recognition(state: &AppState, id: Uuid) -> Result<InvoiceItem
     state.recognition_service().retry(id).await?.try_into()
 }
 
+/// What one bulk retry of the failed recognitions changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryFailedRecognitionsReport {
+    /// Failed invoices the recognizer was actually run on.
+    pub attempted: u32,
+    /// Invoices whose recognition succeeded in this run.
+    pub recovered: u32,
+    /// Invoices that failed (or could not even be read) again.
+    pub still_failed: u32,
+    /// Failed invoices that were left untouched: link placeholders and other
+    /// originals the extractor can never normalize, plus the ones an explicit
+    /// `limit` left out of this run.
+    pub skipped: u32,
+}
+
+/// The repository never returns more than this many invoices per page.
+const FAILED_RETRY_PAGE_SIZE: usize = 200;
+
+/// Re-runs recognition for every invoice currently in the "识别失败" queue.
+///
+/// Recognition is what writes `normalized_pdf_path`, the derived fields and the
+/// failure reason back onto the invoice, so this reuses
+/// `RecognitionService::recognize_item` instead of duplicating the pipeline.
+/// Every invoice is recognized and committed on its own: one broken file never
+/// aborts the run, and the command returns a report the UI can show. Link
+/// placeholders (`.url`) and other originals the extractor cannot normalize
+/// (`recognition::original_can_be_normalized`) are counted as skipped instead
+/// of being retried forever.
+///
+/// `limit` caps how many invoices one run may attempt; the whole failed queue is
+/// processed when it is `None`. Invoices left out by the cap are reported as
+/// skipped too, so `attempted + skipped` always accounts for the queue.
+pub async fn retry_failed_recognitions(
+    state: &AppState,
+    limit: Option<u32>,
+) -> Result<RetryFailedRecognitionsReport, AppError> {
+    if limit == Some(0) {
+        return Err(AppError::validation("limit", "limit must be at least 1"));
+    }
+    // Suspected duplicates are shown in their own inbox tab, but their
+    // recognition still failed; a successful retry is what makes keeping them
+    // useful again, so they are part of the queue.
+    let mut failed = Vec::new();
+    for status in [
+        ItemStatus::RecognitionFailed,
+        ItemStatus::SuspectedDuplicate,
+    ] {
+        let filter = ItemFilter {
+            status: Some(status),
+            ..ItemFilter::default()
+        };
+        let mut cursor = None;
+        loop {
+            let page = state
+                .item_service()
+                .list_page(filter.clone(), cursor, FAILED_RETRY_PAGE_SIZE)
+                .await?;
+            failed.extend(
+                page.items
+                    .into_iter()
+                    .filter(|item| item.recognition_status == RecognitionStatus::Failed),
+            );
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+
+    let mut remaining_budget = limit.map_or(usize::MAX, |limit| limit as usize);
+    let mut report = RetryFailedRecognitionsReport::default();
+    for item in failed {
+        if remaining_budget == 0 || !original_can_be_normalized(&item.original_name) {
+            report.skipped = report.skipped.saturating_add(1);
+            continue;
+        }
+        remaining_budget -= 1;
+        report.attempted = report.attempted.saturating_add(1);
+        match state.recognition_service().recognize_item(item.id).await {
+            Ok(recognized) if recognized.recognition_status == RecognitionStatus::Succeeded => {
+                report.recovered = report.recovered.saturating_add(1);
+            }
+            Ok(_) => {
+                report.still_failed = report.still_failed.saturating_add(1);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    item_id = %item.id,
+                    error = %error,
+                    "bulk recognition retry failed for item"
+                );
+                report.still_failed = report.still_failed.saturating_add(1);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// One skip-reason bucket of a QR rescue run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QrRecoverySkipDto {
+    pub code: String,
+    pub label: String,
+    pub count: u32,
+}
+
+/// What one "补救二维码票据" run changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QrRecoveryReportDto {
+    /// Image invoices the run looked at.
+    pub examined: u32,
+    /// Invoices whose stored image carried an HTTPS QR link.
+    pub decoded: u32,
+    /// Invoices whose stored image was replaced by the downloaded invoice.
+    pub downloaded: u32,
+    /// Invoices that ended recognized after the replacement.
+    pub recognized: u32,
+    /// Invoices that could not be rescued; see `skippedBreakdown`.
+    pub skipped: u32,
+    /// Skip reasons grouped by stable code, deterministic by code.
+    pub skipped_breakdown: Vec<QrRecoverySkipDto>,
+}
+
+fn qr_skip_label(code: &str) -> &'static str {
+    match code {
+        qr_recovery::QR_SKIP_NO_CODE => "没有二维码",
+        qr_recovery::QR_SKIP_NOT_INVOICE_LINK => "不是发票链接",
+        qr_recovery::QR_SKIP_DOWNLOAD_FAILED => "下载失败",
+        qr_recovery::QR_SKIP_UNREADABLE_ORIGINAL => "原件无法读取",
+        qr_recovery::QR_SKIP_REPLACEMENT_FAILED => "替换原件失败",
+        qr_recovery::QR_SKIP_ITEM_CHANGED => "票据在补救时被修改",
+        qr_recovery::QR_SKIP_RECOGNITION_FAILED => "重新识别失败",
+        _ => "其他原因",
+    }
+}
+
+fn qr_recovery_dto(report: QrRecoveryReport) -> QrRecoveryReportDto {
+    QrRecoveryReportDto {
+        examined: report.examined,
+        decoded: report.decoded,
+        downloaded: report.downloaded,
+        recognized: report.recognized,
+        skipped: report.skipped,
+        skipped_breakdown: report
+            .skip_reasons
+            .into_iter()
+            .map(|entry| QrRecoverySkipDto {
+                label: qr_skip_label(&entry.code).to_owned(),
+                code: entry.code,
+                count: entry.count,
+            })
+            .collect(),
+    }
+}
+
+/// Rescues every stored image invoice whose QR code links to the real file.
+///
+/// Recognition cannot rescue these invoices on its own: the image simply has no
+/// amount. This decodes the QR code of the stored original, follows the link
+/// through the same download pipeline new mail uses, replaces the original and
+/// re-runs recognition. `limit` caps one run; the whole eligible set is
+/// processed when it is `None`, and invoices left out by the cap are not
+/// counted as examined.
+pub async fn recover_qr_invoices(
+    state: &AppState,
+    limit: Option<u32>,
+) -> Result<QrRecoveryReportDto, AppError> {
+    let report = state.qr_recovery_service().recover_all(limit).await?;
+    Ok(qr_recovery_dto(report))
+}
+
+/// Rescues one stored image invoice the user picked in the drawer.
+pub async fn recover_qr_invoice(
+    state: &AppState,
+    item_id: Uuid,
+) -> Result<QrRecoveryReportDto, AppError> {
+    let report = state.qr_recovery_service().recover_item(item_id).await?;
+    Ok(qr_recovery_dto(report))
+}
+
+/// One skip-reason bucket of a link rescue run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRecoverySkipDto {
+    pub code: String,
+    pub label: String,
+    pub count: u32,
+}
+
+/// What one "补救链接票据" run changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRecoveryReportDto {
+    /// Link placeholders the run looked at.
+    pub examined: u32,
+    /// Placeholders whose stored file was replaced by a downloaded invoice.
+    pub downloaded: u32,
+    /// Placeholders that ended recognized after the replacement.
+    pub recognized: u32,
+    /// Placeholders that could not be rescued; see `skippedBreakdown`.
+    pub skipped: u32,
+    /// Placeholders marked as non-invoice files during the run.
+    pub archived: u32,
+    /// Placeholders skipped because the host is not an invoice portal.
+    pub not_invoice_portal: u32,
+    /// Skip reasons grouped by stable code, deterministic by code.
+    pub skipped_breakdown: Vec<LinkRecoverySkipDto>,
+}
+
+fn link_skip_label(code: &str) -> &'static str {
+    match code {
+        link_recovery::LINK_SKIP_MISSING_URL => "占位里没有链接",
+        link_recovery::LINK_SKIP_INVALID_URL => "链接不合法",
+        link_recovery::LINK_SKIP_NOT_INVOICE_PORTAL => "非发票网站",
+        link_recovery::LINK_SKIP_REQUIRES_LOGIN => "门户需要登录",
+        link_recovery::LINK_SKIP_EXPIRED => "链接已失效",
+        link_recovery::LINK_SKIP_DOWNLOAD_FAILED => "下载失败",
+        link_recovery::LINK_SKIP_NOT_INVOICE => "下载到的不是发票",
+        link_recovery::LINK_SKIP_REPLACE_FAILED => "替换原件失败",
+        link_recovery::LINK_SKIP_RECOGNIZED_FAILED => "重新识别失败",
+        _ => "其他原因",
+    }
+}
+
+fn link_recovery_dto(report: LinkRecoveryReport) -> LinkRecoveryReportDto {
+    LinkRecoveryReportDto {
+        examined: report.examined,
+        downloaded: report.downloaded,
+        recognized: report.recognized,
+        skipped: report.skipped,
+        archived: report.archived,
+        not_invoice_portal: report.not_invoice_portal,
+        skipped_breakdown: report
+            .skip_reasons
+            .into_iter()
+            .map(|entry| LinkRecoverySkipDto {
+                label: link_skip_label(&entry.code).to_owned(),
+                code: entry.code,
+                count: entry.count,
+            })
+            .collect(),
+    }
+}
+
+/// Rescues every stored link placeholder that can still become an invoice.
+///
+/// Recognition cannot rescue these invoices on its own: the placeholder only
+/// contains the mail link. This reads the link, downloads it through the same
+/// pipeline new mail uses, replaces the placeholder and re-runs recognition.
+/// Marketing/tracking hosts are not requested at all and are marked as
+/// non-invoice files. `limit` caps one run; the whole eligible set is processed
+/// when it is `None`, and placeholders left out by the cap are not counted as
+/// examined.
+pub async fn recover_link_invoices(
+    state: &AppState,
+    limit: Option<u32>,
+) -> Result<LinkRecoveryReportDto, AppError> {
+    let report = state.link_recovery_service().recover_all(limit).await?;
+    Ok(link_recovery_dto(report))
+}
+
+/// Rescues one stored link placeholder the user picked in the drawer.
+pub async fn recover_link_invoice(
+    state: &AppState,
+    item_id: Uuid,
+) -> Result<LinkRecoveryReportDto, AppError> {
+    let report = state.link_recovery_service().recover_item(item_id).await?;
+    Ok(link_recovery_dto(report))
+}
+
+/// What one "把非发票文件移出待处理队列" run changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveNonInvoiceReportDto {
+    pub archived_count: u32,
+}
+
+/// Dismisses every office document / archive that can never be an invoice.
+///
+/// The files stay in the library ("全部") and on disk; only their queue views,
+/// the pending/failed counters and the bulk-confirm statistics stop counting
+/// them. The mark is persistent, so a dismissed file never comes back into the
+/// queue by itself.
+pub async fn archive_non_invoice_items(
+    state: &AppState,
+) -> Result<ArchiveNonInvoiceReportDto, AppError> {
+    let repository = ItemRepository::new(state.pool().clone());
+    let archived = repository
+        .mark_non_invoice_documents(NON_INVOICE_DOCUMENT_REASON)
+        .await?;
+    Ok(ArchiveNonInvoiceReportDto {
+        archived_count: u32::try_from(archived).unwrap_or(u32::MAX),
+    })
+}
+
+/// Counts behind the inbox "N 个非发票文件 → 移出队列" banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NonInvoiceSummaryDto {
+    /// Office documents / archives the dismissal would mark right now.
+    pub markable_count: u64,
+    /// Already dismissed files (still visible in "全部").
+    pub marked_count: u64,
+}
+
+pub async fn non_invoice_summary(state: &AppState) -> Result<NonInvoiceSummaryDto, AppError> {
+    let repository = ItemRepository::new(state.pool().clone());
+    Ok(NonInvoiceSummaryDto {
+        markable_count: repository.count_non_invoice_candidates().await?,
+        marked_count: repository.count_marked_non_invoice().await?,
+    })
+}
+
+/// One bucket of invoices a bulk recoverable confirmation had to skip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverableSettleSkipDto {
+    pub code: String,
+    pub label: String,
+    pub count: u32,
+}
+
+/// Report of the inbox-level "批量确认可推导的票据" action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverableSettleOutcomeDto {
+    pub confirmed_count: u32,
+    pub skipped_count: u32,
+    pub filled_invoice_date_count: u32,
+    pub applied_category_count: u32,
+    /// Normalized PDFs regenerated for the invoices confirmed above.
+    pub repaired_count: u32,
+    /// Skip reasons grouped by stable code, deterministic by code.
+    pub skipped_breakdown: Vec<RecoverableSettleSkipDto>,
+}
+
+fn recoverable_skip_label(code: &str) -> &'static str {
+    match code {
+        "missing_amount" => "缺金额",
+        "missing_invoice_date" => "缺开票日期",
+        "missing_normalized_pdf" => "缺归一化 PDF",
+        "missing_category" => "缺分类",
+        "suspected_duplicate" => "疑似重复",
+        "recognition_failed" => "识别失败",
+        "not_recognized" => "尚未完成识别",
+        "unsupported_format" => "原件格式不支持",
+        _ => "其他原因",
+    }
+}
+
+/// Confirms every pending invoice in the library whose missing values can be
+/// derived from what is already stored, then repairs the normalized PDFs the
+/// confirmed invoices still miss.
+///
+/// The per-invoice rules live in `BatchService::settle_recoverable_items` and
+/// are shared with the per-batch settle. Only an explicit user action runs this:
+/// no read path ever confirms invoices on its own.
+pub async fn settle_recoverable_items(
+    state: &AppState,
+) -> Result<RecoverableSettleOutcomeDto, AppError> {
+    let service = BatchService::new(state.pool().clone());
+    let outcome = service
+        .settle_recoverable_items(RecoverableSettleInput::default())
+        .await?;
+    let repaired_count = if outcome.confirmed_item_ids.is_empty() {
+        0
+    } else {
+        let items = ItemRepository::new(state.pool().clone())
+            .list_by_ids(&outcome.confirmed_item_ids)
+            .await?;
+        repair_missing_normalized_pdfs(state.paths(), &state.recognition_service(), &items).await
+    };
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    for skipped in &outcome.skipped {
+        let count = counts.entry(skipped.code.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    let skipped_breakdown = counts
+        .into_iter()
+        .map(|(code, count)| RecoverableSettleSkipDto {
+            label: recoverable_skip_label(&code).to_owned(),
+            code,
+            count,
+        })
+        .collect();
+    Ok(RecoverableSettleOutcomeDto {
+        confirmed_count: outcome.confirmed_count,
+        skipped_count: u32::try_from(outcome.skipped.len()).unwrap_or(u32::MAX),
+        filled_invoice_date_count: outcome.filled_invoice_date_count,
+        applied_category_count: outcome.applied_category_count,
+        repaired_count,
+        skipped_breakdown,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginalOpenTarget {
     LocalPath(PathBuf),
@@ -480,6 +894,14 @@ impl TryFrom<(ItemFilterDto, DateTime<Utc>)> for ItemFilter {
     fn try_from((filter, now): (ItemFilterDto, DateTime<Utc>)) -> Result<Self, Self::Error> {
         Ok(Self {
             status: filter.status,
+            source_account_id: filter
+                .source_account_id
+                .map(|id| {
+                    Uuid::parse_str(&id)
+                        .map_err(|_| AppError::validation("sourceAccountId", "invalid account ID"))
+                })
+                .transpose()?,
+            source_uid: filter.source_uid,
             created_after: filter
                 .recent
                 .then(|| crate::services::dashboard::recent_item_cutoff(now)),
@@ -518,7 +940,11 @@ pub(crate) mod ipc {
     use tauri::State;
     use uuid::Uuid;
 
-    use super::{InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto, ReviewItemInputDto};
+    use super::{
+        ArchiveNonInvoiceReportDto, InvoiceItemDto, ItemFilterDto, LinkRecoveryReportDto,
+        ManualImportOutcomeDto, NonInvoiceSummaryDto, QrRecoveryReportDto,
+        RecoverableSettleOutcomeDto, RetryFailedRecognitionsReport, ReviewItemInputDto,
+    };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
     use crate::state::AppState;
@@ -579,5 +1005,66 @@ pub(crate) mod ipc {
         item_id: Uuid,
     ) -> Result<InvoiceItemDto, AppError> {
         super::retry_recognition(&state, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn retry_failed_recognitions(
+        state: State<'_, AppState>,
+        limit: Option<u32>,
+    ) -> Result<RetryFailedRecognitionsReport, AppError> {
+        super::retry_failed_recognitions(&state, limit).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn settle_recoverable_items(
+        state: State<'_, AppState>,
+    ) -> Result<RecoverableSettleOutcomeDto, AppError> {
+        super::settle_recoverable_items(&state).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_qr_invoices(
+        state: State<'_, AppState>,
+        limit: Option<u32>,
+    ) -> Result<QrRecoveryReportDto, AppError> {
+        super::recover_qr_invoices(&state, limit).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_qr_invoice(
+        state: State<'_, AppState>,
+        item_id: Uuid,
+    ) -> Result<QrRecoveryReportDto, AppError> {
+        super::recover_qr_invoice(&state, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_link_invoices(
+        state: State<'_, AppState>,
+        limit: Option<u32>,
+    ) -> Result<LinkRecoveryReportDto, AppError> {
+        super::recover_link_invoices(&state, limit).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_link_invoice(
+        state: State<'_, AppState>,
+        item_id: Uuid,
+    ) -> Result<LinkRecoveryReportDto, AppError> {
+        super::recover_link_invoice(&state, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn archive_non_invoice_items(
+        state: State<'_, AppState>,
+    ) -> Result<ArchiveNonInvoiceReportDto, AppError> {
+        super::archive_non_invoice_items(&state).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn get_non_invoice_summary(
+        state: State<'_, AppState>,
+    ) -> Result<NonInvoiceSummaryDto, AppError> {
+        super::non_invoice_summary(&state).await
     }
 }

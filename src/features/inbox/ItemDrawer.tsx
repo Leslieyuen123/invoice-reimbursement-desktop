@@ -1,13 +1,17 @@
-import { Check, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, Link2, QrCode, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../lib/api";
 import { formatAmountCents } from "../../lib/amount";
+import { formatLocalDateTime } from "../../lib/datetime";
+import { isSystemNote, systemNote } from "../../lib/systemNote";
 import {
   MAX_SAFE_AMOUNT_CENTS,
   type AppError,
   type Category,
   type InvoiceItemDto,
+  type LinkRecoveryReportDto,
+  type QrRecoveryReportDto,
 } from "../../types";
 import { ItemPreview } from "./ItemPreview";
 
@@ -16,6 +20,7 @@ const categories: Array<{ value: Category; label: string }> = [
   { value: "dining", label: "餐饮" },
   { value: "accommodation", label: "住宿" },
   { value: "hospitality", label: "招待" },
+  { value: "other", label: "其他" },
 ];
 
 const categoryLabels = Object.fromEntries(
@@ -69,6 +74,57 @@ function messageFromError(error: unknown) {
   return "保存失败，请重试";
 }
 
+/**
+ * Mirrors the backend QR rescue scope: an image original outside a batch with
+ * no amount is the only shape that can be repaired by following its QR link.
+ */
+function canRescueQrInvoice(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus !== "suspected_duplicate" &&
+    /\.(jpe?g|png)$/iu.test(item.originalName)
+  );
+}
+
+function qrRecoveryReportText(report: QrRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  return `已补救 ${report.recognized} 张，${skipped}`;
+}
+
+/**
+ * Mirrors the backend link rescue scope: a `.url` placeholder outside a batch
+ * with no amount and marked unique is the only shape it can repair.
+ */
+function canRescueLinkInvoice(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus === "unique" &&
+    !item.nonInvoiceReason &&
+    /\.url$/iu.test(item.originalName)
+  );
+}
+
+function linkRecoveryReportText(report: LinkRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  const archived =
+    report.archived > 0
+      ? `，已归档 ${report.archived} 个非发票链接（其中非发票网站 ${report.notInvoicePortal} 个）`
+      : "";
+  return `已补救 ${report.recognized} 张，${skipped}${archived}`;
+}
+
 export function ItemDrawer({
   item,
   onClose,
@@ -76,7 +132,7 @@ export function ItemDrawer({
   onSaved,
 }: ItemDrawerProps) {
   const [category, setCategory] = useState<Category>(
-    item.finalCategory ?? item.suggestedCategory ?? "transport",
+    item.finalCategory ?? item.suggestedCategory ?? "other",
   );
   const [invoiceDate, setInvoiceDate] = useState(item.invoiceDate ?? "");
   const [suggestedPeriod, setSuggestedPeriod] = useState(
@@ -85,7 +141,11 @@ export function ItemDrawer({
   const [amount, setAmount] = useState(() => initialAmount(item));
   const [city, setCity] = useState(item.city ?? "");
   const [company, setCompany] = useState(item.company ?? "");
-  const [note, setNote] = useState(item.note ?? "");
+  // The backend writes machine reasons such as "识别失败：…" into the same
+  // column the user types remarks into. Show those as a reason, and keep the
+  // remark box for the user so saving an unrelated field cannot turn the
+  // system reason into a user remark.
+  const [note, setNote] = useState(isSystemNote(item.note) ? "" : (item.note ?? ""));
   const [eventTag, setEventTag] = useState(item.eventTag ?? "");
   const [projectTag, setProjectTag] = useState(item.projectTag ?? "");
   const [amountError, setAmountError] = useState<string | null>(null);
@@ -93,6 +153,16 @@ export function ItemDrawer({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [rescuingQr, setRescuingQr] = useState(false);
+  const [qrRecoveryReport, setQrRecoveryReport] =
+    useState<QrRecoveryReportDto | null>(null);
+  const [qrRecoveryError, setQrRecoveryError] = useState<string | null>(null);
+  const [rescuingLink, setRescuingLink] = useState(false);
+  const [linkRecoveryReport, setLinkRecoveryReport] =
+    useState<LinkRecoveryReportDto | null>(null);
+  const [linkRecoveryError, setLinkRecoveryError] = useState<string | null>(
+    null,
+  );
   const [resolvingDuplicate, setResolvingDuplicate] = useState<
     "keep" | "delete" | null
   >(null);
@@ -190,7 +260,7 @@ export function ItemDrawer({
         amountCents: parsedAmount.cents,
         city: optional(city),
         company: optional(company),
-        note: optional(note),
+        note: optional(note) ?? (isSystemNote(item.note) ? item.note : null),
         eventTag: optional(eventTag),
         projectTag: optional(projectTag),
       });
@@ -206,6 +276,8 @@ export function ItemDrawer({
     }
   }
 
+  const failureReason = systemNote(item.note);
+
   async function retryRecognition() {
     setSaveError(null);
     setRetrying(true);
@@ -215,6 +287,43 @@ export function ItemDrawer({
       setSaveError(messageFromError(error));
     } finally {
       setRetrying(false);
+    }
+  }
+
+  async function rescueQrInvoice() {
+    setSaveError(null);
+    setQrRecoveryError(null);
+    setRescuingQr(true);
+    try {
+      const report = await api.recoverQrInvoice(item.id);
+      setQrRecoveryReport(report);
+      // A downloaded original means the row changed; reload it so the read-only
+      // section (and the parent list) show the recognized values.
+      if (report.downloaded > 0) onSaved(await api.getItem(item.id));
+    } catch (error) {
+      setQrRecoveryError(messageFromError(error));
+    } finally {
+      setRescuingQr(false);
+    }
+  }
+
+  async function rescueLinkInvoice() {
+    setSaveError(null);
+    setLinkRecoveryError(null);
+    setRescuingLink(true);
+    try {
+      const report = await api.recoverLinkInvoice(item.id);
+      setLinkRecoveryReport(report);
+      // A downloaded original or an archived non-invoice placeholder means the
+      // row changed; reload it so the drawer and the parent list (where an
+      // archived placeholder is no longer a queue entry) show the new state.
+      if (report.downloaded > 0 || report.archived > 0) {
+        onSaved(await api.getItem(item.id));
+      }
+    } catch (error) {
+      setLinkRecoveryError(messageFromError(error));
+    } finally {
+      setRescuingLink(false);
     }
   }
 
@@ -265,6 +374,72 @@ export function ItemDrawer({
         />
 
         <div className="item-editor">
+          {(() => {
+            const readiness = [
+              { label: "开票日期", ok: item.invoiceDate !== null },
+              { label: "金额", ok: item.amountCents !== null },
+              {
+                // Export and batch membership only accept `finalCategory`; a
+                // suggested category alone does not make an invoice ready, so
+                // the ✓ here must not be looser than the export rule.
+                label: "分类",
+                ok: item.finalCategory !== null,
+              },
+              { label: "归属月份", ok: item.suggestedPeriod !== null },
+              { label: "归一化 PDF", ok: item.hasNormalizedPdf },
+            ];
+            const missing = readiness.filter((entry) => !entry.ok);
+            return (
+              <section
+                className="item-readiness"
+                aria-label="导出就绪检查"
+                data-ready={missing.length === 0 ? "true" : "false"}
+              >
+                <h3>导出就绪检查</h3>
+                <ul>
+                  {readiness.map((entry) => (
+                    <li key={entry.label} data-ok={entry.ok ? "true" : "false"}>
+                      <span aria-hidden="true">{entry.ok ? "✓" : "✗"}</span>
+                      {entry.label}
+                    </li>
+                  ))}
+                </ul>
+                <p>
+                  {missing.length === 0
+                    ? "这张票据可以进入批次并导出。"
+                    : `还缺：${missing.map((entry) => entry.label).join("、")}。`}
+                </p>
+              </section>
+            );
+          })()}
+          {failureReason ? (
+            <p className="item-failure-reason" role="alert">
+              <strong>失败原因</strong>
+              <span>{failureReason}</span>
+            </p>
+          ) : null}
+          {qrRecoveryError ? (
+            <p className="item-failure-reason" role="alert">
+              <strong>二维码补救</strong>
+              <span>{qrRecoveryError}</span>
+            </p>
+          ) : null}
+          {qrRecoveryReport ? (
+            <p className="item-normalization-warning" role="status">
+              {qrRecoveryReportText(qrRecoveryReport)}
+            </p>
+          ) : null}
+          {linkRecoveryError ? (
+            <p className="item-failure-reason" role="alert">
+              <strong>链接补救</strong>
+              <span>{linkRecoveryError}</span>
+            </p>
+          ) : null}
+          {linkRecoveryReport ? (
+            <p className="item-normalization-warning" role="status">
+              {linkRecoveryReportText(linkRecoveryReport)}
+            </p>
+          ) : null}
           {!item.hasNormalizedPdf ? (
             <p className="item-normalization-warning" role="status">
               这张票据还没有归一化 PDF，导出时会被拒绝。PDF、JPG、PNG
@@ -279,9 +454,19 @@ export function ItemDrawer({
                 <dd>{item.sourceType === "email" ? "邮箱" : "手动上传"}</dd>
               </div>
               <div>
-                <dt>抓取时间</dt>
-                <dd>{item.fetchedAt.replace("T", " ").slice(0, 16)}</dd>
+                <dt>邮件收到</dt>
+                <dd>
+                  {item.sourceType === "email"
+                    ? formatLocalDateTime(item.fetchedAt)
+                    : "手动导入"}
+                </dd>
               </div>
+              {item.sourceReceivedDate ? (
+                <div>
+                  <dt>归属日期</dt>
+                  <dd>{item.sourceReceivedDate}</dd>
+                </div>
+              ) : null}
               <div>
                 <dt>识别日期</dt>
                 <dd>{item.invoiceDate ?? "未识别"}</dd>
@@ -442,6 +627,38 @@ export function ItemDrawer({
               {resolvingDuplicate === "delete" ? "删除中" : "删除重复"}
             </button>
           </div>
+        ) : null}
+        {canRescueQrInvoice(item) ? (
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={
+              rescuingQr ||
+              retrying ||
+              saving ||
+              resolvingDuplicate !== null
+            }
+            onClick={() => void rescueQrInvoice()}
+          >
+            <QrCode size={16} strokeWidth={1.7} aria-hidden="true" />
+            {rescuingQr ? "补救中" : "补救二维码"}
+          </button>
+        ) : null}
+        {canRescueLinkInvoice(item) ? (
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={
+              rescuingLink ||
+              retrying ||
+              saving ||
+              resolvingDuplicate !== null
+            }
+            onClick={() => void rescueLinkInvoice()}
+          >
+            <Link2 size={16} strokeWidth={1.7} aria-hidden="true" />
+            {rescuingLink ? "补救中" : "补救链接"}
+          </button>
         ) : null}
         <button
           className="button button-secondary"

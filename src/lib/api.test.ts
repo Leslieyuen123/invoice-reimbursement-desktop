@@ -58,6 +58,7 @@ const preferencesInput: PreferencesInputDto = {
   backgroundSyncEnabled: true,
   exportDirectory: "/Users/finance/Exports",
   batchDirectoryPattern: "{batchName}-{timestamp}",
+  markProcessedMailSeen: true,
 };
 
 const commandCases: Array<{

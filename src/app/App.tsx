@@ -12,6 +12,7 @@ import { BatchDetailPage } from "../features/batches/BatchDetailPage";
 import { BatchListPage } from "../features/batches/BatchListPage";
 import { CreateBatchDialog } from "../features/batches/CreateBatchDialog";
 import { InboxPage } from "../features/inbox/InboxPage";
+import { MailLedgerPage } from "../features/mail/MailLedgerPage";
 import { SettingsPage } from "../features/settings/SettingsPage";
 import { AppShell } from "./AppShell";
 
@@ -36,6 +37,7 @@ export function App() {
           <Route element={<AppShell />}>
             <Route index element={<DashboardPage />} />
             <Route path="inbox" element={<InboxPage />} />
+            <Route path="mail" element={<MailLedgerPage />} />
             <Route path="batches" element={<BatchListPage />} />
             <Route path="batches/new" element={<CreateBatchDialog />} />
             <Route path="batches/:batchId" element={<BatchDetailPage />} />

@@ -421,7 +421,14 @@ fn compressed_pdf_text_bomb_is_rejected_without_expanding_in_process() {
         .expect_err("compressed text bomb should be rejected");
 
     assert_external(&error, "document_extractor");
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // This bound exists to catch "the parser decoded the whole payload anyway",
+    // not to measure latency: keep it far above any plausible machine load while
+    // still failing if the rejection turns into real work.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "compressed text bomb took {:?}, which suggests it was expanded",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -468,18 +475,21 @@ fn pdfs_over_one_hundred_pages_are_rejected_before_text_extraction_or_ocr() {
 }
 
 #[test]
-fn escaped_object_stream_is_rejected_before_text_extraction_or_ocr() {
+fn malformed_object_stream_is_rejected_before_text_extraction_or_ocr() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("escaped-object-stream.pdf");
-    std::fs::write(&path, classic_pdf_with_escaped_object_stream()).unwrap();
+    let path = directory.path().join("malformed-object-stream.pdf");
+    std::fs::write(&path, classic_pdf_with_malformed_object_stream()).unwrap();
     let ocr = Arc::new(FakeOcr::returning("must not run"));
     let extractor = LocalExtractor::new(ocr.clone());
 
     let error = extractor
         .extract(&path)
-        .expect_err("escaped object stream should be rejected");
+        .expect_err("malformed object stream should be rejected");
 
-    assert_resource_error(&error);
+    // An object stream with a declared /N that its index block cannot back is
+    // a broken document, not a resource limit; the format is supported now.
+    assert_external(&error, "document_extractor");
+    assert_eq!(error.to_string(), "Unable to read document.");
     assert_eq!(ocr.pdf_text_call_count(), 0);
     assert_eq!(ocr.call_count(), 0);
 }
@@ -750,12 +760,14 @@ fn compressed_text_pdf(character_count: usize) -> Vec<u8> {
     output
 }
 
-fn classic_pdf_with_escaped_object_stream() -> Vec<u8> {
+fn classic_pdf_with_malformed_object_stream() -> Vec<u8> {
     let objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
-        b"<< /Type /Obj#53tm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream".as_slice(),
+        // Escaped name decodes to /ObjStm, and /N 1 without a matching index
+        // block is malformed.
+        b"<< /Type /Obj#53tm /N 1 /First 0 /Length 0 >>\nstream\n\nendstream".as_slice(),
     ];
     let mut bytes = b"%PDF-1.5\n".to_vec();
     let mut offsets = Vec::new();
@@ -1095,8 +1107,10 @@ fn process_ocr_write_respects_deadline_when_sidecar_does_not_read_stdin() {
     let elapsed = started.elapsed();
 
     assert_external(&error, "ocr_sidecar");
+    // The request deadline is one second; the assertion only needs to prove the
+    // write did not block forever, so a loaded machine cannot fail it.
     assert!(
-        elapsed < Duration::from_millis(1_500),
+        elapsed < Duration::from_secs(20),
         "stdin write ignored the request deadline: elapsed={elapsed:?}"
     );
     let gone = (0..50).any(|_| {

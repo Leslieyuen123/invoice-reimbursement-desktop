@@ -52,6 +52,7 @@ function itemFixture(overrides: Partial<InvoiceItemDto> = {}): InvoiceItemDto {
     sourceType: "email",
     sourceAccountId: "account-finance",
     fetchedAt: "2026-07-15T09:45:00+08:00",
+    sourceReceivedDate: null,
     invoiceDate: "2026-07-14",
     suggestedPeriod: "2026-07",
     batchId: null,
@@ -75,7 +76,10 @@ function itemFixture(overrides: Partial<InvoiceItemDto> = {}): InvoiceItemDto {
   };
 }
 
-function detailFixture(items: InvoiceItemDto[] = []): BatchDetailDto {
+function detailFixture(
+  items: InvoiceItemDto[] = [],
+  summaryOverrides: Partial<BatchDetailDto["summary"]> = {},
+): BatchDetailDto {
   const totalAmountCents = items.reduce(
     (total, item) => total + (item.amountCents ?? 0),
     0,
@@ -93,7 +97,9 @@ function detailFixture(items: InvoiceItemDto[] = []): BatchDetailDto {
       dining: { itemCount: 0, amountCents: 0 },
       accommodation: { itemCount: 0, amountCents: 0 },
       hospitality: { itemCount: 0, amountCents: 0 },
+      other: { itemCount: 0, amountCents: 0 },
       unconfirmedCount: 0,
+      ...summaryOverrides,
     },
     warnings: [],
     issues: [],
@@ -241,6 +247,181 @@ describe("Batch workspace", () => {
     expect(await screen.findByText(/merged\.pdf/)).toBeInTheDocument();
   });
 
+  it("moves the batch range without rebuilding the batch", async () => {
+    const user = userEvent.setup();
+    let detail = detailFixture([itemFixture()]);
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("get_batch", () => detail);
+    mockCommand("update_batch_range", (arguments_) => {
+      const input = (arguments_ as { input: { startDate: string; endDate: string } })
+        .input;
+      expect(input).toEqual({
+        startDate: "2026-06-01",
+        endDate: "2026-09-15",
+      });
+      detail = {
+        ...detail,
+        batch: {
+          ...detail.batch,
+          endDate: "2026-09-15",
+          status: "draft",
+        },
+      };
+      return detail;
+    });
+
+    renderAppAt("/batches/batch-summer");
+
+    await user.click(
+      await screen.findByRole("button", { name: "编辑批次范围" }),
+    );
+    const endDate = screen.getByLabelText("结束日期");
+    await user.clear(endDate);
+    await user.type(endDate, "2026-09-15");
+    await user.click(screen.getByRole("button", { name: "保存范围" }));
+
+    await waitFor(() =>
+      expect(commandCalls("update_batch_range")).toHaveLength(1),
+    );
+    expect(
+      await screen.findByText("2026-06-01 至 2026-09-15"),
+    ).toBeInTheDocument();
+  });
+
+  it("removes the selected invoices in one bulk call", async () => {
+    const user = userEvent.setup();
+    const first = itemFixture({ id: "invoice-one", originalName: "一号.pdf" });
+    const second = itemFixture({ id: "invoice-two", originalName: "二号.pdf" });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    let detail = detailFixture([first, second]);
+    mockCommand("get_batch", () => detail);
+    mockCommand("remove_batch_items", (arguments_) => {
+      const removed = (arguments_ as { itemIds: string[] }).itemIds;
+      expect(removed).toEqual(["invoice-one"]);
+      detail = detailFixture([second]);
+      return detail;
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("checkbox", { name: "选择 一号.pdf" }),
+    );
+
+    expect(screen.getByText("已选 1 张")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "移出所选票据" }));
+
+    await waitFor(() =>
+      expect(commandCalls("remove_batch_items")).toHaveLength(1),
+    );
+    expect(
+      await screen.findByRole("checkbox", { name: "选择 二号.pdf" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: "选择 一号.pdf" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("settles derivable invoices and reports the ones that still need work", async () => {
+    const user = userEvent.setup();
+    const pending = itemFixture({
+      id: "invoice-pending",
+      originalName: "待确认.pdf",
+      status: "pending_confirmation",
+      confirmationStatus: "pending",
+      finalCategory: null,
+      suggestedCategory: "dining",
+    });
+    const noAmount = itemFixture({
+      id: "invoice-no-amount",
+      originalName: "缺金额.pdf",
+      status: "pending_confirmation",
+      confirmationStatus: "pending",
+      amountCents: null,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    let detail = detailFixture([pending, noAmount], { unconfirmedCount: 2 });
+    mockCommand("get_batch", () => detail);
+    mockCommand("settle_batch_items", () => {
+      detail = detailFixture(
+        [
+          { ...pending, confirmationStatus: "confirmed", status: "ready" },
+          noAmount,
+        ],
+        { unconfirmedCount: 1 },
+      );
+      return {
+        confirmedCount: 1,
+        filledInvoiceDateCount: 1,
+        appliedCategoryCount: 1,
+        repairedCount: 0,
+        skipped: [
+          {
+            itemId: "invoice-no-amount",
+            fileName: "缺金额.pdf",
+            code: "missing_amount",
+            message: "缺少金额，必须对照原件人工填写",
+          },
+        ],
+      };
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(
+      await screen.findByRole("button", { name: "清空待确认（2）" }),
+    );
+    // The dialog files every uncategorized invoice under 其他 by default and
+    // still lets the user choose another category or none.
+    const defaultCategorySelect = screen.getByRole("combobox", {
+      name: /没有分类时统一设为/,
+    });
+    expect(defaultCategorySelect).toHaveValue("other");
+    expect(
+      within(defaultCategorySelect).getByRole("option", { name: "其他" }),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "确认可推导的票据" }),
+    );
+
+    // commandCalls unwraps the `input` payload of wire commands.
+    expect(commandCalls("settle_batch_items")[0]).toEqual({
+      fillInvoiceDateFromReceived: true,
+      applySuggestedCategory: true,
+      // Defaults to "其他": the user's rule is that an invoice without a
+      // category is filed under 其他 instead of staying unclassified.
+      defaultCategory: "other",
+    });
+    const report = await screen.findByRole("status", {
+      name: "已确认 1 张票据",
+    });
+    expect(within(report).getByText("1 张按邮件收到日期补齐开票日期")).toBeInTheDocument();
+    expect(within(report).getByText("缺金额.pdf")).toBeInTheDocument();
+    expect(
+      within(report).getByText("缺少金额，必须对照原件人工填写"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows 其他 in the category summary and the member table", async () => {
+    const otherItem = itemFixture({
+      id: "invoice-other",
+      originalName: "其他票据.pdf",
+      suggestedCategory: "other",
+      finalCategory: "other",
+    });
+    mockDetail(
+      detailFixture([otherItem], {
+        transport: { itemCount: 0, amountCents: 0 },
+        other: { itemCount: 1, amountCents: 12_850 },
+      }),
+    );
+
+    renderAppAt("/batches/batch-summer");
+
+    const summary = await screen.findByRole("region", { name: "分类汇总" });
+    expect(within(summary).getByText("其他")).toBeInTheDocument();
+    const members = screen.getByRole("region", { name: "已归属票据" });
+    expect(within(members).getByText("其他")).toBeInTheDocument();
+  });
+
   it("automatically processes and exports a newly created monthly batch", async () => {
     const user = userEvent.setup();
     const created = batchFixture({
@@ -316,6 +497,8 @@ describe("Batch workspace", () => {
     await act(async () => {
       automation.resolve(
         automationFixture({
+          movedFromOtherBatchesCount: 1,
+          categorizedAsOtherCount: 2,
           exceptionCount: 2,
           failedAccounts: [
             {
@@ -339,6 +522,8 @@ describe("Batch workspace", () => {
     expect(completionStatus).toHaveAttribute("aria-live", "polite");
     expect(screen.getByText("1 张新导入")).toBeInTheDocument();
     expect(screen.getByText("1 张已自动纳入")).toBeInTheDocument();
+    expect(screen.getByText("1 张从其他批次移入")).toBeInTheDocument();
+    expect(screen.getByText("2 张按其他分类纳入")).toBeInTheDocument();
     expect(screen.getByText("2 个异常项")).toBeInTheDocument();
     expect(screen.getByText("1 个邮箱失败")).toBeInTheDocument();
     expect(
@@ -940,7 +1125,7 @@ describe("Batch workspace", () => {
     expect(within(dialog).getByRole("checkbox", { name: "识别失败发票.pdf" })).toBeDisabled();
     expect(within(dialog).getByText("识别失败，不能归属")).toBeInTheDocument();
 
-    await user.type(within(dialog).getByLabelText("搜索未归属票据"), "苏州");
+    await user.type(within(dialog).getByLabelText("搜索票据"), "苏州");
     await user.click(within(dialog).getByRole("button", { name: "搜索" }));
     expect(await within(dialog).findByText("苏州酒店发票.pdf")).toBeInTheDocument();
     expect(within(dialog).getByText("日期超出批次范围")).toBeInTheDocument();
@@ -979,6 +1164,59 @@ describe("Batch workspace", () => {
       "日期超出批次范围；疑似重复，不能归属",
     );
     expect(screen.getByText("日期超出批次范围；疑似重复，不能归属")).toBeInTheDocument();
+  });
+
+  it("warns that an invoice owned by another batch will be moved on assignment", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(
+      itemFixture({
+        id: "invoice-reanchored",
+        originalName: "旧批次发票.pdf",
+        batchId: "batch-previous",
+      }),
+    );
+    mockDetail(detailFixture(), [candidate]);
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    const checkbox = await within(dialog).findByRole("checkbox", {
+      name: "旧批次发票.pdf",
+    });
+
+    expect(checkbox).toBeEnabled();
+    expect(checkbox).toHaveAccessibleDescription(
+      "已在其他批次，归属后将移入本批次",
+    );
+    expect(
+      within(dialog).getByText("已在其他批次，归属后将移入本批次"),
+    ).toBeInTheDocument();
+  });
+
+  it("reports invoices moved in from another batch after a manual assignment", async () => {
+    const user = userEvent.setup();
+    const candidate = candidateFixture(
+      itemFixture({ id: "invoice-moved", batchId: "batch-previous" }),
+    );
+    mockDetail(detailFixture(), [candidate]);
+    mockCommand("assign_items_to_batch", {
+      ...detailFixture([{ ...candidate.item, batchId: "batch-summer" }]),
+      movedFromOtherBatchesCount: 1,
+    });
+
+    renderAppAt("/batches/batch-summer");
+    await user.click(await screen.findByRole("button", { name: "调整票据" }));
+    const dialog = screen.getByRole("dialog", { name: "调整票据归属" });
+    await user.click(
+      await within(dialog).findByRole("checkbox", {
+        name: "高铁电子发票.pdf",
+      }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "归属所选票据" }));
+
+    expect(
+      await screen.findByText("已从其他批次移入 1 张票据"),
+    ).toBeInTheDocument();
   });
 
   it("does not let an earlier dialog session replace reopened candidate results", async () => {
@@ -1110,7 +1348,7 @@ describe("Batch workspace", () => {
     });
 
     expect(
-      await within(secondDialog).findByText("当前日期范围内没有未归属票据"),
+      await within(secondDialog).findByText("当前日期范围内没有可归属票据"),
     ).toBeInTheDocument();
     expect(within(secondDialog).queryByText("高铁电子发票.pdf")).not.toBeInTheDocument();
     expect(commandCalls("list_batch_candidates")).toHaveLength(3);

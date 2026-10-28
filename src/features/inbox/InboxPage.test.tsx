@@ -42,6 +42,7 @@ function pendingInvoiceFixture(
     sourceType: "email",
     sourceAccountId: "account-finance",
     fetchedAt: "2026-07-15T09:45:00+08:00",
+    sourceReceivedDate: null,
     invoiceDate: "2026-07-14",
     suggestedPeriod: "2026-07",
     batchId: null,
@@ -1301,6 +1302,309 @@ describe("InboxPage", () => {
     });
   });
 
+  it("retries every recognizable recognition failure in one go", async () => {
+    const user = userEvent.setup();
+    const failedItem = pendingInvoiceFixture({
+      status: "recognition_failed",
+      recognitionStatus: "failed",
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [failedItem], nextCursor: null });
+    mockCommand("retry_failed_recognitions", {
+      attempted: 3,
+      recovered: 2,
+      stillFailed: 1,
+      skipped: 4,
+    });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await screen.findByText("出租车电子发票.pdf");
+    const button = screen.getByRole("button", {
+      name: "重试全部识别失败",
+    });
+    expect(button).toBeEnabled();
+    await user.click(button);
+
+    await waitFor(() => {
+      expect(commandCalls("retry_failed_recognitions")).toHaveLength(1);
+    });
+    expect(commandCalls("retry_failed_recognitions")[0].limit).toBeUndefined();
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "已尝试 3 张，恢复 2 张，仍失败 1 张，跳过 4 张",
+    );
+  });
+
+  it("disables the bulk retry when the failed queue is empty", async () => {
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [], nextCursor: null });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    const button = await screen.findByRole("button", {
+      name: "重试全部识别失败",
+    });
+
+    expect(button).toBeDisabled();
+    expect(commandCalls("retry_failed_recognitions")).toEqual([]);
+  });
+
+  it("rescues QR invoices from the pending pool and explains every skip", async () => {
+    const user = userEvent.setup();
+    const qrItem = pendingInvoiceFixture({
+      originalName: "二维码发票.png",
+      amountCents: null,
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [qrItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_qr_invoices", {
+      examined: 2,
+      decoded: 2,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 1,
+      skippedBreakdown: [
+        { code: "download_failed", label: "下载失败", count: 1 },
+      ],
+    });
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await screen.findByText("二维码发票.png");
+    const qrButton = screen.getByRole("button", { name: "补救二维码票据" });
+    await user.click(qrButton);
+
+    await waitFor(() => {
+      expect(commandCalls("recover_qr_invoices")).toHaveLength(1);
+    });
+    expect(await screen.findByText(/已补救 1 张/)).toHaveTextContent(
+      "已补救 1 张（检查 2 张、解码 2 张、下载 1 张），跳过 1 张（下载失败 1 张）",
+    );
+  });
+
+  it("dismisses non-invoice files out of the pending queue", async () => {
+    const user = userEvent.setup();
+    let markableCount = 3;
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture({ amountCents: null })],
+      nextCursor: null,
+    });
+    mockCommand("get_non_invoice_summary", () => ({
+      markableCount,
+      markedCount: 0,
+    }));
+    mockCommand("archive_non_invoice_items", () => {
+      markableCount = 0;
+      return { archivedCount: 3 };
+    });
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await screen.findByText("出租车电子发票.pdf");
+    const dismiss = await screen.findByRole("button", {
+      name: "3 个非发票文件 → 移出队列",
+    });
+    expect(
+      screen.getByText(
+        "这些 Word/Excel/压缩包文件无法识别为发票，移出后仍可在「全部」查看",
+      ),
+    ).toBeInTheDocument();
+    await user.click(dismiss);
+
+    await waitFor(() => {
+      expect(commandCalls("archive_non_invoice_items")).toHaveLength(1);
+    });
+    expect(
+      await screen.findByText(
+        "已移出 3 个非发票文件（仍可在「全部」查看）",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("rescues a single QR invoice from the drawer", async () => {
+    const user = userEvent.setup();
+    const qrItem = pendingInvoiceFixture({
+      originalName: "二维码发票.png",
+      amountCents: null,
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [qrItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_qr_invoice", {
+      examined: 1,
+      decoded: 1,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 0,
+      skippedBreakdown: [],
+    });
+    mockCommand(
+      "get_item",
+      pendingInvoiceFixture({
+        originalName: "portal-invoice.pdf",
+        amountCents: 12_850,
+        hasNormalizedPdf: true,
+      }),
+    );
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await user.click(await screen.findByText("二维码发票.png"));
+    await user.click(screen.getByRole("button", { name: "补救二维码" }));
+
+    await waitFor(() => {
+      expect(commandCalls("recover_qr_invoice")).toEqual([
+        { itemId: "invoice-taxi" },
+      ]);
+    });
+    expect(await screen.findByText("已补救 1 张，跳过 0 张")).toBeInTheDocument();
+  });
+
+  it("rescues link placeholders from the pending pool and explains every skip", async () => {
+    const user = userEvent.setup();
+    const linkItem = pendingInvoiceFixture({
+      originalName: "download-1-2.url",
+      amountCents: null,
+      hasNormalizedPdf: false,
+      recognitionStatus: "failed",
+      status: "recognition_failed",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [linkItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_link_invoices", {
+      examined: 3,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 2,
+      archived: 1,
+      notInvoicePortal: 1,
+      skippedBreakdown: [
+        { code: "not_invoice_portal", label: "非发票网站", count: 1 },
+        { code: "requires_login", label: "门户需要登录", count: 1 },
+      ],
+    });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await screen.findByText("download-1-2.url");
+    const linkButton = screen.getByRole("button", { name: "补救链接票据" });
+    await user.click(linkButton);
+
+    await waitFor(() => {
+      expect(commandCalls("recover_link_invoices")).toHaveLength(1);
+    });
+    expect(await screen.findByText(/已补救 1 张/)).toHaveTextContent(
+      "已补救 1 张（检查 3 张、下载 1 张），跳过 2 张（非发票网站 1 张、门户需要登录 1 张），已归档 1 个非发票链接（其中非发票网站 1 个）",
+    );
+  });
+
+  it("rescues a single link placeholder from the drawer", async () => {
+    const user = userEvent.setup();
+    const linkItem = pendingInvoiceFixture({
+      originalName: "download-1-2.url",
+      amountCents: null,
+      hasNormalizedPdf: false,
+      recognitionStatus: "failed",
+      status: "recognition_failed",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [linkItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_link_invoice", {
+      examined: 1,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 0,
+      archived: 0,
+      notInvoicePortal: 0,
+      skippedBreakdown: [],
+    });
+    mockCommand(
+      "get_item",
+      pendingInvoiceFixture({
+        originalName: "portal-invoice.pdf",
+        amountCents: 12_850,
+        hasNormalizedPdf: true,
+        recognitionStatus: "succeeded",
+        status: "pending_confirmation",
+      }),
+    );
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await user.click(await screen.findByText("download-1-2.url"));
+    await user.click(screen.getByRole("button", { name: "补救链接" }));
+
+    await waitFor(() => {
+      expect(commandCalls("recover_link_invoice")).toEqual([
+        { itemId: "invoice-taxi" },
+      ]);
+    });
+    expect(await screen.findByText("已补救 1 张，跳过 0 张")).toBeInTheDocument();
+  });
+
+  it("archives a single non-portal link placeholder from the drawer", async () => {
+    const user = userEvent.setup();
+    const linkItem = pendingInvoiceFixture({
+      originalName: "download-1-2.url",
+      amountCents: null,
+      hasNormalizedPdf: false,
+      recognitionStatus: "failed",
+      status: "recognition_failed",
+    });
+    let listed = [linkItem];
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => ({ items: listed, nextCursor: null }));
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_link_invoice", {
+      examined: 1,
+      downloaded: 0,
+      recognized: 0,
+      skipped: 1,
+      archived: 1,
+      notInvoicePortal: 1,
+      skippedBreakdown: [
+        { code: "not_invoice_portal", label: "非发票网站", count: 1 },
+      ],
+    });
+    mockCommand("get_item", () => {
+      listed = [];
+      return linkItem;
+    });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await user.click(await screen.findByText("download-1-2.url"));
+    await user.click(screen.getByRole("button", { name: "补救链接" }));
+
+    await waitFor(() => {
+      expect(commandCalls("recover_link_invoice")).toEqual([
+        { itemId: "invoice-taxi" },
+      ]);
+    });
+    expect(
+      await screen.findByText(
+        "已补救 0 张，跳过 1 张（非发票网站 1 张），已归档 1 个非发票链接（其中非发票网站 1 个）",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(commandCalls("get_item")).toHaveLength(1);
+    });
+  });
+
   it("keeps or deletes suspected duplicates from the drawer", async () => {
     const user = userEvent.setup();
     const duplicateOne = pendingInvoiceFixture({
@@ -1431,6 +1735,85 @@ describe("InboxPage", () => {
     expect(screen.getByRole("columnheader", { name: "批次" })).toBeInTheDocument();
   });
 
+  it("lists what still blocks an export in the item drawer", async () => {
+    const user = userEvent.setup();
+    const incomplete = pendingInvoiceFixture({
+      id: "invoice-incomplete",
+      originalName: "缺字段.pdf",
+      amountCents: null,
+      finalCategory: null,
+      suggestedCategory: null,
+      hasNormalizedPdf: false,
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => ({ items: [incomplete], nextCursor: null }));
+
+    renderAppAt("/inbox");
+    await user.click(await screen.findByRole("button", { name: "缺字段.pdf" }));
+
+    const checklist = await screen.findByRole("region", {
+      name: "导出就绪检查",
+    });
+    expect(checklist).toHaveAttribute("data-ready", "false");
+    expect(within(checklist).getByText(/还缺：/)).toHaveTextContent("金额");
+    expect(within(checklist).getByText(/还缺：/)).toHaveTextContent("归一化 PDF");
+  });
+
+  it("keeps the readiness check honest when only a suggested category exists", async () => {
+    const user = userEvent.setup();
+    // Export and batch membership only accept `finalCategory`. A suggested
+    // category must therefore not show a ✓: the invoice is still blocked by
+    // "missing category".
+    const suggestedOnly = pendingInvoiceFixture({
+      id: "invoice-suggested-only",
+      originalName: "仅有建议分类.pdf",
+      finalCategory: null,
+      suggestedCategory: "dining",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => ({
+      items: [suggestedOnly],
+      nextCursor: null,
+    }));
+
+    renderAppAt("/inbox");
+    await user.click(
+      await screen.findByRole("button", { name: "仅有建议分类.pdf" }),
+    );
+
+    const checklist = await screen.findByRole("region", {
+      name: "导出就绪检查",
+    });
+    expect(checklist).toHaveAttribute("data-ready", "false");
+    expect(within(checklist).getByText(/还缺：/)).toHaveTextContent("分类");
+    const categoryRow = within(checklist).getByText("分类").closest("li");
+    expect(categoryRow).toHaveAttribute("data-ok", "false");
+  });
+
+  it("saves 其他 as the chosen category", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+    mockCommand("review_item", (arguments_) => {
+      const input = (arguments_ as { input: Record<string, unknown> }).input;
+      return pendingInvoiceFixture({
+        finalCategory: input.finalCategory as InvoiceItemDto["finalCategory"],
+        status: "ready",
+        confirmationStatus: "confirmed",
+      });
+    });
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await user.click(await screen.findByText("出租车电子发票.pdf"));
+    await user.click(screen.getByRole("radio", { name: "其他" }));
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+
+    expect(commandCalls("review_item")[0].finalCategory).toBe("other");
+  });
+
   it("opens the suspected-duplicate filter after importing a duplicate", async () => {
     const user = userEvent.setup();
     const serverItems: InvoiceItemDto[] = [];
@@ -1464,13 +1847,15 @@ describe("InboxPage", () => {
     await screen.findByText("当前筛选下没有票据");
     await user.click(screen.getByRole("button", { name: "选择文件" }));
 
+    // `history.pushState` is visible before React commits the tab state, so the
+    // URL and the rendered tab have to be awaited together.
     await waitFor(() => {
       expect(window.location.search).toBe("?status=suspected_duplicate");
+      expect(screen.getByRole("tab", { name: "疑似重复" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     });
-    expect(screen.getByRole("tab", { name: "疑似重复" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
     expect(await screen.findByText("重复票据.pdf")).toBeInTheDocument();
   });
 });

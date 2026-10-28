@@ -185,7 +185,7 @@ fn credential_read_timeout_error() -> AppError {
     AppError::External {
         service: "mailbox_credential".to_owned(),
         retryable: false,
-        message: "读取邮箱凭据超时，请解锁 Mac 后重试".to_owned(),
+        message: "钥匙串拒绝了本次读取：请在系统弹窗中点“始终允许”，或到“运行设置 → 邮箱账号”重新保存一次账号".to_owned(),
     }
 }
 
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credential_read_timeout_returns_unlock_guidance() {
+    async fn credential_read_timeout_names_both_ways_to_restore_access() {
         let error = get_credential(Arc::new(SlowCredentialStore), "account-id".to_owned())
             .await
             .unwrap_err();
@@ -224,7 +224,7 @@ mod tests {
             AppError::External {
                 service: "mailbox_credential".to_owned(),
                 retryable: false,
-                message: "读取邮箱凭据超时，请解锁 Mac 后重试".to_owned(),
+                message: "钥匙串拒绝了本次读取：请在系统弹窗中点“始终允许”，或到“运行设置 → 邮箱账号”重新保存一次账号".to_owned(),
             }
         );
     }

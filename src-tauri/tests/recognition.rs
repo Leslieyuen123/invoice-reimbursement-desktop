@@ -501,7 +501,9 @@ fn flattened_date_search_window_counts_unicode_characters() {
         NaiveDate::from_ymd_opt(2026, 6, 14)
     );
     assert_eq!(recognized.suggested_period, "2026-06");
-    assert!(recognized.warnings.is_empty());
+    // The template has a total row but no value, so the amount marker is the
+    // only warning; the date search itself still succeeded.
+    assert_eq!(recognized.warnings, ["ocr_text_without_amount"]);
     assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
 }
 
@@ -524,7 +526,8 @@ fn incomplete_metadata_falls_back_to_received_month_and_needs_confirmation() {
 
     assert_eq!(recognized.invoice_date, None);
     assert_eq!(recognized.suggested_period, "2026-07");
-    assert_eq!(recognized.category, None);
+    // No category keyword matches, so the user's rule files it under "其他".
+    assert_eq!(recognized.category, Some(Category::Other));
     assert_eq!(
         recognized.status(DedupeStatus::Unique),
         ItemStatus::PendingConfirmation
@@ -666,6 +669,86 @@ fn amount_uses_label_priority_instead_of_text_order_or_tax_amount() {
 }
 
 #[test]
+fn amount_supports_lowercase_total_labels_used_by_ocr_images() {
+    for (text, expected) in [
+        ("价税合计（小写）¥648.00", 64_800),
+        ("价税合计(小写) ￥648.00", 64_800),
+        ("价税合计 （小写）\n￥1014.00", 101_400),
+        ("合计金额：648.00", 64_800),
+        ("金额合计 ¥1,234.56", 123_456),
+        ("小写：648.00", 64_800),
+        ("应付金额 648.00元", 64_800),
+        // Shape of the text the OCR sidecar returns for an image invoice: one
+        // line per detected row, no separators around the label.
+        (
+            "北京增值税电子普通发票\n发票号码202607140001\n购买方北京示例科技有限公司\n价税合计128.50",
+            12_850,
+        ),
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+
+        assert_eq!(recognized.amount_cents, Some(expected), "{text}");
+    }
+}
+
+#[test]
+fn amount_accepts_full_width_digits_and_separators() {
+    for (text, expected) in [
+        ("价税合计（小写）￥６４８．００", 64_800),
+        ("价税合计（小写）￥１，２３４．５６", 123_456),
+        ("合计金额 ６４８．００", 64_800),
+    ] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+
+        assert_eq!(recognized.amount_cents, Some(expected), "{text}");
+    }
+}
+
+#[test]
+fn amount_rejects_rates_and_counts_instead_of_misreading_them() {
+    for text in ["税率 1% 数量 18", "税额 ¥6.42 税率 1% 数量 18"] {
+        let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+
+        assert_eq!(recognized.amount_cents, None, "{text}");
+        assert_eq!(recognized.warnings, ["ocr_text_without_amount"], "{text}");
+    }
+}
+
+#[test]
+fn ocr_text_without_amount_distinguishes_a_parse_failure_from_empty_text() {
+    let parsed_but_missing = recognize(
+        "开票日期：2026-06-18 餐饮服务 发票号码 202607140001",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+    assert_eq!(parsed_but_missing.amount_cents, None);
+    assert_eq!(
+        parsed_but_missing.warnings,
+        ["ocr_text_without_amount"],
+        "readable text without a total must say so"
+    );
+
+    let empty = recognize("   \n ", NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+    assert_eq!(empty.amount_cents, None);
+    assert!(
+        !empty
+            .warnings
+            .iter()
+            .any(|warning| warning == "ocr_text_without_amount"),
+        "empty OCR text is a recognition problem, not a parse problem"
+    );
+
+    let malformed = recognize(
+        "价税合计 ￥12.345",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+    assert_eq!(
+        malformed.warnings,
+        ["invalid_amount"],
+        "a malformed total keeps its own marker"
+    );
+}
+
+#[test]
 fn invalid_amount_formats_negative_values_and_overflow_are_rejected() {
     for text in [
         "价税合计 ￥1,23.45",
@@ -716,22 +799,45 @@ fn toll_invoice_vehicle_fields_are_transport() {
 }
 
 #[test]
-fn tied_category_scores_are_left_unclassified() {
+fn tied_category_scores_fall_back_to_other() {
     let recognized = recognize(
         "出租车 网约车 餐饮 食品",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
     );
 
-    assert_eq!(recognized.category, None);
+    assert_eq!(recognized.category, Some(Category::Other));
 }
 
 #[test]
-fn a_single_or_repeated_keyword_does_not_reach_the_category_threshold() {
+fn a_single_or_repeated_keyword_falls_back_to_other() {
     for text in ["酒店", "出租车 出租车 出租车"] {
         let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
 
-        assert_eq!(recognized.category, None, "{text}");
+        assert_eq!(recognized.category, Some(Category::Other), "{text}");
     }
+}
+
+#[test]
+fn unclassifiable_invoice_falls_back_to_other_and_can_auto_confirm() {
+    let recognized = recognize(
+        "开票日期：2026-06-18 价税合计 ￥128.50",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(
+        recognized.invoice_date,
+        NaiveDate::from_ymd_opt(2026, 6, 18)
+    );
+    assert_eq!(recognized.amount_cents, Some(12_850));
+    // No keyword matches, so "其他" is the only honest category, and because
+    // date + amount + category are now all present the original auto-confirm
+    // rule still confirms the invoice.
+    assert_eq!(recognized.category, Some(Category::Other));
+    assert!(recognized.warnings.is_empty());
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
 }
 
 #[test]
@@ -1056,6 +1162,72 @@ async fn repository_get_by_id_returns_the_persisted_item() {
 }
 
 #[tokio::test]
+async fn a_readable_invoice_without_an_amount_writes_the_stable_marker_note() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let record = sample_item(Uuid::new_v4());
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026-06-18\n餐饮 食品\n发票号码：202607140001".to_owned(),
+        normalized_pdf: None,
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::new(repository, extractor);
+
+    let recognized = service.recognize_item(record.id).await.unwrap();
+
+    assert_eq!(recognized.amount_cents, None);
+    assert_eq!(recognized.confirmation_status, ConfirmationStatus::Pending);
+    let note = recognized.note.unwrap_or_default();
+    assert!(
+        note.starts_with("识别失败：") && note.contains("ocr_text_without_amount"),
+        "the failure reason must carry the stable marker, got {note:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_user_remark_is_kept_when_the_amount_is_missing() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let mut record = sample_item(Uuid::new_v4());
+    record.note = Some("客户餐费".to_owned());
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026-06-18\n餐饮 食品".to_owned(),
+        normalized_pdf: None,
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::new(repository, extractor);
+
+    let recognized = service.recognize_item(record.id).await.unwrap();
+
+    assert_eq!(recognized.note.as_deref(), Some("客户餐费"));
+}
+
+#[tokio::test]
+async fn a_parsed_amount_clears_an_old_missing_amount_reason() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let repository = ItemRepository::new(pool);
+    let mut record = sample_item(Uuid::new_v4());
+    record.note = Some(
+        "识别失败：已从原件格式 .pdf 识别到文字，但没有解析出金额（ocr_text_without_amount）"
+            .to_owned(),
+    );
+    repository.insert(&record).await.unwrap();
+    let extractor = Arc::new(FakeExtractor::new(vec![Ok(ExtractedDocument {
+        text: "开票日期：2026-06-18\n餐饮 食品\n价税合计（小写）¥648.00".to_owned(),
+        normalized_pdf: None,
+        warnings: Vec::new(),
+    })]));
+    let service = RecognitionService::new(repository, extractor);
+
+    let recognized = service.recognize_item(record.id).await.unwrap();
+
+    assert_eq!(recognized.amount_cents, Some(64_800));
+    assert_eq!(recognized.note, None);
+}
+
+#[tokio::test]
 async fn recognize_item_persists_automatic_fields_and_preserves_manual_fields() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let repository = ItemRepository::new(pool.clone());
@@ -1223,12 +1395,16 @@ async fn retry_clears_or_replaces_old_automatic_fields_and_preserves_everything_
 
     assert_eq!(retried.invoice_date, NaiveDate::from_ymd_opt(2026, 6, 18));
     assert_eq!(retried.suggested_period.as_deref(), Some("2026-06"));
-    assert_eq!(retried.suggested_category, None);
+    // The retried text has no category keyword, so the automatic suggestion is
+    // "其他"; the manually chosen final category is still preserved below.
+    assert_eq!(retried.suggested_category, Some(Category::Other));
     assert_eq!(retried.amount_cents, Some(50_000));
     assert_eq!(retried.city, None);
     assert_eq!(retried.company, None);
     assert_eq!(retried.recognition_status, RecognitionStatus::Succeeded);
-    assert_eq!(retried.confirmation_status, ConfirmationStatus::Pending);
+    // Date + amount + a (fallback "其他") category now complete the automatic
+    // confirmation rule, while the manually chosen final category is preserved.
+    assert_eq!(retried.confirmation_status, ConfirmationStatus::Confirmed);
     assert_eq!(retried.final_category, before.final_category);
     assert_eq!(retried.batch_id, before.batch_id);
     assert_eq!(retried.note, before.note);

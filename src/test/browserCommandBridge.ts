@@ -1,5 +1,6 @@
 import type {
   AppError,
+  ArchiveNonInvoiceReportDto,
   BatchAutomationResultDto,
   BatchCandidateDto,
   BatchDetailDto,
@@ -13,14 +14,28 @@ import type {
   InvoiceItemDto,
   ItemFilter,
   ItemStatus,
+  MailLedgerCountsDto,
+  MailLedgerEntryDto,
+  MailLedgerFilter,
+  MailLedgerPageDto,
   MailboxAccountDto,
+  LinkRecoveryReportDto,
+  NonInvoiceSummaryDto,
+  QrRecoveryReportDto,
+  SettleBatchInputDto,
+  SettleBatchOutcomeDto,
+  UpdateBatchRangeInputDto,
   ManualImportOutcomeDto,
   NewBatchInputDto,
   PageDto,
   PageRequestDto,
   PreferencesDto,
   ReviewItemInputDto,
+  RecoverableSettleOutcomeDto,
+  RetryFailedRecognitionsReportDto,
   SaveMailboxAccountInputDto,
+  ConsistencyReportDto,
+  SyncProgressDto,
   StorageStatusDto,
   TestMailboxAccountInputDto,
 } from "../types";
@@ -35,10 +50,13 @@ export type BrowserCommandBridge = <T>(
 
 interface BridgeState {
   items: InvoiceItemDto[];
+  mailLedger: MailLedgerEntryDto[];
   batches: BatchDto[];
   accounts: MailboxAccountDto[];
   preferences: PreferencesDto;
   storage: StorageStatusDto;
+  consistency: ConsistencyReportDto;
+  syncProgress: SyncProgressDto[];
   nextItemId: number;
   nextBatchId: number;
   nextAccountId: number;
@@ -57,10 +75,13 @@ interface BrowserBridgeOptions {
 
 export interface BrowserBridgeSeed {
   items?: InvoiceItemDto[];
+  mailLedger?: MailLedgerEntryDto[];
   batches?: BatchDto[];
   accounts?: MailboxAccountDto[];
   preferences?: PreferencesDto;
   storage?: StorageStatusDto;
+  consistency?: ConsistencyReportDto;
+  syncProgress?: SyncProgressDto[];
   nextItemId?: number;
   nextBatchId?: number;
   nextAccountId?: number;
@@ -150,12 +171,14 @@ function paginate<T>(
 function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
   const defaults: BridgeState = {
     items: [],
+    mailLedger: [],
     batches: [],
     accounts: [],
     preferences: {
       backgroundSyncEnabled: true,
       exportDirectory: "/tmp/invoice-reimbursement/e2e",
       batchDirectoryPattern: "{batchName}-{timestamp}",
+      markProcessedMailSeen: true,
     },
     storage: {
       localDataDirectory: "/tmp/invoice-reimbursement/e2e/data",
@@ -163,6 +186,13 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
       availableBytes: 8_589_934_592,
       recoveryError: null,
     },
+    consistency: {
+      checkedAt: now,
+      itemsChecked: 0,
+      batchesChecked: 0,
+      issues: [],
+    },
+    syncProgress: [],
     nextItemId: 1,
     nextBatchId: 1,
     nextAccountId: 1,
@@ -171,10 +201,14 @@ function initialState(seed: BrowserBridgeSeed = {}): BridgeState {
     ...defaults,
     ...seed,
     items: seed.items?.map((item) => ({ ...item })) ?? defaults.items,
+    mailLedger:
+      seed.mailLedger?.map((entry) => ({ ...entry })) ?? defaults.mailLedger,
     batches: seed.batches?.map((batch) => ({ ...batch })) ?? defaults.batches,
     accounts: seed.accounts?.map((account) => ({ ...account })) ?? defaults.accounts,
     preferences: { ...(seed.preferences ?? defaults.preferences) },
     storage: { ...(seed.storage ?? defaults.storage) },
+    consistency: { ...(seed.consistency ?? defaults.consistency) },
+    syncProgress: seed.syncProgress?.map((entry) => ({ ...entry })) ?? defaults.syncProgress,
   };
 }
 
@@ -208,6 +242,7 @@ function batchDetail(state: BridgeState, batchId: string): BatchDetailDto {
     dining: categorySummary(items, "dining"),
     accommodation: categorySummary(items, "accommodation"),
     hospitality: categorySummary(items, "hospitality"),
+    other: categorySummary(items, "other"),
     unconfirmedCount: items.filter((item) => item.confirmationStatus !== "confirmed")
       .length,
   };
@@ -282,6 +317,245 @@ function exportBlocker(item: InvoiceItemDto): BatchIssueDto | null {
 
 function canNormalize(item: InvoiceItemDto) {
   return /\.(pdf|jpe?g|png)$/iu.test(item.originalName);
+}
+
+const NON_INVOICE_NAME = /\.(doc|docx|xls|xlsx|zip)$/iu;
+const QR_IMAGE_NAME = /\.(jpe?g|png)$/iu;
+
+/** Mirrors the backend's dismissable non-invoice file predicate. */
+function isMarkableNonInvoice(item: InvoiceItemDto) {
+  return (
+    !item.nonInvoiceReason &&
+    item.batchId === null &&
+    item.dedupeStatus !== "suspected_duplicate" &&
+    NON_INVOICE_NAME.test(item.originalName) &&
+    (item.amountCents === null || item.recognitionStatus === "failed")
+  );
+}
+
+/** Mirrors the backend's QR rescue candidate predicate. */
+function isQrRescueCandidate(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus !== "suspected_duplicate" &&
+    !item.nonInvoiceReason &&
+    QR_IMAGE_NAME.test(item.originalName)
+  );
+}
+
+const LINK_PLACEHOLDER_NAME = /\.url$/iu;
+
+/** Mirrors the backend's link rescue candidate predicate. */
+function isLinkRescueCandidate(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus === "unique" &&
+    !item.nonInvoiceReason &&
+    LINK_PLACEHOLDER_NAME.test(item.originalName)
+  );
+}
+
+/**
+ * The development bridge cannot download mail links, so it reports the honest
+ * "download failed" skip: the result line and the reload path stay exercised.
+ */
+function linkRecoveryReport(examined: number): LinkRecoveryReportDto {
+  return {
+    examined,
+    downloaded: 0,
+    recognized: 0,
+    skipped: examined,
+    archived: 0,
+    notInvoicePortal: 0,
+    skippedBreakdown:
+      examined > 0
+        ? [{ code: "download_failed", label: "下载失败", count: examined }]
+        : [],
+  };
+}
+
+/**
+ * The development bridge cannot decode QR codes, so it reports the honest
+ * "no QR code" skip: the result line and the reload path stay exercised.
+ */
+function qrRecoveryReport(examined: number): QrRecoveryReportDto {
+  return {
+    examined,
+    decoded: 0,
+    downloaded: 0,
+    recognized: 0,
+    skipped: examined,
+    skippedBreakdown:
+      examined > 0
+        ? [{ code: "no_qr_code", label: "没有二维码", count: examined }]
+        : [],
+  };
+}
+
+/** Mirrors `BatchService::settle_items` for the development bridge. */
+function settleBatchItems(
+  state: BridgeState,
+  batchId: string,
+  input: SettleBatchInputDto,
+) {
+  const detail = batchDetail(state, batchId);
+  const skipped: SettleBatchOutcomeDto["skipped"] = [];
+  let confirmedCount = 0;
+  let filledInvoiceDateCount = 0;
+  let appliedCategoryCount = 0;
+  for (const item of detail.items) {
+    if (item.confirmationStatus === "confirmed") continue;
+    const skip = (code: string, message: string) =>
+      skipped.push({ itemId: item.id, fileName: item.originalName, code, message });
+    if (item.dedupeStatus === "suspected_duplicate") {
+      skip("suspected_duplicate", "疑似重复，需先处理重复");
+      continue;
+    }
+    if (item.recognitionStatus === "failed") {
+      skip("recognition_failed", "识别失败，需重新识别或更换原件");
+      continue;
+    }
+    if (item.recognitionStatus === "pending") {
+      skip("not_recognized", "尚未完成识别");
+      continue;
+    }
+    if (item.amountCents === null) {
+      skip("missing_amount", "缺少金额，必须对照原件人工填写");
+      continue;
+    }
+    const derivedDate =
+      item.invoiceDate ??
+      (input.fillInvoiceDateFromReceived && item.sourceType === "email"
+        ? mailReceivedDate(item)
+        : null);
+    if (derivedDate === null) {
+      skip("missing_invoice_date", "缺少开票日期，且无法从邮件日期推导");
+      continue;
+    }
+    const period = item.suggestedPeriod ?? derivedDate.slice(0, 7);
+    const category =
+      item.finalCategory ??
+      (input.applySuggestedCategory ? item.suggestedCategory : null) ??
+      input.defaultCategory;
+    if (category === null) {
+      skip("missing_category", "缺少分类，且没有可采用的建议分类");
+      continue;
+    }
+    if (!item.hasNormalizedPdf && !/\\.(pdf|jpe?g|png)$/iu.test(item.originalName)) {
+      skip(
+        "unsupported_format",
+        "原件格式不支持生成归一化 PDF，请改用 PDF/JPG/PNG 或移出批次",
+      );
+      continue;
+    }
+    // Mirrors `batch_membership_date`: email invoices belong to the mail month,
+    // manual uploads to their invoice date.
+    const membershipDate =
+      item.sourceType === "email" ? mailReceivedDate(item) : derivedDate;
+    if (
+      membershipDate < detail.batch.startDate ||
+      membershipDate > detail.batch.endDate
+    ) {
+      skip("outside_date_range", "票据日期不在批次范围内");
+      continue;
+    }
+    const target = state.items.find((candidate) => candidate.id === item.id);
+    if (!target) continue;
+    if (item.invoiceDate === null) filledInvoiceDateCount += 1;
+    if (item.finalCategory !== category) appliedCategoryCount += 1;
+    Object.assign(target, {
+      invoiceDate: derivedDate,
+      suggestedPeriod: period,
+      finalCategory: category,
+      recognitionStatus: "succeeded",
+      confirmationStatus: "confirmed",
+      updatedAt: now,
+    });
+    // The backend derives `status` from the three status columns.
+    target.status = derivedStatus(target);
+    confirmedCount += 1;
+  }
+  if (confirmedCount !== 0) markBatchDraft(state, batchId);
+  const repairedCount = repairMissingNormalized(state, batchDetail(state, batchId).items);
+  const refreshed = batchDetail(state, batchId);
+  return {
+    confirmedCount,
+    filledInvoiceDateCount,
+    appliedCategoryCount,
+    repairedCount,
+    skipped,
+    issues: refreshed.issues,
+  } satisfies SettleBatchOutcomeDto;
+}
+
+const recoverableSkipLabels: Record<string, string> = {
+  missing_amount: "缺金额",
+  missing_invoice_date: "缺开票日期",
+  missing_normalized_pdf: "缺归一化 PDF",
+  missing_category: "缺分类",
+  suspected_duplicate: "疑似重复",
+  recognition_failed: "识别失败",
+  not_recognized: "尚未完成识别",
+  unsupported_format: "原件格式不支持",
+};
+
+/** Mirrors `BatchService::settle_recoverable_items` for the development bridge. */
+function settleRecoverableItems(state: BridgeState): RecoverableSettleOutcomeDto {
+  const skippedCounts = new Map<string, number>();
+  const confirmed: InvoiceItemDto[] = [];
+  let appliedCategoryCount = 0;
+  for (const item of state.items) {
+    if (item.confirmationStatus !== "pending") continue;
+    if (item.recognitionStatus !== "succeeded") continue;
+    if (item.dedupeStatus !== "unique") continue;
+    const skip = (code: string) =>
+      skippedCounts.set(code, (skippedCounts.get(code) ?? 0) + 1);
+    if (item.amountCents === null) {
+      skip("missing_amount");
+      continue;
+    }
+    if (item.invoiceDate === null) {
+      skip("missing_invoice_date");
+      continue;
+    }
+    if (!item.hasNormalizedPdf && !canNormalize(item)) {
+      skip("missing_normalized_pdf");
+      continue;
+    }
+    if (item.finalCategory === null) appliedCategoryCount += 1;
+    Object.assign(item, {
+      suggestedPeriod: item.suggestedPeriod ?? item.invoiceDate.slice(0, 7),
+      finalCategory: item.finalCategory ?? item.suggestedCategory ?? "other",
+      confirmationStatus: "confirmed",
+      status: "ready",
+      updatedAt: now,
+    });
+    markBatchDraft(state, item.batchId);
+    confirmed.push(item);
+  }
+  const repairedCount = repairMissingNormalized(state, confirmed);
+  const skippedBreakdown = [...skippedCounts.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([code, count]) => ({
+      code,
+      label: recoverableSkipLabels[code] ?? "其他原因",
+      count,
+    }));
+  return {
+    confirmedCount: confirmed.length,
+    skippedCount: skippedBreakdown.reduce((total, entry) => total + entry.count, 0),
+    filledInvoiceDateCount: 0,
+    appliedCategoryCount,
+    repairedCount,
+    skippedBreakdown,
+  };
+}
+
+/** The received date is the invoice date fallback for email invoices. */
+function mailReceivedDate(item: InvoiceItemDto) {
+  return item.fetchedAt.slice(0, 10);
 }
 
 /** Mirrors `repair_missing_normalized_pdfs` for the development bridge. */
@@ -360,6 +634,28 @@ function isSafeAutomationCandidate(item: InvoiceItemDto, batch: BatchDto) {
   );
 }
 
+/**
+ * Mirrors `batch_eligibility::can_fill_other_category`: the invoice is fully
+ * exportable once "其他" and a confirmed status are filled in, so batch
+ * automation may decide the category for the user.
+ */
+function canFillOtherCategory(item: InvoiceItemDto, batch: BatchDto) {
+  if (item.finalCategory !== null || item.invoiceDate === null) return false;
+  if (!["pending_confirmation", "ready"].includes(derivedStatus(item))) {
+    return false;
+  }
+  if (item.invoiceDate < batch.startDate || item.invoiceDate > batch.endDate) {
+    return false;
+  }
+  const probe: InvoiceItemDto = {
+    ...item,
+    finalCategory: "other",
+    confirmationStatus: "confirmed",
+    suggestedPeriod: item.suggestedPeriod ?? item.invoiceDate.slice(0, 7),
+  };
+  return exportBlocker(probe) === null;
+}
+
 function seedAutomationScenario(
   state: BridgeState,
   batch: BatchDto,
@@ -376,6 +672,7 @@ function seedAutomationScenario(
       sourceType: "email",
       sourceAccountId: accountId,
       fetchedAt: now,
+      sourceReceivedDate: null,
       invoiceDate: batch.startDate,
       suggestedPeriod: period,
       batchId: null,
@@ -403,6 +700,7 @@ function seedAutomationScenario(
       sourceType: "email",
       sourceAccountId: accountId,
       fetchedAt: now,
+      sourceReceivedDate: null,
       invoiceDate: batch.startDate,
       suggestedPeriod: period,
       batchId: null,
@@ -431,10 +729,21 @@ function seedAutomationScenario(
   return imported.length;
 }
 
+function isQueueStatus(status: ItemStatus | undefined) {
+  return (
+    status === "pending_recognition" ||
+    status === "pending_confirmation" ||
+    status === "recognition_failed" ||
+    status === "ready"
+  );
+}
+
 function itemMatches(item: InvoiceItemDto, filter: ItemFilter) {
   const query = filter.query?.trim().toLocaleLowerCase("zh-CN");
   return (
     (!filter.status || item.status === filter.status) &&
+    // Dismissed non-invoice files leave the queue views but stay in "全部".
+    (!isQueueStatus(filter.status) || !item.nonInvoiceReason) &&
     (!filter.recent || isRecentItem(item.createdAt, Date.parse(now))) &&
     (!filter.suggestedPeriod || item.suggestedPeriod === filter.suggestedPeriod) &&
     (!filter.category || item.finalCategory === filter.category) &&
@@ -456,6 +765,7 @@ function createItem(state: BridgeState, path: string): InvoiceItemDto {
     sourceType: "manual_upload",
     sourceAccountId: null,
     fetchedAt: now,
+    sourceReceivedDate: null,
     invoiceDate: "2026-07-15",
     suggestedPeriod: "2026-07",
     batchId: null,
@@ -487,13 +797,16 @@ function dashboard(state: BridgeState): DashboardDto {
       isRecentItem(item.createdAt, Date.parse(now)),
     ).length,
     pendingConfirmationCount: state.items.filter(
-      (item) => item.status === "pending_confirmation",
+      (item) => item.status === "pending_confirmation" && !item.nonInvoiceReason,
     ).length,
     recognitionFailedCount: state.items.filter(
-      (item) => item.status === "recognition_failed",
+      (item) => item.status === "recognition_failed" && !item.nonInvoiceReason,
     ).length,
     suspectedDuplicateCount: state.items.filter(
       (item) => item.status === "suspected_duplicate",
+    ).length,
+    mailNeedsAttentionCount: state.mailLedger.filter(
+      (entry) => entry.outcome === "partial" || entry.outcome === "failed",
     ).length,
     recentBatches: state.batches.slice(0, 5).map((batch) => ({ ...batch })),
   };
@@ -573,6 +886,93 @@ function makeHandlers(
       markBatchDraft(state, item.batchId);
       Object.assign(item, { recognitionStatus: "succeeded", status: "pending_confirmation", updatedAt: now });
       return { ...item };
+    }],
+    [API_COMMANDS.retryFailedRecognitions, () => {
+      const report: RetryFailedRecognitionsReportDto = {
+        attempted: 0,
+        recovered: 0,
+        stillFailed: 0,
+        skipped: 0,
+      };
+      for (const item of state.items) {
+        if (item.recognitionStatus !== "failed") continue;
+        if (!canNormalize(item)) {
+          report.skipped += 1;
+          continue;
+        }
+        report.attempted += 1;
+        markBatchDraft(state, item.batchId);
+        Object.assign(item, {
+          recognitionStatus: "succeeded",
+          status: "pending_confirmation",
+          updatedAt: now,
+        });
+        report.recovered += 1;
+      }
+      return report;
+    }],
+    [API_COMMANDS.settleRecoverableItems, () => {
+      const report = settleRecoverableItems(state);
+      persistState();
+      return report;
+    }],
+    [API_COMMANDS.recoverQrInvoices, () => {
+      const examined = state.items.filter(isQrRescueCandidate).length;
+      return qrRecoveryReport(examined);
+    }],
+    [API_COMMANDS.recoverQrInvoice, (arguments_) => {
+      const item = state.items.find(
+        (candidate) => candidate.id === requiredString(arguments_, "itemId"),
+      );
+      if (!item) throw notFound("item");
+      if (!isQrRescueCandidate(item)) {
+        throw {
+          code: "validation",
+          field: "item",
+          message:
+            "该票据不是可补救的二维码图片票据（需要 JPG/PNG 原件、尚未填写金额、不在批次中）",
+        } satisfies AppError;
+      }
+      return qrRecoveryReport(1);
+    }],
+    [API_COMMANDS.recoverLinkInvoices, () => {
+      const examined = state.items.filter(isLinkRescueCandidate).length;
+      return linkRecoveryReport(examined);
+    }],
+    [API_COMMANDS.recoverLinkInvoice, (arguments_) => {
+      const item = state.items.find(
+        (candidate) => candidate.id === requiredString(arguments_, "itemId"),
+      );
+      if (!item) throw notFound("item");
+      if (!isLinkRescueCandidate(item)) {
+        throw {
+          code: "validation",
+          field: "item",
+          message:
+            "该票据不是可补救的链接票据（需要 .url 占位原件、尚未填写金额、不在批次中）",
+        } satisfies AppError;
+      }
+      return linkRecoveryReport(1);
+    }],
+    [API_COMMANDS.getNonInvoiceSummary, () => {
+      const summary: NonInvoiceSummaryDto = {
+        markableCount: state.items.filter(isMarkableNonInvoice).length,
+        markedCount: state.items.filter((item) => Boolean(item.nonInvoiceReason))
+          .length,
+      };
+      return summary;
+    }],
+    [API_COMMANDS.archiveNonInvoiceItems, () => {
+      let archivedCount = 0;
+      for (const item of state.items) {
+        if (!isMarkableNonInvoice(item)) continue;
+        item.nonInvoiceReason = "document_not_invoice";
+        item.updatedAt = now;
+        archivedCount += 1;
+      }
+      persistState();
+      const report: ArchiveNonInvoiceReportDto = { archivedCount };
+      return report;
     }],
     [API_COMMANDS.listBatches, (arguments_) =>
       paginate(
@@ -716,9 +1116,21 @@ function makeHandlers(
       const safeCandidates = candidates.filter((item) =>
         isSafeAutomationCandidate(item, batch),
       );
+      const otherCategoryCandidates = candidates.filter(
+        (item) =>
+          !safeCandidates.includes(item) && canFillOtherCategory(item, batch),
+      );
       markBatchDraft(state, batchId);
-      for (const item of safeCandidates) {
+      for (const item of [...safeCandidates, ...otherCategoryCandidates]) {
         Object.assign(item, { batchId, updatedAt: now });
+      }
+      for (const item of otherCategoryCandidates) {
+        Object.assign(item, {
+          finalCategory: "other",
+          confirmationStatus: "confirmed",
+          status: "ready",
+          updatedAt: now,
+        });
       }
       const detail = batchDetail(state, batchId);
       const repairedCount = repairMissingNormalized(state, detail.items);
@@ -729,12 +1141,63 @@ function makeHandlers(
         scannedAccountCount: enabledAccounts.length,
         failedAccounts: [],
         importedCount,
-        assignedCount: safeCandidates.length,
-        exceptionCount: candidates.length - safeCandidates.length,
+        assignedCount: safeCandidates.length + otherCategoryCandidates.length,
+        categorizedAsOtherCount: otherCategoryCandidates.length,
+        exceptionCount:
+          candidates.length - safeCandidates.length - otherCategoryCandidates.length,
         repairedCount,
         export:
           refreshed.items.length === 0 ? null : exportBatch(state, batchId),
       } satisfies BatchAutomationResultDto;
+    }],
+    [API_COMMANDS.updateBatchRange, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      const input = requiredObject<UpdateBatchRangeInputDto>(arguments_, "input");
+      const batch = state.batches.find((candidate) => candidate.id === batchId);
+      if (!batch) throw notFound("batch");
+      if (input.startDate > input.endDate) {
+        throw {
+          code: "validation",
+          field: "dateRange",
+          message: "start date must not be after end date",
+        } satisfies AppError;
+      }
+      Object.assign(batch, {
+        startDate: input.startDate,
+        endDate: input.endDate,
+        status: "draft",
+        updatedAt: now,
+      });
+      persistState();
+      return batchDetail(state, batchId);
+    }],
+    [API_COMMANDS.settleBatchItems, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      const input = requiredObject<SettleBatchInputDto>(arguments_, "input");
+      const outcome = settleBatchItems(state, batchId, {
+        fillInvoiceDateFromReceived: input.fillInvoiceDateFromReceived === true,
+        applySuggestedCategory: input.applySuggestedCategory === true,
+        defaultCategory: input.defaultCategory ?? null,
+      });
+      persistState();
+      return outcome;
+    }],
+    [API_COMMANDS.removeBatchItems, (arguments_) => {
+      const batchId = requiredString(arguments_, "batchId");
+      batchDetail(state, batchId);
+      const itemIds = arguments_.itemIds;
+      if (!Array.isArray(itemIds) || !itemIds.every((id) => typeof id === "string")) {
+        throw new Error("Browser command argument itemIds must be a string array");
+      }
+      markBatchDraft(state, batchId);
+      for (const itemId of itemIds) {
+        const item = state.items.find((candidate) => candidate.id === itemId);
+        if (item?.batchId === batchId) {
+          Object.assign(item, { batchId: null, updatedAt: now });
+        }
+      }
+      persistState();
+      return batchDetail(state, batchId);
     }],
     [API_COMMANDS.repairBatchNormalizedPdfs, (arguments_) => {
       const batchId = requiredString(arguments_, "batchId");
@@ -746,6 +1209,50 @@ function makeHandlers(
         repairedCount,
         issues: batchDetail(state, batchId).issues,
       } satisfies BatchRepairDto;
+    }],
+    [API_COMMANDS.listMailLedger, (arguments_) => {
+      const filter = (arguments_.filter ?? {}) as MailLedgerFilter;
+      const query = filter.query?.trim().toLocaleLowerCase("zh-CN");
+      const matching = state.mailLedger
+        .filter((entry) => {
+          if (filter.needsAttention && !["partial", "failed"].includes(entry.outcome)) {
+            return false;
+          }
+          if (filter.outcome && entry.outcome !== filter.outcome) return false;
+          if (filter.accountId && entry.accountId !== filter.accountId) return false;
+          if (!query) return true;
+          return [entry.subject, entry.sender]
+            .filter((value): value is string => Boolean(value))
+            .some((value) => value.toLocaleLowerCase("zh-CN").includes(query));
+        })
+        .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt));
+      const cursor = (arguments_.page as { cursor?: { receivedAt: string } } | undefined)
+        ?.cursor;
+      const remaining = cursor
+        ? matching.filter((entry) => entry.receivedAt < cursor.receivedAt)
+        : matching;
+      const pageSize =
+        (arguments_.page as { pageSize?: number } | undefined)?.pageSize ?? 50;
+      const items = remaining.slice(0, pageSize);
+      const last = items.at(-1);
+      return {
+        items: items.map((entry) => ({ ...entry })),
+        nextCursor:
+          remaining.length > items.length && last
+            ? { receivedAt: last.receivedAt, uid: last.uid, accountId: last.accountId }
+            : null,
+      } satisfies MailLedgerPageDto;
+    }],
+    [API_COMMANDS.getMailLedgerCounts, () => {
+      const count = (outcome: string) =>
+        state.mailLedger.filter((entry) => entry.outcome === outcome).length;
+      return {
+        imported: count("imported"),
+        partial: count("partial"),
+        failed: count("failed"),
+        ignored: count("ignored"),
+        needsAttention: count("partial") + count("failed"),
+      } satisfies MailLedgerCountsDto;
     }],
     [API_COMMANDS.listMailboxAccounts, () =>
       state.accounts.map((account) => ({ ...account }))],
@@ -795,6 +1302,25 @@ function makeHandlers(
       return { ...state.preferences };
     }],
     [API_COMMANDS.getStorageStatus, () => ({ ...state.storage })],
+    [API_COMMANDS.getSyncProgress, () => state.syncProgress.map((entry) => ({ ...entry }))],
+    [API_COMMANDS.cancelSync, (arguments_) => {
+      const accountId = requiredString(arguments_, "accountId");
+      const before = state.syncProgress.length;
+      state.syncProgress = state.syncProgress.filter(
+        (entry) => entry.accountId !== accountId,
+      );
+      return state.syncProgress.length !== before;
+    }],
+    [API_COMMANDS.getConsistencyReport, () => ({
+      ...state.consistency,
+      itemsChecked: state.items.length,
+      batchesChecked: state.batches.length,
+    })],
+    [API_COMMANDS.exportDiagnostics, () => ({
+      path: `${state.storage.exportDirectory}/invoice-diagnostics-20260918-070000.zip`,
+      directory: state.storage.exportDirectory,
+      bytes: 2048,
+    })],
     [API_COMMANDS.retryExportRecovery, () => {
       state.storage.recoveryError = null;
       return { ...state.storage };

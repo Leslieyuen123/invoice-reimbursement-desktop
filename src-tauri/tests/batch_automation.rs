@@ -72,12 +72,18 @@ impl ImapGateway for FakeRangeGateway {
             .lock()
             .unwrap()
             .push((config.email.clone(), cursor, range));
-        self.responses
-            .lock()
-            .unwrap()
+        let mut responses = self.responses.lock().unwrap();
+        let queue = responses
             .get_mut(&config.email)
-            .and_then(VecDeque::pop_front)
-            .expect("fake range response should be queued")
+            .expect("fake range response should be queued");
+        match queue.front() {
+            // A queued failure repeats until the test queues a good page: the
+            // sync retries the same page before giving up, which is the point of
+            // `fetch_with_retry`.
+            Some(Err(error)) => Err(error.clone()),
+            Some(Ok(_)) => queue.pop_front().expect("front was present"),
+            None => panic!("fake range response should be queued"),
+        }
     }
 }
 
@@ -912,7 +918,7 @@ async fn range_touched_existing_item_outside_utc_date_bounds_remains_an_exceptio
 }
 
 #[tokio::test]
-async fn touched_item_owned_by_another_batch_is_an_exception_without_being_moved() {
+async fn touched_item_owned_by_another_batch_is_re_anchored_into_the_target_batch() {
     let gateway = Arc::new(FakeRangeGateway::default());
     let message = raw_message(1, include_bytes!("fixtures/mail/attachment.eml"));
     let mut responses = completed_scan(vec![message.clone()]);
@@ -943,16 +949,31 @@ async fn touched_item_owned_by_another_batch_is_an_exception_without_being_moved
 
     assert_eq!(first.assigned_count, 1);
     assert_eq!(second.imported_count, 0);
-    assert_eq!(second.assigned_count, 0);
-    assert_eq!(second.exception_count, 1);
-    assert!(second.export.is_none());
+    // Same range: the target batch re-anchors the invoice away from the
+    // original batch instead of leaving it there.
+    assert_eq!(second.assigned_count, 1);
+    assert_eq!(second.moved_from_other_batches_count, 1);
+    assert_eq!(second.exception_count, 0);
     assert_eq!(
-        ItemRepository::new(harness.pool)
+        second.export.as_ref().map(|export| export.item_count),
+        Some(1)
+    );
+    assert_eq!(
+        ItemRepository::new(harness.pool.clone())
             .get_by_id(item_id)
             .await
             .unwrap()
             .batch_id,
-        Some(original_batch.id)
+        Some(target_batch.id)
+    );
+    let original_detail = BatchService::new(harness.pool)
+        .get(original_batch.id)
+        .await
+        .unwrap();
+    assert!(original_detail.items.is_empty());
+    assert_eq!(
+        original_detail.batch.status,
+        invoice_reimbursement::domain::model::BatchStatus::Draft
     );
 }
 
@@ -1016,6 +1037,276 @@ async fn authoritative_rescan_moves_a_legacy_email_out_of_the_wrong_exported_mon
         invoice_reimbursement::domain::model::BatchStatus::Draft
     );
     assert!(repaired_old_batch.last_exported_at.is_some());
+}
+
+fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).expect("test date should be valid")
+}
+
+async fn create_range_batch(
+    harness: &Harness,
+    name: &str,
+    start_date: &str,
+    end_date: &str,
+) -> invoice_reimbursement::db::batches::Batch {
+    BatchService::new(harness.pool.clone())
+        .create(NewBatchInput {
+            name: name.to_owned(),
+            start_date: start_date.to_owned(),
+            end_date: end_date.to_owned(),
+            note: None,
+        })
+        .await
+        .expect("range batch should create")
+}
+
+/// A batch-ready invoice with real managed files, so safety checks pass.
+fn managed_item(
+    paths: &AppPaths,
+    id: uuid::Uuid,
+    invoice_date: NaiveDate,
+    amount_cents: i64,
+) -> NewItemRecord {
+    let mut item = ready_item(paths, id);
+    let original_bytes = format!("managed original {id}");
+    item.sha256 = format!("{:x}", Sha256::digest(original_bytes.as_bytes()));
+    fs::write(&item.original_path, original_bytes.as_bytes()).unwrap();
+    fs::write(
+        item.normalized_pdf_path.as_deref().unwrap(),
+        include_bytes!("fixtures/text-invoice.pdf"),
+    )
+    .unwrap();
+    item.invoice_date = Some(invoice_date);
+    item.suggested_period = Some(invoice_date.format("%Y-%m").to_string());
+    item.amount_cents = Some(amount_cents);
+    item
+}
+
+#[tokio::test]
+async fn widening_the_range_re_anchors_older_batch_members_and_leaves_outside_invoices_alone() {
+    let email = "reanchor@example.com";
+    let gateway = Arc::new(FakeRangeGateway::default());
+    gateway.queue(email, completed_scan(Vec::new()));
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[]))).await;
+    let account = harness.add_account(email, true).await;
+    let service = BatchService::new(harness.pool.clone());
+    let narrow = create_range_batch(&harness, "5 月中段", "2026-05-14", "2026-05-20").await;
+    let outside = create_range_batch(&harness, "5 月初", "2026-05-01", "2026-05-03").await;
+    let wide = create_range_batch(&harness, "5 月重新锚定", "2026-05-04", "2026-05-20").await;
+    let repository = ItemRepository::new(harness.pool.clone());
+    let first_id = uuid::Uuid::new_v4();
+    let second_id = uuid::Uuid::new_v4();
+    let outside_id = uuid::Uuid::new_v4();
+    for (id, day, amount) in [
+        (first_id, 15_u32, 12_850_i64),
+        (second_id, 18, 5_000),
+        (outside_id, 2, 7_777),
+    ] {
+        repository
+            .insert(&managed_item(
+                &harness.paths,
+                id,
+                date(2026, 5, day),
+                amount,
+            ))
+            .await
+            .unwrap();
+    }
+    // A mail invoice is anchored by its received date, not its invoice date:
+    // it was received inside the range although the extracted date is not.
+    let email_id = uuid::Uuid::new_v4();
+    let mut email_invoice = managed_item(&harness.paths, email_id, date(2026, 4, 30), 2_000);
+    email_invoice.source_type = SourceType::Email;
+    email_invoice.source_account_id = Some(account.id);
+    email_invoice.source_mailbox = Some("INBOX".to_owned());
+    email_invoice.source_uid_validity = Some(1);
+    email_invoice.source_uid = Some(77);
+    email_invoice.source_message_id = Some("<reanchor-email@example.com>".to_owned());
+    email_invoice.source_part_id = Some("1".to_owned());
+    email_invoice.source_received_date = Some(date(2026, 5, 16));
+    repository.insert(&email_invoice).await.unwrap();
+    service
+        .assign_items(narrow.id, &[first_id, second_id])
+        .await
+        .unwrap();
+    service
+        .assign_items(outside.id, &[outside_id])
+        .await
+        .unwrap();
+    sqlx::query("UPDATE items SET batch_id = ? WHERE id = ?")
+        .bind(narrow.id.to_string())
+        .bind(email_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+    let result = harness
+        .state
+        .batch_automation_service()
+        .run(wide.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.imported_count, 0);
+    assert_eq!(result.assigned_count, 3);
+    assert_eq!(result.moved_from_other_batches_count, 3);
+    assert_eq!(result.exception_count, 0);
+    assert_eq!(
+        result.export.as_ref().map(|export| export.item_count),
+        Some(3)
+    );
+    for id in [first_id, second_id, email_id] {
+        assert_eq!(
+            repository.get_by_id(id).await.unwrap().batch_id,
+            Some(wide.id)
+        );
+    }
+    let narrow_detail = service.get(narrow.id).await.unwrap();
+    assert!(narrow_detail.items.is_empty());
+    assert_eq!(narrow_detail.summary.total_amount_cents, 0);
+    let wide_detail = service.get(wide.id).await.unwrap();
+    assert_eq!(wide_detail.summary.item_count, 3);
+    assert_eq!(
+        wide_detail.summary.total_amount_cents,
+        12_850 + 5_000 + 2_000
+    );
+    // The invoice outside the re-anchored range stays where it was.
+    assert_eq!(
+        repository.get_by_id(outside_id).await.unwrap().batch_id,
+        Some(outside.id)
+    );
+    let outside_detail = service.get(outside.id).await.unwrap();
+    assert_eq!(outside_detail.summary.item_count, 1);
+    assert_eq!(outside_detail.summary.total_amount_cents, 7_777);
+    // No invoice is counted by two batches.
+    assert_eq!(
+        narrow_detail.summary.total_amount_cents + wide_detail.summary.total_amount_cents,
+        12_850 + 5_000 + 2_000
+    );
+}
+
+#[tokio::test]
+async fn re_anchoring_is_idempotent_across_repeated_automation_runs() {
+    let email = "reanchor-idempotent@example.com";
+    let gateway = Arc::new(FakeRangeGateway::default());
+    let mut responses = completed_scan(Vec::new());
+    responses.extend(completed_scan(Vec::new()));
+    gateway.queue(email, responses);
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[]))).await;
+    harness.add_account(email, true).await;
+    let service = BatchService::new(harness.pool.clone());
+    let narrow = create_range_batch(&harness, "5 月中段", "2026-05-14", "2026-05-20").await;
+    let wide = create_range_batch(&harness, "5 月重新锚定", "2026-05-04", "2026-05-20").await;
+    let repository = ItemRepository::new(harness.pool.clone());
+    let ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+    for (index, id) in ids.iter().enumerate() {
+        let amount = 1_000_i64 * i64::try_from(index + 1).unwrap();
+        repository
+            .insert(&managed_item(
+                &harness.paths,
+                *id,
+                date(2026, 5, 15 + u32::try_from(index).unwrap()),
+                amount,
+            ))
+            .await
+            .unwrap();
+    }
+    service.assign_items(narrow.id, &ids).await.unwrap();
+    let automation = harness.state.batch_automation_service();
+
+    let first = automation.run(wide.id).await.unwrap();
+    let second = automation.run(wide.id).await.unwrap();
+
+    assert_eq!(first.assigned_count, 2);
+    assert_eq!(first.moved_from_other_batches_count, 2);
+    for id in ids {
+        assert_eq!(
+            repository.get_by_id(id).await.unwrap().batch_id,
+            Some(wide.id)
+        );
+    }
+    // A second run finds nothing left to move and changes nothing.
+    assert_eq!(second.imported_count, 0);
+    assert_eq!(second.assigned_count, 0);
+    assert_eq!(second.moved_from_other_batches_count, 0);
+    assert_eq!(second.exception_count, 0);
+    let wide_detail = service.get(wide.id).await.unwrap();
+    assert_eq!(wide_detail.summary.item_count, 2);
+    assert_eq!(wide_detail.summary.total_amount_cents, 3_000);
+    assert!(service.get(narrow.id).await.unwrap().items.is_empty());
+}
+
+#[tokio::test]
+async fn re_anchoring_still_skips_suspected_duplicates_and_unconfirmed_invoices() {
+    let email = "reanchor-safety@example.com";
+    let gateway = Arc::new(FakeRangeGateway::default());
+    gateway.queue(email, completed_scan(Vec::new()));
+    let harness = Harness::new(gateway, Arc::new(SequenceExtractor::new(&[]))).await;
+    harness.add_account(email, true).await;
+    let service = BatchService::new(harness.pool.clone());
+    let narrow = create_range_batch(&harness, "5 月中段", "2026-05-14", "2026-05-20").await;
+    let wide = create_range_batch(&harness, "5 月重新锚定", "2026-05-04", "2026-05-20").await;
+    let repository = ItemRepository::new(harness.pool.clone());
+    let safe_id = uuid::Uuid::new_v4();
+    let duplicate_id = uuid::Uuid::new_v4();
+    let unconfirmed_id = uuid::Uuid::new_v4();
+    let failed_id = uuid::Uuid::new_v4();
+    repository
+        .insert(&managed_item(
+            &harness.paths,
+            safe_id,
+            date(2026, 5, 16),
+            12_850,
+        ))
+        .await
+        .unwrap();
+    let mut duplicate = managed_item(&harness.paths, duplicate_id, date(2026, 5, 17), 4_000);
+    duplicate.dedupe_status = DedupeStatus::SuspectedDuplicate;
+    duplicate.duplicate_of_id = Some(safe_id);
+    repository.insert(&duplicate).await.unwrap();
+    let mut unconfirmed = managed_item(&harness.paths, unconfirmed_id, date(2026, 5, 18), 3_000);
+    unconfirmed.confirmation_status = ConfirmationStatus::Pending;
+    repository.insert(&unconfirmed).await.unwrap();
+    let mut failed = managed_item(&harness.paths, failed_id, date(2026, 5, 19), 2_500);
+    failed.recognition_status = RecognitionStatus::Failed;
+    repository.insert(&failed).await.unwrap();
+    for id in [safe_id, duplicate_id, unconfirmed_id, failed_id] {
+        sqlx::query("UPDATE items SET batch_id = ? WHERE id = ?")
+            .bind(narrow.id.to_string())
+            .bind(id.to_string())
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+    }
+
+    let result = harness
+        .state
+        .batch_automation_service()
+        .run(wide.id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.assigned_count, 1);
+    assert_eq!(result.moved_from_other_batches_count, 1);
+    assert_eq!(result.exception_count, 3);
+    assert_eq!(
+        result.export.as_ref().map(|export| export.item_count),
+        Some(1)
+    );
+    assert_eq!(
+        repository.get_by_id(safe_id).await.unwrap().batch_id,
+        Some(wide.id)
+    );
+    for id in [duplicate_id, unconfirmed_id, failed_id] {
+        assert_eq!(
+            repository.get_by_id(id).await.unwrap().batch_id,
+            Some(narrow.id)
+        );
+    }
+    let wide_detail = service.get(wide.id).await.unwrap();
+    assert_eq!(wide_detail.summary.item_count, 1);
+    assert_eq!(wide_detail.summary.total_amount_cents, 12_850);
+    assert_eq!(service.get(narrow.id).await.unwrap().summary.item_count, 3);
 }
 
 fn completed_scan(messages: Vec<RawMessage>) -> Vec<Result<MailboxDelta, AppError>> {

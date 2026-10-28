@@ -41,6 +41,16 @@ pub struct Preferences {
     pub background_sync_enabled: bool,
     pub export_directory: String,
     pub batch_directory_pattern: String,
+    /// Marks a mail as read once all of its invoices are in the library.
+    ///
+    /// Absent in preferences saved by earlier versions, where marking read was
+    /// not available, so it defaults to enabled.
+    #[serde(default = "default_mark_processed_mail_seen")]
+    pub mark_processed_mail_seen: bool,
+}
+
+pub(crate) fn default_mark_processed_mail_seen() -> bool {
+    true
 }
 
 impl Default for Preferences {
@@ -49,6 +59,7 @@ impl Default for Preferences {
             background_sync_enabled: true,
             export_directory: "exports".to_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: default_mark_processed_mail_seen(),
         }
     }
 }
@@ -58,6 +69,7 @@ pub struct PreferencesInput {
     pub background_sync_enabled: bool,
     pub export_directory: String,
     pub batch_directory_pattern: String,
+    pub mark_processed_mail_seen: bool,
 }
 
 #[derive(Clone, Default)]
@@ -214,6 +226,7 @@ impl SettingsService {
             background_sync_enabled: input.background_sync_enabled,
             export_directory: input.export_directory.trim().to_owned(),
             batch_directory_pattern: input.batch_directory_pattern.trim().to_owned(),
+            mark_processed_mail_seen: input.mark_processed_mail_seen,
         };
         validate_preferences(&preferences)?;
         let current = load_preferences(&self.pool).await?;

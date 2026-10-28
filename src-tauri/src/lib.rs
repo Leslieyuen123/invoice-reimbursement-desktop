@@ -135,6 +135,17 @@ pub fn run() {
         })
         .setup(|app| {
             let state = initialize_state(app.handle())?;
+            // A crash can leave a sync marked as running; clear it before the
+            // dashboard reads anything.
+            if let Ok(interrupted) = tauri::async_runtime::block_on(
+                crate::db::accounts::interrupt_stale_sync_runs(state.pool()),
+            ) && interrupted != 0
+            {
+                tracing::warn!(
+                    interrupted,
+                    "closed sync runs abandoned by an earlier crash"
+                );
+            }
             let pending_confirmation_count =
                 tauri::async_runtime::block_on(state.dashboard_service().load())?
                     .counts

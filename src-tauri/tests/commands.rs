@@ -269,6 +269,14 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "review_item",
             "resolve_duplicate",
             "retry_recognition",
+            "retry_failed_recognitions",
+            "settle_recoverable_items",
+            "recover_qr_invoices",
+            "recover_qr_invoice",
+            "recover_link_invoices",
+            "recover_link_invoice",
+            "archive_non_invoice_items",
+            "get_non_invoice_summary",
             "list_batches",
             "get_batch",
             "list_batch_candidates",
@@ -303,6 +311,8 @@ fn batch_automation_dto_maps_the_backend_result_without_rewriting_failure_messag
         }],
         imported_count: 2,
         assigned_count: 3,
+        moved_from_other_batches_count: 1,
+        categorized_as_other_count: 2,
         exception_count: 4,
         repaired_count: 6,
         export: Some(ExportResult {
@@ -321,6 +331,8 @@ fn batch_automation_dto_maps_the_backend_result_without_rewriting_failure_messag
     assert_eq!(dto.failed_accounts[0].message, "backend-safe failure");
     assert_eq!(dto.imported_count, 2);
     assert_eq!(dto.assigned_count, 3);
+    assert_eq!(dto.moved_from_other_batches_count, 1);
+    assert_eq!(dto.categorized_as_other_count, 2);
     assert_eq!(dto.exception_count, 4);
     assert_eq!(dto.repaired_count, 6);
     assert_eq!(dto.export.unwrap().item_count, 5);
@@ -337,6 +349,8 @@ fn batch_automation_dto_serializes_only_safe_camel_case_fields() {
         }],
         imported_count: 2,
         assigned_count: 3,
+        moved_from_other_batches_count: 1,
+        categorized_as_other_count: 2,
         exception_count: 4,
         repaired_count: 0,
         export: None,
@@ -353,6 +367,8 @@ fn batch_automation_dto_serializes_only_safe_camel_case_fields() {
             }],
             "importedCount": 2,
             "assignedCount": 3,
+            "movedFromOtherBatchesCount": 1,
+            "categorizedAsOtherCount": 2,
             "exceptionCount": 4,
             "repairedCount": 0,
             "export": null,
@@ -562,6 +578,7 @@ async fn export_recovery_error_is_scoped_to_the_root_that_failed() {
             background_sync_enabled: true,
             export_directory: replacement_root.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -602,6 +619,7 @@ async fn saving_unrelated_preferences_does_not_hide_a_recovery_failure() {
             background_sync_enabled: !preferences.background_sync_enabled,
             export_directory: preferences.export_directory,
             batch_directory_pattern: preferences.batch_directory_pattern,
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -647,6 +665,7 @@ async fn successful_recovery_clears_only_the_repaired_export_root_failure() {
             background_sync_enabled: true,
             export_directory: root_b.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -666,6 +685,7 @@ async fn successful_recovery_clears_only_the_repaired_export_root_failure() {
             background_sync_enabled: true,
             export_directory: root_a.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await
@@ -932,6 +952,7 @@ async fn settings_adapters_preserve_account_saga_and_preferences() {
             background_sync_enabled: false,
             export_directory: chosen_exports.to_string_lossy().into_owned(),
             batch_directory_pattern: "{batchName}-{timestamp}".to_owned(),
+            mark_processed_mail_seen: true,
         },
     )
     .await

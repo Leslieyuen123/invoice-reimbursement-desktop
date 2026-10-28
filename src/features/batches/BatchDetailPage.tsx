@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { join } from "@tauri-apps/api/path";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  CalendarRange,
+  CheckCheck,
   CircleAlert,
   CircleCheck,
   FileArchive,
@@ -29,6 +31,7 @@ import type {
   ExportResultDto,
   InvoiceItemDto,
   ItemStatus,
+  SettleBatchOutcomeDto,
 } from "../../types";
 import { AssignItemsDialog } from "./AssignItemsDialog";
 import "./Batches.css";
@@ -50,6 +53,7 @@ const categories = [
   ["餐饮", "dining"],
   ["住宿", "accommodation"],
   ["招待", "hospitality"],
+  ["其他", "other"],
 ] as const;
 
 const categoryLabels: Record<Category, string> = {
@@ -57,6 +61,7 @@ const categoryLabels: Record<Category, string> = {
   dining: "餐饮",
   accommodation: "住宿",
   hospitality: "招待",
+  other: "其他",
 };
 
 const statusLabels: Record<ItemStatus, string> = {
@@ -137,6 +142,17 @@ function automationErrorMessage(error: unknown) {
   return sanitizeAutomationErrorMessage(error.message) || AUTOMATION_ERROR_FALLBACK;
 }
 
+/**
+ * User-visible report for invoices re-anchored from another batch.
+ *
+ * Batch membership is single-owner, so the operation response carries the
+ * count; a later reload sees the invoices as ordinary members.
+ */
+function movedFromOtherBatchesReport(count: number | undefined) {
+  const moved = count ?? 0;
+  return moved === 0 ? null : `已从其他批次移入 ${moved} 张票据`;
+}
+
 export function BatchDetailPage() {
   const { batchId = "" } = useParams();
   const location = useLocation();
@@ -151,6 +167,7 @@ export function BatchDetailPage() {
     useState<AutomationFeedback>({ status: "idle" });
   const [recommendPending, setRecommendPending] = useState(false);
   const [recommendError, setRecommendError] = useState<string | null>(null);
+  const [assignReport, setAssignReport] = useState<string | null>(null);
   const [exportPending, setExportPending] = useState(false);
   const [exportResult, setExportResult] = useState<ExportResultDto | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -160,6 +177,21 @@ export function BatchDetailPage() {
   const [repairMessage, setRepairMessage] = useState<string | null>(null);
   const [repairError, setRepairError] = useState<string | null>(null);
   const [issueRemovingId, setIssueRemovingId] = useState<string | null>(null);
+  const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
+  const [bulkRemovePending, setBulkRemovePending] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [rangeOpen, setRangeOpen] = useState(false);
+  const [rangeStart, setRangeStart] = useState("");
+  const [rangeEnd, setRangeEnd] = useState("");
+  const [rangePending, setRangePending] = useState(false);
+  const [rangeError, setRangeError] = useState<string | null>(null);
+  const [settleOpen, setSettleOpen] = useState(false);
+  const [settlePending, setSettlePending] = useState(false);
+  const [settleError, setSettleError] = useState<string | null>(null);
+  const [settleReport, setSettleReport] = useState<SettleBatchOutcomeDto | null>(null);
+  const [settleFillDate, setSettleFillDate] = useState(true);
+  const [settleApplyCategory, setSettleApplyCategory] = useState(true);
+  const [settleDefaultCategory, setSettleDefaultCategory] = useState<Category | "">("other");
   const [manualRevealError, setManualRevealError] = useState<string | null>(null);
   const [assignDialogOpen, setAssignDialogOpen] = useState(false);
   const [assignDialogSession, setAssignDialogSession] = useState(0);
@@ -200,6 +232,7 @@ export function BatchDetailPage() {
     setAutomationFeedback({ status: "idle" });
     setRecommendPending(false);
     setRecommendError(null);
+    setAssignReport(null);
     setExportPending(false);
     setExportResult(null);
     setExportError(null);
@@ -344,10 +377,11 @@ export function BatchDetailPage() {
         setRecommendError("当前日期范围内没有可加入的推荐票据");
         return;
       }
-      await api.assignItemsToBatch(operationBatchId, itemIds);
+      const assigned = await api.assignItemsToBatch(operationBatchId, itemIds);
       reconcileBatchDetail(operationBatchId);
       advanceBatchContentRevision(operationBatchId);
       if (session !== routeSession.current) return;
+      setAssignReport(movedFromOtherBatchesReport(assigned.movedFromOtherBatchesCount));
     } catch (error) {
       if (session === routeSession.current) {
         setRecommendError(errorMessage(error, "推荐票据加入失败"));
@@ -429,8 +463,9 @@ export function BatchDetailPage() {
     queueMicrotask(() => opener?.focus());
   }
 
-  function acceptAssignedDetail(_detail: BatchDetailDto, sessionId: number) {
+  function acceptAssignedDetail(detail: BatchDetailDto, sessionId: number) {
     if (sessionId !== assignDialogSession) return;
+    setAssignReport(movedFromOtherBatchesReport(detail.movedFromOtherBatchesCount));
     closeAssignDialog();
   }
 
@@ -541,6 +576,84 @@ export function BatchDetailPage() {
     }
   }
 
+  function toggleItemSelection(itemId: string, selected: boolean) {
+    setSelectedItemIds((current) => {
+      const next = new Set(current);
+      if (selected) next.add(itemId);
+      else next.delete(itemId);
+      return next;
+    });
+  }
+
+  async function removeSelectedItems() {
+    if (selectedItemIds.size === 0) return;
+    const session = routeSession.current;
+    const operationBatchId = batchId;
+    setBulkRemovePending(true);
+    setBulkError(null);
+    try {
+      await api.removeBatchItems(operationBatchId, [...selectedItemIds]);
+      setSelectedItemIds(new Set());
+      reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
+    } catch (error) {
+      if (session === routeSession.current) {
+        setBulkError(errorMessage(error, "批量移出失败"));
+      }
+    } finally {
+      if (session === routeSession.current) setBulkRemovePending(false);
+    }
+  }
+
+  async function saveRange() {
+    const session = routeSession.current;
+    const operationBatchId = batchId;
+    setRangePending(true);
+    setRangeError(null);
+    try {
+      await api.updateBatchRange(operationBatchId, {
+        startDate: rangeStart,
+        endDate: rangeEnd,
+      });
+      reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
+      if (session !== routeSession.current) return;
+      setRangeOpen(false);
+    } catch (error) {
+      if (session === routeSession.current) {
+        setRangeError(errorMessage(error, "批次范围更新失败"));
+      }
+    } finally {
+      if (session === routeSession.current) setRangePending(false);
+    }
+  }
+
+  async function runSettle() {
+    const session = routeSession.current;
+    const operationBatchId = batchId;
+    setSettlePending(true);
+    setSettleError(null);
+    try {
+      const outcome = await api.settleBatchItems(operationBatchId, {
+        fillInvoiceDateFromReceived: settleFillDate,
+        applySuggestedCategory: settleApplyCategory,
+        defaultCategory: settleDefaultCategory === "" ? null : settleDefaultCategory,
+      });
+      reconcileBatchDetail(operationBatchId);
+      advanceBatchContentRevision(operationBatchId);
+      if (session !== routeSession.current) return;
+      setSettleReport(outcome);
+      setSettleOpen(false);
+      setSelectedItemIds(new Set());
+    } catch (error) {
+      if (session === routeSession.current) {
+        setSettleError(errorMessage(error, "批量确认失败"));
+      }
+    } finally {
+      if (session === routeSession.current) setSettlePending(false);
+    }
+  }
+
   if (batchQuery.isPending) {
     return (
       <div className="batch-detail-page batch-detail-loading" role="status">
@@ -610,6 +723,33 @@ export function BatchDetailPage() {
           </button>
           <button
             type="button"
+            className="button button-secondary"
+            onClick={() => {
+              setRangeStart(detail.batch.startDate);
+              setRangeEnd(detail.batch.endDate);
+              setRangeError(null);
+              setRangeOpen(true);
+            }}
+          >
+            <CalendarRange size={16} strokeWidth={1.7} aria-hidden="true" />
+            编辑批次范围
+          </button>
+          <button
+            type="button"
+            className="button button-secondary"
+            disabled={detail.summary.unconfirmedCount === 0}
+            onClick={() => {
+              setSettleError(null);
+              setSettleOpen(true);
+            }}
+          >
+            <CheckCheck size={16} strokeWidth={1.7} aria-hidden="true" />
+            {detail.summary.unconfirmedCount === 0
+              ? "没有待确认票据"
+              : `清空待确认（${detail.summary.unconfirmedCount}）`}
+          </button>
+          <button
+            type="button"
             className="button button-primary"
             disabled={exportBlocked || hasExportIssues || exportPending}
             onClick={() => void runExport()}
@@ -624,6 +764,10 @@ export function BatchDetailPage() {
         <div className="batch-inline-error" role="alert">{recommendError}</div>
       ) : null}
 
+      {assignReport ? (
+        <div className="batch-inline-note" role="status">{assignReport}</div>
+      ) : null}
+
       <section
         className={`batch-automation-strip is-${automationFeedback.status}`}
         aria-labelledby="batch-automation-title"
@@ -634,7 +778,9 @@ export function BatchDetailPage() {
               <Sparkles size={17} strokeWidth={1.7} aria-hidden="true" />
               <h2 id="batch-automation-title">自动处理</h2>
             </div>
-            <p>同步该日期范围的邮箱票据，纳入安全项并生成报销包。</p>
+            <p>
+              同步该日期范围的邮箱票据，把区间内的票据重新锚定到本批次（包括其他批次中的票据），并生成报销包。
+            </p>
           </div>
         ) : automationFeedback.status === "pending" ? (
           <div
@@ -667,6 +813,16 @@ export function BatchDetailPage() {
             <ul className="batch-automation-counts">
               <li>{automationFeedback.result.importedCount} 张新导入</li>
               <li>{automationFeedback.result.assignedCount} 张已自动纳入</li>
+              {(automationFeedback.result.movedFromOtherBatchesCount ?? 0) > 0 ? (
+                <li>
+                  {automationFeedback.result.movedFromOtherBatchesCount} 张从其他批次移入
+                </li>
+              ) : null}
+              {(automationFeedback.result.categorizedAsOtherCount ?? 0) > 0 ? (
+                <li>
+                  {automationFeedback.result.categorizedAsOtherCount} 张按其他分类纳入
+                </li>
+              ) : null}
               <li>{automationFeedback.result.exceptionCount} 个异常项</li>
               <li>{automationFeedback.result.failedAccounts.length} 个邮箱失败</li>
               {automationFeedback.result.repairedCount > 0 ? (
@@ -786,6 +942,48 @@ export function BatchDetailPage() {
         <div className="batch-inline-note" role="status">{repairMessage}</div>
       ) : null}
 
+      {settleReport ? (
+        <section className="batch-settle-report" role="status" aria-labelledby="settle-report-title">
+          <div className="batch-automation-title">
+            <CheckCheck size={17} strokeWidth={1.7} aria-hidden="true" />
+            <h2 id="settle-report-title">
+              已确认 {settleReport.confirmedCount} 张票据
+            </h2>
+          </div>
+          <ul className="batch-automation-counts">
+            <li>{settleReport.filledInvoiceDateCount} 张按邮件收到日期补齐开票日期</li>
+            <li>{settleReport.appliedCategoryCount} 张采用建议或默认分类</li>
+            <li>{settleReport.repairedCount} 张补齐归一化 PDF</li>
+            <li>{settleReport.skipped.length} 张仍需人工处理</li>
+          </ul>
+          {settleReport.skipped.length > 0 ? (
+            <>
+              <ul className="batch-settle-skipped">
+                {settleReport.skipped.map((skipped) => (
+                  <li key={skipped.itemId}>
+                    <strong>{skipped.fileName}</strong>
+                    <small>{skipped.message}</small>
+                  </li>
+                ))}
+              </ul>
+              <p className="batch-settle-hint">
+                缺金额的票据必须对照原件填写，请在待处理池逐张补全后重新确认。
+                <Link to={`/inbox?status=pending_confirmation&batchId=${batchId}`}>
+                  查看待确认票据
+                </Link>
+              </p>
+            </>
+          ) : null}
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={() => setSettleReport(null)}
+          >
+            关闭报告
+          </button>
+        </section>
+      ) : null}
+
       <div className="batch-summary-strip">
         <div>
           <span>票据</span>
@@ -825,10 +1023,50 @@ export function BatchDetailPage() {
           <h2 id="assigned-items-title">已归属票据</h2>
           <span>{detail.items.length} 张</span>
         </div>
+        {selectedItemIds.size > 0 ? (
+          <div className="batch-selection-bar" role="status">
+            <span>已选 {selectedItemIds.size} 张</span>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={() => setSelectedItemIds(new Set())}
+            >
+              取消选择
+            </button>
+            <button
+              type="button"
+              className="button button-danger"
+              disabled={bulkRemovePending}
+              onClick={() => void removeSelectedItems()}
+            >
+              {bulkRemovePending ? "正在移出" : "移出所选票据"}
+            </button>
+          </div>
+        ) : null}
+        {bulkError ? (
+          <div className="batch-inline-error" role="alert">{bulkError}</div>
+        ) : null}
         <div className="batch-items-table-region">
           <table className="batch-items-table">
             <thead>
               <tr>
+                <th className="batch-select-column">
+                  <input
+                    type="checkbox"
+                    aria-label="全选批次票据"
+                    checked={
+                      detail.items.length > 0 &&
+                      selectedItemIds.size === detail.items.length
+                    }
+                    onChange={(event) =>
+                      setSelectedItemIds(
+                        event.target.checked
+                          ? new Set(detail.items.map((item) => item.id))
+                          : new Set(),
+                      )
+                    }
+                  />
+                </th>
                 <th>文件</th>
                 <th>日期</th>
                 <th>分类</th>
@@ -841,12 +1079,24 @@ export function BatchDetailPage() {
             <tbody>
               {detail.items.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="batch-empty-row">尚未归属票据</td>
+                  <td colSpan={8} className="batch-empty-row">尚未归属票据</td>
                 </tr>
               ) : (
                 detail.items.map((item) => (
                   <tr key={item.id}>
-                    <td title={item.originalName}>{item.originalName}</td>
+                    <td className="batch-select-column">
+                      <input
+                        type="checkbox"
+                        aria-label={`选择 ${item.originalName}`}
+                        checked={selectedItemIds.has(item.id)}
+                        onChange={(event) =>
+                          toggleItemSelection(item.id, event.target.checked)
+                        }
+                      />
+                    </td>
+                    <td className="batch-file-cell" title={item.originalName}>
+                      {item.originalName}
+                    </td>
                     <td>{item.invoiceDate ?? "日期待补充"}</td>
                     <td>{categoryLabel(item.finalCategory ?? item.suggestedCategory)}</td>
                     <td>{statusLabels[item.status]}</td>
@@ -941,6 +1191,132 @@ export function BatchDetailPage() {
           onAssigned={acceptAssignedDetail}
           onClose={closeAssignDialog}
         />
+      ) : null}
+
+      {rangeOpen ? (
+        <div className="batch-dialog-backdrop" role="presentation">
+          <div
+            className="batch-confirm-dialog batch-range-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="range-dialog-title"
+          >
+            <h2 id="range-dialog-title">编辑批次范围</h2>
+            <p>
+              调整后批次会回到「未导出」，已归属的票据全部保留；日期超出新范围的票据会继续显示提示。
+            </p>
+            <label className="batch-range-field">
+              <span>开始日期</span>
+              <input
+                type="date"
+                value={rangeStart}
+                onChange={(event) => setRangeStart(event.target.value)}
+              />
+            </label>
+            <label className="batch-range-field">
+              <span>结束日期</span>
+              <input
+                type="date"
+                value={rangeEnd}
+                onChange={(event) => setRangeEnd(event.target.value)}
+              />
+            </label>
+            {rangeError ? (
+              <div className="batch-inline-error" role="alert">{rangeError}</div>
+            ) : null}
+            <div className="batch-form-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                aria-disabled={rangePending || undefined}
+                autoFocus
+                onClick={() => {
+                  if (!rangePending) setRangeOpen(false);
+                }}
+              >
+                {rangePending ? "正在保存" : "取消"}
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                disabled={rangePending || !rangeStart || !rangeEnd}
+                onClick={() => void saveRange()}
+              >
+                保存范围
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {settleOpen ? (
+        <div className="batch-dialog-backdrop" role="presentation">
+          <div
+            className="batch-confirm-dialog batch-settle-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settle-dialog-title"
+          >
+            <h2 id="settle-dialog-title">清空待确认票据</h2>
+            <p>
+              只确认能从票据已有数据补全的票据；缺金额的票据必须人工填写，不会被自动确认。
+            </p>
+            <label className="batch-settle-option">
+              <input
+                type="checkbox"
+                checked={settleFillDate}
+                onChange={(event) => setSettleFillDate(event.target.checked)}
+              />
+              <span>用邮件收到日期补齐缺失的开票日期</span>
+            </label>
+            <label className="batch-settle-option">
+              <input
+                type="checkbox"
+                checked={settleApplyCategory}
+                onChange={(event) => setSettleApplyCategory(event.target.checked)}
+              />
+              <span>采用已识别的建议分类</span>
+            </label>
+            <label className="batch-settle-option">
+              <span>没有分类时统一设为</span>
+              <select
+                value={settleDefaultCategory}
+                onChange={(event) =>
+                  setSettleDefaultCategory(event.target.value as Category | "")
+                }
+              >
+                <option value="">不设置</option>
+                {categories.map(([label, value]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+            </label>
+            {settleError ? (
+              <div className="batch-inline-error" role="alert">{settleError}</div>
+            ) : null}
+            <div className="batch-form-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                aria-disabled={settlePending || undefined}
+                autoFocus
+                onClick={() => {
+                  if (!settlePending) setSettleOpen(false);
+                }}
+              >
+                {settlePending ? "正在确认" : "取消"}
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                disabled={settlePending}
+                onClick={() => void runSettle()}
+              >
+                确认可推导的票据
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {removeTarget ? (

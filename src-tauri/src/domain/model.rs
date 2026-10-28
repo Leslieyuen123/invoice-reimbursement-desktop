@@ -22,6 +22,10 @@ pub enum Category {
     Dining,
     Accommodation,
     Hospitality,
+    /// Catch-all for invoices the recognizer cannot place in the four real
+    /// buckets. The user's rule: when no category matches, treat it as
+    /// "其他" instead of leaving it unclassified (which blocked batches).
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -64,6 +68,37 @@ pub enum DedupeStatus {
     Unique,
     SuspectedDuplicate,
     Resolved,
+}
+
+/// How one scanned mail ended up in the invoice library.
+///
+/// `Partial` and `Failed` mean the user still has something to do in the
+/// mailbox, which is why the ledger exposes them instead of only counting
+/// imported invoices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum MailOutcome {
+    Imported,
+    Partial,
+    Failed,
+    Ignored,
+}
+
+impl MailOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Imported => "imported",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Ignored => "ignored",
+        }
+    }
+
+    /// Whether the user should look at this mail again.
+    pub const fn needs_attention(self) -> bool {
+        matches!(self, Self::Partial | Self::Failed)
+    }
 }
 
 pub fn derive_item_status(
@@ -206,6 +241,7 @@ mod tests {
             (Category::Dining, "dining"),
             (Category::Accommodation, "accommodation"),
             (Category::Hospitality, "hospitality"),
+            (Category::Other, "other"),
         ]);
         assert_enum_round_trips(&[
             (SourceType::Email, "email"),

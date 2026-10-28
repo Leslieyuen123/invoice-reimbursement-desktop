@@ -11,6 +11,7 @@ use crate::infra::credentials::CredentialStore;
 use crate::infra::extraction::{DocumentExtractor, ExtractedDocument};
 use crate::infra::files::AppPaths;
 use crate::infra::imap::{ImapGateway, NativeTlsImapGateway};
+use crate::infra::invoice_download::{InvoiceLinkDownloader, SecureInvoiceLinkDownloader};
 use crate::services::account_saves::{
     AccountSagaShutdown, AccountSaveCoordinator, AccountSaveReconciliationReport,
 };
@@ -20,8 +21,10 @@ use crate::services::dashboard::DashboardService;
 use crate::services::export::{ExportCoordinator, ExportService};
 use crate::services::import::ImportService;
 use crate::services::items::ItemService;
+use crate::services::link_recovery::LinkRecoveryService;
 use crate::services::operations::AccountOperationCoordinator;
 use crate::services::preview::{PreviewCoordinator, PreviewService};
+use crate::services::qr_recovery::QrRecoveryService;
 use crate::services::recognition::RecognitionService;
 use crate::services::scheduler::{Clock, Scheduler, SyncRunner, SyncStartBarrier};
 use crate::services::settings::{BackgroundSyncGate, ExportPreferenceGate, SettingsService};
@@ -34,6 +37,11 @@ pub struct AppState {
     paths: AppPaths,
     credentials: Arc<dyn CredentialStore>,
     gateway: Arc<dyn ImapGateway>,
+    /// Downloader used by the recovery actions for stored invoices.
+    ///
+    /// Injectable so tests can drive the whole rescue with a fake portal instead
+    /// of the network.
+    link_downloader: Arc<dyn InvoiceLinkDownloader>,
     import_service: ImportService,
     item_service: ItemService,
     recognition_service: RecognitionService,
@@ -113,6 +121,7 @@ impl AppState {
             paths,
             credentials,
             gateway,
+            link_downloader: Arc::new(SecureInvoiceLinkDownloader),
             import_service,
             item_service,
             recognition_service,
@@ -128,6 +137,15 @@ impl AppState {
             runtime_operations: RuntimeOperationCoordinator::default(),
             export_recovery_failures: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Replaces the invoice-link downloader used by the QR rescue.
+    ///
+    /// Production always uses [`SecureInvoiceLinkDownloader`]; tests inject a
+    /// local fake so the rescue never touches the network.
+    pub fn with_link_downloader(mut self, downloader: Arc<dyn InvoiceLinkDownloader>) -> Self {
+        self.link_downloader = downloader;
+        self
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -194,6 +212,24 @@ impl AppState {
 
     pub fn recognition_service(&self) -> RecognitionService {
         self.recognition_service.clone()
+    }
+
+    pub fn qr_recovery_service(&self) -> QrRecoveryService {
+        QrRecoveryService::new(
+            ItemRepository::new(self.pool.clone()),
+            self.recognition_service(),
+            self.paths.clone(),
+            self.link_downloader.clone(),
+        )
+    }
+
+    pub fn link_recovery_service(&self) -> LinkRecoveryService {
+        LinkRecoveryService::new(
+            ItemRepository::new(self.pool.clone()),
+            self.recognition_service(),
+            self.paths.clone(),
+            self.link_downloader.clone(),
+        )
     }
 
     pub fn dashboard_service(&self) -> DashboardService {

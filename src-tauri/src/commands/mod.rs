@@ -1,7 +1,10 @@
 pub mod batches;
+pub mod consistency;
 pub mod dashboard;
+pub mod diagnostics;
 pub mod export;
 pub mod items;
+pub mod mail;
 pub mod settings;
 pub mod sync;
 
@@ -55,6 +58,14 @@ pub const COMMAND_NAMES: &[&str] = &[
     "review_item",
     "resolve_duplicate",
     "retry_recognition",
+    "retry_failed_recognitions",
+    "settle_recoverable_items",
+    "recover_qr_invoices",
+    "recover_qr_invoice",
+    "recover_link_invoices",
+    "recover_link_invoice",
+    "archive_non_invoice_items",
+    "get_non_invoice_summary",
     "list_batches",
     "get_batch",
     "list_batch_candidates",
@@ -79,6 +90,8 @@ pub fn invoke_handler<R: tauri::Runtime>()
 -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         dashboard::ipc::get_dashboard,
+        diagnostics::ipc::export_diagnostics,
+        consistency::ipc::get_consistency_report,
         items::ipc::list_items,
         items::ipc::get_item,
         items::ipc::open_item_original,
@@ -86,9 +99,22 @@ pub fn invoke_handler<R: tauri::Runtime>()
         items::ipc::review_item,
         items::ipc::resolve_duplicate,
         items::ipc::retry_recognition,
+        items::ipc::retry_failed_recognitions,
+        items::ipc::settle_recoverable_items,
+        items::ipc::recover_qr_invoices,
+        items::ipc::recover_qr_invoice,
+        items::ipc::recover_link_invoices,
+        items::ipc::recover_link_invoice,
+        items::ipc::archive_non_invoice_items,
+        items::ipc::get_non_invoice_summary,
+        mail::ipc::list_mail_ledger,
+        mail::ipc::get_mail_ledger_counts,
         batches::ipc::list_batches,
         batches::ipc::get_batch,
         batches::ipc::repair_batch_normalized_pdfs,
+        batches::ipc::update_batch_range,
+        batches::ipc::settle_batch_items,
+        batches::ipc::remove_batch_items,
         batches::ipc::list_batch_candidates,
         batches::ipc::create_month_batch,
         batches::ipc::create_custom_batch,
@@ -105,5 +131,7 @@ pub fn invoke_handler<R: tauri::Runtime>()
         settings::ipc::get_storage_status,
         settings::ipc::retry_export_recovery,
         sync::ipc::sync_account_now,
+        sync::ipc::get_sync_progress,
+        sync::ipc::cancel_sync,
     ]
 }

@@ -1,9 +1,19 @@
 import {
   type InfiniteData,
   useInfiniteQuery,
+  useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { Check, RotateCcw, Search, TriangleAlert, X } from "lucide-react";
+import {
+  ArchiveX,
+  Check,
+  Link2,
+  QrCode,
+  RotateCcw,
+  Search,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
@@ -12,12 +22,17 @@ import { api } from "../../lib/api";
 import { queryKeys } from "../../lib/queryKeys";
 import { isRecentItem } from "../../lib/recent";
 import type {
+  ArchiveNonInvoiceReportDto,
   Category,
   InvoiceItemDto,
   ItemFilter,
   ItemStatus,
+  LinkRecoveryReportDto,
   ManualImportOutcomeDto,
   PageDto,
+  QrRecoveryReportDto,
+  RecoverableSettleOutcomeDto,
+  RetryFailedRecognitionsReportDto,
   SourceType,
 } from "../../types";
 import { InboxTable } from "./InboxTable";
@@ -42,7 +57,7 @@ const statusTabs: Array<{ value?: ItemStatus; label: string }> = [
   { value: "ready", label: "可纳入批次" },
 ];
 
-function errorMessage(error: unknown) {
+function errorMessage(error: unknown, fallback = "待处理池暂时无法加载") {
   if (
     typeof error === "object" &&
     error !== null &&
@@ -51,7 +66,45 @@ function errorMessage(error: unknown) {
   ) {
     return error.message;
   }
-  return "待处理池暂时无法加载";
+  return fallback;
+}
+
+function recoverableReportText(report: RecoverableSettleOutcomeDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skippedCount} 张（${breakdown}）`
+    : `跳过 ${report.skippedCount} 张`;
+  const repaired =
+    report.repairedCount > 0
+      ? `，补齐归一化 PDF ${report.repairedCount} 张`
+      : "";
+  return `已确认 ${report.confirmedCount} 张，${skipped}${repaired}`;
+}
+
+function qrRecoveryReportText(report: QrRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  return `已补救 ${report.recognized} 张（检查 ${report.examined} 张、解码 ${report.decoded} 张、下载 ${report.downloaded} 张），${skipped}`;
+}
+
+function linkRecoveryReportText(report: LinkRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  const archived =
+    report.archived > 0
+      ? `，已归档 ${report.archived} 个非发票链接（其中非发票网站 ${report.notInvoicePortal} 个）`
+      : "";
+  return `已补救 ${report.recognized} 张（检查 ${report.examined} 张、下载 ${report.downloaded} 张），${skipped}${archived}`;
 }
 
 function statusFromSearch(value: string | null): ItemStatus | undefined {
@@ -145,6 +198,28 @@ export function InboxPage() {
     ManualImportOutcomeDto[]
   >([]);
   const [importingPaths, setImportingPaths] = useState<string[]>([]);
+  const [retryingFailed, setRetryingFailed] = useState(false);
+  const [retryFailedReport, setRetryFailedReport] =
+    useState<RetryFailedRecognitionsReportDto | null>(null);
+  const [retryFailedError, setRetryFailedError] = useState<string | null>(null);
+  const [settlingRecoverable, setSettlingRecoverable] = useState(false);
+  const [recoverableReport, setRecoverableReport] =
+    useState<RecoverableSettleOutcomeDto | null>(null);
+  const [recoverableError, setRecoverableError] = useState<string | null>(null);
+  const [recoveringQr, setRecoveringQr] = useState(false);
+  const [qrRecoveryReport, setQrRecoveryReport] =
+    useState<QrRecoveryReportDto | null>(null);
+  const [qrRecoveryError, setQrRecoveryError] = useState<string | null>(null);
+  const [recoveringLinks, setRecoveringLinks] = useState(false);
+  const [linkRecoveryReport, setLinkRecoveryReport] =
+    useState<LinkRecoveryReportDto | null>(null);
+  const [linkRecoveryError, setLinkRecoveryError] = useState<string | null>(
+    null,
+  );
+  const [archivingNonInvoice, setArchivingNonInvoice] = useState(false);
+  const [archiveReport, setArchiveReport] =
+    useState<ArchiveNonInvoiceReportDto | null>(null);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
   const status = statusFromSearch(searchParams.get("status"));
   const recent = searchParams.get("scope") === "recent";
   const batchId = searchParams.get("batchId")?.trim() || undefined;
@@ -160,6 +235,14 @@ export function InboxPage() {
     }),
     [batchId, category, query, recent, sourceType, status, suggestedPeriod],
   );
+  // The non-invoice banner only matters on the two queue tabs it can clean up.
+  const nonInvoiceSummary = useQuery({
+    queryKey: queryKeys.nonInvoiceSummary,
+    queryFn: () => api.getNonInvoiceSummary(),
+    enabled:
+      status === "recognition_failed" || status === "pending_confirmation",
+    retry: false,
+  });
   const itemsQuery = useInfiniteQuery({
     queryKey: queryKeys.items(filter),
     initialPageParam: undefined as
@@ -331,6 +414,87 @@ export function InboxPage() {
     [searchParams],
   );
 
+  async function retryAllFailedRecognitions() {
+    setRetryingFailed(true);
+    setRetryFailedError(null);
+    try {
+      const report = await api.retryFailedRecognitions();
+      setRetryFailedReport(report);
+      invalidateItemLists();
+    } catch (error) {
+      setRetryFailedError(errorMessage(error, "批量重试失败，请稍后再试"));
+    } finally {
+      setRetryingFailed(false);
+    }
+  }
+
+  async function settleRecoverablePending() {
+    setSettlingRecoverable(true);
+    setRecoverableError(null);
+    try {
+      const report = await api.settleRecoverableItems();
+      setRecoverableReport(report);
+      invalidateItemLists();
+    } catch (error) {
+      setRecoverableError(errorMessage(error, "批量确认失败，请稍后再试"));
+    } finally {
+      setSettlingRecoverable(false);
+    }
+  }
+
+  async function recoverQrInvoices() {
+    setRecoveringQr(true);
+    setQrRecoveryError(null);
+    try {
+      const report = await api.recoverQrInvoices();
+      setQrRecoveryReport(report);
+      invalidateItemLists();
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.nonInvoiceSummary,
+      });
+    } catch (error) {
+      setQrRecoveryError(errorMessage(error, "补救二维码票据失败，请稍后再试"));
+    } finally {
+      setRecoveringQr(false);
+    }
+  }
+
+  async function recoverLinkInvoices() {
+    setRecoveringLinks(true);
+    setLinkRecoveryError(null);
+    try {
+      const report = await api.recoverLinkInvoices();
+      setLinkRecoveryReport(report);
+      invalidateItemLists();
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.nonInvoiceSummary,
+      });
+    } catch (error) {
+      setLinkRecoveryError(
+        errorMessage(error, "补救链接票据失败，请稍后再试"),
+      );
+    } finally {
+      setRecoveringLinks(false);
+    }
+  }
+
+  async function archiveNonInvoiceFiles() {
+    setArchivingNonInvoice(true);
+    setArchiveError(null);
+    try {
+      const report = await api.archiveNonInvoiceItems();
+      setArchiveReport(report);
+      invalidateItemLists();
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.nonInvoiceSummary,
+      });
+    } catch (error) {
+      setArchiveError(errorMessage(error, "移出非发票文件失败，请稍后再试"));
+    } finally {
+      setArchivingNonInvoice(false);
+    }
+  }
+
   function fileName(path: string) {
     return path.split(/[\\/]/).pop() ?? path;
   }
@@ -398,6 +562,122 @@ export function InboxPage() {
         ))}
       </div>
 
+      {status === "recognition_failed" ? (
+        <div
+          className="inbox-active-filters"
+          role="group"
+          aria-label="批量重试识别失败"
+        >
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={retryingFailed || items.length === 0}
+            onClick={() => void retryAllFailedRecognitions()}
+          >
+            <RotateCcw size={15} strokeWidth={1.8} aria-hidden="true" />
+            {retryingFailed ? "正在重试…" : "重试全部识别失败"}
+          </button>
+          {retryFailedReport ? (
+            <span role="status">
+              {`已尝试 ${retryFailedReport.attempted} 张，恢复 ${retryFailedReport.recovered} 张，仍失败 ${retryFailedReport.stillFailed} 张，跳过 ${retryFailedReport.skipped} 张`}
+            </span>
+          ) : null}
+          {retryFailedError ? <span role="alert">{retryFailedError}</span> : null}
+        </div>
+      ) : null}
+
+      {status === "pending_confirmation" ? (
+        <div
+          className="inbox-active-filters"
+          role="group"
+          aria-label="批量确认可推导票据"
+        >
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={settlingRecoverable || items.length === 0}
+            onClick={() => void settleRecoverablePending()}
+          >
+            <Check size={15} strokeWidth={1.8} aria-hidden="true" />
+            {settlingRecoverable ? "正在确认…" : "批量确认可推导的票据"}
+          </button>
+          {recoverableReport ? (
+            <span role="status">{recoverableReportText(recoverableReport)}</span>
+          ) : null}
+          {recoverableError ? (
+            <span role="alert">{recoverableError}</span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {status === "recognition_failed" ||
+      status === "pending_confirmation" ? (
+        <div
+          className="inbox-active-filters"
+          role="group"
+          aria-label="二维码补救与非发票文件"
+        >
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={recoveringQr}
+            onClick={() => void recoverQrInvoices()}
+          >
+            <QrCode size={15} strokeWidth={1.8} aria-hidden="true" />
+            {recoveringQr ? "正在补救…" : "补救二维码票据"}
+          </button>
+          {qrRecoveryReport ? (
+            <span role="status">{qrRecoveryReportText(qrRecoveryReport)}</span>
+          ) : null}
+          {qrRecoveryError ? (
+            <span role="alert">{qrRecoveryError}</span>
+          ) : null}
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={recoveringLinks}
+            onClick={() => void recoverLinkInvoices()}
+          >
+            <Link2 size={15} strokeWidth={1.8} aria-hidden="true" />
+            {recoveringLinks ? "正在补救…" : "补救链接票据"}
+          </button>
+          {linkRecoveryReport ? (
+            <span role="status">
+              {linkRecoveryReportText(linkRecoveryReport)}
+            </span>
+          ) : null}
+          {linkRecoveryError ? (
+            <span role="alert">{linkRecoveryError}</span>
+          ) : null}
+          {nonInvoiceSummary.data &&
+          nonInvoiceSummary.data.markableCount > 0 ? (
+            <button
+              className="button button-secondary"
+              type="button"
+              disabled={archivingNonInvoice}
+              onClick={() => void archiveNonInvoiceFiles()}
+            >
+              <ArchiveX size={15} strokeWidth={1.8} aria-hidden="true" />
+              {archivingNonInvoice
+                ? "正在移出…"
+                : `${nonInvoiceSummary.data.markableCount} 个非发票文件 → 移出队列`}
+            </button>
+          ) : null}
+          {nonInvoiceSummary.data &&
+          nonInvoiceSummary.data.markableCount > 0 ? (
+            <span role="status">
+              这些 Word/Excel/压缩包文件无法识别为发票，移出后仍可在「全部」查看
+            </span>
+          ) : null}
+          {archiveReport ? (
+            <span role="status">
+              {`已移出 ${archiveReport.archivedCount} 个非发票文件（仍可在「全部」查看）`}
+            </span>
+          ) : null}
+          {archiveError ? <span role="alert">{archiveError}</span> : null}
+        </div>
+      ) : null}
+
       {recent ? (
         <div className="inbox-active-filters" aria-label="活动筛选">
           <button
@@ -433,6 +713,7 @@ export function InboxPage() {
             <option value="dining">餐饮</option>
             <option value="accommodation">住宿</option>
             <option value="hospitality">招待</option>
+            <option value="other">其他</option>
           </select>
         </label>
         <label>

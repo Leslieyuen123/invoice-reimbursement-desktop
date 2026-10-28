@@ -13,6 +13,8 @@ pub struct DashboardDto {
     pub pending_confirmation_count: u64,
     pub recognition_failed_count: u64,
     pub suspected_duplicate_count: u64,
+    /// Mails whose invoices still need attention (partial or failed extraction).
+    pub mail_needs_attention_count: u64,
     pub recent_batches: Vec<BatchDto>,
 }
 
@@ -31,6 +33,7 @@ pub async fn load(state: &AppState) -> Result<DashboardDto, AppError> {
         pending_confirmation_count: snapshot.counts.pending_confirmation,
         recognition_failed_count: snapshot.counts.recognition_failed,
         suspected_duplicate_count: snapshot.counts.suspected_duplicate,
+        mail_needs_attention_count: snapshot.counts.mail_needs_attention,
         recent_batches,
     })
 }

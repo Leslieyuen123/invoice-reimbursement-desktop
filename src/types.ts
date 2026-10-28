@@ -9,7 +9,8 @@ export type Category =
   | "transport"
   | "dining"
   | "accommodation"
-  | "hospitality";
+  | "hospitality"
+  | "other";
 
 export type SourceType = "email" | "manual_upload";
 
@@ -63,6 +64,8 @@ export interface InvoiceItemDto {
   sourceType: SourceType;
   sourceAccountId: string | null;
   fetchedAt: string;
+  /** Local date the mail was received; the date batches are keyed on. */
+  sourceReceivedDate: string | null;
   invoiceDate: string | null;
   suggestedPeriod: string | null;
   batchId: string | null;
@@ -80,6 +83,11 @@ export interface InvoiceItemDto {
   note: string | null;
   eventTag: string | null;
   projectTag: string | null;
+  /**
+   * Set when the user dismissed the file as "not an invoice" (Word, Excel or an
+   * archive). Dismissed files stay in "全部" but leave the work queue.
+   */
+  nonInvoiceReason?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -119,11 +127,15 @@ export interface DashboardDto {
   pendingConfirmationCount: number;
   recognitionFailedCount: number;
   suspectedDuplicateCount: number;
+  /** Mails whose invoices still need attention (partial or failed extraction). */
+  mailNeedsAttentionCount: number;
   recentBatches: BatchDto[];
 }
 
 export interface ItemFilter {
   status?: ItemStatus;
+  sourceAccountId?: string;
+  sourceUid?: number;
   recent?: boolean;
   suggestedPeriod?: string;
   category?: Category;
@@ -136,6 +148,8 @@ export interface PreferencesDto {
   backgroundSyncEnabled: boolean;
   exportDirectory: string;
   batchDirectoryPattern: string;
+  /** Mark a mail as read once every invoice from it is in the library. */
+  markProcessedMailSeen: boolean;
 }
 
 export interface StorageStatusDto {
@@ -143,6 +157,40 @@ export interface StorageStatusDto {
   exportDirectory: string;
   availableBytes: number | null;
   recoveryError: string | null;
+}
+
+export interface SyncProgressDto {
+  accountId: string;
+  mailbox: string | null;
+  processed: number;
+  imported: number;
+  failed: number;
+  startedAt: string;
+}
+
+export interface ConsistencyIssueDto {
+  key: string;
+  label: string;
+  count: number;
+  hint: string;
+  samples: string[];
+}
+
+export interface ConsistencyReportDto {
+  checkedAt: string;
+  itemsChecked: number;
+  batchesChecked: number;
+  issues: ConsistencyIssueDto[];
+}
+
+export interface ExportDiagnosticsInputDto {
+  destination: string | null;
+}
+
+export interface DiagnosticsBundleDto {
+  path: string;
+  directory: string;
+  bytes: number;
 }
 
 export interface ReviewItemInputDto {
@@ -174,6 +222,7 @@ export interface BatchDetailSummaryDto {
   dining: CategorySummaryDto;
   accommodation: CategorySummaryDto;
   hospitality: CategorySummaryDto;
+  other: CategorySummaryDto;
   unconfirmedCount: number;
 }
 
@@ -192,10 +241,92 @@ export interface BatchDetailDto {
   summary: BatchDetailSummaryDto;
   warnings: string[];
   issues: BatchIssueDto[];
+  /**
+   * Invoices this operation pulled in from another batch (range re-anchor).
+   *
+   * An operation report rather than stored state: a plain reload reports 0.
+   */
+  movedFromOtherBatchesCount?: number;
+}
+
+/** How one scanned mail ended up in the invoice library. */
+export type MailOutcome = "imported" | "partial" | "failed" | "ignored";
+
+export interface MailLedgerEntryDto {
+  accountId: string;
+  mailbox: string;
+  uid: number;
+  subject: string | null;
+  sender: string | null;
+  receivedAt: string;
+  processedAt: string;
+  candidateCount: number;
+  importedCount: number;
+  existingCount: number;
+  failedCount: number;
+  outcome: MailOutcome;
+  reason: string | null;
+  markedSeen: boolean;
+  /** Invoices are in the library but the mailbox still shows the mail unread. */
+  seenMismatch: boolean;
+}
+
+export interface MailLedgerCountsDto {
+  imported: number;
+  partial: number;
+  failed: number;
+  ignored: number;
+  needsAttention: number;
+}
+
+export interface MailLedgerCursorDto {
+  receivedAt: string;
+  uid: number;
+  accountId: string;
+}
+
+export interface MailLedgerPageDto {
+  items: MailLedgerEntryDto[];
+  nextCursor: MailLedgerCursorDto | null;
+}
+
+export interface MailLedgerFilter {
+  outcome?: MailOutcome;
+  needsAttention?: boolean;
+  accountId?: string;
+  query?: string;
+}
+
+export interface MailLedgerPageRequestDto {
+  cursor?: MailLedgerCursorDto;
+  pageSize?: number;
 }
 
 export interface BatchRepairDto {
   repairedCount: number;
+  issues: BatchIssueDto[];
+}
+
+/** One invoice the bulk confirm could not settle, with a stable reason code. */
+export interface SkippedBatchItemDto {
+  itemId: string;
+  fileName: string;
+  code: string;
+  message: string;
+}
+
+export interface SettleBatchInputDto {
+  fillInvoiceDateFromReceived: boolean;
+  applySuggestedCategory: boolean;
+  defaultCategory: Category | null;
+}
+
+export interface SettleBatchOutcomeDto {
+  confirmedCount: number;
+  filledInvoiceDateCount: number;
+  appliedCategoryCount: number;
+  repairedCount: number;
+  skipped: SkippedBatchItemDto[];
   issues: BatchIssueDto[];
 }
 
@@ -213,6 +344,11 @@ export interface BatchCandidateDto {
   outsideBatchRange: boolean;
   eligible: boolean;
   disabledReason: BatchCandidateDisabledReason | null;
+}
+
+export interface UpdateBatchRangeInputDto {
+  startDate: string;
+  endDate: string;
 }
 
 export interface NewBatchInputDto {
@@ -239,6 +375,10 @@ export interface BatchAutomationResultDto {
   failedAccounts: AccountAutomationFailureDto[];
   importedCount: number;
   assignedCount: number;
+  /** Batch members this run took over from another batch (range re-anchor). */
+  movedFromOtherBatchesCount?: number;
+  /** Invoices this run admitted by filling their missing category as "其他". */
+  categorizedAsOtherCount?: number;
   exceptionCount: number;
   repairedCount: number;
   export: ExportResultDto | null;
@@ -267,3 +407,95 @@ export interface TestMailboxAccountInputDto {
 export type PreferencesInputDto = PreferencesDto;
 
 export type BatchSummaryDto = BatchDto;
+
+/** What one bulk retry over the failed recognitions changed. */
+export interface RetryFailedRecognitionsReportDto {
+  /** Failed invoices the recognizer was run on in this batch. */
+  attempted: number;
+  /** Invoices whose recognition succeeded again. */
+  recovered: number;
+  /** Invoices that failed (or could not be read) again. */
+  stillFailed: number;
+  /** Placeholders (`.url`) and anything else that cannot be re-recognized. */
+  skipped: number;
+}
+
+/** One skip-reason bucket of the bulk "confirm derivable invoices" action. */
+export interface RecoverableSettleSkipDto {
+  code: string;
+  label: string;
+  count: number;
+}
+
+/** What one global "confirm every derivable invoice" run changed. */
+export interface RecoverableSettleOutcomeDto {
+  confirmedCount: number;
+  skippedCount: number;
+  filledInvoiceDateCount: number;
+  appliedCategoryCount: number;
+  repairedCount: number;
+  skippedBreakdown: RecoverableSettleSkipDto[];
+}
+
+/** One skip-reason bucket of the QR rescue run. */
+export interface QrRecoverySkipDto {
+  /** Stable machine-readable code, e.g. `no_qr_code`. */
+  code: string;
+  /** Chinese explanation shown in the result line. */
+  label: string;
+  count: number;
+}
+
+/** What one "补救二维码票据" run changed. */
+export interface QrRecoveryReportDto {
+  /** Stored image invoices the run looked at. */
+  examined: number;
+  /** Invoices whose stored image carried an HTTPS QR link. */
+  decoded: number;
+  /** Invoices whose original was replaced by the downloaded invoice. */
+  downloaded: number;
+  /** Invoices that ended recognized after the replacement. */
+  recognized: number;
+  /** Invoices that could not be rescued; see `skippedBreakdown`. */
+  skipped: number;
+  skippedBreakdown: QrRecoverySkipDto[];
+}
+
+/** What one "移出非发票文件" run changed. */
+export interface ArchiveNonInvoiceReportDto {
+  archivedCount: number;
+}
+
+/** One skip-reason bucket of the link rescue run. */
+export interface LinkRecoverySkipDto {
+  /** Stable machine-readable code, e.g. `not_invoice_portal`. */
+  code: string;
+  /** Chinese explanation shown in the result line. */
+  label: string;
+  count: number;
+}
+
+/** What one "补救链接票据" run changed. */
+export interface LinkRecoveryReportDto {
+  /** `.url` placeholders the run looked at. */
+  examined: number;
+  /** Placeholders whose stored file was replaced by a downloaded invoice. */
+  downloaded: number;
+  /** Placeholders that ended recognized after the replacement. */
+  recognized: number;
+  /** Placeholders that could not be rescued; see `skippedBreakdown`. */
+  skipped: number;
+  /** Placeholders marked as non-invoice files during the run. */
+  archived: number;
+  /** Placeholders skipped because the host is not an invoice portal. */
+  notInvoicePortal: number;
+  skippedBreakdown: LinkRecoverySkipDto[];
+}
+
+/** Counts behind the inbox "N 个非发票文件 → 移出队列" banner. */
+export interface NonInvoiceSummaryDto {
+  /** Office documents / archives a dismissal would mark right now. */
+  markableCount: number;
+  /** Already dismissed files (still visible in "全部"). */
+  markedCount: number;
+}

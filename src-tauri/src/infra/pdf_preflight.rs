@@ -1,7 +1,9 @@
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 
+use flate2::read::ZlibDecoder;
 use thiserror::Error;
 
 use crate::domain::error::AppError;
@@ -17,6 +19,8 @@ pub(crate) enum PdfPreflightError {
     Invalid,
     #[error("归一化 PDF 包含不受支持的压缩对象结构")]
     Unsupported,
+    #[error("归一化 PDF 不得加密")]
+    Encrypted,
     #[error("PDF 对象数超过导出限制")]
     ResourceLimit,
 }
@@ -953,6 +957,1012 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Input preflight: standard PDF 1.5+ object streams and cross-reference streams
+// ---------------------------------------------------------------------------
+
+/// The exporter only ever writes flat PDFs, so its preflight
+/// ([`validate_pdf_structure_with_limit`]) keeps rejecting embedded object and
+/// cross-reference streams. Real invoices, on the other hand, routinely store
+/// most objects inside `/ObjStm` streams and describe them with a compressed
+/// `/Type /XRef` cross-reference stream (and sometimes use the hybrid
+/// `/XRefStm` trailer entry). This entry point accepts exactly those standard
+/// structures while keeping the resource budget enforced *before* lopdf ever
+/// decodes anything:
+///
+/// * every xref section and object stream is decoded with a hard byte cap;
+/// * the loader-compatible object budget is still counted before parsing;
+/// * encrypted documents get their own error classification;
+/// * malformed xref graphs (out-of-range offsets, object headers that do not
+///   match their xref entry, object streams whose index does not agree with the
+///   xref) are still rejected.
+pub(crate) fn validate_pdf_input_structure_with_limit(
+    bytes: &[u8],
+    max_active_entries: usize,
+) -> Result<(), PdfPreflightError> {
+    let xref_start = input_terminal_startxref(bytes)?;
+    let mut collection = InputXrefCollection::new(max_active_entries);
+    collect_input_xref_offsets(bytes, xref_start, &mut collection)?;
+    validate_input_xref_entries(bytes, &mut collection)?;
+    Ok(())
+}
+
+/// Decoded object-stream budget for one input PDF, aligned with
+/// `pdf_resources::DEFAULT_PDF_DECODED_STREAM_BYTES_PER_ITEM`.
+const MAX_INPUT_DECODED_STREAM_BYTES: u64 = 100 * 1024 * 1024;
+
+/// The final, loader-visible xref entry for one object number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalXrefEntry {
+    Normal { generation: usize, offset: usize },
+    Compressed { container: usize, index: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InputRevisionEntry {
+    Normal {
+        object_number: usize,
+        generation: usize,
+        offset: usize,
+    },
+    Compressed {
+        object_number: usize,
+        container: usize,
+        index: usize,
+    },
+    Free,
+}
+
+struct InputXrefCollection {
+    visited_xrefs: HashSet<usize>,
+    total_entries: usize,
+    active_entries_total: usize,
+    max_active_entries: usize,
+    final_entries: HashMap<usize, FinalXrefEntry>,
+    decoded_stream_bytes: u64,
+}
+
+impl InputXrefCollection {
+    fn new(max_active_entries: usize) -> Self {
+        Self {
+            visited_xrefs: HashSet::new(),
+            total_entries: 0,
+            active_entries_total: 0,
+            max_active_entries,
+            final_entries: HashMap::new(),
+            decoded_stream_bytes: 0,
+        }
+    }
+
+    fn record_decoded_stream_bytes(&mut self, decoded: u64) -> Result<(), PdfPreflightError> {
+        self.decoded_stream_bytes = self
+            .decoded_stream_bytes
+            .checked_add(decoded)
+            .filter(|total| *total <= MAX_INPUT_DECODED_STREAM_BYTES)
+            .ok_or_else(resource_limit)?;
+        Ok(())
+    }
+
+    fn record_active_entry(&mut self) -> Result<(), PdfPreflightError> {
+        self.active_entries_total = self
+            .active_entries_total
+            .checked_add(1)
+            .filter(|total| *total <= self.max_active_entries)
+            .ok_or_else(resource_limit)?;
+        Ok(())
+    }
+}
+
+/// Mimic lopdf's merge order without allocating its full xref: within a
+/// revision the last entry for an object number wins, and older revisions only
+/// fill gaps. Free entries are dropped by lopdf's parsers, so they never hide an
+/// older in-use entry.
+fn record_input_revision_entries(
+    revision_entries: Vec<InputRevisionEntry>,
+    collection: &mut InputXrefCollection,
+) -> Result<(), PdfPreflightError> {
+    for entry in revision_entries.into_iter().rev() {
+        let (object_number, final_entry) = match entry {
+            InputRevisionEntry::Free => continue,
+            InputRevisionEntry::Normal {
+                object_number,
+                generation,
+                offset,
+            } => (object_number, FinalXrefEntry::Normal { generation, offset }),
+            InputRevisionEntry::Compressed {
+                object_number,
+                container,
+                index,
+            } => (
+                object_number,
+                FinalXrefEntry::Compressed { container, index },
+            ),
+        };
+        if collection.final_entries.contains_key(&object_number) {
+            continue;
+        }
+        collection.final_entries.insert(object_number, final_entry);
+        collection.record_active_entry()?;
+    }
+    Ok(())
+}
+
+fn validate_input_xref_entries(
+    bytes: &[u8],
+    collection: &mut InputXrefCollection,
+) -> Result<(), PdfPreflightError> {
+    let mut normal_entries = collection
+        .final_entries
+        .iter()
+        .filter_map(|(&object_number, entry)| match *entry {
+            FinalXrefEntry::Normal { generation, offset } => {
+                Some((object_number, generation, offset))
+            }
+            FinalXrefEntry::Compressed { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    normal_entries.sort_unstable_by_key(|(object_number, _, _)| *object_number);
+
+    let mut entries_by_offset: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (object_number, generation, offset) in &normal_entries {
+        entries_by_offset
+            .entry(*offset)
+            .or_default()
+            .push((*object_number, *generation));
+    }
+    let mut header_cache: HashMap<usize, (usize, usize)> = HashMap::new();
+    for (offset, claims) in &entries_by_offset {
+        let header = match header_cache.get(offset).copied() {
+            Some(header) => header,
+            None => {
+                if header_cache.len() >= MAX_XREF_ENTRIES {
+                    return Err(resource_limit());
+                }
+                let header = parse_indirect_object_header(bytes, *offset)?;
+                header_cache.insert(*offset, header);
+                header
+            }
+        };
+        // stale duplicate xref lines resolve to the object that actually lives
+        // at the offset; lopdf drops the others, so accept the offset as long
+        // as at least one claim matches the real object header.
+        if !claims.contains(&header) {
+            return Err(invalid_pdf_structure());
+        }
+    }
+
+    let mut object_offsets = normal_entries
+        .iter()
+        .map(|(_, _, offset)| *offset)
+        .collect::<Vec<_>>();
+    object_offsets.sort_unstable();
+    object_offsets.dedup();
+
+    let mut object_streams: HashMap<usize, InputObjectStreamInfo> = HashMap::new();
+    for offset in object_offsets {
+        let (object_number, _) = parse_indirect_object_header(bytes, offset)?;
+        if let Some(info) = inspect_input_object(bytes, offset, collection)?
+            && object_streams.insert(object_number, info).is_some()
+        {
+            return Err(invalid_pdf_structure());
+        }
+    }
+
+    for (&object_number, entry) in &collection.final_entries {
+        let FinalXrefEntry::Compressed { container, index } = *entry else {
+            continue;
+        };
+        let info = object_streams
+            .get(&container)
+            .ok_or_else(invalid_pdf_structure)?;
+        let contained_number = info
+            .objects
+            .get(index)
+            .map(|(contained, _)| *contained)
+            .ok_or_else(invalid_pdf_structure)?;
+        if contained_number != object_number {
+            return Err(invalid_pdf_structure());
+        }
+    }
+
+    for info in object_streams.values() {
+        for (object_number, _) in &info.objects {
+            if !collection.final_entries.contains_key(object_number) {
+                // lopdf would inject this object into the loaded document even
+                // though no xref entry accounts for it.
+                return Err(invalid_pdf_structure());
+            }
+        }
+    }
+    Ok(())
+}
+
+struct InputObjectStreamInfo {
+    /// `(object number, absolute offset in the decoded stream)`, in the order
+    /// declared by the object stream index.
+    objects: Vec<(usize, usize)>,
+}
+
+fn inspect_input_object(
+    bytes: &[u8],
+    offset: usize,
+    collection: &mut InputXrefCollection,
+) -> Result<Option<InputObjectStreamInfo>, PdfPreflightError> {
+    let mut lexer = RawLexer::at(bytes, offset);
+    parse_structural_usize(lexer.next_structural_token()?)?;
+    parse_structural_usize(lexer.next_structural_token()?)?;
+    expect_structural_word(&mut lexer, b"obj")?;
+    let dictionary_start = lexer.position;
+    if !matches!(
+        lexer.next_structural_token()?,
+        StructuralToken::DictionaryStart
+    ) {
+        return Ok(None);
+    }
+    if !input_dictionary_is_object_stream(&mut lexer)? {
+        return Ok(None);
+    }
+    lexer.position = dictionary_start;
+    match lexer.next_structural_token()? {
+        StructuralToken::DictionaryStart => {}
+        _ => return Err(invalid_pdf_structure()),
+    }
+    let dictionary = parse_input_object_stream_dictionary(&mut lexer)?;
+    expect_structural_word(&mut lexer, b"stream")?;
+
+    let length = dictionary.length.ok_or_else(invalid_pdf_structure)?;
+    let declared_objects = dictionary.n.ok_or_else(invalid_pdf_structure)?;
+    let first = dictionary.first.ok_or_else(invalid_pdf_structure)?;
+    if declared_objects > MAX_XREF_ENTRIES {
+        return Err(resource_limit());
+    }
+
+    let content_start = stream_content_start(bytes, lexer.position)?;
+    let content_end = content_start
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(invalid_pdf_structure)?;
+    validate_endstream(bytes, content_end)?;
+    let content = &bytes[content_start..content_end];
+
+    let remaining = MAX_INPUT_DECODED_STREAM_BYTES.saturating_sub(collection.decoded_stream_bytes);
+    let (decoded, decoded_bytes) = decode_input_stream(
+        content,
+        dictionary.filter,
+        dictionary.decode_parms,
+        remaining,
+    )?;
+    collection.record_decoded_stream_bytes(decoded_bytes)?;
+
+    if first > decoded.len() {
+        return Err(invalid_pdf_structure());
+    }
+    let mut index_lexer = RawLexer::new(&decoded[..first]);
+    let mut objects = Vec::with_capacity(declared_objects);
+    let mut seen_object_numbers = HashSet::with_capacity(declared_objects);
+    for _ in 0..declared_objects {
+        let object_number = parse_usize_word(index_lexer.next_token()?)?;
+        let relative_offset = parse_usize_word(index_lexer.next_token()?)?;
+        let absolute_offset = first
+            .checked_add(relative_offset)
+            .filter(|offset| *offset < decoded.len())
+            .ok_or_else(invalid_pdf_structure)?;
+        if !seen_object_numbers.insert(object_number) {
+            return Err(invalid_pdf_structure());
+        }
+        objects.push((object_number, absolute_offset));
+    }
+    let mut index_end = index_lexer.position;
+    while decoded
+        .get(index_end)
+        .is_some_and(|byte| is_whitespace(*byte))
+    {
+        index_end += 1;
+    }
+    if index_end != first {
+        return Err(invalid_pdf_structure());
+    }
+    for (_, absolute_offset) in &objects {
+        let mut value_lexer = RawLexer::at(&decoded, *absolute_offset);
+        consume_raw_value(&mut value_lexer, 0)?;
+    }
+    Ok(Some(InputObjectStreamInfo { objects }))
+}
+
+/// Walk the top-level dictionary entries only (nested dictionaries are skipped)
+/// and report whether it declares `/Type /ObjStm`. Cheap because it is a single
+/// linear token pass, which also lets non-object-stream dictionaries stay
+/// tolerant of indirect `/Length` values.
+fn input_dictionary_is_object_stream(lexer: &mut RawLexer<'_>) -> Result<bool, PdfPreflightError> {
+    let mut depth = 1_usize;
+    let mut previous_name: Option<Vec<u8>> = None;
+    let mut is_object_stream = false;
+    loop {
+        let token = lexer.next_structural_token()?;
+        match token {
+            StructuralToken::DictionaryStart | StructuralToken::ArrayStart => {
+                if depth == 1 {
+                    previous_name = None;
+                }
+                depth = depth.checked_add(1).ok_or_else(invalid_pdf_structure)?;
+                if depth > MAX_OBJECT_NESTING {
+                    return Err(resource_limit());
+                }
+            }
+            StructuralToken::DictionaryEnd | StructuralToken::ArrayEnd => {
+                depth = depth.checked_sub(1).ok_or_else(invalid_pdf_structure)?;
+                if depth == 0 {
+                    return Ok(is_object_stream);
+                }
+                if depth == 1 {
+                    previous_name = None;
+                }
+            }
+            StructuralToken::Name(name) => {
+                if depth == 1 {
+                    if previous_name.as_deref() == Some(b"Type") && name == b"ObjStm" {
+                        is_object_stream = true;
+                    }
+                    previous_name = Some(name);
+                }
+            }
+            StructuralToken::Word(_) | StructuralToken::Scalar => {
+                if depth == 1 {
+                    previous_name = None;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFilterKind {
+    Flate,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamDecodeParms {
+    predictor: Option<PngPredictor>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PngPredictor {
+    columns: usize,
+}
+
+#[derive(Default)]
+struct InputXrefStreamDictionary {
+    is_xref: bool,
+    length: Option<usize>,
+    size: Option<usize>,
+    widths: Option<[usize; 3]>,
+    index: Option<Vec<usize>>,
+    previous_xref: Option<usize>,
+    filter: Option<StreamFilterKind>,
+    decode_parms: Option<StreamDecodeParms>,
+}
+
+#[derive(Default)]
+struct InputObjectStreamDictionary {
+    length: Option<usize>,
+    n: Option<usize>,
+    first: Option<usize>,
+    filter: Option<StreamFilterKind>,
+    decode_parms: Option<StreamDecodeParms>,
+    saw_type: bool,
+}
+
+fn parse_input_object_stream_dictionary(
+    lexer: &mut RawLexer<'_>,
+) -> Result<InputObjectStreamDictionary, PdfPreflightError> {
+    let mut dictionary = InputObjectStreamDictionary::default();
+    loop {
+        let key = match lexer.next_structural_token()? {
+            StructuralToken::DictionaryEnd => return Ok(dictionary),
+            StructuralToken::Name(key) => key,
+            _ => return Err(invalid_pdf_structure()),
+        };
+        match key.as_slice() {
+            b"Type" => {
+                if dictionary.saw_type {
+                    return Err(invalid_pdf_structure());
+                }
+                dictionary.saw_type = true;
+                match lexer.next_structural_token()? {
+                    StructuralToken::Name(name) if name == b"ObjStm" => {}
+                    _ => return Err(invalid_pdf_structure()),
+                }
+            }
+            b"Length" => {
+                dictionary.length = Some(parse_unique_structural_usize(lexer, dictionary.length)?);
+            }
+            b"N" => {
+                dictionary.n = Some(parse_unique_structural_usize(lexer, dictionary.n)?);
+            }
+            b"First" => {
+                dictionary.first = Some(parse_unique_structural_usize(lexer, dictionary.first)?);
+            }
+            b"Filter" => {
+                if dictionary.filter.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                dictionary.filter = Some(parse_input_stream_filter(lexer)?);
+            }
+            b"DecodeParms" => {
+                if dictionary.decode_parms.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                dictionary.decode_parms = Some(parse_input_decode_parms(lexer)?);
+            }
+            b"Extends" => return Err(unsupported_pdf_structure()),
+            _ => consume_raw_value(lexer, 0)?,
+        }
+    }
+}
+
+fn parse_input_xref_stream_dictionary(
+    lexer: &mut RawLexer<'_>,
+) -> Result<InputXrefStreamDictionary, PdfPreflightError> {
+    let mut dictionary = InputXrefStreamDictionary::default();
+    loop {
+        let key = match lexer.next_structural_token()? {
+            StructuralToken::DictionaryEnd => return Ok(dictionary),
+            StructuralToken::Name(key) => key,
+            _ => return Err(invalid_pdf_structure()),
+        };
+        match key.as_slice() {
+            b"Type" => {
+                if dictionary.is_xref {
+                    return Err(invalid_pdf_structure());
+                }
+                dictionary.is_xref = matches!(
+                    lexer.next_structural_token()?,
+                    StructuralToken::Name(name) if name == b"XRef"
+                );
+                if !dictionary.is_xref {
+                    return Err(invalid_pdf_structure());
+                }
+            }
+            b"Length" => {
+                dictionary.length = Some(parse_unique_structural_usize(lexer, dictionary.length)?);
+            }
+            b"Size" => {
+                dictionary.size = Some(parse_unique_structural_usize(lexer, dictionary.size)?);
+            }
+            b"Prev" => {
+                dictionary.previous_xref = Some(parse_unique_structural_usize(
+                    lexer,
+                    dictionary.previous_xref,
+                )?);
+            }
+            b"W" => {
+                if dictionary.widths.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                let values = parse_usize_array(lexer)?;
+                dictionary.widths = Some(values.try_into().map_err(|_| invalid_pdf_structure())?);
+            }
+            b"Index" => {
+                if dictionary.index.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                dictionary.index = Some(parse_usize_array(lexer)?);
+            }
+            b"Filter" => {
+                if dictionary.filter.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                dictionary.filter = Some(parse_input_stream_filter(lexer)?);
+            }
+            b"DecodeParms" => {
+                if dictionary.decode_parms.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                dictionary.decode_parms = Some(parse_input_decode_parms(lexer)?);
+            }
+            b"Encrypt" => return Err(encrypted_pdf_structure()),
+            _ => consume_raw_value(lexer, 0)?,
+        }
+    }
+}
+
+fn parse_input_stream_filter(
+    lexer: &mut RawLexer<'_>,
+) -> Result<StreamFilterKind, PdfPreflightError> {
+    let mut names = Vec::new();
+    match lexer.next_structural_token()? {
+        StructuralToken::Name(name) => names.push(name),
+        StructuralToken::ArrayStart => loop {
+            match lexer.next_structural_token()? {
+                StructuralToken::ArrayEnd => break,
+                StructuralToken::Name(name) => names.push(name),
+                _ => return Err(unsupported_pdf_structure()),
+            }
+        },
+        _ => return Err(unsupported_pdf_structure()),
+    }
+    if names.len() != 1 {
+        return Err(unsupported_pdf_structure());
+    }
+    match names[0].as_slice() {
+        b"FlateDecode" | b"Fl" => Ok(StreamFilterKind::Flate),
+        _ => Err(unsupported_pdf_structure()),
+    }
+}
+
+fn parse_input_decode_parms(
+    lexer: &mut RawLexer<'_>,
+) -> Result<StreamDecodeParms, PdfPreflightError> {
+    match lexer.next_structural_token()? {
+        StructuralToken::DictionaryStart => parse_input_decode_parms_dictionary(lexer),
+        StructuralToken::ArrayStart => {
+            let parms = match lexer.next_structural_token()? {
+                StructuralToken::DictionaryStart => parse_input_decode_parms_dictionary(lexer)?,
+                StructuralToken::Word(b"null") => StreamDecodeParms::default(),
+                _ => return Err(unsupported_pdf_structure()),
+            };
+            match lexer.next_structural_token()? {
+                StructuralToken::ArrayEnd => Ok(parms),
+                _ => Err(unsupported_pdf_structure()),
+            }
+        }
+        StructuralToken::Word(b"null") => Ok(StreamDecodeParms::default()),
+        _ => Err(unsupported_pdf_structure()),
+    }
+}
+
+fn parse_input_decode_parms_dictionary(
+    lexer: &mut RawLexer<'_>,
+) -> Result<StreamDecodeParms, PdfPreflightError> {
+    let mut predictor_seen = false;
+    let mut columns_seen = false;
+    let mut predictor = 1_usize;
+    let mut columns = 1_usize;
+    loop {
+        let key = match lexer.next_structural_token()? {
+            StructuralToken::DictionaryEnd => break,
+            StructuralToken::Name(key) => key,
+            _ => return Err(invalid_pdf_structure()),
+        };
+        match key.as_slice() {
+            b"Predictor" => {
+                if predictor_seen {
+                    return Err(invalid_pdf_structure());
+                }
+                predictor_seen = true;
+                predictor = parse_structural_usize(lexer.next_structural_token()?)?;
+            }
+            b"Columns" => {
+                if columns_seen {
+                    return Err(invalid_pdf_structure());
+                }
+                columns_seen = true;
+                columns = parse_structural_usize(lexer.next_structural_token()?)?;
+            }
+            _ => consume_raw_value(lexer, 0)?,
+        }
+    }
+    match predictor {
+        1 => Ok(StreamDecodeParms::default()),
+        10..=15 => {
+            if columns == 0 {
+                return Err(invalid_pdf_structure());
+            }
+            Ok(StreamDecodeParms {
+                predictor: Some(PngPredictor { columns }),
+            })
+        }
+        _ => Err(unsupported_pdf_structure()),
+    }
+}
+
+fn collect_input_xref_offsets(
+    bytes: &[u8],
+    xref_start: usize,
+    collection: &mut InputXrefCollection,
+) -> Result<(), PdfPreflightError> {
+    if xref_start >= bytes.len()
+        || collection.visited_xrefs.len() >= MAX_XREF_REVISIONS
+        || !collection.visited_xrefs.insert(xref_start)
+    {
+        return Err(invalid_pdf_structure());
+    }
+    let mut lexer = RawLexer::at(bytes, xref_start);
+    let first = lexer.next_token()?;
+    let (previous_xref, hybrid_xref_stream) = match first {
+        RawToken::Word(b"xref") => collect_input_classic_xref_section(&mut lexer, collection)?,
+        RawToken::Word(_) => (
+            collect_input_xref_stream(bytes, xref_start, collection)?,
+            None,
+        ),
+        _ => return Err(invalid_pdf_structure()),
+    };
+    // Hybrid-reference files point at the cross-reference stream from the
+    // trailer. lopdf merges it in after the previous revision, so filling gaps
+    // in either order keeps the object budget conservative.
+    if let Some(hybrid_xref_stream) = hybrid_xref_stream {
+        collect_input_xref_offsets(bytes, hybrid_xref_stream, collection)?;
+    }
+    if let Some(previous_xref) = previous_xref {
+        collect_input_xref_offsets(bytes, previous_xref, collection)?;
+    }
+    Ok(())
+}
+
+fn collect_input_classic_xref_section(
+    lexer: &mut RawLexer<'_>,
+    collection: &mut InputXrefCollection,
+) -> Result<(Option<usize>, Option<usize>), PdfPreflightError> {
+    let mut revision_entries = Vec::new();
+    let (previous_xref, hybrid_xref_stream) = loop {
+        let token = lexer.next_token()?;
+        match token {
+            RawToken::Word(b"trailer") => break parse_input_classic_trailer(lexer)?,
+            RawToken::Word(first) => {
+                let first_object = parse_usize(first)?;
+                let count = parse_usize_word(lexer.next_token()?)?;
+                record_xref_entries(&mut collection.total_entries, count)?;
+                for index in 0..count {
+                    let object_number = first_object
+                        .checked_add(index)
+                        .ok_or_else(invalid_pdf_structure)?;
+                    let offset = parse_usize_word(lexer.next_token()?)?;
+                    let generation = parse_usize_word(lexer.next_token()?)?;
+                    match lexer.next_token()? {
+                        RawToken::Word(b"n") => {
+                            // lopdf's classic-xref parser drops entries whose
+                            // generation does not fit in u16; mirror that instead
+                            // of rejecting documents that merely carry a stale
+                            // xref line.
+                            if generation <= u16::MAX as usize {
+                                revision_entries.push(InputRevisionEntry::Normal {
+                                    object_number,
+                                    generation,
+                                    offset,
+                                });
+                            }
+                        }
+                        RawToken::Word(b"f") => revision_entries.push(InputRevisionEntry::Free),
+                        _ => return Err(invalid_pdf_structure()),
+                    }
+                }
+            }
+            _ => return Err(invalid_pdf_structure()),
+        }
+    };
+    record_input_revision_entries(revision_entries, collection)?;
+    Ok((previous_xref, hybrid_xref_stream))
+}
+
+fn parse_input_classic_trailer(
+    lexer: &mut RawLexer<'_>,
+) -> Result<(Option<usize>, Option<usize>), PdfPreflightError> {
+    match lexer.next_structural_token()? {
+        StructuralToken::DictionaryStart => {}
+        _ => return Err(invalid_pdf_structure()),
+    }
+    let mut previous_xref = None;
+    let mut hybrid_xref_stream = None;
+    loop {
+        let key = match lexer.next_structural_token()? {
+            StructuralToken::DictionaryEnd => break,
+            StructuralToken::Name(name) => name,
+            _ => return Err(invalid_pdf_structure()),
+        };
+        match key.as_slice() {
+            b"Prev" => {
+                if previous_xref.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                previous_xref = Some(parse_structural_usize(lexer.next_structural_token()?)?);
+            }
+            b"XRefStm" => {
+                if hybrid_xref_stream.is_some() {
+                    return Err(invalid_pdf_structure());
+                }
+                hybrid_xref_stream = Some(parse_structural_usize(lexer.next_structural_token()?)?);
+            }
+            b"Encrypt" => return Err(encrypted_pdf_structure()),
+            _ => consume_raw_value(lexer, 0)?,
+        }
+    }
+
+    expect_structural_word(lexer, b"startxref")?;
+    // The loader derives the xref graph from the terminal `startxref` and the
+    // `/Prev` chain; the per-section `startxref` value is never consulted. Some
+    // linearized writers put `startxref 0` (or point back at the first-page
+    // table) there, so only require the token to be well formed.
+    parse_structural_usize(lexer.next_structural_token()?)?;
+    Ok((previous_xref, hybrid_xref_stream))
+}
+
+fn collect_input_xref_stream(
+    bytes: &[u8],
+    xref_start: usize,
+    collection: &mut InputXrefCollection,
+) -> Result<Option<usize>, PdfPreflightError> {
+    let prefix_end = xref_start
+        .checked_add(MAX_XREF_STREAM_DICTIONARY_BYTES)
+        .map(|end| end.min(bytes.len()))
+        .ok_or_else(invalid_pdf_structure)?;
+    let mut lexer = RawLexer::at(&bytes[..prefix_end], xref_start);
+    let stream_object_number = parse_structural_usize(lexer.next_structural_token()?)?;
+    let stream_generation = parse_structural_usize(lexer.next_structural_token()?)?;
+    if stream_generation > u16::MAX as usize {
+        return Err(invalid_pdf_structure());
+    }
+    expect_structural_word(&mut lexer, b"obj")?;
+    match lexer.next_structural_token()? {
+        StructuralToken::DictionaryStart => {}
+        _ => return Err(invalid_pdf_structure()),
+    }
+    let dictionary = parse_input_xref_stream_dictionary(&mut lexer)?;
+    expect_structural_word(&mut lexer, b"stream")?;
+
+    let length = dictionary.length.ok_or_else(invalid_pdf_structure)?;
+    let size = dictionary.size.ok_or_else(invalid_pdf_structure)?;
+    let widths = dictionary.widths.ok_or_else(invalid_pdf_structure)?;
+    if !dictionary.is_xref || size == 0 || size > MAX_XREF_ENTRIES || stream_object_number >= size {
+        return Err(invalid_pdf_structure());
+    }
+    let index = dictionary.index.unwrap_or_else(|| vec![0, size]);
+    let entry_count = validate_xref_index(&index, size)?;
+    record_xref_entries(&mut collection.total_entries, entry_count)?;
+
+    let entry_width = widths
+        .into_iter()
+        .try_fold(0_usize, |total, width| total.checked_add(width))
+        .ok_or_else(invalid_pdf_structure)?;
+    if entry_width == 0 || widths.into_iter().any(|width| width > 8) {
+        return Err(invalid_pdf_structure());
+    }
+    let table_size = entry_count
+        .checked_mul(entry_width)
+        .ok_or_else(invalid_pdf_structure)?;
+    if dictionary.filter.is_none() && dictionary.decode_parms.is_some() {
+        return Err(invalid_pdf_structure());
+    }
+    if let Some(predictor) = dictionary.decode_parms.and_then(|parms| parms.predictor)
+        && predictor.columns != entry_width
+    {
+        return Err(invalid_pdf_structure());
+    }
+
+    let content_start = stream_content_start(bytes, lexer.position)?;
+    let content_end = content_start
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(invalid_pdf_structure)?;
+    validate_endstream(bytes, content_end)?;
+
+    let decode_limit = u64::try_from(table_size)
+        .ok()
+        .and_then(|tables| tables.checked_add(entry_count as u64))
+        .ok_or_else(resource_limit)?;
+    let (table, _decoded_bytes) = decode_input_stream(
+        &bytes[content_start..content_end],
+        dictionary.filter,
+        dictionary.decode_parms,
+        decode_limit,
+    )?;
+    if table.len() != table_size {
+        return Err(invalid_pdf_structure());
+    }
+
+    let mut cursor = 0_usize;
+    let mut revision_entries = Vec::with_capacity(entry_count);
+    for range in index.as_chunks::<2>().0 {
+        for index_offset in 0..range[1] {
+            let object_number = range[0] + index_offset;
+            let entry_end = cursor
+                .checked_add(entry_width)
+                .filter(|end| *end <= table_size)
+                .ok_or_else(invalid_pdf_structure)?;
+            let entry = &table[cursor..entry_end];
+            cursor = entry_end;
+            let type_end = widths[0];
+            let offset_end = type_end + widths[1];
+            let entry_type = if widths[0] == 0 {
+                1_usize
+            } else {
+                usize::try_from(read_big_endian(&entry[..type_end])?)
+                    .map_err(|_| invalid_pdf_structure())?
+            };
+            let field_two = read_big_endian(&entry[type_end..offset_end])?;
+            let field_three = read_big_endian(&entry[offset_end..])?;
+            match entry_type {
+                0 => revision_entries.push(InputRevisionEntry::Free),
+                1 => {
+                    let offset = usize::try_from(field_two).map_err(|_| invalid_pdf_structure())?;
+                    let generation = usize::try_from(field_three)
+                        .ok()
+                        .filter(|generation| *generation <= u16::MAX as usize)
+                        .ok_or_else(invalid_pdf_structure)?;
+                    if offset >= bytes.len() {
+                        return Err(invalid_pdf_structure());
+                    }
+                    if object_number == stream_object_number
+                        && (offset != xref_start || generation != stream_generation)
+                    {
+                        return Err(invalid_pdf_structure());
+                    }
+                    revision_entries.push(InputRevisionEntry::Normal {
+                        object_number,
+                        generation,
+                        offset,
+                    });
+                }
+                2 => {
+                    if object_number == stream_object_number {
+                        return Err(invalid_pdf_structure());
+                    }
+                    let container =
+                        usize::try_from(field_two).map_err(|_| invalid_pdf_structure())?;
+                    let compressed_index = usize::try_from(field_three)
+                        .ok()
+                        .filter(|index| *index <= u16::MAX as usize)
+                        .ok_or_else(invalid_pdf_structure)?;
+                    if container == 0 || container >= size {
+                        return Err(invalid_pdf_structure());
+                    }
+                    revision_entries.push(InputRevisionEntry::Compressed {
+                        object_number,
+                        container,
+                        index: compressed_index,
+                    });
+                }
+                _ => return Err(invalid_pdf_structure()),
+            }
+        }
+    }
+    if cursor != table_size {
+        return Err(invalid_pdf_structure());
+    }
+    record_input_revision_entries(revision_entries, collection)?;
+    Ok(dictionary.previous_xref)
+}
+
+fn input_terminal_startxref(bytes: &[u8]) -> Result<usize, PdfPreflightError> {
+    // Mirror the loader: the terminal `%%EOF` has to live in the last 512 bytes
+    // (real invoices sometimes append JSON metadata after it), and `startxref`
+    // has to sit right before it.
+    let window_start = bytes.len().saturating_sub(512);
+    let eof_position = bytes[window_start..]
+        .windows(b"%%EOF".len())
+        .position(|window| window == b"%%EOF")
+        .map(|position| window_start + position)
+        .ok_or_else(invalid_pdf_structure)?;
+    if eof_position <= 25 {
+        return Err(invalid_pdf_structure());
+    }
+    let marker = b"startxref";
+    let search_start = eof_position - 25;
+    let mut positions = bytes[search_start..eof_position]
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(position, window)| (window == marker).then_some(search_start + position));
+    let position = positions.next().ok_or_else(invalid_pdf_structure)?;
+    if positions.next().is_some() || !token_boundary_before(bytes, position) {
+        return Err(invalid_pdf_structure());
+    }
+    let mut cursor = position + marker.len();
+    consume_eol(bytes, &mut cursor)?;
+    while bytes.get(cursor) == Some(&b' ') {
+        cursor += 1;
+    }
+    let integer_start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if cursor == integer_start {
+        return Err(invalid_pdf_structure());
+    }
+    let xref_start = parse_usize(&bytes[integer_start..cursor])?;
+    while bytes.get(cursor) == Some(&b' ') {
+        cursor += 1;
+    }
+    consume_eol(bytes, &mut cursor)?;
+    if cursor != eof_position {
+        return Err(invalid_pdf_structure());
+    }
+    Ok(xref_start)
+}
+
+fn decode_input_stream(
+    content: &[u8],
+    filter: Option<StreamFilterKind>,
+    decode_parms: Option<StreamDecodeParms>,
+    limit: u64,
+) -> Result<(Vec<u8>, u64), PdfPreflightError> {
+    let Some(filter) = filter else {
+        if content.len() as u64 > limit {
+            return Err(resource_limit());
+        }
+        return Ok((content.to_vec(), content.len() as u64));
+    };
+    match filter {
+        StreamFilterKind::Flate => {
+            let decoded = bounded_flate_decode(content, limit)?;
+            let decoded_bytes = decoded.len() as u64;
+            let table = match decode_parms.and_then(|parms| parms.predictor) {
+                Some(predictor) => undo_png_predictor(&decoded, predictor.columns)?,
+                None => decoded,
+            };
+            Ok((table, decoded_bytes))
+        }
+    }
+}
+
+fn bounded_flate_decode(content: &[u8], limit: u64) -> Result<Vec<u8>, PdfPreflightError> {
+    let decoder = ZlibDecoder::new(content);
+    let mut bounded = decoder.take(limit.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut decoded = Vec::new();
+    loop {
+        match bounded.read(&mut buffer) {
+            Ok(0) => return Ok(decoded),
+            Ok(read) => {
+                decoded.extend_from_slice(&buffer[..read]);
+                if decoded.len() as u64 > limit {
+                    return Err(resource_limit());
+                }
+            }
+            Err(_) => return Err(invalid_pdf_structure()),
+        }
+    }
+}
+
+fn undo_png_predictor(decoded: &[u8], columns: usize) -> Result<Vec<u8>, PdfPreflightError> {
+    if columns == 0 {
+        return Err(invalid_pdf_structure());
+    }
+    let row_len = columns.checked_add(1).ok_or_else(invalid_pdf_structure)?;
+    if !decoded.len().is_multiple_of(row_len) {
+        return Err(invalid_pdf_structure());
+    }
+    let mut table = Vec::with_capacity(decoded.len());
+    let mut previous = vec![0_u8; columns];
+    for row in decoded.chunks_exact(row_len) {
+        let filter = row[0];
+        let mut current = row[1..].to_vec();
+        for index in 0..columns {
+            let left = if index == 0 { 0 } else { current[index - 1] };
+            let up = previous[index];
+            let up_left = if index == 0 { 0 } else { previous[index - 1] };
+            let predicted = match filter {
+                0 => 0,
+                1 => left,
+                2 => up,
+                3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
+                4 => paeth_predictor(left, up, up_left),
+                _ => return Err(invalid_pdf_structure()),
+            };
+            current[index] = current[index].wrapping_add(predicted);
+        }
+        table.extend_from_slice(&current);
+        previous = current;
+    }
+    Ok(table)
+}
+
+fn paeth_predictor(left: u8, up: u8, up_left: u8) -> u8 {
+    let estimate = i16::from(left) + i16::from(up) - i16::from(up_left);
+    let left_distance = (estimate - i16::from(left)).abs();
+    let up_distance = (estimate - i16::from(up)).abs();
+    let up_left_distance = (estimate - i16::from(up_left)).abs();
+    if left_distance <= up_distance && left_distance <= up_left_distance {
+        left
+    } else if up_distance <= up_left_distance {
+        up
+    } else {
+        up_left
+    }
+}
+
+fn encrypted_pdf_structure() -> PdfPreflightError {
+    PdfPreflightError::Encrypted
+}
+
 fn invalid_pdf_structure() -> PdfPreflightError {
     PdfPreflightError::Invalid
 }
@@ -966,602 +1976,4 @@ fn resource_limit() -> PdfPreflightError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Write;
-
-    use lopdf::{Document, Object, dictionary};
-
-    use super::{
-        MAX_XREF_ENTRIES, PdfPreflightError, RawLexer, RawToken, reject_unsafe_object_dictionary,
-        reset_header_parse_offsets, take_header_parse_offsets, validate_pdf_structure_with_limit,
-    };
-
-    fn validate_pdf_structure(bytes: &[u8]) -> Result<(), PdfPreflightError> {
-        validate_pdf_structure_with_limit(bytes, MAX_XREF_ENTRIES)
-    }
-
-    #[test]
-    fn accepts_uncompressed_xref_stream_without_compressed_entries() {
-        validate_pdf_structure(&lopdf_xref_stream_pdf()).unwrap();
-    }
-
-    #[test]
-    fn accepts_nested_noncritical_xref_stream_dictionary_values() {
-        let bytes = handcrafted_xref_stream_pdf(
-            1,
-            b"/Meta << /Type /ObjStm /Filter /FlateDecode /Length 1 /Size 1 /W [8 8 8] /Index [0 1] /Prev 0 >> ",
-        );
-
-        validate_pdf_structure(&bytes).unwrap();
-    }
-
-    #[test]
-    fn rejects_filtered_xref_stream() {
-        let bytes = handcrafted_xref_stream_pdf(1, b"/Filter /FlateDecode ");
-
-        let error = validate_pdf_structure(&bytes).unwrap_err();
-        assert!(error.to_string().contains("压缩对象"));
-    }
-
-    #[test]
-    fn rejects_xref_stream_with_compressed_object_entry() {
-        let bytes = handcrafted_xref_stream_pdf(2, b"");
-
-        let error = validate_pdf_structure(&bytes).unwrap_err();
-        assert!(error.to_string().contains("压缩对象"));
-    }
-
-    #[test]
-    fn rejects_classic_xref_entries_whose_object_header_does_not_match() {
-        for bytes in [
-            classic_pdf_with_entry_override(2, 0, 1),
-            classic_pdf_with_entry_override(1, 1, 1),
-        ] {
-            assert_eq!(
-                validate_pdf_structure(&bytes),
-                Err(PdfPreflightError::Invalid)
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_xref_stream_entries_whose_object_header_does_not_match() {
-        for bytes in [
-            handcrafted_xref_stream_pdf_with_page_entry(1, 1, 0, b""),
-            handcrafted_xref_stream_pdf_with_page_entry(1, 3, 1, b""),
-        ] {
-            assert_eq!(
-                validate_pdf_structure(&bytes),
-                Err(PdfPreflightError::Invalid)
-            );
-        }
-    }
-
-    #[test]
-    fn free_xref_entries_do_not_consume_the_active_entry_budget() {
-        let bytes = classic_pdf_with_free_xref_entries(20_001);
-
-        validate_pdf_structure_with_limit(&bytes, 3).unwrap();
-    }
-
-    #[test]
-    fn repeated_entries_parse_each_unique_header_offset_once() {
-        let (bytes, shared_offset) = classic_pdf_with_repeated_commented_entry(2_000, 64 * 1024);
-        reset_header_parse_offsets();
-
-        validate_pdf_structure_with_limit(&bytes, MAX_XREF_ENTRIES).unwrap();
-
-        let parsed_offsets = take_header_parse_offsets();
-        assert_eq!(
-            parsed_offsets
-                .iter()
-                .filter(|offset| **offset == shared_offset)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn newest_normal_entry_shadows_older_active_entry_for_the_budget() {
-        let bytes = incremental_pdf_with_latest_entry(b"n", true);
-
-        validate_pdf_structure_with_limit(&bytes, 3).unwrap();
-    }
-
-    #[test]
-    fn newest_free_entry_does_not_hide_older_normal_from_loader_budget() {
-        let bytes = incremental_pdf_with_latest_entry(b"f", false);
-        let loaded = Document::load_mem(&bytes).unwrap();
-
-        assert!(loaded.objects.contains_key(&(1, 0)));
-
-        assert_eq!(
-            validate_pdf_structure_with_limit(&bytes, 2),
-            Err(PdfPreflightError::ResourceLimit)
-        );
-    }
-
-    #[test]
-    fn historical_unique_objects_still_consume_the_active_entry_budget() {
-        let bytes = incremental_pdf_with_unique_object();
-
-        assert_eq!(
-            validate_pdf_structure_with_limit(&bytes, 3),
-            Err(PdfPreflightError::ResourceLimit)
-        );
-    }
-
-    #[test]
-    fn accepts_dangerous_names_inside_strings_and_stream_content() {
-        let bytes = classic_pdf(
-            b"<< /Length 8 /Note (/Obj#53tm) >>\nstream\n/ObjStm\nendstream",
-            b"",
-        );
-
-        validate_pdf_structure(&bytes).unwrap();
-    }
-
-    #[test]
-    fn rejects_escaped_object_and_hybrid_xref_names() {
-        let object_dictionary =
-            b"<< /Type /Obj#53tm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream";
-        let mut name_lexer = RawLexer::new(b"/Obj#53tm");
-        assert!(matches!(
-            name_lexer.next_token().unwrap(),
-            RawToken::Name(name) if name == b"ObjStm"
-        ));
-        assert!(reject_unsafe_object_dictionary(object_dictionary).is_err());
-        let object_stream = classic_pdf(object_dictionary, b"");
-        let hybrid = classic_pdf(b"null", b"/XRef#53tm 42");
-
-        assert!(validate_pdf_structure(&object_stream).is_err());
-        assert!(validate_pdf_structure(&hybrid).is_err());
-    }
-
-    #[test]
-    fn rejects_startxref_that_points_to_an_indirect_object() {
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let object_offset = bytes.len();
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef >>\nendobj\n");
-        write!(&mut bytes, "startxref\n{object_offset}\n%%EOF\n").unwrap();
-
-        assert!(validate_pdf_structure(&bytes).is_err());
-    }
-
-    #[test]
-    fn rejects_trailing_startxref_that_lopdf_does_not_accept() {
-        let bytes = pdf_with_malicious_terminal_graph_and_benign_trailing_graph();
-        assert!(Document::load_mem(&bytes).is_err());
-
-        assert!(validate_pdf_structure(&bytes).is_err());
-    }
-
-    #[test]
-    fn rejects_nested_prev_that_hides_lopdf_malicious_previous_graph() {
-        let bytes = pdf_with_top_level_malicious_prev_and_nested_benign_prev();
-        let loaded = Document::load_mem(&bytes).unwrap();
-        assert!(loaded.objects.values().any(|object| {
-            object
-                .as_stream()
-                .is_ok_and(|stream| stream.dict.has_type(b"ObjStm"))
-        }));
-
-        assert!(validate_pdf_structure(&bytes).is_err());
-    }
-
-    #[test]
-    fn accepts_multiple_classic_xref_revisions() {
-        let bytes = incremental_classic_pdf();
-        let loaded = Document::load_mem(&bytes).unwrap();
-        assert_eq!(loaded.objects.len(), 5);
-
-        validate_pdf_structure(&bytes).unwrap();
-    }
-
-    #[test]
-    fn rejects_non_direct_or_ambiguous_classic_prev_values() {
-        let base = classic_pdf(b"null", b"");
-        let xref_start = base
-            .windows(b"xref".len())
-            .position(|window| window == b"xref")
-            .unwrap();
-        let cycle = format!("/Prev {xref_start}");
-        for bytes in [
-            classic_pdf(b"null", b"/Prev 1 /Prev 2"),
-            classic_pdf(b"null", b"/Prev 1 0 R"),
-            classic_pdf(b"null", b"/Prev /Other"),
-            classic_pdf(b"null", b"/Prev 999999"),
-            classic_pdf(b"null", cycle.as_bytes()),
-        ] {
-            assert!(validate_pdf_structure(&bytes).is_err());
-        }
-    }
-
-    #[test]
-    fn terminal_tail_allows_only_pdf_whitespace_after_eof() {
-        let mut whitespace = classic_pdf(b"null", b"");
-        whitespace.extend_from_slice(b"\0\t\n\x0c\r ");
-        validate_pdf_structure(&whitespace).unwrap();
-
-        let mut comment = classic_pdf(b"null", b"");
-        comment.extend_from_slice(b"% trailing comment\n");
-        assert!(validate_pdf_structure(&comment).is_err());
-    }
-
-    fn classic_pdf(extra_object: &[u8], trailer_extra: &[u8]) -> Vec<u8> {
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
-            extra_object,
-        ];
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(bytes.len());
-            writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
-            bytes.extend_from_slice(object);
-            bytes.extend_from_slice(b"\nendobj\n");
-        }
-        let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
-        for offset in offsets {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R ");
-        bytes.extend_from_slice(trailer_extra);
-        write!(&mut bytes, ">>\nstartxref\n{xref_offset}\n%%EOF\n").unwrap();
-        bytes
-    }
-
-    fn classic_pdf_with_entry_override(
-        target_object: usize,
-        generation: usize,
-        offset_object: usize,
-    ) -> Vec<u8> {
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
-        ];
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(bytes.len());
-            writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
-            bytes.extend_from_slice(object);
-            bytes.extend_from_slice(b"\nendobj\n");
-        }
-        let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for object_number in 1..=objects.len() {
-            let offset = if object_number == target_object {
-                offsets[offset_object - 1]
-            } else {
-                offsets[object_number - 1]
-            };
-            let generation = if object_number == target_object {
-                generation
-            } else {
-                0
-            };
-            writeln!(&mut bytes, "{offset:010} {generation:05} n ").unwrap();
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn classic_pdf_with_free_xref_entries(free_count: usize) -> Vec<u8> {
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
-        ];
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(bytes.len());
-            writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
-            bytes.extend_from_slice(object);
-            bytes.extend_from_slice(b"\nendobj\n");
-        }
-        let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for offset in offsets {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        if free_count != 0 {
-            writeln!(&mut bytes, "4 {free_count}").unwrap();
-            for _ in 0..free_count {
-                bytes.extend_from_slice(b"0000000000 65535 f \n");
-            }
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
-            free_count + 4,
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn classic_pdf_with_repeated_commented_entry(
-        repeated_entries: usize,
-        comment_bytes: usize,
-    ) -> (Vec<u8>, usize) {
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let shared_offset = bytes.len();
-        bytes.push(b'%');
-        bytes.extend(std::iter::repeat_n(b'x', comment_bytes));
-        bytes.push(b'\n');
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-        let pages_offset = bytes.len();
-        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-        let page_offset = bytes.len();
-        bytes.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>\nendobj\n",
-        );
-
-        let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for offset in [shared_offset, pages_offset, page_offset] {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        for _ in 0..repeated_entries {
-            writeln!(&mut bytes, "1 1\n{shared_offset:010} 00000 n ").unwrap();
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
-        )
-        .unwrap();
-        (bytes, shared_offset)
-    }
-
-    fn incremental_pdf_with_latest_entry(status: &[u8], write_updated_object: bool) -> Vec<u8> {
-        let mut bytes = classic_pdf_with_free_xref_entries(0);
-        let previous_xref = bytes
-            .windows(b"xref".len())
-            .position(|window| window == b"xref")
-            .unwrap();
-        let entry_offset = if write_updated_object {
-            let offset = bytes.len();
-            bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-            offset
-        } else {
-            0
-        };
-        let latest_xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n1 1\n");
-        writeln!(
-            &mut bytes,
-            "{entry_offset:010} 00000 {} ",
-            std::str::from_utf8(status).unwrap()
-        )
-        .unwrap();
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 4 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{latest_xref}\n%%EOF\n"
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn incremental_pdf_with_unique_object() -> Vec<u8> {
-        let mut bytes = classic_pdf_with_free_xref_entries(0);
-        let previous_xref = bytes
-            .windows(b"xref".len())
-            .position(|window| window == b"xref")
-            .unwrap();
-        let object_offset = bytes.len();
-        bytes.extend_from_slice(b"4 0 obj\nnull\nendobj\n");
-        let latest_xref = bytes.len();
-        write!(
-            &mut bytes,
-            "xref\n4 1\n{object_offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{latest_xref}\n%%EOF\n"
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn pdf_with_malicious_terminal_graph_and_benign_trailing_graph() -> Vec<u8> {
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
-            b"<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream".as_slice(),
-        ];
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(bytes.len());
-            writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
-            bytes.extend_from_slice(object);
-            bytes.extend_from_slice(b"\nendobj\n");
-        }
-
-        let malicious_xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
-        for offset in &offsets {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{malicious_xref}\n%%EOF\n"
-        )
-        .unwrap();
-
-        let benign_xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for offset in &offsets[..3] {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{benign_xref}\n"
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn pdf_with_top_level_malicious_prev_and_nested_benign_prev() -> Vec<u8> {
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
-            b"<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream".as_slice(),
-        ];
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(bytes.len());
-            writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
-            bytes.extend_from_slice(object);
-            bytes.extend_from_slice(b"\nendobj\n");
-        }
-
-        let malicious_xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
-        for offset in &offsets {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{malicious_xref}\n%%EOF\n"
-        )
-        .unwrap();
-
-        let benign_xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for offset in &offsets[..3] {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{benign_xref}\n%%EOF\n"
-        )
-        .unwrap();
-
-        let latest_xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
-        for offset in &offsets[..3] {
-            writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap();
-        }
-        write!(
-            &mut bytes,
-            "trailer\n<< /Size 4 /Root 1 0 R /Prev {malicious_xref} /Meta << /Prev {benign_xref} >> >>\nstartxref\n{latest_xref}\n%%EOF\n"
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn incremental_classic_pdf() -> Vec<u8> {
-        let mut bytes = classic_pdf(b"null", b"");
-        let previous_xref = bytes
-            .windows(b"xref".len())
-            .position(|window| window == b"xref")
-            .unwrap();
-        let update_object = bytes.len();
-        bytes.extend_from_slice(b"5 0 obj\n<< /Producer (incremental update) >>\nendobj\n");
-        let latest_xref = bytes.len();
-        write!(
-            &mut bytes,
-            "xref\n5 1\n{update_object:010} 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{latest_xref}\n%%EOF\n"
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn lopdf_xref_stream_pdf() -> Vec<u8> {
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let page_id = document.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 150.into()],
-        });
-        document.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => vec![Object::Reference(page_id)],
-                "Count" => 1,
-            }),
-        );
-        let catalog_id = document.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => pages_id,
-        });
-        document.trailer.set("Root", catalog_id);
-        let mut bytes = Vec::new();
-        document.save_to(&mut bytes).unwrap();
-        bytes
-    }
-
-    fn handcrafted_xref_stream_pdf(page_entry_type: u8, dictionary_extra: &[u8]) -> Vec<u8> {
-        handcrafted_xref_stream_pdf_with_page_entry(page_entry_type, 3, 0, dictionary_extra)
-    }
-
-    fn handcrafted_xref_stream_pdf_with_page_entry(
-        page_entry_type: u8,
-        page_offset_object: usize,
-        page_generation: u16,
-        dictionary_extra: &[u8],
-    ) -> Vec<u8> {
-        let objects = [
-            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 150] >>".as_slice(),
-        ];
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = Vec::new();
-        for (index, object) in objects.iter().enumerate() {
-            offsets.push(bytes.len());
-            writeln!(&mut bytes, "{} 0 obj", index + 1).unwrap();
-            bytes.extend_from_slice(object);
-            bytes.extend_from_slice(b"\nendobj\n");
-        }
-        let xref_offset = bytes.len();
-        let mut entries = Vec::new();
-        write_xref_stream_entry(&mut entries, 0, 0, u16::MAX);
-        write_xref_stream_entry(&mut entries, 1, offsets[0], 0);
-        write_xref_stream_entry(&mut entries, 1, offsets[1], 0);
-        write_xref_stream_entry(
-            &mut entries,
-            page_entry_type,
-            offsets[page_offset_object - 1],
-            page_generation,
-        );
-        write_xref_stream_entry(&mut entries, 1, xref_offset, 0);
-        write!(
-            &mut bytes,
-            "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 4 2] /Index [0 5] /Length {} ",
-            entries.len()
-        )
-        .unwrap();
-        bytes.extend_from_slice(dictionary_extra);
-        bytes.extend_from_slice(b">>\nstream\n");
-        bytes.extend_from_slice(&entries);
-        write!(
-            &mut bytes,
-            "\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n"
-        )
-        .unwrap();
-        bytes
-    }
-
-    fn write_xref_stream_entry(
-        entries: &mut Vec<u8>,
-        entry_type: u8,
-        offset: usize,
-        generation: u16,
-    ) {
-        entries.push(entry_type);
-        entries.extend_from_slice(&(offset as u32).to_be_bytes());
-        entries.extend_from_slice(&generation.to_be_bytes());
-    }
-}
+mod tests;
