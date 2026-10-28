@@ -740,6 +740,7 @@ fn category_label(category: Category) -> &'static str {
         Category::Dining => "餐饮",
         Category::Accommodation => "住宿",
         Category::Hospitality => "招待",
+        Category::Other => "其他",
     }
 }
 

@@ -524,7 +524,8 @@ fn incomplete_metadata_falls_back_to_received_month_and_needs_confirmation() {
 
     assert_eq!(recognized.invoice_date, None);
     assert_eq!(recognized.suggested_period, "2026-07");
-    assert_eq!(recognized.category, None);
+    // No category keyword matches, so the user's rule files it under "其他".
+    assert_eq!(recognized.category, Some(Category::Other));
     assert_eq!(
         recognized.status(DedupeStatus::Unique),
         ItemStatus::PendingConfirmation
@@ -716,22 +717,45 @@ fn toll_invoice_vehicle_fields_are_transport() {
 }
 
 #[test]
-fn tied_category_scores_are_left_unclassified() {
+fn tied_category_scores_fall_back_to_other() {
     let recognized = recognize(
         "出租车 网约车 餐饮 食品",
         NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
     );
 
-    assert_eq!(recognized.category, None);
+    assert_eq!(recognized.category, Some(Category::Other));
 }
 
 #[test]
-fn a_single_or_repeated_keyword_does_not_reach_the_category_threshold() {
+fn a_single_or_repeated_keyword_falls_back_to_other() {
     for text in ["酒店", "出租车 出租车 出租车"] {
         let recognized = recognize(text, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
 
-        assert_eq!(recognized.category, None, "{text}");
+        assert_eq!(recognized.category, Some(Category::Other), "{text}");
     }
+}
+
+#[test]
+fn unclassifiable_invoice_falls_back_to_other_and_can_auto_confirm() {
+    let recognized = recognize(
+        "开票日期：2026-06-18 价税合计 ￥128.50",
+        NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+    );
+
+    assert_eq!(
+        recognized.invoice_date,
+        NaiveDate::from_ymd_opt(2026, 6, 18)
+    );
+    assert_eq!(recognized.amount_cents, Some(12_850));
+    // No keyword matches, so "其他" is the only honest category, and because
+    // date + amount + category are now all present the original auto-confirm
+    // rule still confirms the invoice.
+    assert_eq!(recognized.category, Some(Category::Other));
+    assert!(recognized.warnings.is_empty());
+    assert_eq!(
+        recognized.confirmation_status,
+        ConfirmationStatus::Confirmed
+    );
 }
 
 #[test]
@@ -1223,12 +1247,16 @@ async fn retry_clears_or_replaces_old_automatic_fields_and_preserves_everything_
 
     assert_eq!(retried.invoice_date, NaiveDate::from_ymd_opt(2026, 6, 18));
     assert_eq!(retried.suggested_period.as_deref(), Some("2026-06"));
-    assert_eq!(retried.suggested_category, None);
+    // The retried text has no category keyword, so the automatic suggestion is
+    // "其他"; the manually chosen final category is still preserved below.
+    assert_eq!(retried.suggested_category, Some(Category::Other));
     assert_eq!(retried.amount_cents, Some(50_000));
     assert_eq!(retried.city, None);
     assert_eq!(retried.company, None);
     assert_eq!(retried.recognition_status, RecognitionStatus::Succeeded);
-    assert_eq!(retried.confirmation_status, ConfirmationStatus::Pending);
+    // Date + amount + a (fallback "其他") category now complete the automatic
+    // confirmation rule, while the manually chosen final category is preserved.
+    assert_eq!(retried.confirmation_status, ConfirmationStatus::Confirmed);
     assert_eq!(retried.final_category, before.final_category);
     assert_eq!(retried.batch_id, before.batch_id);
     assert_eq!(retried.note, before.note);

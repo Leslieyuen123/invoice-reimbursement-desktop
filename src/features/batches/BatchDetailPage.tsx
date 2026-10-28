@@ -53,6 +53,7 @@ const categories = [
   ["餐饮", "dining"],
   ["住宿", "accommodation"],
   ["招待", "hospitality"],
+  ["其他", "other"],
 ] as const;
 
 const categoryLabels: Record<Category, string> = {
@@ -60,6 +61,7 @@ const categoryLabels: Record<Category, string> = {
   dining: "餐饮",
   accommodation: "住宿",
   hospitality: "招待",
+  other: "其他",
 };
 
 const statusLabels: Record<ItemStatus, string> = {
@@ -189,7 +191,7 @@ export function BatchDetailPage() {
   const [settleReport, setSettleReport] = useState<SettleBatchOutcomeDto | null>(null);
   const [settleFillDate, setSettleFillDate] = useState(true);
   const [settleApplyCategory, setSettleApplyCategory] = useState(true);
-  const [settleDefaultCategory, setSettleDefaultCategory] = useState<Category | "">("");
+  const [settleDefaultCategory, setSettleDefaultCategory] = useState<Category | "">("other");
   const [manualRevealError, setManualRevealError] = useState<string | null>(null);
   const [assignDialogOpen, setAssignDialogOpen] = useState(false);
   const [assignDialogSession, setAssignDialogSession] = useState(0);
@@ -814,6 +816,11 @@ export function BatchDetailPage() {
               {(automationFeedback.result.movedFromOtherBatchesCount ?? 0) > 0 ? (
                 <li>
                   {automationFeedback.result.movedFromOtherBatchesCount} 张从其他批次移入
+                </li>
+              ) : null}
+              {(automationFeedback.result.categorizedAsOtherCount ?? 0) > 0 ? (
+                <li>
+                  {automationFeedback.result.categorizedAsOtherCount} 张按其他分类纳入
                 </li>
               ) : null}
               <li>{automationFeedback.result.exceptionCount} 个异常项</li>

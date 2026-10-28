@@ -4,14 +4,18 @@ use std::io::Read;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use std::collections::BTreeMap;
+
 use crate::commands::{CursorDto, PageDto, PageRequestDto, validated_page_size};
-use crate::db::items::{InvoiceItem, ItemFilter, ItemPageCursor};
+use crate::db::items::{InvoiceItem, ItemFilter, ItemPageCursor, ItemRepository};
 use crate::domain::amount::{validate_amount_cents, validate_optional_amount_cents};
 use crate::domain::error::AppError;
 use crate::domain::model::{
     Category, ConfirmationStatus, DedupeStatus, ItemStatus, RecognitionStatus, SourceType,
 };
 use crate::infra::files::open_contained_regular_file;
+use crate::services::batch_repair::repair_missing_normalized_pdfs;
+use crate::services::batches::{BatchService, RecoverableSettleInput};
 use crate::services::items::ItemReview;
 use crate::services::recognition::original_can_be_normalized;
 use crate::state::AppState;
@@ -397,6 +401,88 @@ pub async fn retry_failed_recognitions(
     Ok(report)
 }
 
+/// One bucket of invoices a bulk recoverable confirmation had to skip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverableSettleSkipDto {
+    pub code: String,
+    pub label: String,
+    pub count: u32,
+}
+
+/// Report of the inbox-level "批量确认可推导的票据" action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverableSettleOutcomeDto {
+    pub confirmed_count: u32,
+    pub skipped_count: u32,
+    pub filled_invoice_date_count: u32,
+    pub applied_category_count: u32,
+    /// Normalized PDFs regenerated for the invoices confirmed above.
+    pub repaired_count: u32,
+    /// Skip reasons grouped by stable code, deterministic by code.
+    pub skipped_breakdown: Vec<RecoverableSettleSkipDto>,
+}
+
+fn recoverable_skip_label(code: &str) -> &'static str {
+    match code {
+        "missing_amount" => "缺金额",
+        "missing_invoice_date" => "缺开票日期",
+        "missing_normalized_pdf" => "缺归一化 PDF",
+        "missing_category" => "缺分类",
+        "suspected_duplicate" => "疑似重复",
+        "recognition_failed" => "识别失败",
+        "not_recognized" => "尚未完成识别",
+        "unsupported_format" => "原件格式不支持",
+        _ => "其他原因",
+    }
+}
+
+/// Confirms every pending invoice in the library whose missing values can be
+/// derived from what is already stored, then repairs the normalized PDFs the
+/// confirmed invoices still miss.
+///
+/// The per-invoice rules live in `BatchService::settle_recoverable_items` and
+/// are shared with the per-batch settle. Only an explicit user action runs this:
+/// no read path ever confirms invoices on its own.
+pub async fn settle_recoverable_items(
+    state: &AppState,
+) -> Result<RecoverableSettleOutcomeDto, AppError> {
+    let service = BatchService::new(state.pool().clone());
+    let outcome = service
+        .settle_recoverable_items(RecoverableSettleInput::default())
+        .await?;
+    let repaired_count = if outcome.confirmed_item_ids.is_empty() {
+        0
+    } else {
+        let items = ItemRepository::new(state.pool().clone())
+            .list_by_ids(&outcome.confirmed_item_ids)
+            .await?;
+        repair_missing_normalized_pdfs(state.paths(), &state.recognition_service(), &items).await
+    };
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    for skipped in &outcome.skipped {
+        let count = counts.entry(skipped.code.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    let skipped_breakdown = counts
+        .into_iter()
+        .map(|(code, count)| RecoverableSettleSkipDto {
+            label: recoverable_skip_label(&code).to_owned(),
+            code,
+            count,
+        })
+        .collect();
+    Ok(RecoverableSettleOutcomeDto {
+        confirmed_count: outcome.confirmed_count,
+        skipped_count: u32::try_from(outcome.skipped.len()).unwrap_or(u32::MAX),
+        filled_invoice_date_count: outcome.filled_invoice_date_count,
+        applied_category_count: outcome.applied_category_count,
+        repaired_count,
+        skipped_breakdown,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginalOpenTarget {
     LocalPath(PathBuf),
@@ -634,8 +720,8 @@ pub(crate) mod ipc {
     use uuid::Uuid;
 
     use super::{
-        InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto, RetryFailedRecognitionsReport,
-        ReviewItemInputDto,
+        InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto, RecoverableSettleOutcomeDto,
+        RetryFailedRecognitionsReport, ReviewItemInputDto,
     };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
@@ -705,5 +791,12 @@ pub(crate) mod ipc {
         limit: Option<u32>,
     ) -> Result<RetryFailedRecognitionsReport, AppError> {
         super::retry_failed_recognitions(&state, limit).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn settle_recoverable_items(
+        state: State<'_, AppState>,
+    ) -> Result<RecoverableSettleOutcomeDto, AppError> {
+        super::settle_recoverable_items(&state).await
     }
 }

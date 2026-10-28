@@ -114,6 +114,7 @@ pub struct BatchDetailSummaryDto {
     pub dining: CategorySummaryDto,
     pub accommodation: CategorySummaryDto,
     pub hospitality: CategorySummaryDto,
+    pub other: CategorySummaryDto,
     pub unconfirmed_count: u64,
 }
 
@@ -131,6 +132,7 @@ impl TryFrom<BatchDetailSummary> for BatchDetailSummaryDto {
             dining: summary.dining.try_into()?,
             accommodation: summary.accommodation.try_into()?,
             hospitality: summary.hospitality.try_into()?,
+            other: summary.other.try_into()?,
             unconfirmed_count: summary.unconfirmed_count,
         })
     }
@@ -269,6 +271,8 @@ pub struct BatchAutomationResultDto {
     pub assigned_count: u32,
     /// Batch members this run took over from another batch (range re-anchor).
     pub moved_from_other_batches_count: u32,
+    /// Invoices this run admitted by filling their missing category as "其他".
+    pub categorized_as_other_count: u32,
     pub exception_count: u32,
     pub repaired_count: u32,
     pub export: Option<ExportResultDto>,
@@ -288,6 +292,7 @@ impl TryFrom<BatchAutomationResult> for BatchAutomationResultDto {
             imported_count: result.imported_count,
             assigned_count: result.assigned_count,
             moved_from_other_batches_count: result.moved_from_other_batches_count,
+            categorized_as_other_count: result.categorized_as_other_count,
             exception_count: result.exception_count,
             repaired_count: result.repaired_count,
             export: result.export.map(ExportResultDto::try_from).transpose()?,

@@ -852,6 +852,29 @@ impl ItemRepository {
         rows.into_iter().map(InvoiceItem::try_from).collect()
     }
 
+    /// Every invoice that is recognized but still waiting for confirmation.
+    ///
+    /// This is the scope of the inbox-level "批量确认可推导的票据" action: the
+    /// global counterpart of the per-batch settle. Suspected duplicates and
+    /// unresolved recognition failures are deliberately excluded — they have
+    /// their own workflows and are never silently confirmed here.
+    pub(crate) async fn list_pending_recoverable_with_connection(
+        connection: &mut SqliteConnection,
+    ) -> Result<Vec<InvoiceItem>, AppError> {
+        let query = format!(
+            "SELECT {ITEM_COLUMNS} FROM items \
+             WHERE confirmation_status = 'pending' \
+               AND recognition_status = 'succeeded' \
+               AND dedupe_status = 'unique' \
+             ORDER BY created_at DESC, id DESC"
+        );
+        let rows = sqlx::query_as::<_, DbItemRow>(&query)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| map_database_error("failed to list pending items", error))?;
+        rows.into_iter().map(InvoiceItem::try_from).collect()
+    }
+
     pub async fn update_fields(&self, id: Uuid, patch: ItemPatch) -> Result<InvoiceItem, AppError> {
         self.update_fields_internal(id, patch, false).await
     }
@@ -1916,6 +1939,7 @@ pub(crate) fn category_str(value: Category) -> &'static str {
         Category::Dining => "dining",
         Category::Accommodation => "accommodation",
         Category::Hospitality => "hospitality",
+        Category::Other => "other",
     }
 }
 
@@ -1926,6 +1950,7 @@ fn parse_optional_category(value: Option<String>) -> Result<Option<Category>, Ap
             "dining" => Ok(Category::Dining),
             "accommodation" => Ok(Category::Accommodation),
             "hospitality" => Ok(Category::Hospitality),
+            "other" => Ok(Category::Other),
             _ => Err(internal_error("invalid category", value)),
         })
         .transpose()

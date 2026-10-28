@@ -472,7 +472,10 @@ pub fn recognize_with_warnings(
             None
         }
     };
-    let category = scored_category(text);
+    // The user's rule: when none of the four real categories matches, the
+    // invoice is classified as "其他" instead of being left without a category
+    // (which kept it out of every reimbursement batch).
+    let category = Some(scored_category(text).unwrap_or(Category::Other));
     let company = labeled_company_value(text, "销售方名称")
         .or_else(|| company_value_from_parallel_ocr_sections(text, 1))
         .or_else(|| company_value_from_compact_section(text, "销售方信息"))

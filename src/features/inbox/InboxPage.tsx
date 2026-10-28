@@ -18,6 +18,7 @@ import type {
   ItemStatus,
   ManualImportOutcomeDto,
   PageDto,
+  RecoverableSettleOutcomeDto,
   RetryFailedRecognitionsReportDto,
   SourceType,
 } from "../../types";
@@ -53,6 +54,20 @@ function errorMessage(error: unknown, fallback = "待处理池暂时无法加载
     return error.message;
   }
   return fallback;
+}
+
+function recoverableReportText(report: RecoverableSettleOutcomeDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skippedCount} 张（${breakdown}）`
+    : `跳过 ${report.skippedCount} 张`;
+  const repaired =
+    report.repairedCount > 0
+      ? `，补齐归一化 PDF ${report.repairedCount} 张`
+      : "";
+  return `已确认 ${report.confirmedCount} 张，${skipped}${repaired}`;
 }
 
 function statusFromSearch(value: string | null): ItemStatus | undefined {
@@ -150,6 +165,10 @@ export function InboxPage() {
   const [retryFailedReport, setRetryFailedReport] =
     useState<RetryFailedRecognitionsReportDto | null>(null);
   const [retryFailedError, setRetryFailedError] = useState<string | null>(null);
+  const [settlingRecoverable, setSettlingRecoverable] = useState(false);
+  const [recoverableReport, setRecoverableReport] =
+    useState<RecoverableSettleOutcomeDto | null>(null);
+  const [recoverableError, setRecoverableError] = useState<string | null>(null);
   const status = statusFromSearch(searchParams.get("status"));
   const recent = searchParams.get("scope") === "recent";
   const batchId = searchParams.get("batchId")?.trim() || undefined;
@@ -350,6 +369,20 @@ export function InboxPage() {
     }
   }
 
+  async function settleRecoverablePending() {
+    setSettlingRecoverable(true);
+    setRecoverableError(null);
+    try {
+      const report = await api.settleRecoverableItems();
+      setRecoverableReport(report);
+      invalidateItemLists();
+    } catch (error) {
+      setRecoverableError(errorMessage(error, "批量确认失败，请稍后再试"));
+    } finally {
+      setSettlingRecoverable(false);
+    }
+  }
+
   function fileName(path: string) {
     return path.split(/[\\/]/).pop() ?? path;
   }
@@ -441,6 +474,30 @@ export function InboxPage() {
         </div>
       ) : null}
 
+      {status === "pending_confirmation" ? (
+        <div
+          className="inbox-active-filters"
+          role="group"
+          aria-label="批量确认可推导票据"
+        >
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={settlingRecoverable || items.length === 0}
+            onClick={() => void settleRecoverablePending()}
+          >
+            <Check size={15} strokeWidth={1.8} aria-hidden="true" />
+            {settlingRecoverable ? "正在确认…" : "批量确认可推导的票据"}
+          </button>
+          {recoverableReport ? (
+            <span role="status">{recoverableReportText(recoverableReport)}</span>
+          ) : null}
+          {recoverableError ? (
+            <span role="alert">{recoverableError}</span>
+          ) : null}
+        </div>
+      ) : null}
+
       {recent ? (
         <div className="inbox-active-filters" aria-label="活动筛选">
           <button
@@ -476,6 +533,7 @@ export function InboxPage() {
             <option value="dining">餐饮</option>
             <option value="accommodation">住宿</option>
             <option value="hospitality">招待</option>
+            <option value="other">其他</option>
           </select>
         </label>
         <label>

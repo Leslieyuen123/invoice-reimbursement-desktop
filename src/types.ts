@@ -9,7 +9,8 @@ export type Category =
   | "transport"
   | "dining"
   | "accommodation"
-  | "hospitality";
+  | "hospitality"
+  | "other";
 
 export type SourceType = "email" | "manual_upload";
 
@@ -216,6 +217,7 @@ export interface BatchDetailSummaryDto {
   dining: CategorySummaryDto;
   accommodation: CategorySummaryDto;
   hospitality: CategorySummaryDto;
+  other: CategorySummaryDto;
   unconfirmedCount: number;
 }
 
@@ -370,6 +372,8 @@ export interface BatchAutomationResultDto {
   assignedCount: number;
   /** Batch members this run took over from another batch (range re-anchor). */
   movedFromOtherBatchesCount?: number;
+  /** Invoices this run admitted by filling their missing category as "其他". */
+  categorizedAsOtherCount?: number;
   exceptionCount: number;
   repairedCount: number;
   export: ExportResultDto | null;
@@ -409,4 +413,21 @@ export interface RetryFailedRecognitionsReportDto {
   stillFailed: number;
   /** Placeholders (`.url`) and anything else that cannot be re-recognized. */
   skipped: number;
+}
+
+/** One skip-reason bucket of the bulk "confirm derivable invoices" action. */
+export interface RecoverableSettleSkipDto {
+  code: string;
+  label: string;
+  count: number;
+}
+
+/** What one global "confirm every derivable invoice" run changed. */
+export interface RecoverableSettleOutcomeDto {
+  confirmedCount: number;
+  skippedCount: number;
+  filledInvoiceDateCount: number;
+  appliedCategoryCount: number;
+  repairedCount: number;
+  skippedBreakdown: RecoverableSettleSkipDto[];
 }

@@ -223,6 +223,7 @@ describe("browser command bridge", () => {
       failedAccounts: [],
       importedCount: 0,
       assignedCount: 1,
+      categorizedAsOtherCount: 0,
       exceptionCount: 1,
       repairedCount: 0,
       export: {
@@ -259,6 +260,7 @@ describe("browser command bridge", () => {
       failedAccounts: [],
       importedCount: 0,
       assignedCount: 0,
+      categorizedAsOtherCount: 0,
       exceptionCount: 0,
       repairedCount: 0,
       export: null,
@@ -298,6 +300,7 @@ describe("browser command bridge", () => {
       failedAccounts: [],
       importedCount: 2,
       assignedCount: 1,
+      categorizedAsOtherCount: 0,
       exceptionCount: 1,
       repairedCount: 0,
       export: {
@@ -411,14 +414,18 @@ describe("browser command bridge", () => {
       batchId: batch.id,
       itemIds: [safe.id],
     });
+    // Manual assignment refuses the unconfirmed invoice, but re-running the
+    // automation is allowed to file "ready except for the category" invoices
+    // under 其他, so the blocked item joins and the batch stays exportable.
     await expect(
       bridge<BatchAutomationResultDto>("run_batch_automation", {
         batchId: batch.id,
       }),
     ).resolves.toMatchObject({
-      assignedCount: 0,
+      assignedCount: 1,
+      categorizedAsOtherCount: 1,
       repairedCount: 0,
-      export: { itemCount: 1, totalAmountCents: 12_850 },
+      export: { itemCount: 2, totalAmountCents: 25_700 },
     });
 
     window.history.replaceState({}, "", "/");
@@ -430,11 +437,15 @@ describe("browser command bridge", () => {
     ).resolves.toMatchObject({ batchId: batch.id });
     await expect(
       restoredBridge<InvoiceItemDto>("get_item", { itemId: blocked.id }),
-    ).resolves.toMatchObject({ batchId: null });
+    ).resolves.toMatchObject({
+      batchId: batch.id,
+      finalCategory: "other",
+      confirmationStatus: "confirmed",
+    });
     await expect(
       restoredBridge<BatchDetailDto>("get_batch", { batchId: batch.id }),
     ).resolves.toMatchObject({
-      batch: { status: "exported", itemCount: 1 },
+      batch: { status: "exported", itemCount: 2, totalAmountCents: 25_700 },
     });
   });
 

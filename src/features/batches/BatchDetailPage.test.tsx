@@ -97,6 +97,7 @@ function detailFixture(
       dining: { itemCount: 0, amountCents: 0 },
       accommodation: { itemCount: 0, amountCents: 0 },
       hospitality: { itemCount: 0, amountCents: 0 },
+      other: { itemCount: 0, amountCents: 0 },
       unconfirmedCount: 0,
       ...summaryOverrides,
     },
@@ -368,6 +369,15 @@ describe("Batch workspace", () => {
     await user.click(
       await screen.findByRole("button", { name: "清空待确认（2）" }),
     );
+    // The dialog files every uncategorized invoice under 其他 by default and
+    // still lets the user choose another category or none.
+    const defaultCategorySelect = screen.getByRole("combobox", {
+      name: /没有分类时统一设为/,
+    });
+    expect(defaultCategorySelect).toHaveValue("other");
+    expect(
+      within(defaultCategorySelect).getByRole("option", { name: "其他" }),
+    ).toBeInTheDocument();
     await user.click(
       screen.getByRole("button", { name: "确认可推导的票据" }),
     );
@@ -376,7 +386,9 @@ describe("Batch workspace", () => {
     expect(commandCalls("settle_batch_items")[0]).toEqual({
       fillInvoiceDateFromReceived: true,
       applySuggestedCategory: true,
-      defaultCategory: null,
+      // Defaults to "其他": the user's rule is that an invoice without a
+      // category is filed under 其他 instead of staying unclassified.
+      defaultCategory: "other",
     });
     const report = await screen.findByRole("status", {
       name: "已确认 1 张票据",
@@ -386,6 +398,28 @@ describe("Batch workspace", () => {
     expect(
       within(report).getByText("缺少金额，必须对照原件人工填写"),
     ).toBeInTheDocument();
+  });
+
+  it("shows 其他 in the category summary and the member table", async () => {
+    const otherItem = itemFixture({
+      id: "invoice-other",
+      originalName: "其他票据.pdf",
+      suggestedCategory: "other",
+      finalCategory: "other",
+    });
+    mockDetail(
+      detailFixture([otherItem], {
+        transport: { itemCount: 0, amountCents: 0 },
+        other: { itemCount: 1, amountCents: 12_850 },
+      }),
+    );
+
+    renderAppAt("/batches/batch-summer");
+
+    const summary = await screen.findByRole("region", { name: "分类汇总" });
+    expect(within(summary).getByText("其他")).toBeInTheDocument();
+    const members = screen.getByRole("region", { name: "已归属票据" });
+    expect(within(members).getByText("其他")).toBeInTheDocument();
   });
 
   it("automatically processes and exports a newly created monthly batch", async () => {
@@ -464,6 +498,7 @@ describe("Batch workspace", () => {
       automation.resolve(
         automationFixture({
           movedFromOtherBatchesCount: 1,
+          categorizedAsOtherCount: 2,
           exceptionCount: 2,
           failedAccounts: [
             {
@@ -488,6 +523,7 @@ describe("Batch workspace", () => {
     expect(screen.getByText("1 张新导入")).toBeInTheDocument();
     expect(screen.getByText("1 张已自动纳入")).toBeInTheDocument();
     expect(screen.getByText("1 张从其他批次移入")).toBeInTheDocument();
+    expect(screen.getByText("2 张按其他分类纳入")).toBeInTheDocument();
     expect(screen.getByText("2 个异常项")).toBeInTheDocument();
     expect(screen.getByText("1 个邮箱失败")).toBeInTheDocument();
     expect(

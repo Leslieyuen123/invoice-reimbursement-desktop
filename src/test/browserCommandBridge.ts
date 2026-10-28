@@ -27,6 +27,7 @@ import type {
   PageRequestDto,
   PreferencesDto,
   ReviewItemInputDto,
+  RecoverableSettleOutcomeDto,
   RetryFailedRecognitionsReportDto,
   SaveMailboxAccountInputDto,
   ConsistencyReportDto,
@@ -237,6 +238,7 @@ function batchDetail(state: BridgeState, batchId: string): BatchDetailDto {
     dining: categorySummary(items, "dining"),
     accommodation: categorySummary(items, "accommodation"),
     hospitality: categorySummary(items, "hospitality"),
+    other: categorySummary(items, "other"),
     unconfirmedCount: items.filter((item) => item.confirmationStatus !== "confirmed")
       .length,
   };
@@ -409,6 +411,69 @@ function settleBatchItems(
   } satisfies SettleBatchOutcomeDto;
 }
 
+const recoverableSkipLabels: Record<string, string> = {
+  missing_amount: "缺金额",
+  missing_invoice_date: "缺开票日期",
+  missing_normalized_pdf: "缺归一化 PDF",
+  missing_category: "缺分类",
+  suspected_duplicate: "疑似重复",
+  recognition_failed: "识别失败",
+  not_recognized: "尚未完成识别",
+  unsupported_format: "原件格式不支持",
+};
+
+/** Mirrors `BatchService::settle_recoverable_items` for the development bridge. */
+function settleRecoverableItems(state: BridgeState): RecoverableSettleOutcomeDto {
+  const skippedCounts = new Map<string, number>();
+  const confirmed: InvoiceItemDto[] = [];
+  let appliedCategoryCount = 0;
+  for (const item of state.items) {
+    if (item.confirmationStatus !== "pending") continue;
+    if (item.recognitionStatus !== "succeeded") continue;
+    if (item.dedupeStatus !== "unique") continue;
+    const skip = (code: string) =>
+      skippedCounts.set(code, (skippedCounts.get(code) ?? 0) + 1);
+    if (item.amountCents === null) {
+      skip("missing_amount");
+      continue;
+    }
+    if (item.invoiceDate === null) {
+      skip("missing_invoice_date");
+      continue;
+    }
+    if (!item.hasNormalizedPdf && !canNormalize(item)) {
+      skip("missing_normalized_pdf");
+      continue;
+    }
+    if (item.finalCategory === null) appliedCategoryCount += 1;
+    Object.assign(item, {
+      suggestedPeriod: item.suggestedPeriod ?? item.invoiceDate.slice(0, 7),
+      finalCategory: item.finalCategory ?? item.suggestedCategory ?? "other",
+      confirmationStatus: "confirmed",
+      status: "ready",
+      updatedAt: now,
+    });
+    markBatchDraft(state, item.batchId);
+    confirmed.push(item);
+  }
+  const repairedCount = repairMissingNormalized(state, confirmed);
+  const skippedBreakdown = [...skippedCounts.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([code, count]) => ({
+      code,
+      label: recoverableSkipLabels[code] ?? "其他原因",
+      count,
+    }));
+  return {
+    confirmedCount: confirmed.length,
+    skippedCount: skippedBreakdown.reduce((total, entry) => total + entry.count, 0),
+    filledInvoiceDateCount: 0,
+    appliedCategoryCount,
+    repairedCount,
+    skippedBreakdown,
+  };
+}
+
 /** The received date is the invoice date fallback for email invoices. */
 function mailReceivedDate(item: InvoiceItemDto) {
   return item.fetchedAt.slice(0, 10);
@@ -488,6 +553,28 @@ function isSafeAutomationCandidate(item: InvoiceItemDto, batch: BatchDto) {
     item.suggestedPeriod !== null &&
     item.hasNormalizedPdf
   );
+}
+
+/**
+ * Mirrors `batch_eligibility::can_fill_other_category`: the invoice is fully
+ * exportable once "其他" and a confirmed status are filled in, so batch
+ * automation may decide the category for the user.
+ */
+function canFillOtherCategory(item: InvoiceItemDto, batch: BatchDto) {
+  if (item.finalCategory !== null || item.invoiceDate === null) return false;
+  if (!["pending_confirmation", "ready"].includes(derivedStatus(item))) {
+    return false;
+  }
+  if (item.invoiceDate < batch.startDate || item.invoiceDate > batch.endDate) {
+    return false;
+  }
+  const probe: InvoiceItemDto = {
+    ...item,
+    finalCategory: "other",
+    confirmationStatus: "confirmed",
+    suggestedPeriod: item.suggestedPeriod ?? item.invoiceDate.slice(0, 7),
+  };
+  return exportBlocker(probe) === null;
 }
 
 function seedAutomationScenario(
@@ -734,6 +821,11 @@ function makeHandlers(
       }
       return report;
     }],
+    [API_COMMANDS.settleRecoverableItems, () => {
+      const report = settleRecoverableItems(state);
+      persistState();
+      return report;
+    }],
     [API_COMMANDS.listBatches, (arguments_) =>
       paginate(
         state.batches.map((batch) => ({ ...batch })),
@@ -876,9 +968,21 @@ function makeHandlers(
       const safeCandidates = candidates.filter((item) =>
         isSafeAutomationCandidate(item, batch),
       );
+      const otherCategoryCandidates = candidates.filter(
+        (item) =>
+          !safeCandidates.includes(item) && canFillOtherCategory(item, batch),
+      );
       markBatchDraft(state, batchId);
-      for (const item of safeCandidates) {
+      for (const item of [...safeCandidates, ...otherCategoryCandidates]) {
         Object.assign(item, { batchId, updatedAt: now });
+      }
+      for (const item of otherCategoryCandidates) {
+        Object.assign(item, {
+          finalCategory: "other",
+          confirmationStatus: "confirmed",
+          status: "ready",
+          updatedAt: now,
+        });
       }
       const detail = batchDetail(state, batchId);
       const repairedCount = repairMissingNormalized(state, detail.items);
@@ -889,8 +993,10 @@ function makeHandlers(
         scannedAccountCount: enabledAccounts.length,
         failedAccounts: [],
         importedCount,
-        assignedCount: safeCandidates.length,
-        exceptionCount: candidates.length - safeCandidates.length,
+        assignedCount: safeCandidates.length + otherCategoryCandidates.length,
+        categorizedAsOtherCount: otherCategoryCandidates.length,
+        exceptionCount:
+          candidates.length - safeCandidates.length - otherCategoryCandidates.length,
         repairedCount,
         export:
           refreshed.items.length === 0 ? null : exportBatch(state, batchId),

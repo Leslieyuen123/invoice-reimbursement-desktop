@@ -1502,6 +1502,61 @@ describe("InboxPage", () => {
     expect(within(checklist).getByText(/还缺：/)).toHaveTextContent("归一化 PDF");
   });
 
+  it("keeps the readiness check honest when only a suggested category exists", async () => {
+    const user = userEvent.setup();
+    // Export and batch membership only accept `finalCategory`. A suggested
+    // category must therefore not show a ✓: the invoice is still blocked by
+    // "missing category".
+    const suggestedOnly = pendingInvoiceFixture({
+      id: "invoice-suggested-only",
+      originalName: "仅有建议分类.pdf",
+      finalCategory: null,
+      suggestedCategory: "dining",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => ({
+      items: [suggestedOnly],
+      nextCursor: null,
+    }));
+
+    renderAppAt("/inbox");
+    await user.click(
+      await screen.findByRole("button", { name: "仅有建议分类.pdf" }),
+    );
+
+    const checklist = await screen.findByRole("region", {
+      name: "导出就绪检查",
+    });
+    expect(checklist).toHaveAttribute("data-ready", "false");
+    expect(within(checklist).getByText(/还缺：/)).toHaveTextContent("分类");
+    const categoryRow = within(checklist).getByText("分类").closest("li");
+    expect(categoryRow).toHaveAttribute("data-ok", "false");
+  });
+
+  it("saves 其他 as the chosen category", async () => {
+    const user = userEvent.setup();
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", {
+      items: [pendingInvoiceFixture()],
+      nextCursor: null,
+    });
+    mockCommand("review_item", (arguments_) => {
+      const input = (arguments_ as { input: Record<string, unknown> }).input;
+      return pendingInvoiceFixture({
+        finalCategory: input.finalCategory as InvoiceItemDto["finalCategory"],
+        status: "ready",
+        confirmationStatus: "confirmed",
+      });
+    });
+
+    renderAppAt("/inbox?status=pending_confirmation");
+    await user.click(await screen.findByText("出租车电子发票.pdf"));
+    await user.click(screen.getByRole("radio", { name: "其他" }));
+    await user.click(screen.getByRole("button", { name: "保存并确认" }));
+
+    expect(commandCalls("review_item")[0].finalCategory).toBe("other");
+  });
+
   it("opens the suspected-duplicate filter after importing a duplicate", async () => {
     const user = userEvent.setup();
     const serverItems: InvoiceItemDto[] = [];

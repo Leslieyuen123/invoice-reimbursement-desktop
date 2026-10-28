@@ -13,7 +13,8 @@ use crate::domain::model::{
 };
 use crate::infra::files::AppPaths;
 use crate::services::batch_eligibility::{
-    BatchIssue, db_export_blocker, describe_issues, is_in_batch_range, is_safe_batch_candidate,
+    BatchIssue, can_fill_other_category, db_export_blocker, describe_issues, is_in_batch_range,
+    is_safe_batch_candidate,
 };
 use crate::services::recognition::original_can_be_normalized;
 
@@ -42,6 +43,7 @@ pub struct BatchDetailSummary {
     pub dining: CategorySummary,
     pub accommodation: CategorySummary,
     pub hospitality: CategorySummary,
+    pub other: CategorySummary,
     pub unconfirmed_count: u64,
 }
 
@@ -65,6 +67,9 @@ pub(crate) struct AutomationAssignmentOutcome {
     pub assigned_ids: Vec<Uuid>,
     /// How many of `assigned_ids` were taken away from another batch.
     pub moved_from_other_batches_count: u32,
+    /// How many assigned invoices had their missing category filled as "其他"
+    /// by this automation pass (the user-facing "按其他分类纳入" count).
+    pub categorized_as_other_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +103,27 @@ pub struct SettleBatchOutcome {
     pub confirmed_count: u32,
     pub filled_invoice_date_count: u32,
     pub applied_category_count: u32,
+    pub skipped: Vec<SkippedBatchItem>,
+}
+
+/// Options for the inbox-level "confirm every derivable invoice" action.
+///
+/// Unlike [`SettleBatchInput`] this has no category choices: an invoice with no
+/// category is filed under "其他" because that is the user's standing rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoverableSettleInput {
+    /// Use the mail received date when an invoice date could not be read.
+    pub fill_invoice_date_from_received: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoverableSettleOutcome {
+    pub confirmed_count: u32,
+    pub filled_invoice_date_count: u32,
+    pub applied_category_count: u32,
+    /// Ids of the invoices this run confirmed, so the caller can repair the
+    /// normalized PDFs they still miss.
+    pub confirmed_item_ids: Vec<Uuid>,
     pub skipped: Vec<SkippedBatchItem>,
 }
 
@@ -390,11 +416,17 @@ impl BatchService {
     /// behind. Invoices outside the range are never touched. Every move happens
     /// inside one `BEGIN IMMEDIATE` transaction, the source batches fall back to
     /// `draft`, and the caller learns how many invoices actually changed hands.
+    ///
+    /// `fill_category_ids` are candidate ids the caller found fully exportable
+    /// except for the missing category. Inside the same transaction they get
+    /// `final_category = 'other'` (and the confirmation that category unlocks)
+    /// before being claimed, so a batch is never left half-settled.
     pub(crate) async fn assign_unassigned_items(
         &self,
         batch_id: Uuid,
         paths: &AppPaths,
         item_ids: &[Uuid],
+        fill_category_ids: &[Uuid],
     ) -> Result<AutomationAssignmentOutcome, AppError> {
         let mut seen = HashSet::with_capacity(item_ids.len());
         let item_ids = item_ids
@@ -402,6 +434,7 @@ impl BatchService {
             .copied()
             .filter(|id| seen.insert(*id))
             .collect::<Vec<_>>();
+        let fill_category_ids = fill_category_ids.iter().copied().collect::<HashSet<_>>();
         let mut transaction = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -414,15 +447,32 @@ impl BatchService {
             let updated_at = Utc::now().to_rfc3339();
             let mut outcome = AutomationAssignmentOutcome::default();
             let mut source_batches = Vec::new();
+            let mut filled_category_ids = HashSet::new();
             for item_id in item_ids {
-                let Some(item) =
+                let Some(mut item) =
                     ItemRepository::find_by_id_with_connection(&mut transaction, item_id).await?
                 else {
                     continue;
                 };
-                if item.batch_id == Some(batch_id)
-                    || !is_safe_batch_candidate(paths, &item, batch.start_date, batch.end_date)
-                {
+                if item.batch_id == Some(batch_id) {
+                    continue;
+                }
+                if item.final_category.is_none() && fill_category_ids.contains(&item_id) {
+                    let Some(filled) = Self::fill_other_category(
+                        &mut transaction,
+                        paths,
+                        &batch,
+                        &item,
+                        &updated_at,
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    item = filled;
+                    filled_category_ids.insert(item_id);
+                }
+                if !is_safe_batch_candidate(paths, &item, batch.start_date, batch.end_date) {
                     continue;
                 }
                 let affected = sqlx::query(
@@ -444,6 +494,12 @@ impl BatchService {
                     source_batches.push(previous_batch);
                     outcome.moved_from_other_batches_count = outcome
                         .moved_from_other_batches_count
+                        .checked_add(1)
+                        .ok_or_else(summary_count_overflow)?;
+                }
+                if filled_category_ids.contains(&item_id) {
+                    outcome.categorized_as_other_count = outcome
+                        .categorized_as_other_count
                         .checked_add(1)
                         .ok_or_else(summary_count_overflow)?;
                 }
@@ -476,6 +532,50 @@ impl BatchService {
         .await;
 
         finish_automation_assignment(transaction, result).await
+    }
+
+    /// Fills the missing category of an otherwise-exportable invoice as "其他"
+    /// and confirms it, inside the caller's automation transaction.
+    ///
+    /// Returns the refreshed invoice when the row was actually updated so the
+    /// caller re-validates the *stored* state instead of the stale scan result.
+    /// The same `BEGIN IMMEDIATE` transaction then claims the invoice, which
+    /// keeps "categorized" and "assigned" from ever diverging.
+    async fn fill_other_category(
+        connection: &mut SqliteConnection,
+        paths: &AppPaths,
+        batch: &Batch,
+        item: &InvoiceItem,
+        updated_at: &str,
+    ) -> Result<Option<InvoiceItem>, AppError> {
+        if item.final_category.is_some()
+            || !is_in_batch_range(item, batch.start_date, batch.end_date)
+            || !can_fill_other_category(paths, item)
+        {
+            return Ok(None);
+        }
+        let Some(suggested_period) = item.suggested_period.clone().or_else(|| {
+            item.invoice_date
+                .map(|date| date.format("%Y-%m").to_string())
+        }) else {
+            return Ok(None);
+        };
+        let affected = sqlx::query(
+            "UPDATE items SET final_category = 'other', suggested_period = ?, \
+                confirmation_status = 'confirmed', updated_at = ? \
+             WHERE id = ? AND final_category IS NULL",
+        )
+        .bind(&suggested_period)
+        .bind(updated_at)
+        .bind(item.id.to_string())
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| database_error("failed to fill missing category as other", error))?
+        .rows_affected();
+        if affected != 1 {
+            return Ok(None);
+        }
+        ItemRepository::find_by_id_with_connection(connection, item.id).await
     }
 
     pub async fn remove_item(
@@ -698,65 +798,28 @@ impl BatchService {
                 if item.confirmation_status == ConfirmationStatus::Confirmed {
                     continue;
                 }
-                let skip = |outcome: &mut SettleBatchOutcome, code: &str| {
+                let decision = match settle_decision(
+                    &item,
+                    input.fill_invoice_date_from_received,
+                    input.apply_suggested_category,
+                    input.default_category,
+                ) {
+                    Ok(decision) => decision,
+                    Err(code) => {
+                        outcome.skipped.push(SkippedBatchItem {
+                            item_id: item.id,
+                            file_name: item.original_name.clone(),
+                            code: code.to_owned(),
+                        });
+                        continue;
+                    }
+                };
+                if !is_in_batch_range(&item, batch.start_date, batch.end_date) {
                     outcome.skipped.push(SkippedBatchItem {
                         item_id: item.id,
                         file_name: item.original_name.clone(),
-                        code: code.to_owned(),
+                        code: "outside_date_range".to_owned(),
                     });
-                };
-                if item.dedupe_status == DedupeStatus::SuspectedDuplicate {
-                    skip(&mut outcome, "suspected_duplicate");
-                    continue;
-                }
-                if item.recognition_status == RecognitionStatus::Failed {
-                    skip(&mut outcome, "recognition_failed");
-                    continue;
-                }
-                if item.recognition_status == RecognitionStatus::Pending {
-                    skip(&mut outcome, "not_recognized");
-                    continue;
-                }
-                if item.amount_cents.is_none() {
-                    skip(&mut outcome, "missing_amount");
-                    continue;
-                }
-
-                let derived_date = item.invoice_date.or_else(|| {
-                    (input.fill_invoice_date_from_received && item.source_type == SourceType::Email)
-                        .then_some(item.source_received_date)
-                        .flatten()
-                });
-                let Some(invoice_date) = derived_date else {
-                    skip(&mut outcome, "missing_invoice_date");
-                    continue;
-                };
-                let suggested_period = item.suggested_period.clone().unwrap_or_else(|| {
-                    format!("{:04}-{:02}", invoice_date.year(), invoice_date.month())
-                });
-                let final_category = item
-                    .final_category
-                    .or_else(|| {
-                        input
-                            .apply_suggested_category
-                            .then_some(item.suggested_category)
-                            .flatten()
-                    })
-                    .or(input.default_category);
-                let Some(final_category) = final_category else {
-                    skip(&mut outcome, "missing_category");
-                    continue;
-                };
-                // Confirming an invoice whose original can never be normalized
-                // would recreate the very state that blocked exports.
-                if item.normalized_pdf_path.is_none()
-                    && !original_can_be_normalized(&item.original_name)
-                {
-                    skip(&mut outcome, "unsupported_format");
-                    continue;
-                }
-                if !is_in_batch_range(&item, batch.start_date, batch.end_date) {
-                    skip(&mut outcome, "outside_date_range");
                     continue;
                 }
 
@@ -767,9 +830,9 @@ impl BatchService {
                         updated_at = ? \
                      WHERE id = ? AND confirmation_status = 'pending'",
                 )
-                .bind(invoice_date.to_string())
-                .bind(&suggested_period)
-                .bind(category_str(final_category))
+                .bind(decision.invoice_date.to_string())
+                .bind(&decision.suggested_period)
+                .bind(category_str(decision.final_category))
                 .bind(updated_at.to_rfc3339())
                 .bind(item.id.to_string())
                 .execute(&mut *transaction)
@@ -785,7 +848,7 @@ impl BatchService {
                     outcome.filled_invoice_date_count =
                         outcome.filled_invoice_date_count.saturating_add(1);
                 }
-                if item.final_category != Some(final_category) {
+                if item.final_category != Some(decision.final_category) {
                     outcome.applied_category_count =
                         outcome.applied_category_count.saturating_add(1);
                 }
@@ -800,6 +863,102 @@ impl BatchService {
                         database_error("failed to refresh batch after settle", error)
                     })?;
                 validate_summary_total(&mut transaction, batch_id).await?;
+            }
+            Ok(outcome)
+        }
+        .await;
+
+        finish_bulk_transaction(transaction, result).await
+    }
+
+    /// Confirms every invoice in the library that is recognized but still
+    /// waiting for confirmation, as long as its missing values can be derived
+    /// from what is already stored.
+    ///
+    /// This is the inbox-level counterpart of [`Self::settle_items`] and shares
+    /// its per-item rules (and its `BEGIN IMMEDIATE` transaction). An invoice
+    /// with no category is filed under the suggested category, or "其他" when
+    /// there is none; a missing month is derived from the invoice date. Amount,
+    /// invoice date and a normalizable original remain hard requirements, so a
+    /// skipped invoice is reported with a stable reason instead of being
+    /// confirmed without the data an export needs.
+    pub async fn settle_recoverable_items(
+        &self,
+        input: RecoverableSettleInput,
+    ) -> Result<RecoverableSettleOutcome, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| database_error("failed to begin recoverable settle", error))?;
+        let result = async {
+            let items =
+                ItemRepository::list_pending_recoverable_with_connection(&mut transaction).await?;
+            let mut outcome = RecoverableSettleOutcome::default();
+            let mut batches_to_refresh = HashSet::new();
+            for item in items {
+                let decision = match settle_decision(
+                    &item,
+                    input.fill_invoice_date_from_received,
+                    true,
+                    Some(Category::Other),
+                ) {
+                    Ok(decision) => decision,
+                    Err(code) => {
+                        outcome.skipped.push(SkippedBatchItem {
+                            item_id: item.id,
+                            file_name: item.original_name.clone(),
+                            code: recoverable_skip_code(code).to_owned(),
+                        });
+                        continue;
+                    }
+                };
+
+                let updated_at = Utc::now();
+                let affected = sqlx::query(
+                    "UPDATE items SET invoice_date = ?, suggested_period = ?, final_category = ?, \
+                        recognition_status = 'succeeded', confirmation_status = 'confirmed', \
+                        updated_at = ? \
+                     WHERE id = ? AND confirmation_status = 'pending'",
+                )
+                .bind(decision.invoice_date.to_string())
+                .bind(&decision.suggested_period)
+                .bind(category_str(decision.final_category))
+                .bind(updated_at.to_rfc3339())
+                .bind(item.id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| database_error("failed to confirm recoverable item", error))?
+                .rows_affected();
+                if affected == 0 {
+                    continue;
+                }
+                outcome.confirmed_count = outcome.confirmed_count.saturating_add(1);
+                outcome.confirmed_item_ids.push(item.id);
+                if item.invoice_date.is_none() {
+                    outcome.filled_invoice_date_count =
+                        outcome.filled_invoice_date_count.saturating_add(1);
+                }
+                if item.final_category != Some(decision.final_category) {
+                    outcome.applied_category_count =
+                        outcome.applied_category_count.saturating_add(1);
+                }
+                if let Some(batch_id) = item.batch_id {
+                    batches_to_refresh.insert(batch_id);
+                }
+            }
+            // A confirmed invoice can belong to an already exported batch; that
+            // batch has to be exported again so the export reflects the change.
+            let refreshed_at = Utc::now().to_rfc3339();
+            for batch_id in batches_to_refresh {
+                sqlx::query("UPDATE batches SET status = 'draft', updated_at = ? WHERE id = ?")
+                    .bind(&refreshed_at)
+                    .bind(batch_id.to_string())
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        database_error("failed to refresh a batch after recoverable settle", error)
+                    })?;
             }
             Ok(outcome)
         }
@@ -871,6 +1030,83 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The reviewed values a bulk confirmation writes onto one invoice.
+struct SettleDecision {
+    invoice_date: NaiveDate,
+    suggested_period: String,
+    final_category: Category,
+}
+
+/// Applies the shared "can this invoice be confirmed from its own data?" rule.
+///
+/// Both the per-batch settle and the inbox-level recoverable settle use this so
+/// they can never disagree about what counts as derivable. The `Err` value is
+/// the stable skip code reported to the user; a missing category is never an
+/// error when a fallback (suggested category or the caller's default) exists.
+fn settle_decision(
+    item: &InvoiceItem,
+    fill_invoice_date_from_received: bool,
+    apply_suggested_category: bool,
+    default_category: Option<Category>,
+) -> Result<SettleDecision, &'static str> {
+    if item.dedupe_status == DedupeStatus::SuspectedDuplicate {
+        return Err("suspected_duplicate");
+    }
+    if item.recognition_status == RecognitionStatus::Failed {
+        return Err("recognition_failed");
+    }
+    if item.recognition_status == RecognitionStatus::Pending {
+        return Err("not_recognized");
+    }
+    if item.amount_cents.is_none() {
+        return Err("missing_amount");
+    }
+    let derived_date = item.invoice_date.or_else(|| {
+        (fill_invoice_date_from_received && item.source_type == SourceType::Email)
+            .then_some(item.source_received_date)
+            .flatten()
+    });
+    let Some(invoice_date) = derived_date else {
+        return Err("missing_invoice_date");
+    };
+    let suggested_period = item
+        .suggested_period
+        .clone()
+        .unwrap_or_else(|| format!("{:04}-{:02}", invoice_date.year(), invoice_date.month()));
+    let final_category = item
+        .final_category
+        .or_else(|| {
+            apply_suggested_category
+                .then_some(item.suggested_category)
+                .flatten()
+        })
+        .or(default_category);
+    let Some(final_category) = final_category else {
+        return Err("missing_category");
+    };
+    // Confirming an invoice whose original can never be normalized would
+    // recreate the very state that blocked exports.
+    if item.normalized_pdf_path.is_none() && !original_can_be_normalized(&item.original_name) {
+        return Err("unsupported_format");
+    }
+    Ok(SettleDecision {
+        invoice_date,
+        suggested_period,
+        final_category,
+    })
+}
+
+/// User-facing skip code for the inbox-level recoverable settle.
+///
+/// The per-item rule reports "unsupported_format"; at library scope the user
+/// cares that the invoice has no normalized PDF at all.
+fn recoverable_skip_code(code: &'static str) -> &'static str {
+    match code {
+        "unsupported_format" => "missing_normalized_pdf",
+        other => other,
+    }
+}
+
 fn build_summary(items: &[InvoiceItem]) -> Result<BatchDetailSummary, AppError> {
     let mut summary = BatchDetailSummary {
         item_count: u64::try_from(items.len()).map_err(|_| summary_count_overflow())?,
@@ -892,6 +1128,7 @@ fn build_summary(items: &[InvoiceItem]) -> Result<BatchDetailSummary, AppError> 
                 Category::Dining => &mut summary.dining,
                 Category::Accommodation => &mut summary.accommodation,
                 Category::Hospitality => &mut summary.hospitality,
+                Category::Other => &mut summary.other,
             };
             category_summary.item_count = category_summary
                 .item_count

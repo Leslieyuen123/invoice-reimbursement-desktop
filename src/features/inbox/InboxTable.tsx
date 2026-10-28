@@ -17,6 +17,7 @@ const categoryLabels = {
   dining: "餐饮",
   accommodation: "住宿",
   hospitality: "招待",
+  other: "其他",
 } as const;
 
 const sourceLabels = {

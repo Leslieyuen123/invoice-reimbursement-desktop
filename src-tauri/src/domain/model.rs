@@ -22,6 +22,10 @@ pub enum Category {
     Dining,
     Accommodation,
     Hospitality,
+    /// Catch-all for invoices the recognizer cannot place in the four real
+    /// buckets. The user's rule: when no category matches, treat it as
+    /// "其他" instead of leaving it unclassified (which blocked batches).
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -237,6 +241,7 @@ mod tests {
             (Category::Dining, "dining"),
             (Category::Accommodation, "accommodation"),
             (Category::Hospitality, "hospitality"),
+            (Category::Other, "other"),
         ]);
         assert_enum_round_trips(&[
             (SourceType::Email, "email"),

@@ -559,3 +559,94 @@ async fn automation_repairs_a_batch_member_that_lost_its_normalized_pdf() {
     assert_eq!(repaired.confirmation_status, ConfirmationStatus::Confirmed);
     assert!(result.export.is_some());
 }
+
+#[tokio::test]
+async fn automation_files_otherwise_ready_candidates_without_a_category_under_other() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let paths = AppPaths::create(directory.path().join("storage")).unwrap();
+    let email = "other-category@example.com";
+    let credentials = Arc::new(MemoryCredentialStore::default());
+    let state = AppState::with_gateway_and_extractor(
+        pool.clone(),
+        paths.clone(),
+        credentials.clone(),
+        Arc::new(AccountBudgetGateway::empty(email)),
+        Arc::new(AccountBudgetExtractor),
+    );
+    let account = MailboxAccountRepository::new(pool.clone())
+        .insert(NewMailboxAccount {
+            provider: MailboxProvider::Gmail,
+            email: email.to_owned(),
+            imap_host: "imap.gmail.com".to_owned(),
+            imap_port: 993,
+            enabled: true,
+            sync_interval_minutes: 15,
+        })
+        .await
+        .unwrap();
+    credentials.set(&account.id.to_string(), "secret").unwrap();
+    let batch = BatchService::new(pool.clone())
+        .create_month(2026, 5)
+        .await
+        .unwrap();
+    let items = ItemRepository::new(pool.clone());
+    let ready_id = Uuid::new_v4();
+    items.insert(&safe_item(&paths, ready_id)).await.unwrap();
+    // The real library state: recognized, dated, priced and normalized, but no
+    // category was ever assigned, so it never got confirmed.
+    sqlx::query(
+        "UPDATE items SET suggested_category = NULL, final_category = NULL, \
+            confirmation_status = 'pending' WHERE id = ?",
+    )
+    .bind(ready_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let missing_amount_id = Uuid::new_v4();
+    let mut incomplete = safe_item(&paths, missing_amount_id);
+    incomplete.amount_cents = None;
+    incomplete.suggested_category = None;
+    incomplete.final_category = None;
+    incomplete.confirmation_status = ConfirmationStatus::Pending;
+    items.insert(&incomplete).await.unwrap();
+
+    let service = state.batch_automation_service();
+    let first = service.run(batch.id).await.unwrap();
+
+    assert_eq!(first.assigned_count, 1);
+    assert_eq!(first.categorized_as_other_count, 1);
+    assert_eq!(first.exception_count, 1);
+    assert_eq!(
+        first.export.as_ref().map(|export| export.item_count),
+        Some(1)
+    );
+    let stored = items.get_by_id(ready_id).await.unwrap();
+    assert_eq!(stored.final_category, Some(Category::Other));
+    assert_eq!(stored.confirmation_status, ConfirmationStatus::Confirmed);
+    assert_eq!(stored.batch_id, Some(batch.id));
+    // An invoice missing its amount is not "ready except for the category", so
+    // automation must not invent a category (or confirmation) for it.
+    let untouched = items.get_by_id(missing_amount_id).await.unwrap();
+    assert_eq!(untouched.final_category, None);
+    assert_eq!(untouched.confirmation_status, ConfirmationStatus::Pending);
+    assert_eq!(untouched.batch_id, None);
+
+    // Re-running the automation is idempotent: nothing is re-categorized. A
+    // fresh service instance shares the database, so this is the same pass with
+    // a fresh mailbox scan budget.
+    let second_state = AppState::with_gateway_and_extractor(
+        pool.clone(),
+        paths.clone(),
+        credentials.clone(),
+        Arc::new(AccountBudgetGateway::empty(email)),
+        Arc::new(AccountBudgetExtractor),
+    );
+    let second = second_state
+        .batch_automation_service()
+        .run(batch.id)
+        .await
+        .unwrap();
+    assert_eq!(second.assigned_count, 0);
+    assert_eq!(second.categorized_as_other_count, 0);
+}

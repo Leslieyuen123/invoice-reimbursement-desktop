@@ -18,6 +18,7 @@ const categories: Array<{ value: Category; label: string }> = [
   { value: "dining", label: "餐饮" },
   { value: "accommodation", label: "住宿" },
   { value: "hospitality", label: "招待" },
+  { value: "other", label: "其他" },
 ];
 
 const categoryLabels = Object.fromEntries(
@@ -78,7 +79,7 @@ export function ItemDrawer({
   onSaved,
 }: ItemDrawerProps) {
   const [category, setCategory] = useState<Category>(
-    item.finalCategory ?? item.suggestedCategory ?? "transport",
+    item.finalCategory ?? item.suggestedCategory ?? "other",
   );
   const [invoiceDate, setInvoiceDate] = useState(item.invoiceDate ?? "");
   const [suggestedPeriod, setSuggestedPeriod] = useState(
@@ -278,8 +279,11 @@ export function ItemDrawer({
               { label: "开票日期", ok: item.invoiceDate !== null },
               { label: "金额", ok: item.amountCents !== null },
               {
+                // Export and batch membership only accept `finalCategory`; a
+                // suggested category alone does not make an invoice ready, so
+                // the ✓ here must not be looser than the export rule.
                 label: "分类",
-                ok: (item.finalCategory ?? item.suggestedCategory) !== null,
+                ok: item.finalCategory !== null,
               },
               { label: "归属月份", ok: item.suggestedPeriod !== null },
               { label: "归一化 PDF", ok: item.hasNormalizedPdf },

@@ -10,7 +10,9 @@ use crate::db::accounts::MailboxAccountRepository;
 use crate::db::items::ItemRepository;
 use crate::domain::error::{AppError, sanitize_message};
 use crate::infra::files::AppPaths;
-use crate::services::batch_eligibility::is_safe_batch_candidate;
+use crate::services::batch_eligibility::{
+    can_fill_other_category, is_in_batch_range, is_safe_batch_candidate,
+};
 use crate::services::batch_repair::repair_missing_normalized_pdfs;
 use crate::services::batches::{AutomationAssignmentOutcome, BatchService};
 use crate::services::export::{ExportResult, ExportService};
@@ -37,6 +39,8 @@ pub struct BatchAutomationResult {
     pub assigned_count: u32,
     /// Batch members this run took over from another batch (range re-anchor).
     pub moved_from_other_batches_count: u32,
+    /// Invoices this run admitted by filling their missing category as "其他".
+    pub categorized_as_other_count: u32,
     pub exception_count: u32,
     /// Normalized PDFs regenerated for batch members that were missing one.
     pub repaired_count: u32,
@@ -216,6 +220,11 @@ impl BatchAutomationService {
         let mut cursor = None;
         let mut safe_ids = Vec::new();
         let mut safe_id_set = HashSet::new();
+        // Candidates that are fully exportable except for the missing category:
+        // the run may decide "其他" for them while claiming them (see the
+        // user's "找不到分类就统一设置为其他" rule).
+        let mut other_category_ids = Vec::new();
+        let mut other_category_id_set = HashSet::new();
         let mut exception_ids = HashSet::new();
         loop {
             let page = self
@@ -226,6 +235,12 @@ impl BatchAutomationService {
                 if is_safe_batch_candidate(&self.paths, &item, batch.start_date, batch.end_date) {
                     if safe_id_set.insert(item.id) {
                         safe_ids.push(item.id);
+                    }
+                } else if is_in_batch_range(&item, batch.start_date, batch.end_date)
+                    && can_fill_other_category(&self.paths, &item)
+                {
+                    if other_category_id_set.insert(item.id) {
+                        other_category_ids.push(item.id);
                     }
                 } else {
                     exception_ids.insert(item.id);
@@ -243,7 +258,10 @@ impl BatchAutomationService {
             .list_by_ids(&touched_item_ids)
             .await?
         {
-            if item.batch_id != Some(batch_id) && !safe_id_set.contains(&item.id) {
+            if item.batch_id != Some(batch_id)
+                && !safe_id_set.contains(&item.id)
+                && !other_category_id_set.contains(&item.id)
+            {
                 exception_ids.insert(item.id);
             }
         }
@@ -254,17 +272,35 @@ impl BatchAutomationService {
             pause.release.notified().await;
         }
 
-        let assignment = if safe_ids.is_empty() {
+        let mut assignment_ids = safe_ids.clone();
+        for id in &other_category_ids {
+            if !assignment_ids.contains(id) {
+                assignment_ids.push(*id);
+            }
+        }
+        let assignment = if assignment_ids.is_empty() {
             AutomationAssignmentOutcome::default()
         } else {
             self.batches
-                .assign_unassigned_items(batch_id, &self.paths, &safe_ids)
+                .assign_unassigned_items(
+                    batch_id,
+                    &self.paths,
+                    &assignment_ids,
+                    &other_category_ids,
+                )
                 .await?
         };
         let assigned_ids = assignment.assigned_ids;
         let moved_from_other_batches_count = assignment.moved_from_other_batches_count;
+        let categorized_as_other_count = assignment.categorized_as_other_count;
         let assigned_id_set = assigned_ids.iter().copied().collect::<HashSet<_>>();
-        let skipped_safe_ids = safe_ids
+        let mut requested_ids = safe_ids;
+        for id in other_category_ids {
+            if !requested_ids.contains(&id) {
+                requested_ids.push(id);
+            }
+        }
+        let skipped_safe_ids = requested_ids
             .iter()
             .copied()
             .filter(|id| !assigned_id_set.contains(id))
@@ -301,6 +337,7 @@ impl BatchAutomationService {
             imported_count,
             assigned_count,
             moved_from_other_batches_count,
+            categorized_as_other_count,
             exception_count,
             repaired_count,
             export,

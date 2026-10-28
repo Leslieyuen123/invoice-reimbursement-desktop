@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::db::items::InvoiceItem;
 use crate::domain::amount::validate_amount_cents;
-use crate::domain::model::ItemStatus;
+use crate::domain::model::{Category, ConfirmationStatus, ItemStatus};
 use crate::infra::files::{AppPaths, open_contained_regular_file};
 
 /// The single authoritative reason an invoice cannot be exported inside a batch.
@@ -176,6 +176,36 @@ pub(crate) fn is_safe_batch_candidate(
     end_date: NaiveDate,
 ) -> bool {
     is_export_ready(paths, item) && is_in_batch_range(item, start_date, end_date)
+}
+
+/// Whether batch automation may decide "其他" for an invoice whose only
+/// remaining export gaps are the missing category and the confirmation that
+/// category feeds.
+///
+/// The rule mirrors what a user means by "除分类外都齐备": the invoice must be
+/// recognized, not a suspected duplicate, carry a date, an amount and a
+/// normalized PDF, and every other export prerequisite must already hold. The
+/// check is a dry run of the authoritative predicate with `Category::Other`
+/// and a confirmed status filled in, so it can never be looser than export.
+pub(crate) fn can_fill_other_category(paths: &AppPaths, item: &InvoiceItem) -> bool {
+    if item.final_category.is_some() || item.invoice_date.is_none() {
+        return false;
+    }
+    if !matches!(
+        item.status(),
+        ItemStatus::PendingConfirmation | ItemStatus::Ready
+    ) {
+        return false;
+    }
+    let mut probe = item.clone();
+    probe.final_category = Some(Category::Other);
+    probe.confirmation_status = ConfirmationStatus::Confirmed;
+    if probe.suggested_period.is_none() {
+        probe.suggested_period = item
+            .invoice_date
+            .map(|date| date.format("%Y-%m").to_string());
+    }
+    export_blocker(paths, &probe).is_none()
 }
 
 /// One batch member that currently blocks the whole export.
