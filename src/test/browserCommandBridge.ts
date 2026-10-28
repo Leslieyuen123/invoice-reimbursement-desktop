@@ -19,6 +19,7 @@ import type {
   MailLedgerFilter,
   MailLedgerPageDto,
   MailboxAccountDto,
+  LinkRecoveryReportDto,
   NonInvoiceSummaryDto,
   QrRecoveryReportDto,
   SettleBatchInputDto,
@@ -341,6 +342,38 @@ function isQrRescueCandidate(item: InvoiceItemDto) {
     !item.nonInvoiceReason &&
     QR_IMAGE_NAME.test(item.originalName)
   );
+}
+
+const LINK_PLACEHOLDER_NAME = /\.url$/iu;
+
+/** Mirrors the backend's link rescue candidate predicate. */
+function isLinkRescueCandidate(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus === "unique" &&
+    !item.nonInvoiceReason &&
+    LINK_PLACEHOLDER_NAME.test(item.originalName)
+  );
+}
+
+/**
+ * The development bridge cannot download mail links, so it reports the honest
+ * "download failed" skip: the result line and the reload path stay exercised.
+ */
+function linkRecoveryReport(examined: number): LinkRecoveryReportDto {
+  return {
+    examined,
+    downloaded: 0,
+    recognized: 0,
+    skipped: examined,
+    archived: 0,
+    notInvoicePortal: 0,
+    skippedBreakdown:
+      examined > 0
+        ? [{ code: "download_failed", label: "下载失败", count: examined }]
+        : [],
+  };
 }
 
 /**
@@ -901,6 +934,25 @@ function makeHandlers(
         } satisfies AppError;
       }
       return qrRecoveryReport(1);
+    }],
+    [API_COMMANDS.recoverLinkInvoices, () => {
+      const examined = state.items.filter(isLinkRescueCandidate).length;
+      return linkRecoveryReport(examined);
+    }],
+    [API_COMMANDS.recoverLinkInvoice, (arguments_) => {
+      const item = state.items.find(
+        (candidate) => candidate.id === requiredString(arguments_, "itemId"),
+      );
+      if (!item) throw notFound("item");
+      if (!isLinkRescueCandidate(item)) {
+        throw {
+          code: "validation",
+          field: "item",
+          message:
+            "该票据不是可补救的链接票据（需要 .url 占位原件、尚未填写金额、不在批次中）",
+        } satisfies AppError;
+      }
+      return linkRecoveryReport(1);
     }],
     [API_COMMANDS.getNonInvoiceSummary, () => {
       const summary: NonInvoiceSummaryDto = {

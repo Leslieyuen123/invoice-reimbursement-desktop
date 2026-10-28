@@ -26,6 +26,24 @@ pub enum InvoiceLinkDownload {
     Ignored,
 }
 
+/// Why a link download failed, in terms a recovery action can explain.
+///
+/// A single "invoice link download failed" note cannot tell the user whether
+/// the mail was a marketing link, a portal that needs a login, or a temporary
+/// network problem. The recovery services map this kind to a concrete reason,
+/// and only the permanent ones are archived as non-invoice files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadFailureKind {
+    /// The portal answered with a page that needs an interactive login.
+    RequiresLogin,
+    /// The portal reports the link as expired or otherwise no longer valid.
+    Expired,
+    /// A request failure (DNS, timeout, 5xx); retrying later may work.
+    Connection,
+    /// The response is not an invoice file (an HTML page, a ZIP, ...).
+    NotAnInvoice,
+}
+
 #[async_trait]
 pub trait InvoiceLinkDownloader: Send + Sync {
     async fn download(&self, source_url: &str) -> Result<InvoiceLinkDownload, AppError>;
@@ -50,6 +68,26 @@ const NUONUO_FORM_FIELDS: [&str; 5] = [
     "shortLinkSource",
 ];
 
+/// Hosts known to deliver Chinese e-invoices instead of marketing mail.
+///
+/// Link recovery downloads only from these hosts: a tracking or marketing URL
+/// that was wrongly imported as an invoice placeholder is reported as a
+/// non-invoice portal without spending a request on it. A subdomain of a
+/// listed host is accepted, since portals serve files from subdomains.
+const KNOWN_INVOICE_PORTAL_HOSTS: &[&str] = &[
+    NUONUO_HOST,          // 诺诺（江苏）电子发票
+    "fp.nuonuo.com",      // 诺诺开放平台
+    "pis.baiwang.com",    // 百望电子发票
+    "fpkj.vpiaotong.com", // 票通电子发票
+];
+
+/// Failure message of a portal that wants an interactive login first.
+const PORTAL_LOGIN_REQUIRED_MESSAGE: &str = "invoice portal requires an interactive login";
+/// Failure message of a portal that reports the invoice link as expired.
+const PORTAL_LINK_EXPIRED_MESSAGE: &str = "invoice link is no longer valid";
+/// Failure message of the Nuonuo landing resolver.
+const NUONUO_FAILURE_MESSAGE: &str = "Nuonuo invoice link could not be resolved";
+
 #[derive(Clone, Default)]
 pub struct SecureInvoiceLinkDownloader;
 
@@ -70,6 +108,11 @@ impl InvoiceLinkDownloader for SecureInvoiceLinkDownloader {
         // so the page is followed before the link is declared unsupported.
         if let Some(invoice) = download_from_portal_page(&fetched).await {
             return Ok(InvoiceLinkDownload::Downloaded(invoice));
+        }
+        // A page that neither links a file nor can be read without a human:
+        // report the concrete reason instead of a generic download failure.
+        if let Some(error) = classify_portal_page(&fetched.bytes) {
+            return Err(error);
         }
         if !is_nuonuo_landing(&fetched.final_url) {
             return Err(unsupported_download_body());
@@ -392,7 +435,7 @@ fn unsupported_download_body() -> AppError {
 }
 
 fn nuonuo_failure() -> AppError {
-    download_error(false, "Nuonuo invoice link could not be resolved")
+    download_error(false, NUONUO_FAILURE_MESSAGE)
 }
 
 fn download_error(retryable: bool, message: &str) -> AppError {
@@ -506,6 +549,96 @@ fn download_file_name(url: &Url, extension: &str) -> String {
                 .is_some_and(|value| value.eq_ignore_ascii_case(extension))
         });
     candidate.unwrap_or_else(|| format!("downloaded-invoice.{extension}"))
+}
+
+/// Whether this URL may be handed to the secure downloader.
+///
+/// Recovery actions read URLs from stored files, so they apply the same policy
+/// the downloader applies: HTTPS, a host and no embedded credentials.
+pub fn is_downloadable_url(url: &Url) -> bool {
+    validate_source_url(url).is_ok()
+}
+
+/// Whether this link points at a host known to deliver real e-invoices.
+///
+/// Deliberately narrow: a marketing or tracking link that was imported as an
+/// invoice placeholder must not turn "rescue" into a request to its tracker.
+pub fn is_known_invoice_portal(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    KNOWN_INVOICE_PORTAL_HOSTS.iter().any(|portal| {
+        host == *portal
+            || host
+                .strip_suffix(portal)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// Builds the error a classified link failure is reported with.
+///
+/// The secure downloader and the recovery tests share this constructor, so the
+/// mapping in [`download_failure`] stays stable.
+pub fn download_failure_error(kind: DownloadFailureKind) -> AppError {
+    match kind {
+        DownloadFailureKind::RequiresLogin => download_error(false, PORTAL_LOGIN_REQUIRED_MESSAGE),
+        DownloadFailureKind::Expired => download_error(false, PORTAL_LINK_EXPIRED_MESSAGE),
+        DownloadFailureKind::Connection => request_failure(true),
+        DownloadFailureKind::NotAnInvoice => unsupported_download_body(),
+    }
+}
+
+/// Classifies a failed link download for the recovery actions.
+pub fn download_failure(error: &AppError) -> DownloadFailureKind {
+    let AppError::External {
+        service,
+        retryable,
+        message,
+    } = error
+    else {
+        return DownloadFailureKind::NotAnInvoice;
+    };
+    if service != "invoice_download" {
+        return DownloadFailureKind::NotAnInvoice;
+    }
+    if message == PORTAL_LOGIN_REQUIRED_MESSAGE {
+        DownloadFailureKind::RequiresLogin
+    } else if message == PORTAL_LINK_EXPIRED_MESSAGE || message == NUONUO_FAILURE_MESSAGE {
+        DownloadFailureKind::Expired
+    } else if *retryable {
+        DownloadFailureKind::Connection
+    } else {
+        DownloadFailureKind::NotAnInvoice
+    }
+}
+
+/// Recognizes a portal page that only a login or a fresh link could get past.
+///
+/// Only an HTML answer that did not link an invoice file is inspected, so a
+/// page that shows a login banner *and* a direct file link keeps working.
+fn classify_portal_page(bytes: &[u8]) -> Option<AppError> {
+    if file_signature::detect(bytes) != FileKind::Html {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    // Expiry first: an expired link belongs to a real invoice the user may
+    // still recover from the mail, so it must win over a site header that
+    // merely contains a "登录" navigation entry (expired links are reported,
+    // login walls are archived).
+    if ["已失效", "已过期", "过期", "expired", "链接无效"]
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        return Some(download_failure_error(DownloadFailureKind::Expired));
+    }
+    if ["登录", "login", "sign in", "signin", "passport"]
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        return Some(download_failure_error(DownloadFailureKind::RequiresLogin));
+    }
+    None
 }
 
 #[cfg(test)]

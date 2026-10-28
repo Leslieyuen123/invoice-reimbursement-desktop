@@ -273,6 +273,8 @@ fn desktop_api_exposes_only_the_planned_command_names() {
             "settle_recoverable_items",
             "recover_qr_invoices",
             "recover_qr_invoice",
+            "recover_link_invoices",
+            "recover_link_invoice",
             "archive_non_invoice_items",
             "get_non_invoice_summary",
             "list_batches",

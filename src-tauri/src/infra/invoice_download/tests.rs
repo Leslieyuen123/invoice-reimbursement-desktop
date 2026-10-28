@@ -3,9 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 use super::{
-    DownloadedInvoice, MAX_DOWNLOAD_BYTES, append_bounded_chunk, classify_download,
-    is_ignored_source, is_public_ip, nuonuo_form_fields, parse_nuonuo_pdf_url,
-    validate_content_length, validate_source_url,
+    DownloadFailureKind, DownloadedInvoice, MAX_DOWNLOAD_BYTES, append_bounded_chunk,
+    classify_download, classify_portal_page, download_failure, download_failure_error,
+    is_downloadable_url, is_ignored_source, is_known_invoice_portal, is_public_ip,
+    nuonuo_form_fields, parse_nuonuo_pdf_url, validate_content_length, validate_source_url,
 };
 
 #[test]
@@ -198,4 +199,92 @@ fn nuonuo_parser_returns_only_a_valid_https_pdf_url() {
         assert!(!message.contains("token=secret"));
         assert!(message.contains("Nuonuo"));
     }
+}
+
+#[test]
+fn only_known_invoice_portals_may_be_downloaded_by_recovery() {
+    for value in [
+        "https://nnfp.jss.com.cn/5TQY1_XFJO-11SlG",
+        "https://fp.nuonuo.com/invoice/123",
+        "https://pis.baiwang.com/invoice/123",
+        "https://fpkj.vpiaotong.com/invoice/123",
+        "https://download.pis.baiwang.com/invoice.pdf",
+    ] {
+        let url = Url::parse(value).unwrap();
+        assert!(is_known_invoice_portal(&url), "{value} must be a portal");
+        assert!(is_downloadable_url(&url), "{value} must be downloadable");
+    }
+
+    for value in [
+        "https://shop.10086.cn/marketing",
+        "https://happy.mail.10086.cn/marketing",
+        "https://mx.tumblr.com/post",
+        "https://countmkt.mail.163.com/mail",
+        "https://clicks.aweber.com/link",
+        "https://support.google.com/answer",
+        "https://nam.safelink.emails.azure.net/link",
+        "https://baiwang.com/invoice/123",
+        "https://pis.baiwang.com.evil.example/invoice/123",
+        "https://notbaiwang.com/invoice/123",
+    ] {
+        assert!(
+            !is_known_invoice_portal(&Url::parse(value).unwrap()),
+            "{value} must not be treated as an invoice portal"
+        );
+    }
+
+    assert!(!is_downloadable_url(
+        &Url::parse("http://nnfp.jss.com.cn/short").unwrap()
+    ));
+}
+
+#[test]
+fn portal_login_and_expiry_pages_map_to_explicit_failure_kinds() {
+    let login = classify_portal_page("<!doctype html><title>请先登录</title>".as_bytes()).unwrap();
+    assert_eq!(download_failure(&login), DownloadFailureKind::RequiresLogin);
+
+    let expired =
+        classify_portal_page("<!doctype html><p>该链接已失效，请重新获取</p>".as_bytes()).unwrap();
+    assert_eq!(download_failure(&expired), DownloadFailureKind::Expired);
+
+    // A page header with a login link must not turn an expired invoice link
+    // into an archived login wall.
+    let expired_with_login_nav =
+        classify_portal_page("<!doctype html><nav><a>登录</a></nav><p>链接已过期</p>".as_bytes())
+            .unwrap();
+    assert_eq!(
+        download_failure(&expired_with_login_nav),
+        DownloadFailureKind::Expired
+    );
+
+    // A page that only needs to be parsed as a portal page is not classified
+    // here: the caller follows its direct file links first.
+    assert!(
+        classify_portal_page("<!doctype html><title>invoice portal</title>".as_bytes()).is_none()
+    );
+    assert!(classify_portal_page(b"%PDF-1.7\n%%EOF\n").is_none());
+    assert!(classify_portal_page(b"plain text").is_none());
+}
+
+#[test]
+fn classified_failures_round_trip_through_their_constructor() {
+    for kind in [
+        DownloadFailureKind::RequiresLogin,
+        DownloadFailureKind::Expired,
+        DownloadFailureKind::Connection,
+        DownloadFailureKind::NotAnInvoice,
+    ] {
+        assert_eq!(download_failure(&download_failure_error(kind)), kind);
+    }
+
+    // A failure from another service is never mistaken for a portal condition.
+    let unrelated = crate::domain::error::AppError::External {
+        service: "ocr".to_owned(),
+        retryable: true,
+        message: "engine crashed".to_owned(),
+    };
+    assert_eq!(
+        download_failure(&unrelated),
+        DownloadFailureKind::NotAnInvoice
+    );
 }

@@ -12,6 +12,7 @@ import type {
   BatchDto,
   BatchRepairDto,
   DashboardDto,
+  LinkRecoveryReportDto,
   NonInvoiceSummaryDto,
   QrRecoveryReportDto,
   SettleBatchInputDto,
@@ -77,6 +78,8 @@ export const API_COMMANDS = {
   settleRecoverableItems: "settle_recoverable_items",
   recoverQrInvoices: "recover_qr_invoices",
   recoverQrInvoice: "recover_qr_invoice",
+  recoverLinkInvoices: "recover_link_invoices",
+  recoverLinkInvoice: "recover_link_invoice",
   archiveNonInvoiceItems: "archive_non_invoice_items",
   getNonInvoiceSummary: "get_non_invoice_summary",
   listBatches: "list_batches",
@@ -140,6 +143,10 @@ export const api = {
     call<QrRecoveryReportDto>(API_COMMANDS.recoverQrInvoices, { limit }),
   recoverQrInvoice: (itemId: string) =>
     call<QrRecoveryReportDto>(API_COMMANDS.recoverQrInvoice, { itemId }),
+  recoverLinkInvoices: (limit?: number) =>
+    call<LinkRecoveryReportDto>(API_COMMANDS.recoverLinkInvoices, { limit }),
+  recoverLinkInvoice: (itemId: string) =>
+    call<LinkRecoveryReportDto>(API_COMMANDS.recoverLinkInvoice, { itemId }),
   archiveNonInvoiceItems: () =>
     call<ArchiveNonInvoiceReportDto>(API_COMMANDS.archiveNonInvoiceItems),
   getNonInvoiceSummary: () =>

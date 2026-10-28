@@ -21,6 +21,7 @@ use crate::services::dashboard::DashboardService;
 use crate::services::export::{ExportCoordinator, ExportService};
 use crate::services::import::ImportService;
 use crate::services::items::ItemService;
+use crate::services::link_recovery::LinkRecoveryService;
 use crate::services::operations::AccountOperationCoordinator;
 use crate::services::preview::{PreviewCoordinator, PreviewService};
 use crate::services::qr_recovery::QrRecoveryService;
@@ -36,7 +37,7 @@ pub struct AppState {
     paths: AppPaths,
     credentials: Arc<dyn CredentialStore>,
     gateway: Arc<dyn ImapGateway>,
-    /// Downloader used by the QR rescue for stored invoices.
+    /// Downloader used by the recovery actions for stored invoices.
     ///
     /// Injectable so tests can drive the whole rescue with a fake portal instead
     /// of the network.
@@ -215,6 +216,15 @@ impl AppState {
 
     pub fn qr_recovery_service(&self) -> QrRecoveryService {
         QrRecoveryService::new(
+            ItemRepository::new(self.pool.clone()),
+            self.recognition_service(),
+            self.paths.clone(),
+            self.link_downloader.clone(),
+        )
+    }
+
+    pub fn link_recovery_service(&self) -> LinkRecoveryService {
+        LinkRecoveryService::new(
             ItemRepository::new(self.pool.clone()),
             self.recognition_service(),
             self.paths.clone(),

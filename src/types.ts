@@ -466,6 +466,32 @@ export interface ArchiveNonInvoiceReportDto {
   archivedCount: number;
 }
 
+/** One skip-reason bucket of the link rescue run. */
+export interface LinkRecoverySkipDto {
+  /** Stable machine-readable code, e.g. `not_invoice_portal`. */
+  code: string;
+  /** Chinese explanation shown in the result line. */
+  label: string;
+  count: number;
+}
+
+/** What one "补救链接票据" run changed. */
+export interface LinkRecoveryReportDto {
+  /** `.url` placeholders the run looked at. */
+  examined: number;
+  /** Placeholders whose stored file was replaced by a downloaded invoice. */
+  downloaded: number;
+  /** Placeholders that ended recognized after the replacement. */
+  recognized: number;
+  /** Placeholders that could not be rescued; see `skippedBreakdown`. */
+  skipped: number;
+  /** Placeholders marked as non-invoice files during the run. */
+  archived: number;
+  /** Placeholders skipped because the host is not an invoice portal. */
+  notInvoicePortal: number;
+  skippedBreakdown: LinkRecoverySkipDto[];
+}
+
 /** Counts behind the inbox "N 个非发票文件 → 移出队列" banner. */
 export interface NonInvoiceSummaryDto {
   /** Office documents / archives a dismissal would mark right now. */

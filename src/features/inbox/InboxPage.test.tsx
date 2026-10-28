@@ -1466,6 +1466,145 @@ describe("InboxPage", () => {
     expect(await screen.findByText("已补救 1 张，跳过 0 张")).toBeInTheDocument();
   });
 
+  it("rescues link placeholders from the pending pool and explains every skip", async () => {
+    const user = userEvent.setup();
+    const linkItem = pendingInvoiceFixture({
+      originalName: "download-1-2.url",
+      amountCents: null,
+      hasNormalizedPdf: false,
+      recognitionStatus: "failed",
+      status: "recognition_failed",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [linkItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_link_invoices", {
+      examined: 3,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 2,
+      archived: 1,
+      notInvoicePortal: 1,
+      skippedBreakdown: [
+        { code: "not_invoice_portal", label: "非发票网站", count: 1 },
+        { code: "requires_login", label: "门户需要登录", count: 1 },
+      ],
+    });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await screen.findByText("download-1-2.url");
+    const linkButton = screen.getByRole("button", { name: "补救链接票据" });
+    await user.click(linkButton);
+
+    await waitFor(() => {
+      expect(commandCalls("recover_link_invoices")).toHaveLength(1);
+    });
+    expect(await screen.findByText(/已补救 1 张/)).toHaveTextContent(
+      "已补救 1 张（检查 3 张、下载 1 张），跳过 2 张（非发票网站 1 张、门户需要登录 1 张），已归档 1 个非发票链接（其中非发票网站 1 个）",
+    );
+  });
+
+  it("rescues a single link placeholder from the drawer", async () => {
+    const user = userEvent.setup();
+    const linkItem = pendingInvoiceFixture({
+      originalName: "download-1-2.url",
+      amountCents: null,
+      hasNormalizedPdf: false,
+      recognitionStatus: "failed",
+      status: "recognition_failed",
+    });
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", { items: [linkItem], nextCursor: null });
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_link_invoice", {
+      examined: 1,
+      downloaded: 1,
+      recognized: 1,
+      skipped: 0,
+      archived: 0,
+      notInvoicePortal: 0,
+      skippedBreakdown: [],
+    });
+    mockCommand(
+      "get_item",
+      pendingInvoiceFixture({
+        originalName: "portal-invoice.pdf",
+        amountCents: 12_850,
+        hasNormalizedPdf: true,
+        recognitionStatus: "succeeded",
+        status: "pending_confirmation",
+      }),
+    );
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await user.click(await screen.findByText("download-1-2.url"));
+    await user.click(screen.getByRole("button", { name: "补救链接" }));
+
+    await waitFor(() => {
+      expect(commandCalls("recover_link_invoice")).toEqual([
+        { itemId: "invoice-taxi" },
+      ]);
+    });
+    expect(await screen.findByText("已补救 1 张，跳过 0 张")).toBeInTheDocument();
+  });
+
+  it("archives a single non-portal link placeholder from the drawer", async () => {
+    const user = userEvent.setup();
+    const linkItem = pendingInvoiceFixture({
+      originalName: "download-1-2.url",
+      amountCents: null,
+      hasNormalizedPdf: false,
+      recognitionStatus: "failed",
+      status: "recognition_failed",
+    });
+    let listed = [linkItem];
+    mockCommand("get_dashboard", new Promise(() => undefined));
+    mockCommand("list_items", () => ({ items: listed, nextCursor: null }));
+    mockCommand("get_non_invoice_summary", {
+      markableCount: 0,
+      markedCount: 0,
+    });
+    mockCommand("recover_link_invoice", {
+      examined: 1,
+      downloaded: 0,
+      recognized: 0,
+      skipped: 1,
+      archived: 1,
+      notInvoicePortal: 1,
+      skippedBreakdown: [
+        { code: "not_invoice_portal", label: "非发票网站", count: 1 },
+      ],
+    });
+    mockCommand("get_item", () => {
+      listed = [];
+      return linkItem;
+    });
+
+    renderAppAt("/inbox?status=recognition_failed");
+    await user.click(await screen.findByText("download-1-2.url"));
+    await user.click(screen.getByRole("button", { name: "补救链接" }));
+
+    await waitFor(() => {
+      expect(commandCalls("recover_link_invoice")).toEqual([
+        { itemId: "invoice-taxi" },
+      ]);
+    });
+    expect(
+      await screen.findByText(
+        "已补救 0 张，跳过 1 张（非发票网站 1 张），已归档 1 个非发票链接（其中非发票网站 1 个）",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(commandCalls("get_item")).toHaveLength(1);
+    });
+  });
+
   it("keeps or deletes suspected duplicates from the drawer", async () => {
     const user = userEvent.setup();
     const duplicateOne = pendingInvoiceFixture({

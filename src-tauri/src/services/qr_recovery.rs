@@ -29,7 +29,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::db::items::{EmailFileReplacement, InvoiceItem, ItemRepository, is_image_original_name};
+use crate::db::items::{
+    EmailFileReplacement, InvoiceItem, ItemRepository, RecoveryOriginalKind, is_image_original_name,
+};
 use crate::domain::error::AppError;
 use crate::domain::model::{DedupeStatus, RecognitionStatus};
 use crate::infra::file_signature;
@@ -224,7 +226,15 @@ impl QrRecoveryService {
             Ok(downloaded) => downloaded,
             Err(code) => return Some(code),
         };
-        match self.replace_original(item, &downloaded).await {
+        match replace_original_with_download(
+            &self.items,
+            &self.paths,
+            item,
+            &downloaded,
+            RecoveryOriginalKind::QrImage,
+        )
+        .await
+        {
             Ok(()) => report.downloaded = report.downloaded.saturating_add(1),
             Err(error) => {
                 tracing::warn!(
@@ -294,93 +304,92 @@ impl QrRecoveryService {
             Err(QR_SKIP_NOT_INVOICE_LINK)
         }
     }
+}
 
-    /// Replaces the image original with the downloaded invoice.
-    ///
-    /// The bytes are written through the same staging directory and promotion
-    /// used by the import pipeline, and the database swap mirrors the import
-    /// side: the new file is promoted first, the row is updated transactionally,
-    /// and a failed update rolls the promoted file back. The previous original
-    /// and normalized PDF are deleted only after the row no longer references
-    /// them, and a failed cleanup is left to the startup recovery instead of
-    /// failing the already-successful repair.
-    async fn replace_original(
-        &self,
-        item: &InvoiceItem,
-        downloaded: &DownloadedInvoice,
-    ) -> Result<(), AppError> {
-        let kind = file_signature::detect(&downloaded.bytes);
-        let Some((extension, mime_type)) = kind.invoice_identity() else {
-            return Err(AppError::validation(
-                "downloadedInvoice",
-                "下载到的文件不是可识别的发票文件",
-            ));
-        };
-        let sha256 = format!("{:x}", Sha256::digest(&downloaded.bytes));
-        let candidate_id = Uuid::new_v4();
-        let paths = self.paths.clone();
-        let bytes = downloaded.bytes.clone();
-        let staged =
-            tokio::task::spawn_blocking(move || stage_original(&paths, candidate_id, &bytes))
-                .await
-                .map_err(|error| AppError::Internal {
-                    message: format!("QR replacement staging task failed: {error}"),
-                })??;
-        let date = item
-            .batch_membership_date()
-            .unwrap_or_else(|| item.fetched_at.date_naive());
-        let promoted = staged.promote(date, item.id, extension)?;
-        let replacement = EmailFileReplacement {
-            original_name: downloaded.file_name.clone(),
-            original_path: promoted.path().to_string_lossy().into_owned(),
-            sha256,
-            mime_type: mime_type.to_owned(),
-        };
-        match self
-            .items
-            .replace_image_original_for_qr_recovery(item.id, replacement)
-            .await
-        {
-            Ok(Some(_replaced)) => {
-                promoted.commit();
-                if self.paths.delete_original(&item.original_path).is_err() {
-                    tracing::warn!(
-                        item_id = %item.id,
-                        "QR rescue left an unreferenced image original for startup recovery"
-                    );
-                }
-                if let Some(normalized) = item.normalized_pdf_path.as_deref()
-                    && self
-                        .paths
-                        .delete_normalized_pdf(Path::new(normalized))
-                        .is_err()
-                {
-                    tracing::warn!(
-                        item_id = %item.id,
-                        "QR rescue left an unreferenced normalized PDF for startup recovery"
-                    );
-                }
-                Ok(())
+/// Replaces a stored original with a downloaded invoice file.
+///
+/// Shared by the QR rescue and the link rescue. The bytes are written through
+/// the same staging directory and promotion used by the import pipeline, and
+/// the database swap mirrors the import side: the new file is promoted first,
+/// the row is updated transactionally, and a failed update rolls the promoted
+/// file back. The previous original and normalized PDF are deleted only after
+/// the row no longer references them, and a failed cleanup is left to the
+/// startup recovery instead of failing the already-successful repair.
+pub(crate) async fn replace_original_with_download(
+    items: &ItemRepository,
+    paths: &AppPaths,
+    item: &InvoiceItem,
+    downloaded: &DownloadedInvoice,
+    kind: RecoveryOriginalKind,
+) -> Result<(), AppError> {
+    let file_kind = file_signature::detect(&downloaded.bytes);
+    let Some((extension, mime_type)) = file_kind.invoice_identity() else {
+        return Err(AppError::validation(
+            "downloadedInvoice",
+            "下载到的文件不是可识别的发票文件",
+        ));
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&downloaded.bytes));
+    let candidate_id = Uuid::new_v4();
+    let paths_for_staging = paths.clone();
+    let bytes = downloaded.bytes.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        stage_original(&paths_for_staging, candidate_id, &bytes)
+    })
+    .await
+    .map_err(|error| AppError::Internal {
+        message: format!("recovery replacement staging task failed: {error}"),
+    })??;
+    let date = item
+        .batch_membership_date()
+        .unwrap_or_else(|| item.fetched_at.date_naive());
+    let promoted = staged.promote(date, item.id, extension)?;
+    let replacement = EmailFileReplacement {
+        original_name: downloaded.file_name.clone(),
+        original_path: promoted.path().to_string_lossy().into_owned(),
+        sha256,
+        mime_type: mime_type.to_owned(),
+    };
+    match items
+        .replace_original_for_recovery(item.id, replacement, kind)
+        .await
+    {
+        Ok(Some(_replaced)) => {
+            promoted.commit();
+            if paths.delete_original(&item.original_path).is_err() {
+                tracing::warn!(
+                    item_id = %item.id,
+                    "recovery left an unreferenced original for startup recovery"
+                );
             }
-            Ok(None) => {
-                promoted.rollback()?;
-                Err(AppError::Conflict {
-                    message: "票据在补救过程中被修改，已放弃本次替换".to_owned(),
-                })
+            if let Some(normalized) = item.normalized_pdf_path.as_deref()
+                && paths.delete_normalized_pdf(Path::new(normalized)).is_err()
+            {
+                tracing::warn!(
+                    item_id = %item.id,
+                    "recovery left an unreferenced normalized PDF for startup recovery"
+                );
             }
-            Err(database_error) => match promoted.rollback() {
-                Ok(()) => Err(database_error),
-                Err(cleanup_error) => Err(AppError::External {
-                    service: "filesystem_sync".to_owned(),
-                    retryable: false,
-                    message: format!(
-                        "QR rescue replacement failed and downloaded file cleanup was incomplete; \
-                         manual recovery is required: database error: {database_error}; cleanup \
-                         error: {cleanup_error}"
-                    ),
-                }),
-            },
+            Ok(())
         }
+        Ok(None) => {
+            promoted.rollback()?;
+            Err(AppError::Conflict {
+                message: "票据在补救过程中被修改，已放弃本次替换".to_owned(),
+            })
+        }
+        Err(database_error) => match promoted.rollback() {
+            Ok(()) => Err(database_error),
+            Err(cleanup_error) => Err(AppError::External {
+                service: "filesystem_sync".to_owned(),
+                retryable: false,
+                message: format!(
+                    "recovery replacement failed and downloaded file cleanup was incomplete; \
+                     manual recovery is required: database error: {database_error}; cleanup \
+                     error: {cleanup_error}"
+                ),
+            }),
+        },
     }
 }
 
@@ -414,7 +423,14 @@ fn read_and_decode(paths: &AppPaths, source: &Path) -> Result<Vec<String>, AppEr
 }
 
 /// Writes the downloaded bytes into the staging area, exactly like an import.
-fn stage_original(paths: &AppPaths, id: Uuid, bytes: &[u8]) -> Result<StagedOriginal, AppError> {
+///
+/// Shared by every recovery service so a repaired original goes through the
+/// same durable staging/promotion path as a fresh import.
+pub(crate) fn stage_original(
+    paths: &AppPaths,
+    id: Uuid,
+    bytes: &[u8],
+) -> Result<StagedOriginal, AppError> {
     let (staged, mut file) = paths.begin_staged_original(id)?;
     let result = (|| {
         file.write_all(bytes).map_err(|error| AppError::Internal {

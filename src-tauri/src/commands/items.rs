@@ -19,6 +19,7 @@ use crate::infra::files::open_contained_regular_file;
 use crate::services::batch_repair::repair_missing_normalized_pdfs;
 use crate::services::batches::{BatchService, RecoverableSettleInput};
 use crate::services::items::ItemReview;
+use crate::services::link_recovery::{self, LinkRecoveryReport};
 use crate::services::qr_recovery::{self, QrRecoveryReport};
 use crate::services::recognition::original_can_be_normalized;
 use crate::state::AppState;
@@ -488,6 +489,96 @@ pub async fn recover_qr_invoice(
     Ok(qr_recovery_dto(report))
 }
 
+/// One skip-reason bucket of a link rescue run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRecoverySkipDto {
+    pub code: String,
+    pub label: String,
+    pub count: u32,
+}
+
+/// What one "补救链接票据" run changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRecoveryReportDto {
+    /// Link placeholders the run looked at.
+    pub examined: u32,
+    /// Placeholders whose stored file was replaced by a downloaded invoice.
+    pub downloaded: u32,
+    /// Placeholders that ended recognized after the replacement.
+    pub recognized: u32,
+    /// Placeholders that could not be rescued; see `skippedBreakdown`.
+    pub skipped: u32,
+    /// Placeholders marked as non-invoice files during the run.
+    pub archived: u32,
+    /// Placeholders skipped because the host is not an invoice portal.
+    pub not_invoice_portal: u32,
+    /// Skip reasons grouped by stable code, deterministic by code.
+    pub skipped_breakdown: Vec<LinkRecoverySkipDto>,
+}
+
+fn link_skip_label(code: &str) -> &'static str {
+    match code {
+        link_recovery::LINK_SKIP_MISSING_URL => "占位里没有链接",
+        link_recovery::LINK_SKIP_INVALID_URL => "链接不合法",
+        link_recovery::LINK_SKIP_NOT_INVOICE_PORTAL => "非发票网站",
+        link_recovery::LINK_SKIP_REQUIRES_LOGIN => "门户需要登录",
+        link_recovery::LINK_SKIP_EXPIRED => "链接已失效",
+        link_recovery::LINK_SKIP_DOWNLOAD_FAILED => "下载失败",
+        link_recovery::LINK_SKIP_NOT_INVOICE => "下载到的不是发票",
+        link_recovery::LINK_SKIP_REPLACE_FAILED => "替换原件失败",
+        link_recovery::LINK_SKIP_RECOGNIZED_FAILED => "重新识别失败",
+        _ => "其他原因",
+    }
+}
+
+fn link_recovery_dto(report: LinkRecoveryReport) -> LinkRecoveryReportDto {
+    LinkRecoveryReportDto {
+        examined: report.examined,
+        downloaded: report.downloaded,
+        recognized: report.recognized,
+        skipped: report.skipped,
+        archived: report.archived,
+        not_invoice_portal: report.not_invoice_portal,
+        skipped_breakdown: report
+            .skip_reasons
+            .into_iter()
+            .map(|entry| LinkRecoverySkipDto {
+                label: link_skip_label(&entry.code).to_owned(),
+                code: entry.code,
+                count: entry.count,
+            })
+            .collect(),
+    }
+}
+
+/// Rescues every stored link placeholder that can still become an invoice.
+///
+/// Recognition cannot rescue these invoices on its own: the placeholder only
+/// contains the mail link. This reads the link, downloads it through the same
+/// pipeline new mail uses, replaces the placeholder and re-runs recognition.
+/// Marketing/tracking hosts are not requested at all and are marked as
+/// non-invoice files. `limit` caps one run; the whole eligible set is processed
+/// when it is `None`, and placeholders left out by the cap are not counted as
+/// examined.
+pub async fn recover_link_invoices(
+    state: &AppState,
+    limit: Option<u32>,
+) -> Result<LinkRecoveryReportDto, AppError> {
+    let report = state.link_recovery_service().recover_all(limit).await?;
+    Ok(link_recovery_dto(report))
+}
+
+/// Rescues one stored link placeholder the user picked in the drawer.
+pub async fn recover_link_invoice(
+    state: &AppState,
+    item_id: Uuid,
+) -> Result<LinkRecoveryReportDto, AppError> {
+    let report = state.link_recovery_service().recover_item(item_id).await?;
+    Ok(link_recovery_dto(report))
+}
+
 /// What one "把非发票文件移出待处理队列" run changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -850,9 +941,9 @@ pub(crate) mod ipc {
     use uuid::Uuid;
 
     use super::{
-        ArchiveNonInvoiceReportDto, InvoiceItemDto, ItemFilterDto, ManualImportOutcomeDto,
-        NonInvoiceSummaryDto, QrRecoveryReportDto, RecoverableSettleOutcomeDto,
-        RetryFailedRecognitionsReport, ReviewItemInputDto,
+        ArchiveNonInvoiceReportDto, InvoiceItemDto, ItemFilterDto, LinkRecoveryReportDto,
+        ManualImportOutcomeDto, NonInvoiceSummaryDto, QrRecoveryReportDto,
+        RecoverableSettleOutcomeDto, RetryFailedRecognitionsReport, ReviewItemInputDto,
     };
     use crate::commands::{PageDto, PageRequestDto};
     use crate::domain::error::AppError;
@@ -945,6 +1036,22 @@ pub(crate) mod ipc {
         item_id: Uuid,
     ) -> Result<QrRecoveryReportDto, AppError> {
         super::recover_qr_invoice(&state, item_id).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_link_invoices(
+        state: State<'_, AppState>,
+        limit: Option<u32>,
+    ) -> Result<LinkRecoveryReportDto, AppError> {
+        super::recover_link_invoices(&state, limit).await
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn recover_link_invoice(
+        state: State<'_, AppState>,
+        item_id: Uuid,
+    ) -> Result<LinkRecoveryReportDto, AppError> {
+        super::recover_link_invoice(&state, item_id).await
     }
 
     #[tauri::command(rename_all = "camelCase")]

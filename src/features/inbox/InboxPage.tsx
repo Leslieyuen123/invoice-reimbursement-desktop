@@ -7,6 +7,7 @@ import {
 import {
   ArchiveX,
   Check,
+  Link2,
   QrCode,
   RotateCcw,
   Search,
@@ -26,6 +27,7 @@ import type {
   InvoiceItemDto,
   ItemFilter,
   ItemStatus,
+  LinkRecoveryReportDto,
   ManualImportOutcomeDto,
   PageDto,
   QrRecoveryReportDto,
@@ -89,6 +91,20 @@ function qrRecoveryReportText(report: QrRecoveryReportDto) {
     ? `跳过 ${report.skipped} 张（${breakdown}）`
     : `跳过 ${report.skipped} 张`;
   return `已补救 ${report.recognized} 张（检查 ${report.examined} 张、解码 ${report.decoded} 张、下载 ${report.downloaded} 张），${skipped}`;
+}
+
+function linkRecoveryReportText(report: LinkRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  const archived =
+    report.archived > 0
+      ? `，已归档 ${report.archived} 个非发票链接（其中非发票网站 ${report.notInvoicePortal} 个）`
+      : "";
+  return `已补救 ${report.recognized} 张（检查 ${report.examined} 张、下载 ${report.downloaded} 张），${skipped}${archived}`;
 }
 
 function statusFromSearch(value: string | null): ItemStatus | undefined {
@@ -194,6 +210,12 @@ export function InboxPage() {
   const [qrRecoveryReport, setQrRecoveryReport] =
     useState<QrRecoveryReportDto | null>(null);
   const [qrRecoveryError, setQrRecoveryError] = useState<string | null>(null);
+  const [recoveringLinks, setRecoveringLinks] = useState(false);
+  const [linkRecoveryReport, setLinkRecoveryReport] =
+    useState<LinkRecoveryReportDto | null>(null);
+  const [linkRecoveryError, setLinkRecoveryError] = useState<string | null>(
+    null,
+  );
   const [archivingNonInvoice, setArchivingNonInvoice] = useState(false);
   const [archiveReport, setArchiveReport] =
     useState<ArchiveNonInvoiceReportDto | null>(null);
@@ -437,6 +459,25 @@ export function InboxPage() {
     }
   }
 
+  async function recoverLinkInvoices() {
+    setRecoveringLinks(true);
+    setLinkRecoveryError(null);
+    try {
+      const report = await api.recoverLinkInvoices();
+      setLinkRecoveryReport(report);
+      invalidateItemLists();
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.nonInvoiceSummary,
+      });
+    } catch (error) {
+      setLinkRecoveryError(
+        errorMessage(error, "补救链接票据失败，请稍后再试"),
+      );
+    } finally {
+      setRecoveringLinks(false);
+    }
+  }
+
   async function archiveNonInvoiceFiles() {
     setArchivingNonInvoice(true);
     setArchiveError(null);
@@ -590,6 +631,23 @@ export function InboxPage() {
           ) : null}
           {qrRecoveryError ? (
             <span role="alert">{qrRecoveryError}</span>
+          ) : null}
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={recoveringLinks}
+            onClick={() => void recoverLinkInvoices()}
+          >
+            <Link2 size={15} strokeWidth={1.8} aria-hidden="true" />
+            {recoveringLinks ? "正在补救…" : "补救链接票据"}
+          </button>
+          {linkRecoveryReport ? (
+            <span role="status">
+              {linkRecoveryReportText(linkRecoveryReport)}
+            </span>
+          ) : null}
+          {linkRecoveryError ? (
+            <span role="alert">{linkRecoveryError}</span>
           ) : null}
           {nonInvoiceSummary.data &&
           nonInvoiceSummary.data.markableCount > 0 ? (

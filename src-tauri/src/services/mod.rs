@@ -10,6 +10,7 @@ pub mod export;
 pub(crate) mod export_recovery;
 pub mod import;
 pub mod items;
+pub mod link_recovery;
 pub(crate) mod operations;
 pub mod preview;
 pub mod qr_recovery;

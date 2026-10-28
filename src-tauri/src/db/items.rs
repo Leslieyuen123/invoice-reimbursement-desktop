@@ -24,6 +24,33 @@ const MAX_PAGE_SIZE: usize = 200;
 /// merely lacks data.
 pub const NON_INVOICE_DOCUMENT_REASON: &str = "document_not_invoice";
 
+/// Persistent mark for a `.url` placeholder that can never become an invoice.
+///
+/// Link recovery writes this after the target host turns out to be a marketing
+/// or tracking site, a login wall, or an HTML page that is not an invoice. The
+/// file stays on disk and in "全部", but leaves the work queues and the
+/// bulk-confirm skip statistics, exactly like a dismissed office document.
+pub const LINK_NOT_INVOICE_REASON: &str = "link_not_invoice";
+
+/// Note the import pipeline writes when a mail link could not be downloaded.
+///
+/// The link rescue clears it once a replacement file is stored, because the
+/// note would otherwise claim a download failure for an invoice that is now
+/// present on disk.
+pub(crate) const LINK_DOWNLOAD_FAILED_NOTE: &str = "invoice link download failed";
+
+/// Which stored-original shape a recovery action is allowed to replace.
+///
+/// The candidate query and the transactional replacement share this
+/// distinction, so a recovery cannot swap a file it never examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryOriginalKind {
+    /// An image original that carries an invoice QR code.
+    QrImage,
+    /// A `.url` placeholder written when a mail link could not be downloaded.
+    LinkPlaceholder,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceItem {
     pub id: Uuid,
@@ -946,6 +973,99 @@ impl ItemRepository {
         Ok(ItemPage { items, next_cursor })
     }
 
+    /// Link placeholders the rescue may still repair.
+    ///
+    /// A placeholder is the stored `download-*.url` file written when a mail
+    /// link could not be downloaded. The predicate matches the transactional
+    /// replacement guard: once a rescue replaces the placeholder with a real
+    /// invoice the row no longer matches, so a repeated run is a no-op.
+    pub(crate) async fn list_link_recovery_candidates(
+        &self,
+        cursor: Option<ItemPageCursor>,
+        page_size: usize,
+    ) -> Result<ItemPage, AppError> {
+        validate_page_size(page_size)?;
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT ");
+        query.push(ITEM_COLUMNS).push(" FROM items WHERE ");
+        push_link_recovery_criteria(&mut query);
+        if let Some(cursor) = cursor {
+            let created_at = cursor.created_at.to_rfc3339();
+            query
+                .push(" AND (created_at < ")
+                .push_bind(created_at.clone())
+                .push(" OR (created_at = ")
+                .push_bind(created_at)
+                .push(" AND id < ")
+                .push_bind(cursor.id.to_string())
+                .push("))");
+        }
+        let fetch_limit = page_size.checked_add(1).ok_or_else(|| AppError::Internal {
+            message: "item page size overflow".to_owned(),
+        })?;
+        query
+            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(
+                i64::try_from(fetch_limit)
+                    .map_err(|_| AppError::validation("pageSize", "page size is too large"))?,
+            );
+        let rows = query
+            .build_query_as::<DbItemRow>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| internal_error("failed to list link recovery candidates", error))?;
+        let has_next = rows.len() > page_size;
+        let mut rows = rows;
+        rows.truncate(page_size);
+        let items = rows
+            .into_iter()
+            .map(InvoiceItem::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = has_next.then(|| {
+            let last = items.last().expect("nonempty page must have a cursor row");
+            ItemPageCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }
+        });
+        Ok(ItemPage { items, next_cursor })
+    }
+
+    /// Marks a link placeholder as a file that can never become an invoice.
+    ///
+    /// This is the dismissal the link rescue applies to marketing/tracking
+    /// links, login walls and pages that are not invoices. It only rewrites
+    /// `non_invoice_reason`: the original file and every invoice field stay as
+    /// they were, so nothing is lost if the user later inspects the row.
+    pub(crate) async fn mark_link_placeholder_not_invoice(
+        &self,
+        id: Uuid,
+    ) -> Result<bool, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|error| map_database_error("failed to begin link dismissal", error))?;
+        let result = async {
+            let item = get_with_connection(&mut transaction, id).await?;
+            if !is_link_recovery_target(&item) || item.non_invoice_reason.is_some() {
+                return Ok(false);
+            }
+            let updated =
+                sqlx::query("UPDATE items SET non_invoice_reason = ?, updated_at = ? WHERE id = ?")
+                    .bind(LINK_NOT_INVOICE_REASON)
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(id.to_string())
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        map_database_error("failed to dismiss a link placeholder", error)
+                    })?;
+            Ok(updated.rows_affected() > 0)
+        }
+        .await;
+        finish_transaction(transaction, result).await
+    }
+
     /// Marks every office document / archive that can never become an invoice.
     ///
     /// Only files with a missing amount or a failed recognition are marked: an
@@ -1000,17 +1120,19 @@ impl ItemRepository {
         })
     }
 
-    /// Swaps an image original for the invoice PDF downloaded from its QR link.
+    /// Swaps a stored original for the invoice file a recovery download produced.
     ///
-    /// This mirrors [`Self::replace_failed_email_attachment`] (staged file,
-    /// transactional metadata swap, dedupe recomputation), but for a library
-    /// invoice the user asked to repair. User-authored fields (remark, tags) are
-    /// preserved; only data the download invalidates is reset, so the following
-    /// recognition run starts from a clean slate.
-    pub(crate) async fn replace_image_original_for_qr_recovery(
+    /// Shared by the QR rescue and the link rescue: it mirrors
+    /// [`Self::replace_failed_email_attachment`] (the caller stages the file,
+    /// this swaps the metadata transactionally and recomputes dedupe) but for a
+    /// library invoice the user asked to repair. User-authored fields (remark,
+    /// tags) are preserved; only data the download invalidates is reset, so the
+    /// following recognition run starts from a clean slate.
+    pub(crate) async fn replace_original_for_recovery(
         &self,
         id: Uuid,
         replacement: EmailFileReplacement,
+        kind: RecoveryOriginalKind,
     ) -> Result<Option<InvoiceItem>, AppError> {
         if replacement.original_name.trim().is_empty()
             || replacement.original_path.trim().is_empty()
@@ -1018,19 +1140,17 @@ impl ItemRepository {
             || replacement.mime_type.trim().is_empty()
         {
             return Err(AppError::Internal {
-                message: "QR recovery replacement metadata is incomplete".to_owned(),
+                message: "recovery replacement metadata is incomplete".to_owned(),
             });
         }
         let mut transaction = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|error| {
-                map_database_error("failed to begin QR recovery replacement", error)
-            })?;
+            .map_err(|error| map_database_error("failed to begin a recovery replacement", error))?;
         let result = async {
             let item = get_with_connection(&mut transaction, id).await?;
-            if !is_qr_recovery_replacement_target(&item) {
+            if !is_recovery_replacement_target(&item, kind) {
                 return Ok(None);
             }
             let canonical_id = sqlx::query_scalar::<_, String>(
@@ -1043,7 +1163,9 @@ impl ItemRepository {
             .bind(&replacement.sha256)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|error| map_database_error("failed to deduplicate QR replacement", error))?
+            .map_err(|error| {
+                map_database_error("failed to deduplicate a recovery replacement", error)
+            })?
             .map(|value| parse_uuid(&value, "id"))
             .transpose()?;
             let (dedupe_status, duplicate_of_id) = match canonical_id {
@@ -1071,7 +1193,19 @@ impl ItemRepository {
             .bind(id.to_string())
             .execute(&mut *transaction)
             .await
-            .map_err(|error| map_database_error("failed to replace image original", error))?;
+            .map_err(|error| map_database_error("failed to replace a recovery original", error))?;
+            if kind == RecoveryOriginalKind::LinkPlaceholder {
+                // The import pipeline wrote this note when the first download
+                // failed; once the file is replaced it is no longer true.
+                sqlx::query("UPDATE items SET note = NULL WHERE id = ? AND note = ?")
+                    .bind(id.to_string())
+                    .bind(LINK_DOWNLOAD_FAILED_NOTE)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        map_database_error("failed to clear the link failure note", error)
+                    })?;
+            }
             get_with_connection(&mut transaction, id).await.map(Some)
         }
         .await;
@@ -1571,17 +1705,31 @@ fn is_replaceable_failed_email_attachment(item: &InvoiceItem) -> bool {
         && item.batch_id.is_none()
 }
 
-/// Whether an invoice is a valid target for the QR rescue replacement.
+/// Whether an invoice is a valid target for a recovery replacement.
 ///
-/// The same predicate the candidate query encodes: an image original outside a
-/// batch, without an amount, not a suspected duplicate and not already dismissed
-/// as a non-invoice file.
-fn is_qr_recovery_replacement_target(item: &InvoiceItem) -> bool {
+/// The same predicate the matching candidate query encodes: a stored original
+/// of the expected shape, outside a batch, without an amount, not a suspected
+/// duplicate and not already dismissed as a non-invoice file.
+fn is_recovery_replacement_target(item: &InvoiceItem, kind: RecoveryOriginalKind) -> bool {
     item.amount_cents.is_none()
         && item.batch_id.is_none()
         && item.dedupe_status != DedupeStatus::SuspectedDuplicate
         && item.non_invoice_reason.is_none()
-        && is_image_original_name(&item.original_name)
+        && match kind {
+            RecoveryOriginalKind::QrImage => is_image_original_name(&item.original_name),
+            RecoveryOriginalKind::LinkPlaceholder => {
+                is_link_placeholder_original_name(&item.original_name)
+            }
+        }
+}
+
+/// Whether the invoice is a link placeholder the link rescue may still repair.
+fn is_link_recovery_target(item: &InvoiceItem) -> bool {
+    item.amount_cents.is_none()
+        && item.batch_id.is_none()
+        && item.dedupe_status == DedupeStatus::Unique
+        && item.non_invoice_reason.is_none()
+        && is_link_placeholder_original_name(&item.original_name)
 }
 
 /// Whether an original file name has an image extension the QR rescue reads.
@@ -1597,6 +1745,14 @@ pub(crate) fn is_image_original_name(original_name: &str) -> bool {
         })
 }
 
+/// Whether an original file name is a `.url` placeholder written by an import.
+pub(crate) fn is_link_placeholder_original_name(original_name: &str) -> bool {
+    std::path::Path::new(original_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("url"))
+}
+
 /// Extensions treated as "not an invoice file" by the dismissal action.
 ///
 /// ZIP archives are included because the import pipeline expands an archive
@@ -1610,6 +1766,15 @@ fn push_qr_recovery_criteria(query: &mut QueryBuilder<'_, Sqlite>) {
          AND (LOWER(original_name) LIKE '%.jpg' \
               OR LOWER(original_name) LIKE '%.jpeg' \
               OR LOWER(original_name) LIKE '%.png')",
+    );
+}
+
+/// Candidate criteria of the link rescue; mirrors [`is_link_recovery_target`].
+fn push_link_recovery_criteria(query: &mut QueryBuilder<'_, Sqlite>) {
+    query.push(
+        "amount_cents IS NULL AND batch_id IS NULL \
+         AND dedupe_status = 'unique' AND non_invoice_reason IS NULL \
+         AND LOWER(original_name) LIKE '%.url'",
     );
 }
 

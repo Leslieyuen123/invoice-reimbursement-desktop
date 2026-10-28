@@ -1,4 +1,4 @@
-import { Check, QrCode, RotateCcw, Save, Trash2, X } from "lucide-react";
+import { Check, Link2, QrCode, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { api } from "../../lib/api";
@@ -10,6 +10,7 @@ import {
   type AppError,
   type Category,
   type InvoiceItemDto,
+  type LinkRecoveryReportDto,
   type QrRecoveryReportDto,
 } from "../../types";
 import { ItemPreview } from "./ItemPreview";
@@ -96,6 +97,34 @@ function qrRecoveryReportText(report: QrRecoveryReportDto) {
   return `已补救 ${report.recognized} 张，${skipped}`;
 }
 
+/**
+ * Mirrors the backend link rescue scope: a `.url` placeholder outside a batch
+ * with no amount and marked unique is the only shape it can repair.
+ */
+function canRescueLinkInvoice(item: InvoiceItemDto) {
+  return (
+    item.amountCents === null &&
+    item.batchId === null &&
+    item.dedupeStatus === "unique" &&
+    !item.nonInvoiceReason &&
+    /\.url$/iu.test(item.originalName)
+  );
+}
+
+function linkRecoveryReportText(report: LinkRecoveryReportDto) {
+  const breakdown = report.skippedBreakdown
+    .map((entry) => `${entry.label} ${entry.count} 张`)
+    .join("、");
+  const skipped = breakdown
+    ? `跳过 ${report.skipped} 张（${breakdown}）`
+    : `跳过 ${report.skipped} 张`;
+  const archived =
+    report.archived > 0
+      ? `，已归档 ${report.archived} 个非发票链接（其中非发票网站 ${report.notInvoicePortal} 个）`
+      : "";
+  return `已补救 ${report.recognized} 张，${skipped}${archived}`;
+}
+
 export function ItemDrawer({
   item,
   onClose,
@@ -128,6 +157,12 @@ export function ItemDrawer({
   const [qrRecoveryReport, setQrRecoveryReport] =
     useState<QrRecoveryReportDto | null>(null);
   const [qrRecoveryError, setQrRecoveryError] = useState<string | null>(null);
+  const [rescuingLink, setRescuingLink] = useState(false);
+  const [linkRecoveryReport, setLinkRecoveryReport] =
+    useState<LinkRecoveryReportDto | null>(null);
+  const [linkRecoveryError, setLinkRecoveryError] = useState<string | null>(
+    null,
+  );
   const [resolvingDuplicate, setResolvingDuplicate] = useState<
     "keep" | "delete" | null
   >(null);
@@ -272,6 +307,26 @@ export function ItemDrawer({
     }
   }
 
+  async function rescueLinkInvoice() {
+    setSaveError(null);
+    setLinkRecoveryError(null);
+    setRescuingLink(true);
+    try {
+      const report = await api.recoverLinkInvoice(item.id);
+      setLinkRecoveryReport(report);
+      // A downloaded original or an archived non-invoice placeholder means the
+      // row changed; reload it so the drawer and the parent list (where an
+      // archived placeholder is no longer a queue entry) show the new state.
+      if (report.downloaded > 0 || report.archived > 0) {
+        onSaved(await api.getItem(item.id));
+      }
+    } catch (error) {
+      setLinkRecoveryError(messageFromError(error));
+    } finally {
+      setRescuingLink(false);
+    }
+  }
+
   async function resolveDuplicate(keep: boolean) {
     setSaveError(null);
     setResolvingDuplicate(keep ? "keep" : "delete");
@@ -372,6 +427,17 @@ export function ItemDrawer({
           {qrRecoveryReport ? (
             <p className="item-normalization-warning" role="status">
               {qrRecoveryReportText(qrRecoveryReport)}
+            </p>
+          ) : null}
+          {linkRecoveryError ? (
+            <p className="item-failure-reason" role="alert">
+              <strong>链接补救</strong>
+              <span>{linkRecoveryError}</span>
+            </p>
+          ) : null}
+          {linkRecoveryReport ? (
+            <p className="item-normalization-warning" role="status">
+              {linkRecoveryReportText(linkRecoveryReport)}
             </p>
           ) : null}
           {!item.hasNormalizedPdf ? (
@@ -576,6 +642,22 @@ export function ItemDrawer({
           >
             <QrCode size={16} strokeWidth={1.7} aria-hidden="true" />
             {rescuingQr ? "补救中" : "补救二维码"}
+          </button>
+        ) : null}
+        {canRescueLinkInvoice(item) ? (
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={
+              rescuingLink ||
+              retrying ||
+              saving ||
+              resolvingDuplicate !== null
+            }
+            onClick={() => void rescueLinkInvoice()}
+          >
+            <Link2 size={16} strokeWidth={1.7} aria-hidden="true" />
+            {rescuingLink ? "补救中" : "补救链接"}
           </button>
         ) : null}
         <button
